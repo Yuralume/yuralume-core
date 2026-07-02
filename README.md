@@ -40,6 +40,11 @@ Telegram, LINE, Discord, or WhatsApp — it's one relationship, not five clones.
 It is **self-host first and bring-your-own-key**: conversations, memories, and provider keys stay on
 your machine. Nothing is metered, and nothing phones home.
 
+<div align="center">
+<img src="assets/schedule_proactive_tg_demo.webp" alt="A character following her own daily schedule, then sending a proactive Telegram message" width="760" />
+<br/><sub>Schedules, story events, and a proactive Telegram message — real product capture, played at 1.5× speed.</sub>
+</div>
+
 | | Design | What it means |
 |---|---|---|
 | ◐ | **Schedule-driven presence** | Each character has LLM-planned daily activities. Finished activities leave emotional residue and can become memory. |
@@ -51,6 +56,18 @@ your machine. Nothing is metered, and nothing phones home.
 
 Not a ChatGPT skin, and not a character.ai clone — it's infrastructure for treating an LLM character
 as *a person with a life of their own*.
+
+## 🎬 See it in action
+
+<div align="center">
+<img src="assets/create_char_demo.webp" alt="Creating a new character from scratch in the web UI" width="760" />
+<br/><sub>Character creation flow — from a blank form to a living character, played at 6× speed.</sub>
+<br/><br/>
+<img src="assets/gram_memories_demo.webp" alt="Browsing a character's LumeGram feed and memoirs" width="760" />
+<br/><sub>LumeGram — each character's own IG-style feed, plus the memoirs they keep about you.</sub>
+</div>
+
+More clips (full resolution, with audio) on [yuralume.com](https://yuralume.com/#demo).
 
 ## 🚀 Quick start
 
@@ -70,7 +87,11 @@ irm https://yuralume.com/install.ps1 | iex
 
 > Requires [Docker](https://www.docker.com/products/docker-desktop/) · ~2 GB disk · about a minute.
 
-🎬 **Watch it run:** [the full install captured end to end — one command to a character you can talk to, 3 minutes, no edits](https://yuralume.com/self-host_install_demo.mp4).
+<div align="center">
+<img src="assets/self-host_install_demo_timelapse.webp" alt="Timelapse of the one-line install, from one command to a character you can talk to" width="760" />
+<br/><sub>The whole install, one command to a character you can talk to — 3 minutes compressed to ~24 s.
+<a href="https://yuralume.com/self-host_install_demo.mp4">Watch it in real time</a> (no speed-ups, no edits).</sub>
+</div>
 
 ### First run — three steps
 
