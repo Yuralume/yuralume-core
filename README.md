@@ -93,6 +93,85 @@ irm https://yuralume.com/install.ps1 | iex
 <a href="https://yuralume.com/self-host_install_demo.mp4">Watch it in real time</a> (no speed-ups, no edits).</sub>
 </div>
 
+### Prefer not to pipe curl into a shell? Fair.
+
+Good instinct — you shouldn't run strangers' one-liners blind. Three ways to stay in control:
+
+1. **Read the script first.** It's short and human-readable: [install.sh](https://yuralume.com/install.sh) · [install.ps1](https://yuralume.com/install.ps1)
+2. **Know what it does.** The whole script is exactly this: check Docker/Compose → download `docker-compose.yml` + `env.example` → generate three random secrets **locally** and write them into `.env.container` → `docker compose pull && up -d` → poll `http://127.0.0.1:8012/health`. It touches nothing outside `~/yuralume` and Docker volumes, needs no sudo of its own, and sends nothing anywhere.
+3. **Or skip the script entirely** and run the same steps yourself:
+
+**macOS / Linux**
+
+```bash
+# everything lives in this one folder
+mkdir -p ~/yuralume/prompts/tuned ~/yuralume/uploads && cd ~/yuralume
+
+# fetch the compose file + env template (the same two files the script uses)
+curl -fsSL https://yuralume.com/selfhost/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://yuralume.com/selfhost/env.example -o .env.example
+
+# create .env.container — three locally generated secrets, nothing leaves your machine
+CFG=$(openssl rand -hex 24); STO=$(openssl rand -hex 24); DBP=$(openssl rand -hex 24)
+sed -e "s/__CONFIG_KEY__/$CFG/g" \
+    -e "s/__STORAGE_KEY__/$STO/g" \
+    -e "s/__DB_PASSWORD__/$DBP/g" \
+    .env.example > .env.container
+
+# optional: open .env.container and set
+#   USER_PRIMARY_LANGUAGE  (zh-TW | en-US | ja-JP — defaults to zh-TW)
+#   USER_TIMEZONE          (IANA name, e.g. America/New_York — defaults to UTC)
+
+# pull the published images and start
+COMPOSE_PROJECT_NAME=yuralume docker compose pull
+COMPOSE_PROJECT_NAME=yuralume docker compose up -d
+
+# it's up when this returns ok
+curl -fsS http://127.0.0.1:8012/health
+```
+
+<details>
+<summary><b>Windows · PowerShell equivalent</b></summary>
+
+```powershell
+# everything lives in this one folder
+New-Item -ItemType Directory -Force "$HOME\yuralume\prompts\tuned", "$HOME\yuralume\uploads" | Out-Null
+Set-Location "$HOME\yuralume"
+
+# fetch the compose file + env template (the same two files the script uses)
+irm https://yuralume.com/selfhost/docker-compose.yml -OutFile docker-compose.yml
+irm https://yuralume.com/selfhost/env.example -OutFile .env.example
+
+# create .env.container — three locally generated secrets, nothing leaves your machine
+function New-Secret {
+  $b = [byte[]]::new(24)
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+  -join ($b | ForEach-Object { $_.ToString('x2') })
+}
+$envText = Get-Content -Raw .env.example
+$envText = $envText -replace '__CONFIG_KEY__', (New-Secret) `
+                    -replace '__STORAGE_KEY__', (New-Secret) `
+                    -replace '__DB_PASSWORD__', (New-Secret)
+Set-Content .env.container $envText -NoNewline -Encoding utf8
+
+# optional: open .env.container and set
+#   USER_PRIMARY_LANGUAGE  (zh-TW | en-US | ja-JP — defaults to zh-TW)
+#   USER_TIMEZONE          (IANA name, e.g. America/New_York — defaults to UTC)
+
+# pull the published images and start
+$env:COMPOSE_PROJECT_NAME = 'yuralume'
+docker compose pull
+docker compose up -d
+
+# it's up when this answers
+irm http://127.0.0.1:8012/health
+```
+
+</details>
+
+Either way you end up with the identical stack — the one-liner just automates these steps (plus a
+language/timezone prompt and a Docker preflight check).
+
 ### First run — three steps
 
 1. Install [Docker](https://www.docker.com/products/docker-desktop/), then run the one-liner above. It downloads the images and starts everything.
@@ -131,7 +210,7 @@ Every port binds to `127.0.0.1` only. To expose Yuralume on a LAN or VPS, put it
 proxy and set `APP_BASE_URL` in `.env.container`.
 
 <details>
-<summary><b>⚙️ Advanced — tunables, manual install, prompt tuning</b></summary>
+<summary><b>⚙️ Advanced — tunables, prompt tuning</b></summary>
 
 ### Tunables
 
@@ -142,17 +221,6 @@ Set these in your shell before running the one-liner:
 | `YURALUME_HOME` | `~/yuralume` | install directory |
 | `YURALUME_IMAGE_TAG` | `latest` | pin a published build (e.g. `v0.1.0`) |
 | `YURALUME_INSTALL_BASE` | `https://yuralume.com` | where to fetch the bundle |
-
-### Manual install (no script)
-
-```bash
-mkdir -p ~/yuralume/prompts/tuned ~/yuralume/uploads && cd ~/yuralume
-curl -fsSL https://yuralume.com/selfhost/docker-compose.yml -o docker-compose.yml
-curl -fsSL https://yuralume.com/selfhost/env.example -o .env.container
-# edit .env.container: replace every __...__ token with a long random string
-COMPOSE_PROJECT_NAME=yuralume docker compose pull
-COMPOSE_PROJECT_NAME=yuralume docker compose up -d
-```
 
 ### Prompt tuning
 
