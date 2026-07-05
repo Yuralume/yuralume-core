@@ -209,6 +209,25 @@ upgrades images and keeps your secrets and data.
 Every port binds to `127.0.0.1` only. To expose Yuralume on a LAN or VPS, put it behind a reverse
 proxy and set `APP_BASE_URL` in `.env.container`.
 
+**Not using WhatsApp?** `whatsapp-sidecar` is an independent container — the main `app` doesn't
+depend on it to start or run, so you can stop just that one and free up its resources:
+
+```bash
+docker compose stop whatsapp-sidecar
+```
+
+That's enough for now, but plain `docker compose up -d` (e.g. next time you run the `update`
+command) reconciles **every** defined service back to running, so it would start `whatsapp-sidecar`
+again too. To keep it off across updates, either add `--scale whatsapp-sidecar=0` to your `up`
+commands:
+
+```bash
+docker compose up -d --scale whatsapp-sidecar=0
+```
+
+or remove its service block from `docker-compose.yml` entirely if you know you'll never use it.
+Every other channel (web, Telegram, LINE, Discord) is unaffected either way.
+
 <details>
 <summary><b>⚙️ Advanced — tunables, prompt tuning</b></summary>
 
