@@ -52,6 +52,12 @@ class TavilyClient(SearchClientPort):
         self, *, query: str, max_results: int,
     ) -> SearchResponse:
         payload = {
+            # Body ``api_key`` is the legacy auth channel; Tavily's current
+            # API reference + official SDK authenticate via the Authorization
+            # header instead (the /search schema no longer lists body
+            # api_key). We send BOTH — the header is the forward-compatible
+            # method, the body key keeps older/self-hosted gateways working
+            # (audit 2026-07-16).
             "api_key": self._api_key,
             "query": query,
             "search_depth": self._search_depth,
@@ -63,10 +69,11 @@ class TavilyClient(SearchClientPort):
             # length alone (bumped in ``advanced`` depth) is enough.
             "include_raw_content": False,
         }
+        headers = {"Authorization": f"Bearer {self._api_key}"}
         url = f"{self._base_url}/search"
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(url, json=payload)
+                response = await client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException as exc:
             raise SearchError("搜尋逾時") from exc
         except httpx.HTTPError as exc:

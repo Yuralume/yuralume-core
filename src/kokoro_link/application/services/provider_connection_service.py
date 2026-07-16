@@ -99,27 +99,54 @@ _LEGACY_CONFIG_ALIASES: dict[str, dict[str, str]] = {
     "searxng": {"base_url": "searxng_base_url"},
 }
 
+# Retired config keys: fields removed from a provider's catalog entry with NO
+# successor key (unlike the rename aliases above). Rows saved while the field
+# still existed keep the old key, and the admin UI round-trips stored config
+# verbatim on edit — so without this, editing an affected row would raise
+# "does not support field: <key>" and brick the save. Normalization drops the
+# retired key before validation; the stored row self-heals on its next write.
+_RETIRED_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    # 2026-07-16: disable_reasoning (the vLLM chat_template_kwargs
+    # {enable_thinking:false} shape) was pulled from the strict-cloud
+    # openai_compatible providers — it hard-422s on Mistral and is a silent
+    # no-op on OpenAI/OpenRouter/NanoGPT/DeepSeek. It stays offered on the
+    # local/custom presets where chat_template_kwargs is honoured, so those
+    # rows keep the key legitimately (not retired for them).
+    "openai": frozenset({"disable_reasoning"}),
+    "openrouter": frozenset({"disable_reasoning"}),
+    "nanogpt": frozenset({"disable_reasoning"}),
+    "deepseek": frozenset({"disable_reasoning"}),
+    "mistral": frozenset({"disable_reasoning"}),
+}
+
 
 def normalize_legacy_config(
     provider_id: str,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Rename legacy config keys to their current catalog keys.
+    """Rename legacy config keys and drop retired ones before validation.
 
-    An explicit non-empty value under the new key wins; an empty/missing
-    new key inherits the legacy value so a stored setting never silently
-    vanishes on an edit round-trip.
+    Renamed keys: an explicit non-empty value under the new key wins; an
+    empty/missing new key inherits the legacy value so a stored setting
+    never silently vanishes on an edit round-trip.
+
+    Retired keys (no successor): dropped outright so a stored row carrying a
+    field the provider no longer offers stays editable and self-heals on its
+    next write instead of failing ``_clean_config``'s allow-list check.
     """
     aliases = _LEGACY_CONFIG_ALIASES.get(provider_id)
-    if not aliases:
+    retired = _RETIRED_CONFIG_KEYS.get(provider_id)
+    if not aliases and not retired:
         return config
     normalized = dict(config)
-    for old_key, new_key in aliases.items():
+    for old_key, new_key in (aliases or {}).items():
         if old_key not in normalized:
             continue
         value = normalized.pop(old_key)
         if normalized.get(new_key) in ("", None):
             normalized[new_key] = value
+    for key in retired or ():
+        normalized.pop(key, None)
     return normalized
 
 

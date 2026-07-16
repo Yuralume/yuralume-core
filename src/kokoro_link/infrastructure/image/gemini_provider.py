@@ -14,6 +14,12 @@ from kokoro_link.contracts.image_provider import (
     ImageProviderPort,
     ImageTimeoutError,
 )
+from kokoro_link.contracts.provider_probe import (
+    ProbeCheck,
+    probe_http_client,
+    probe_http_error_detail,
+    run_probe_check,
+)
 from kokoro_link.infrastructure.image.native_common import (
     ASPECT_TO_RATIO,
     build_prompt,
@@ -29,7 +35,10 @@ class GeminiImageProvider(ImageProviderPort):
         *,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         api_key: str,
-        model: str = "gemini-2.5-flash-image",
+        # gemini-2.5-flash-image shuts down 2026-10-02; Google's announced
+        # replacement (ai.google.dev/gemini-api/docs/deprecations) — keep
+        # aligned with catalog default_models + runtime_sync._IMAGE_DEFAULTS.
+        model: str = "gemini-3.1-flash-image-preview",
         timeout_seconds: float = 180.0,
     ) -> None:
         if not api_key.strip():
@@ -85,6 +94,50 @@ class GeminiImageProvider(ImageProviderPort):
             raise ImageNoOutputError("Gemini image API produced no images")
         return images
 
+    async def probe_image_generation(
+        self,
+        *,
+        prompt: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout_seconds: float | None = None,
+    ) -> list[ProbeCheck]:
+        """Adapter-owned deep image self-test (admin "Test" button).
+
+        One real ``generateContent`` call via THIS adapter's ``_payload``
+        (``generationConfig.imageConfig.aspectRatio``) and response
+        parsing, so the Test button exercises exactly the runtime shape.
+        """
+
+        async def check() -> tuple[bool, str]:
+            async with probe_http_client(
+                timeout_seconds or self._timeout, transport,
+            ) as client:
+                response = await client.post(
+                    f"{self._base_url}/models/{self._model}:generateContent",
+                    headers=self._headers(),
+                    json=self._payload(prompt=prompt, aspect="square"),
+                )
+            if response.status_code >= 400:
+                return False, (
+                    f"model {self._model!r}: {probe_http_error_detail(response)}"
+                )
+            try:
+                body = response.json()
+            except ValueError:
+                return False, "image response was not JSON"
+            if not isinstance(body, Mapping):
+                return False, "image response was not a JSON object"
+            try:
+                images = _images_from_generate_content(body)
+            except ImageNoOutputError:
+                return False, "image response carried no inline image data"
+            return True, (
+                f"generated {len(images[0])} bytes "
+                f"(inlineData, model {self._model!r})"
+            )
+
+        return [await run_probe_check("generated_image", check)]
+
     def _headers(self) -> dict[str, str]:
         return {
             "Content-Type": "application/json",
@@ -94,18 +147,22 @@ class GeminiImageProvider(ImageProviderPort):
 
     @staticmethod
     def _payload(*, prompt: str, aspect: str) -> dict:
+        # Documented GenerateContentRequest shape for the image models:
+        # aspect ratio lives at generationConfig.imageConfig.aspectRatio
+        # (https://ai.google.dev/gemini-api/docs/image-generation). The
+        # native generativelanguage API hard-rejects unknown JSON fields
+        # ("Invalid JSON payload received. Unknown name ..."), so no
+        # extra/legacy keys may ride along.
         return {
             "contents": [{
                 "parts": [{"text": prompt}],
             }],
             "generationConfig": {
-                "responseFormat": {
-                    "image": {
-                        "aspectRatio": ASPECT_TO_RATIO.get(
-                            aspect,
-                            ASPECT_TO_RATIO["portrait"],
-                        ),
-                    },
+                "imageConfig": {
+                    "aspectRatio": ASPECT_TO_RATIO.get(
+                        aspect,
+                        ASPECT_TO_RATIO["portrait"],
+                    ),
                 },
             },
         }

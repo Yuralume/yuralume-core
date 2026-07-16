@@ -58,6 +58,38 @@ async def test_valid_signature_dispatches_via_slug() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_token_flows_from_webhook_to_outbound() -> None:
+    """End to end: the event's replyToken must reach the adapter so the
+    answer rides the free reply API instead of burning push quota."""
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_line_account(
+        harness, character_id=character.id, channel_secret="SEC",
+    )
+    client = build_messaging_app_client(harness)
+
+    body = _webhook_body()
+    sig = compute_signature(channel_secret="SEC", body=body)
+
+    response = client.post(
+        f"/api/v1/messaging/line/webhook/{account.webhook_slug}",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Line-Signature": sig,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(harness.line_adapter.sent) >= 1
+    assert harness.line_adapter.sent[0].reply_context == {
+        "reply_token": "r-1",
+    }
+    for later in harness.line_adapter.sent[1:]:
+        assert later.reply_context == {}
+
+
+@pytest.mark.asyncio
 async def test_missing_signature_is_rejected() -> None:
     harness = build_messaging_harness()
     character = await create_character(harness)

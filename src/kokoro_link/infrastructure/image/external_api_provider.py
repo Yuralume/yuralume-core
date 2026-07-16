@@ -20,7 +20,15 @@ from kokoro_link.contracts.image_provider import (
     ImageNoOutputError,
     ImageTimeoutError,
 )
+from kokoro_link.contracts.provider_probe import (
+    ProbeCheck,
+    probe_http_client,
+    run_probe_check,
+)
 from kokoro_link.infrastructure.http_error_logging import log_http_error_response
+from kokoro_link.infrastructure.image.native_common import (
+    describe_image_probe_response,
+)
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_visual_identity_lines,
 )
@@ -90,18 +98,7 @@ class ExternalImageApiProvider:
         )
         if not prompt.strip():
             raise ImageGenerationError("image prompt is empty")
-        # NOTE: deliberately no ``response_format`` field. The published
-        # Custom Media Gateway contract (docs/CUSTOM_MEDIA_GATEWAY_SPEC.md)
-        # pins this body to exactly {model, prompt, size, n}, and this one
-        # payload serves every kind routed here (gateway / custom /
-        # openai_compatible — see runtime_sync). Gateways choose b64_json
-        # vs url per item in the response instead.
-        payload = {
-            "model": self._model,
-            "prompt": prompt,
-            "size": ASPECT_TO_SIZE.get(aspect, ASPECT_TO_SIZE["portrait"]),
-            "n": max(1, min(int(batch), 4)),
-        }
+        payload = self._generation_payload(prompt=prompt, aspect=aspect, batch=batch)
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
@@ -122,11 +119,56 @@ class ExternalImageApiProvider:
         except Exception as exc:
             raise ImageGenerationError(str(exc)) from exc
 
+    def _generation_payload(self, *, prompt: str, aspect: str, batch: int) -> dict:
+        """Request body — shared by ``generate()`` and the probe hook.
+
+        NOTE: deliberately no ``response_format`` field. The published
+        Custom Media Gateway contract (docs/CUSTOM_MEDIA_GATEWAY_SPEC.md)
+        pins this body to exactly {model, prompt, size, n}, and this one
+        payload serves every kind routed here (gateway / custom /
+        openai_compatible — see runtime_sync). Gateways choose b64_json
+        vs url per item in the response instead.
+        """
+        return {
+            "model": self._model,
+            "prompt": prompt,
+            "size": ASPECT_TO_SIZE.get(aspect, ASPECT_TO_SIZE["portrait"]),
+            "n": max(1, min(int(batch), 4)),
+        }
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._api_key}",
             "X-Request-Id": f"img-{uuid4().hex}",
         }
+
+    async def probe_image_generation(
+        self,
+        *,
+        prompt: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout_seconds: float | None = None,
+    ) -> list[ProbeCheck]:
+        """Adapter-owned deep image self-test (admin "Test" button).
+
+        One real 1-image generation with THIS adapter's spec-pinned
+        {model, prompt, size, n} body at the smallest allowed size.
+        ``url`` items are acknowledged, never downloaded.
+        """
+
+        async def check() -> tuple[bool, str]:
+            payload = self._generation_payload(prompt=prompt, aspect="square", batch=1)
+            async with probe_http_client(
+                timeout_seconds or self._timeout, transport,
+            ) as client:
+                response = await client.post(
+                    f"{self._base_url}/images/generations",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            return describe_image_probe_response(response, self._model)
+
+        return [await run_probe_check("generated_image", check)]
 
 
 def _build_prompt(

@@ -44,6 +44,22 @@ async def test_send_posts_discord_message_with_bot_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_many_delivers_bubbles_sequentially() -> None:
+    """Discord has no batch endpoint — a batched hand-over must behave
+    exactly like the old per-bubble loop, order preserved."""
+    captured: list[httpx.Request] = []
+    adapter = DiscordAdapter(transport=_ok_transport(captured))
+
+    await adapter.send_many([_outbound(text="第一則"), _outbound(text="第二則")])
+
+    assert len(captured) == 2
+    contents = [
+        json.loads(r.content.decode())["content"] for r in captured
+    ]
+    assert contents == ["第一則", "第二則"]
+
+
+@pytest.mark.asyncio
 async def test_send_appends_attachment_urls_to_text() -> None:
     captured: list[httpx.Request] = []
     adapter = DiscordAdapter(transport=_ok_transport(captured))

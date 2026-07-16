@@ -114,6 +114,53 @@ async def test_batch_clamped_to_max_four(restore_httpx: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_n_shortfall_tops_up_with_single_image_requests(
+    restore_httpx: None,
+) -> None:
+    """OpenRouter providers may clamp ``n`` to their supported subset and
+    silently return fewer images (flux.2-family caps n at 1 — see
+    https://openrouter.ai/docs/guides/overview/multimodal/image-generation
+    'Providers clamp to their supported subset'). The adapter must react
+    to the observed shortfall with n=1 top-up requests — no per-model
+    capability table."""
+    requested_ns: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        requested_ns.append(body["n"])
+        # Always return a single image regardless of n — the clamp.
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+        })
+
+    provider = _provider(handler)
+    images = await provider.generate(character=_character(), positive="x", batch=3)
+
+    assert len(images) == 3
+    assert requested_ns == [3, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_top_up_failure_returns_partial_batch(restore_httpx: None) -> None:
+    """A failed top-up must not throw away already-billed images."""
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(200, json={
+                "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+            })
+        return httpx.Response(429, text="rate limited")
+
+    provider = _provider(handler)
+    images = await provider.generate(character=_character(), positive="x", batch=2)
+
+    assert images == [_PNG]
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_url_item_is_downloaded(restore_httpx: None) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/images"):

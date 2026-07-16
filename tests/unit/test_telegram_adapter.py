@@ -43,6 +43,23 @@ async def test_send_uses_credentials_from_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_many_delivers_bubbles_sequentially() -> None:
+    """Telegram has no batch endpoint — a batched hand-over must behave
+    exactly like the old per-bubble loop, order preserved."""
+    captured: list[httpx.Request] = []
+    adapter = TelegramAdapter(transport=_ok_transport(captured))
+
+    await adapter.send_many([_outbound(text="第一則"), _outbound(text="第二則")])
+
+    assert [r.url.path for r in captured] == [
+        "/botTOKEN/sendMessage",
+        "/botTOKEN/sendMessage",
+    ]
+    texts = [json.loads(r.content.decode())["text"] for r in captured]
+    assert texts == ["第一則", "第二則"]
+
+
+@pytest.mark.asyncio
 async def test_send_uses_per_call_credentials() -> None:
     """Two accounts with different tokens must hit distinct URLs."""
 

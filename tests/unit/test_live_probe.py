@@ -66,7 +66,11 @@ def test_llm_openai_lists_models_then_chats() -> None:
             body = json.loads(request.content)
             assert body["model"] == "gpt-4o-mini"
             assert body["max_tokens"] == 1
-            assert body["messages"] == [{"role": "user", "content": "ping"}]
+            # The probe rides the runtime adapter's own payload builder
+            # (2026-07-16 unification), so it now mirrors the runtime
+            # request shape exactly — including the system message.
+            assert body["messages"][0]["role"] == "system"
+            assert body["messages"][-1] == {"role": "user", "content": "ping"}
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": "pong"}}]},
@@ -292,6 +296,36 @@ def test_tts_openai_synthesizes_hi() -> None:
     assert "marin" in reports[0].detail
 
 
+def test_tts_openrouter_probe_defaults_to_mp3_and_current_model() -> None:
+    """OpenRouter's /audio/speech only accepts response_format mp3|pcm —
+    wav is rejected with a ZodError before auth
+    (https://openrouter.ai/docs/guides/overview/multimodal/tts) — and its
+    speech catalog (GET /models?output_modalities=speech) no longer lists
+    any openai/* TTS model, so the probe must mirror runtime_sync's
+    provider-scoped defaults (x-ai/grok-voice-tts-1.0 + eve + mp3)."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/audio/speech"
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, content=b"mp3-bytes")
+
+    reports = _probe(
+        "openrouter",
+        ["tts"],
+        secret={"api_key": "sk-or-unit"},
+        handler=handler,
+    )
+
+    assert [(report.action, report.ok) for report in reports] == [
+        ("synthesized_speech", True),
+    ]
+    assert seen["response_format"] == "mp3"
+    assert seen["model"] == "x-ai/grok-voice-tts-1.0"
+    assert seen["voice"] == "eve"
+
+
 def test_tts_yuralume_cloud_not_probed_ok() -> None:
     # Poison default handler proves this branch makes no network calls.
     reports = _probe(
@@ -464,6 +498,120 @@ def test_image_deep_gateway_url_item_not_downloaded() -> None:
     assert methods == ["POST"]
 
 
+def test_image_deep_xai_retries_without_aspect_ratio_on_signal() -> None:
+    """The xAI deep probe mirrors XAIImageProvider's request shape AND
+    its signal-driven coping: on the strict 400
+    'Argument not supported: aspect_ratio'
+    (https://docs.x.ai/developers/model-capabilities/images/generation)
+    it retries once without the param, so the Test button matches what
+    the runtime would experience."""
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/images/generations"
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "aspect_ratio" in body:
+            return httpx.Response(400, json={
+                "code": "400",
+                "error": "Argument not supported: aspect_ratio",
+            })
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}],
+        })
+
+    reports = _probe(
+        "xai",
+        ["image"],
+        secret={"api_key": "xai-unit"},
+        handler=handler,
+        deep=True,
+    )
+
+    assert [(report.action, report.ok) for report in reports] == [
+        ("generated_image", True),
+    ]
+    # Default model mirrors runtime_sync._IMAGE_DEFAULTS (current
+    # grok-imagine slug, not the legacy grok-2-image-1212).
+    assert bodies[0]["model"] == "grok-imagine-image-quality"
+    assert len(bodies) == 2
+    assert "aspect_ratio" not in bodies[1]
+
+
+def test_image_deep_gemini_generates_via_image_config() -> None:
+    """The Gemini deep probe posts the documented generateContent shape:
+    generationConfig.imageConfig.aspectRatio
+    (https://ai.google.dev/gemini-api/docs/image-generation)."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        seen["path"] = request.url.path
+        seen["api_key"] = request.headers.get("x-goog-api-key")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": base64.b64encode(b"png-bytes").decode(),
+                        },
+                    }],
+                },
+            }],
+        })
+
+    reports = _probe(
+        "google_gemini",
+        ["image"],
+        secret={"api_key": "gemini-unit"},
+        handler=handler,
+        deep=True,
+    )
+
+    assert [(report.action, report.ok) for report in reports] == [
+        ("generated_image", True),
+    ]
+    assert seen["path"].endswith(
+        "/models/gemini-3.1-flash-image-preview:generateContent",
+    )
+    assert seen["api_key"] == "gemini-unit"
+    assert seen["body"]["generationConfig"] == {
+        "imageConfig": {"aspectRatio": "1:1"},
+    }
+
+
+def test_image_deep_nanogpt_default_model_is_catalog_listed() -> None:
+    """'flux-1.1-pro' vanished from NanoGPT's image catalog (GET
+    /api/v1/image-models, re-checked 2026-07-16 — FLUX ids are now
+    'flux-pro/v1.1' and lack our portrait/landscape sizes); the shipped
+    default must be a listed model that supports the pinned
+    {1024x1024, 1024x1536, 1536x1024} size set → gpt-image-1
+    (https://docs.nano-gpt.com/api-reference/endpoint/image-generation-openai)."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/images/generations"
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}],
+        })
+
+    reports = _probe(
+        "nanogpt",
+        ["image"],
+        secret={"api_key": "sk-nano-unit"},
+        handler=handler,
+        deep=True,
+    )
+
+    assert [(report.action, report.ok) for report in reports] == [
+        ("generated_image", True),
+    ]
+    assert seen["model"] == "gpt-image-1"
+
+
 # ---------------------------------------------------------------------------
 # video + no-strategy pairs
 # ---------------------------------------------------------------------------
@@ -552,3 +700,76 @@ def test_sanitize_error_is_case_insensitive() -> None:
 
     assert "SK-ABCDEFGH12345" not in sanitize_error("denied: SK-ABCDEFGH12345")
     assert "[redacted]" in sanitize_error("denied: SK-ABCDEFGH12345")
+
+
+def test_llm_chat_retries_with_max_completion_tokens_on_signal() -> None:
+    """gpt-5+/o-series models 400 on max_tokens and prescribe
+    max_completion_tokens — the probe must retry on that explicit signal
+    and surface the quirk in the detail (field report 2026-07-16)."""
+    import httpx
+
+    from kokoro_link.infrastructure.provider_settings.catalog import catalog_by_id
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "gpt-5.6-luna"}]})
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if "max_tokens" in body:
+            return httpx.Response(400, json={"error": {
+                "message": "Unsupported parameter: 'max_tokens' is not "
+                "supported with this model. Use 'max_completion_tokens' "
+                "instead.",
+                "type": "invalid_request_error",
+            }})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}],
+        })
+
+    entry = catalog_by_id()["openai"]
+    reports = asyncio.run(
+        probe_connection(
+            entry=entry,
+            capabilities=["llm"],
+            config={"default_model": "gpt-5.6-luna"},
+            secret={"api_key": "sk-test-123456789"},
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    chat = [r for r in reports if r.action == "chat_completion"]
+    assert chat and chat[0].ok, chat
+    assert "max_completion_tokens" in chat[0].detail
+    assert [list(b.keys())[-1] for b in bodies] == [
+        "max_tokens", "max_completion_tokens",
+    ]
+
+
+def test_llm_chat_plain_400_is_not_retried() -> None:
+    """A 400 that does not prescribe the rename must fail once, verbatim."""
+    import httpx
+
+    from kokoro_link.infrastructure.provider_settings.catalog import catalog_by_id
+
+    calls = {"chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        calls["chat"] += 1
+        return httpx.Response(400, json={"error": {"message": "bad prompt"}})
+
+    entry = catalog_by_id()["openai"]
+    reports = asyncio.run(
+        probe_connection(
+            entry=entry,
+            capabilities=["llm"],
+            config={"default_model": "m"},
+            secret={"api_key": "sk-test-123456789"},
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    chat = [r for r in reports if r.action == "chat_completion"]
+    assert chat and not chat[0].ok
+    assert calls["chat"] == 1

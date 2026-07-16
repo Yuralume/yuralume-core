@@ -492,3 +492,101 @@ async def test_list_models_cached_within_ttl() -> None:
 
     # Second call served from cache.
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# max_tokens → max_completion_tokens signal-driven rename (2026-07-16)
+# ---------------------------------------------------------------------------
+
+
+def _max_tokens_rejection() -> httpx.Response:
+    return httpx.Response(400, json={"error": {
+        "message": "Unsupported parameter: 'max_tokens' is not supported "
+        "with this model. Use 'max_completion_tokens' instead.",
+        "type": "invalid_request_error",
+    }})
+
+
+def _chat_ok() -> httpx.Response:
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": "ok"}}],
+    })
+
+
+def _build_capped(model: str = "gpt-5.6-luna") -> OpenAICompatibleChatModel:
+    return OpenAICompatibleChatModel(
+        provider_id="openai",
+        base_url="https://api.example.invalid/v1",
+        api_key="sk-test",
+        model=model,
+        max_tokens=4096,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_renames_max_tokens_on_server_signal() -> None:
+    """The server prescribes max_completion_tokens → retry once with the
+    rename, and remember it so the next call skips the failed round."""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if "max_tokens" in body:
+            return _max_tokens_rejection()
+        return _chat_ok()
+
+    chat = _build_capped()
+    with _patch_transport(httpx.MockTransport(handler)):
+        assert await chat.generate("hi") == "ok"
+        # Memoized: the second call must go straight to the renamed param.
+        assert await chat.generate("hi again") == "ok"
+
+    assert "max_tokens" in bodies[0]
+    assert "max_completion_tokens" in bodies[1]
+    assert "max_tokens" not in bodies[1]
+    assert len(bodies) == 3, "second generate must not re-hit the rejection"
+    assert "max_completion_tokens" in bodies[2]
+
+
+@pytest.mark.asyncio
+async def test_generate_plain_400_is_not_retried() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(400, json={"error": {"message": "bad prompt"}})
+
+    chat = _build_capped()
+    with _patch_transport(httpx.MockTransport(handler)):
+        with pytest.raises(Exception):
+            await chat.generate("hi")
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_stream_renames_max_tokens_on_server_signal() -> None:
+    bodies: list[dict] = []
+    stream_body = (
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if "max_tokens" in body:
+            return _max_tokens_rejection()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=stream_body,
+        )
+
+    chat = _build_capped()
+    with _patch_transport(httpx.MockTransport(handler)):
+        chunks = [c async for c in chat.generate_stream("hi")]
+
+    assert "".join(chunks) == "ok"
+    assert "max_tokens" in bodies[0]
+    assert "max_completion_tokens" in bodies[1]

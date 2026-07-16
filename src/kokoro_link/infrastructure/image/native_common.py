@@ -13,6 +13,7 @@ from kokoro_link.contracts.image_provider import (
     ImageGenerationError,
     ImageNoOutputError,
 )
+from kokoro_link.contracts.provider_probe import probe_http_error_detail
 from kokoro_link.infrastructure.http_error_logging import log_http_error_response
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_visual_identity_lines,
@@ -116,6 +117,48 @@ async def download_bytes(
             f"image artifact download failed: {response.status_code}",
         )
     return response.content
+
+
+def describe_image_probe_response(
+    response: httpx.Response,
+    model: str,
+) -> tuple[bool, str]:
+    """Describe an OpenAI-Images-shaped generation response for a probe.
+
+    Shared by the image providers' ``probe_image_generation`` hooks.
+    Probe semantics differ from runtime decoding on purpose: a ``url``
+    item's presence is the verification — the artifact is never
+    downloaded by a probe.
+    """
+    if response.status_code >= 400:
+        return False, f"model {model!r}: {probe_http_error_detail(response)}"
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    items: object = None
+    if isinstance(body, dict):
+        items = body.get("data")
+        if not isinstance(items, list):
+            items = body.get("artifacts")
+    if not isinstance(items, list):
+        return False, "image response carried no data array"
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        b64 = item.get("b64_json") or item.get("b64")
+        if isinstance(b64, str) and b64:
+            try:
+                raw = base64.b64decode(b64)
+            except Exception:
+                return False, "image response carried invalid base64 payload"
+            return True, f"generated {len(raw)} bytes (b64_json, model {model!r})"
+        url = item.get("url")
+        if isinstance(url, str) and url:
+            return True, (
+                f"generated image URL returned (not downloaded, model {model!r})"
+            )
+    return False, "image response contained no usable image item"
 
 
 def json_or_raise(response: httpx.Response, label: str) -> Mapping:

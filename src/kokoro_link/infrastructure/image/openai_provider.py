@@ -12,8 +12,11 @@ Compared with the ComfyUI path this adapter is much shorter because:
     operator already wrote (``appearance`` + runtime mood + scene).
   * Aspect → ``size`` is a fixed three-way mapping; there's no LoRA /
     workflow / checkpoint plumbing to thread.
-  * The API returns base64 PNGs inline, so there's no follow-up
-    download step like ComfyUI's history walk.
+  * gpt-image models return base64 PNGs inline (``data[].b64_json``);
+    dall-e-2/3 default to time-limited ``data[].url`` items instead
+    (we deliberately omit ``response_format`` because gpt-image models
+    reject it), so items may also carry a URL we download — pre-signed
+    and short-lived, fetched WITHOUT the Authorization header.
 
 Failure model maps onto the port:
 
@@ -43,7 +46,16 @@ from kokoro_link.contracts.image_provider import (
     ImageTokenUsage,
     ImageTimeoutError,
 )
+from kokoro_link.contracts.provider_probe import (
+    ProbeCheck,
+    probe_http_client,
+    run_probe_check,
+)
 from kokoro_link.infrastructure.http_error_logging import log_http_error_response
+from kokoro_link.infrastructure.image.native_common import (
+    describe_image_probe_response,
+    download_bytes,
+)
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_visual_identity_lines,
 )
@@ -89,7 +101,8 @@ class OpenAIImageProvider(ImageProviderPort):
         self._model = model or "gpt-image-2"
         self._quality = quality if quality in _ALLOWED_QUALITIES else "medium"
         self._timeout = float(timeout_seconds)
-        self._endpoint = f"{base_url.rstrip('/')}/images/generations"
+        self._base_url = base_url.rstrip("/")
+        self._endpoint = f"{self._base_url}/images/generations"
         self.last_model_id = self._model
         self.last_usage: ImageTokenUsage | None = None
 
@@ -124,74 +137,143 @@ class OpenAIImageProvider(ImageProviderPort):
             use_runtime_state=use_runtime_state,
         )
 
-        payload = {
-            "model": self._model,
-            "prompt": prompt_text,
-            "size": size,
-            "quality": self._quality,
-            "n": n,
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        payload = self._generation_payload(prompt=prompt_text, size=size, n=n)
+        headers = self._request_headers()
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(
                     self._endpoint, headers=headers, json=payload,
                 )
+
+                if resp.status_code != 200:
+                    # Surface the upstream message verbatim — operator-facing
+                    # routes already log + render this, so a clean string beats
+                    # losing the upstream error code.
+                    log_http_error_response(
+                        _LOGGER, resp, operation="OpenAI image API",
+                    )
+                    detail = self._safe_error_detail(resp)
+                    raise ImageGenerationError(
+                        f"OpenAI image API HTTP {resp.status_code}: {detail}",
+                    )
+
+                try:
+                    body = resp.json()
+                except ValueError as exc:
+                    raise ImageGenerationError(
+                        f"OpenAI image API 回傳格式錯誤：{exc}",
+                    ) from exc
+
+                data = body.get("data") if isinstance(body, dict) else None
+                if not isinstance(data, list) or not data:
+                    raise ImageNoOutputError("OpenAI image API 沒有回傳任何圖片")
+                self.last_usage = ImageTokenUsage.from_mapping(body.get("usage"))
+                images = await self._decode_items(data, client=client)
         except httpx.TimeoutException as exc:
             raise ImageTimeoutError(
                 f"OpenAI image API 逾時：{exc}",
             ) from exc
+        except ImageGenerationError:
+            raise
         except httpx.HTTPError as exc:
             raise ImageGenerationError(
                 f"OpenAI image API 連線錯誤：{exc}",
             ) from exc
 
-        if resp.status_code != 200:
-            # Surface the upstream message verbatim — operator-facing
-            # routes already log + render this, so a clean string beats
-            # losing the upstream error code.
-            log_http_error_response(_LOGGER, resp, operation="OpenAI image API")
-            detail = self._safe_error_detail(resp)
-            raise ImageGenerationError(
-                f"OpenAI image API HTTP {resp.status_code}: {detail}",
+        if not images:
+            raise ImageNoOutputError(
+                "OpenAI image API 回傳資料中沒有可用的 b64_json 或 url",
             )
+        return images
 
-        try:
-            body = resp.json()
-        except ValueError as exc:
-            raise ImageGenerationError(
-                f"OpenAI image API 回傳格式錯誤：{exc}",
-            ) from exc
+    def _generation_payload(self, *, prompt: str, size: str, n: int) -> dict:
+        """Request body — shared by ``generate()`` and the probe hook."""
+        return {
+            "model": self._model,
+            "prompt": prompt,
+            "size": size,
+            "quality": self._quality,
+            "n": n,
+        }
 
-        data = body.get("data") if isinstance(body, dict) else None
-        if not isinstance(data, list) or not data:
-            raise ImageNoOutputError("OpenAI image API 沒有回傳任何圖片")
-        self.last_usage = ImageTokenUsage.from_mapping(body.get("usage"))
+    def _request_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
 
+    async def probe_image_generation(
+        self,
+        *,
+        prompt: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout_seconds: float | None = None,
+    ) -> list[ProbeCheck]:
+        """Adapter-owned deep image self-test (admin "Test" button).
+
+        One real 1-image generation using THIS adapter's payload builder
+        (including the ``quality`` field the runtime sends) at the
+        smallest allowed size. ``url`` items are acknowledged, never
+        downloaded.
+        """
+
+        async def check() -> tuple[bool, str]:
+            payload = self._generation_payload(
+                prompt=prompt, size=ASPECT_TO_SIZE["square"], n=1,
+            )
+            async with probe_http_client(
+                timeout_seconds or self._timeout, transport,
+            ) as client:
+                response = await client.post(
+                    self._endpoint,
+                    headers=self._request_headers(),
+                    json=payload,
+                )
+            return describe_image_probe_response(response, self._model)
+
+        return [await run_probe_check("generated_image", check)]
+
+    async def _decode_items(
+        self,
+        data: list,
+        *,
+        client: httpx.AsyncClient,
+    ) -> list[bytes]:
+        """Decode ``data[]`` items into raw image bytes.
+
+        gpt-image models always answer ``b64_json``; dall-e-2/3 (which
+        ignore our omitted ``response_format``) answer time-limited
+        ``url`` items instead — those are downloaded exactly like the
+        gateway adapter's artifact download (``download_bytes``), i.e. a
+        plain GET with NO Authorization header: the URL is pre-signed
+        and the docs require no auth on the fetch.
+        """
         images: list[bytes] = []
         for i, item in enumerate(data):
             if not isinstance(item, dict):
                 continue
             b64 = item.get("b64_json")
-            if not isinstance(b64, str) or not b64:
-                _LOGGER.warning(
-                    "OpenAI image item %s missing b64_json (keys=%s)",
-                    i, list(item.keys()) if isinstance(item, dict) else None,
+            if isinstance(b64, str) and b64:
+                try:
+                    images.append(base64.b64decode(b64))
+                except (ValueError, base64.binascii.Error) as exc:
+                    _LOGGER.warning(
+                        "OpenAI image item %s base64 decode failed: %s", i, exc,
+                    )
+                continue
+            url = item.get("url")
+            if isinstance(url, str) and url:
+                images.append(
+                    await download_bytes(
+                        client=client, url=url, base_url=self._base_url,
+                    ),
                 )
                 continue
-            try:
-                images.append(base64.b64decode(b64))
-            except (ValueError, base64.binascii.Error) as exc:
-                _LOGGER.warning(
-                    "OpenAI image item %s base64 decode failed: %s", i, exc,
-                )
-        if not images:
-            raise ImageNoOutputError(
-                "OpenAI image API 回傳資料中沒有可用的 b64_json",
+            _LOGGER.warning(
+                "OpenAI image item %s carried neither b64_json nor url "
+                "(keys=%s)",
+                i, list(item.keys()),
             )
         return images
 

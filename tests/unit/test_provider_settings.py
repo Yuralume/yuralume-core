@@ -79,21 +79,50 @@ def test_openai_compatible_catalog_entries_expose_reasoning_fields() -> None:
     )
 
     catalog = catalog_by_id()
+    # reasoning_effort / extra_request_params / strip_think_tags stay on the
+    # whole openai_compatible family (reasoning_effort is save-time
+    # validated; strip_think_tags is harmless client-side filtering).
+    shared_reasoning = {
+        "reasoning_effort",
+        "extra_request_params",
+        "strip_think_tags",
+    }
     for provider_id in (
         "openai",
         "openrouter",
+        "nanogpt",
         "deepseek",
         "mistral",
         "custom_openai_compatible",
         "local_openai_compatible",
     ):
         keys = {f.key for f in catalog[provider_id].config_fields}
-        assert {
-            "disable_reasoning",
-            "reasoning_effort",
-            "extra_request_params",
-            "strip_think_tags",
-        } <= keys, provider_id
+        assert shared_reasoning <= keys, provider_id
+
+
+def test_disable_reasoning_scoped_to_local_openai_compatible() -> None:
+    """disable_reasoning emits the vLLM chat_template_kwargs shape, which
+    422s on Mistral and is a silent no-op on the other cloud backends — so
+    it is offered ONLY on the local/custom presets where it is honoured
+    (audit 2026-07-16)."""
+    from kokoro_link.infrastructure.provider_settings.catalog import (
+        catalog_by_id,
+    )
+
+    catalog = catalog_by_id()
+    for provider_id in ("local_openai_compatible", "custom_openai_compatible"):
+        keys = {f.key for f in catalog[provider_id].config_fields}
+        assert "disable_reasoning" in keys, provider_id
+    for provider_id in (
+        "openai",
+        "openrouter",
+        "nanogpt",
+        "deepseek",
+        "mistral",
+        "google_gemini",
+    ):
+        keys = {f.key for f in catalog[provider_id].config_fields}
+        assert "disable_reasoning" not in keys, provider_id
 
 
 def test_anthropic_catalog_entry_exposes_thinking_budget() -> None:
@@ -853,8 +882,16 @@ def test_openrouter_embedding_dimension_mismatch_is_rejected(monkeypatch) -> Non
     assert app.state.container.embedder.is_operational is False
 
 
-def test_openrouter_tts_registers_openai_speech_adapter(monkeypatch) -> None:
-    from kokoro_link.infrastructure.tts.external_api import OpenAITTSAdapter
+def test_openrouter_tts_registers_openrouter_speech_adapter(monkeypatch) -> None:
+    """OpenRouter rides the OpenAI speech protocol for synthesis, but its
+    voice catalog is per-model (GET /models?output_modalities=speech →
+    supported_voices) and its response_format default must be mp3 (the
+    endpoint rejects wav — audit 2026-07-16), so it gets the dedicated
+    OpenRouterTTSAdapter subclass."""
+    from kokoro_link.infrastructure.tts.external_api import (
+        OpenAITTSAdapter,
+        OpenRouterTTSAdapter,
+    )
 
     _configure_env(monkeypatch)
     app = create_app()
@@ -868,8 +905,8 @@ def test_openrouter_tts_registers_openai_speech_adapter(monkeypatch) -> None:
             "enabled": True,
             "capabilities": ["tts"],
             "config": {
-                "tts_model": "openai/gpt-4o-mini-tts",
-                "voice_id": "alloy",
+                "tts_model": "x-ai/grok-voice-tts-1.0",
+                "voice_id": "eve",
             },
             "secret": {"api_key": "sk-or-secret"},
         },
@@ -877,16 +914,42 @@ def test_openrouter_tts_registers_openai_speech_adapter(monkeypatch) -> None:
     assert created.status_code == 201
 
     # OpenRouter proxies OpenAI's /audio/speech → the OpenAI-speech
-    # adapter, NOT the generic gateway ExternalTTSAdapter.
+    # adapter family (dedicated subclass), NOT the generic gateway
+    # ExternalTTSAdapter.
     catalog_port = app.state.container.tts_voice_catalog
+    assert isinstance(catalog_port, OpenRouterTTSAdapter)
     assert isinstance(catalog_port, OpenAITTSAdapter)
+    # mp3 default (not wav) — OpenRouter schema-validates response_format
+    # to {mp3, pcm}.
+    assert catalog_port._response_format == "mp3"  # noqa: SLF001
+
+    # Voice discovery hits the speech model catalog — mock the network.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["output_modalities"] == "speech"
+        return httpx.Response(200, json={
+            "data": [
+                {
+                    "id": "x-ai/grok-voice-tts-1.0",
+                    "supported_voices": ["eve", "ara", "rex"],
+                },
+            ],
+        })
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return real_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
 
     assets = client.get("/api/v1/tts/assets")
     assert assets.status_code == 200
     body = assets.json()
     assert body["enabled"] is True
     voice_ids = {row["voice_id"] for row in body["voice_presets"]}
-    assert "alloy" in voice_ids
+    assert voice_ids == {"eve", "ara", "rex"}
 
 
 def test_openrouter_image_registers_openrouter_provider(monkeypatch) -> None:
@@ -966,7 +1029,8 @@ def test_nanogpt_llm_registers_openai_compatible_model(monkeypatch) -> None:
     chat_model = app.state.container.model_registry.resolve("nanogpt")
     # base_url / default_model fall back to _OPENAI_COMPATIBLE_DEFAULTS.
     assert chat_model._base_url == "https://nano-gpt.com/api/v1"  # noqa: SLF001
-    assert chat_model._build_payload("hi")["model"] == "gpt-5.2"  # noqa: SLF001
+    # Canonical NanoGPT id (bare 'gpt-5.2' alias was dropped upstream).
+    assert chat_model._build_payload("hi")["model"] == "openai/gpt-5.2"  # noqa: SLF001
 
 
 def test_nanogpt_image_registers_gateway_profile(monkeypatch) -> None:
@@ -1346,6 +1410,76 @@ def test_normalize_legacy_config_searxng_base_url() -> None:
     # Providers whose catalog legitimately uses base_url are untouched.
     cfg = {"base_url": "https://api.openai.com/v1"}
     assert normalize_legacy_config("openai", cfg) == cfg
+
+
+def test_normalize_legacy_config_drops_retired_disable_reasoning() -> None:
+    """Retired ``disable_reasoning`` key (pulled from strict-cloud providers
+    2026-07-16) is dropped so a legacy row's verbatim edit round-trip does
+    not fail ``_clean_config``'s allow-list. Other config survives intact."""
+    from kokoro_link.application.services.provider_connection_service import (
+        normalize_legacy_config,
+    )
+
+    for provider_id in ("openai", "openrouter", "nanogpt", "deepseek", "mistral"):
+        assert normalize_legacy_config(
+            provider_id,
+            {"default_model": "m", "disable_reasoning": True},
+        ) == {"default_model": "m"}, provider_id
+
+    # A false value is dropped too — the allow-list check fires on the key,
+    # not the value, so both would otherwise brick the save.
+    assert normalize_legacy_config(
+        "openai", {"default_model": "m", "disable_reasoning": False},
+    ) == {"default_model": "m"}
+
+    # Local/custom presets still offer the field → it must NOT be dropped.
+    for provider_id in ("local_openai_compatible", "custom_openai_compatible"):
+        cfg = {"default_model": "m", "disable_reasoning": True}
+        assert normalize_legacy_config(provider_id, cfg) == cfg, provider_id
+
+
+def test_legacy_disable_reasoning_row_stays_editable_and_self_heals() -> None:
+    """End-to-end: a pre-change openai row storing ``disable_reasoning`` must
+    stay editable. The admin UI round-trips stored config verbatim on edit,
+    so without retired-key tolerance ``_clean_config`` would 400 on the
+    now-unknown field. The save must succeed and strip the key (self-heal)."""
+    from datetime import datetime, timezone
+
+    from kokoro_link.application.services.provider_connection_service import (
+        ProviderConnectionService,
+    )
+    from kokoro_link.contracts.provider_settings import ProviderConnection
+    from kokoro_link.infrastructure.repositories.in_memory_provider_connections import (  # noqa: E501
+        InMemoryProviderConnectionRepository,
+    )
+
+    cipher = ProviderSecretCipher("unit-test-provider-secret-key")
+    secret = {"api_key": "sk-legacy"}
+    now = datetime.now(timezone.utc)
+    legacy = ProviderConnection(
+        id="row-legacy",
+        provider="openai",
+        label="OpenAI",
+        enabled=True,
+        capabilities=("llm",),
+        config={"default_model": "gpt-4o-mini", "disable_reasoning": True},
+        encrypted_secret=cipher.encrypt(secret),
+        secret_fingerprint=cipher.fingerprint(secret),
+        created_at=now,
+        updated_at=now,
+    )
+    repo = InMemoryProviderConnectionRepository(seed=[legacy])
+    service = ProviderConnectionService(repository=repo, cipher=cipher)
+
+    updated = asyncio.run(
+        service.update_connection(
+            "row-legacy",
+            # Verbatim round-trip of the stored config, retired key included.
+            config={"default_model": "gpt-4o-mini", "disable_reasoning": True},
+        ),
+    )
+    assert "disable_reasoning" not in updated.config
+    assert updated.config["default_model"] == "gpt-4o-mini"
 
 
 # ---------------------------------------------------------------------------

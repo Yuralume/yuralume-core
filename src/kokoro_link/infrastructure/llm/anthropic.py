@@ -26,6 +26,13 @@ from collections.abc import AsyncIterator, Sequence
 import httpx
 
 from kokoro_link.contracts.llm import ChatModelPort, ReasoningOverrides
+from kokoro_link.contracts.provider_probe import (
+    PROBE_CHAT_PROMPT,
+    ProbeCheck,
+    probe_http_client,
+    probe_http_error_detail,
+    run_probe_check,
+)
 from kokoro_link.infrastructure.http_error_logging import log_http_error_response
 
 _LOGGER = logging.getLogger(__name__)
@@ -122,6 +129,19 @@ class AnthropicChatModel(ChatModelPort):
             "content-type": "application/json",
         }
 
+    def _api_url(self, path: str) -> str:
+        """Endpoint URL for ``path`` (e.g. ``messages`` / ``models``).
+
+        Operators routinely paste a base URL that already ends in
+        ``/v1`` (that's what the OpenAI-compatible fields want), which
+        used to pass the probe but 404 at runtime (``/v1/v1/messages``).
+        Tolerating the suffix here keeps probe and runtime resolving the
+        SAME URL from the same config.
+        """
+        if self._base_url.endswith("/v1"):
+            return f"{self._base_url}/{path}"
+        return f"{self._base_url}/v1/{path}"
+
     def _build_user_content(
         self, prompt: str, image_urls: Sequence[str],
     ) -> list[dict] | str:
@@ -164,10 +184,15 @@ class AnthropicChatModel(ChatModelPort):
         stream: bool = False,
         image_urls: Sequence[str] = (),
         model: str | None = None,
+        max_tokens_override: int | None = None,
     ) -> dict:
         payload: dict = {
             "model": self._resolve_model(model),
-            "max_tokens": self._max_tokens,
+            "max_tokens": (
+                max_tokens_override
+                if max_tokens_override is not None
+                else self._max_tokens
+            ),
             "system": _SYSTEM_PROMPT,
             "messages": [
                 {
@@ -176,7 +201,12 @@ class AnthropicChatModel(ChatModelPort):
                 },
             ],
         }
-        if self._thinking_budget_tokens is not None:
+        # ``max_tokens_override`` is the probe hook's internal cap (1
+        # token). Anthropic requires budget_tokens < max_tokens, which a
+        # 1-token cap can never satisfy, so the thinking block is
+        # omitted under an override — the probe stays cheap and keeps
+        # its historical shape.
+        if self._thinking_budget_tokens is not None and max_tokens_override is None:
             payload["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": self._thinking_budget_tokens,
@@ -184,6 +214,36 @@ class AnthropicChatModel(ChatModelPort):
         if stream:
             payload["stream"] = True
         return payload
+
+    async def probe_chat(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> list[ProbeCheck]:
+        """Adapter-owned live self-test for the admin "Test" button.
+
+        Optional hook the probe engine feature-detects. Completes a
+        1-token ``/v1/messages`` chat built by THIS adapter's
+        ``_build_payload`` and posted to THIS adapter's URL (including
+        the pasted-``/v1`` tolerance), so probe and runtime can never
+        diverge on the request shape again.
+        """
+
+        async def chat_check() -> tuple[bool, str]:
+            payload = self._build_payload(PROBE_CHAT_PROMPT, max_tokens_override=1)
+            async with probe_http_client(timeout_seconds, transport) as client:
+                response = await client.post(
+                    self._api_url("messages"),
+                    json=payload,
+                    headers=self._headers(),
+                )
+            model = str(payload.get("model") or self._model)
+            if response.status_code >= 400:
+                return False, f"model {model!r}: {probe_http_error_detail(response)}"
+            return True, f"model {model!r} completed a 1-token chat"
+
+        return [await run_probe_check("chat_completion", chat_check)]
 
     # ---- generate -----------------------------------------------------
 
@@ -199,7 +259,7 @@ class AnthropicChatModel(ChatModelPort):
         )
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{self._base_url}/v1/messages",
+                self._api_url("messages"),
                 json=payload,
                 headers=self._headers(),
             )
@@ -220,7 +280,7 @@ class AnthropicChatModel(ChatModelPort):
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
             async with client.stream(
                 "POST",
-                f"{self._base_url}/v1/messages",
+                self._api_url("messages"),
                 json=payload,
                 headers=self._headers(),
             ) as response:
@@ -274,7 +334,7 @@ class AnthropicChatModel(ChatModelPort):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
-                    f"{self._base_url}/v1/models",
+                    self._api_url("models"),
                     headers=self._headers(),
                 )
             if response.status_code >= 400:

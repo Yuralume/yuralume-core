@@ -92,11 +92,18 @@ from kokoro_link.infrastructure.llm.openai_compatible import OpenAICompatibleCha
 # model dropdown in the UI. ``base_url`` override is only useful for
 # enterprise endpoints / regional mirrors (Azure OpenAI, Vertex mirror,
 # Moonshot .cn) and is intentionally not documented in .env.example.
+#
+# Model ids must track ``adapter_builders._OPENAI_COMPATIBLE_DEFAULTS``
+# (the catalog source of truth): ``runtime_sync._legacy_provider_drafts``
+# persists these values into DB rows on first boot, so a retired id here
+# outlives the env var as a dead connection. 'deepseek-chat' retires
+# 2026-07-24 → alias target 'deepseek-v4-flash'; 'gemini-2.0-flash' was
+# hard shut down 2026-06-01 → live successor 'gemini-3.5-flash'.
 _OPENAI_COMPATIBLE_CLOUD_PROVIDERS: tuple[tuple[str, str, str, str], ...] = (
     ("openai",     "OPENAI",     "https://api.openai.com/v1",                      "gpt-4o-mini"),
-    ("deepseek",   "DEEPSEEK",   "https://api.deepseek.com/v1",                    "deepseek-chat"),
+    ("deepseek",   "DEEPSEEK",   "https://api.deepseek.com/v1",                    "deepseek-v4-flash"),
     ("openrouter", "OPENROUTER", "https://openrouter.ai/api/v1",                   "openai/gpt-4o-mini"),
-    ("gemini",     "GEMINI",     "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
+    ("gemini",     "GEMINI",     "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.5-flash"),
     ("mistral",    "MISTRAL",    "https://api.mistral.ai/v1",                      "mistral-small-latest"),
 )
 """Gemini uses Google's OpenAI-compatible endpoint (``/v1beta/openai/``)

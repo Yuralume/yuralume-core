@@ -28,6 +28,12 @@ from collections.abc import Sequence
 import httpx
 
 from kokoro_link.contracts.embedder import EmbedderError, EmbedderPort
+from kokoro_link.contracts.provider_probe import (
+    PROBE_CHAT_PROMPT,
+    ProbeCheck,
+    probe_http_client,
+    run_probe_check,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +70,43 @@ class LMStudioEmbedder(EmbedderPort):
     async def embed(self, text: str) -> tuple[float, ...] | None:
         results = await self.embed_many([text])
         return results[0] if results else None
+
+    async def probe_embedding(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> list[ProbeCheck]:
+        """Adapter-owned live self-test for the admin "Test" button.
+
+        Optional hook the probe engine feature-detects. Embeds one short
+        text through THIS adapter's ``_embed_chunk`` (same payload incl.
+        the opt-in ``dimensions`` param, same response parsing) and
+        verifies the vector width matches the memory store's fixed
+        dimension — the most common real-world embedding misconfig.
+        """
+
+        async def check() -> tuple[bool, str]:
+            async with probe_http_client(timeout_seconds, transport) as client:
+                try:
+                    vectors = await self._embed_chunk(client, [PROBE_CHAT_PROMPT])
+                except EmbedderError as exc:
+                    return False, str(exc)
+            dimension = len(vectors[0]) if vectors else 0
+            if dimension != self._dimension:
+                hint = (
+                    ""
+                    if self._request_dimensions
+                    else " — pick a natively matching model or enable "
+                    "Request dimensions"
+                )
+                return False, (
+                    f"model {self._model!r} returned a {dimension}-dim vector "
+                    f"but the memory store requires {self._dimension}{hint}"
+                )
+            return True, f"{dimension}-dim vector (matches memory store)"
+
+        return [await run_probe_check("embedded", check)]
 
     async def embed_many(
         self, texts: Sequence[str],

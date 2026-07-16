@@ -448,6 +448,7 @@ def make_inbound(
     text: str = "hi",
     sender_ref: str = "user-1",
     message_id: str = "m-1",
+    reply_context: dict[str, str] | None = None,
 ) -> InboundMessage:
     return InboundMessage(
         platform=platform,
@@ -457,4 +458,5 @@ def make_inbound(
         text=text,
         platform_message_id=message_id,
         received_at=datetime.now(timezone.utc),
+        reply_context=reply_context or {},
     )

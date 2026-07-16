@@ -128,3 +128,35 @@ def test_unknown_source_type_skipped() -> None:
     }
 
     assert parse_webhook(payload) == []
+
+
+def test_reply_token_extracted_into_reply_context() -> None:
+    """The webhook event's one-time replyToken must survive parsing so
+    the outbound side can answer on the free reply API instead of
+    burning push quota."""
+    payload = {"events": [_text_event(source={"type": "user", "userId": "U1"})]}
+
+    result = parse_webhook(payload)
+
+    assert len(result) == 1
+    assert result[0].reply_context == {"reply_token": "r-1"}
+
+
+def test_missing_reply_token_yields_empty_reply_context() -> None:
+    event = _text_event(source={"type": "user", "userId": "U1"})
+    del event["replyToken"]
+
+    result = parse_webhook({"events": [event]})
+
+    assert len(result) == 1
+    assert result[0].reply_context == {}
+
+
+def test_blank_reply_token_yields_empty_reply_context() -> None:
+    event = _text_event(source={"type": "user", "userId": "U1"})
+    event["replyToken"] = ""
+
+    result = parse_webhook({"events": [event]})
+
+    assert len(result) == 1
+    assert result[0].reply_context == {}

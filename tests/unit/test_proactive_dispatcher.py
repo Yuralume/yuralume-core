@@ -462,6 +462,9 @@ async def test_sent_path_appends_message_and_pushes() -> None:
     sent = harness.telegram_adapter.sent[0]
     assert sent.text == "嗨，我剛做完練習"
     assert sent.credentials == account.credentials
+    # Proactive sends have no inbound event to reply to — the outbound
+    # must carry no reply affinity so channel adapters keep using push.
+    assert sent.reply_context == {}
 
     # conversation now has an assistant message persisted
     refreshed = await harness.binding_repository.get(binding.id)

@@ -102,6 +102,79 @@ async def test_inbound_reply_sends_blank_line_segments_with_attachment_last(
 
 
 @pytest.mark.asyncio
+async def test_inbound_reply_context_rides_first_outbound_segment_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The webhook event's reply affinity (LINE replyToken) must flow
+    through the dispatcher onto the first outbound bubble only — the
+    token is single-use, later bubbles go out as plain push."""
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_line_account(harness, character_id=character.id)
+
+    async def fake_send_message(_request):
+        return SimpleNamespace(
+            assistant_message=SimpleNamespace(
+                content="第一則\n\n第二則",
+                attachments=[],
+            ),
+        )
+
+    monkeypatch.setattr(harness.chat_service, "send_message", fake_send_message)
+
+    await harness.dispatcher.handle_inbound(
+        make_inbound(
+            platform=Platform.LINE,
+            account_id=account.id,
+            chat_ref="U1",
+            text="哈囉",
+            reply_context={"reply_token": "r-1"},
+        ),
+    )
+
+    assert [m.reply_context for m in harness.line_adapter.sent] == [
+        {"reply_token": "r-1"},
+        {},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inbound_multi_bubble_reply_reaches_adapter_as_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All bubbles of one reply must be handed over together so the LINE
+    adapter can pack up to 5 of them into a single (free) reply call."""
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_line_account(harness, character_id=character.id)
+
+    async def fake_send_message(_request):
+        return SimpleNamespace(
+            assistant_message=SimpleNamespace(
+                content="第一則\n\n第二則\n\n第三則",
+                attachments=[],
+            ),
+        )
+
+    monkeypatch.setattr(harness.chat_service, "send_message", fake_send_message)
+
+    await harness.dispatcher.handle_inbound(
+        make_inbound(
+            platform=Platform.LINE,
+            account_id=account.id,
+            chat_ref="U1",
+            text="哈囉",
+            reply_context={"reply_token": "r-1"},
+        ),
+    )
+
+    assert len(harness.line_adapter.batches) == 1
+    batch = harness.line_adapter.batches[0]
+    assert [m.text for m in batch] == ["第一則", "第二則", "第三則"]
+    assert batch[0].reply_context == {"reply_token": "r-1"}
+
+
+@pytest.mark.asyncio
 async def test_inbound_relative_attachment_uses_dynamic_messaging_public_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

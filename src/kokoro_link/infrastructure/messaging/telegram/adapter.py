@@ -24,7 +24,7 @@ entire class of delivery failures.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
@@ -79,6 +79,12 @@ class TelegramAdapter(ChannelAdapterPort):
     @property
     def platform(self) -> Platform:
         return Platform.TELEGRAM
+
+    async def send_many(self, messages: Sequence[OutboundMessage]) -> None:
+        # Telegram has no multi-message endpoint — deliver the batch
+        # sequentially, identical to the old per-bubble loop.
+        for message in messages:
+            await self.send(message)
 
     async def send(self, message: OutboundMessage) -> None:
         if message.platform != Platform.TELEGRAM:

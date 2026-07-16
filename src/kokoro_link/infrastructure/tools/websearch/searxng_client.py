@@ -30,6 +30,26 @@ from kokoro_link.infrastructure.tools.websearch.tool import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Browser-like request headers so SearXNG's limiter/botdetection passes on
+# hardened/public instances. Its header methods each flag a non-browser
+# request: http_user_agent blocks python-httpx/curl UAs; http_accept blocks
+# any Accept without ``text/html``; http_accept_language blocks a missing
+# Accept-Language; http_accept_encoding blocks an Accept-Encoding lacking
+# gzip/deflate. We still get JSON back because ``format=json`` is a query
+# param (SearXNG picks the response format from the query, not the Accept
+# header), so a browser Accept here does not change the response shape. We
+# advertise only gzip/deflate (both natively decoded by httpx) to avoid
+# claiming a br/zstd encoding we might not be able to decompress.
+_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+
 
 class SearXNGSearchClient(SearchClientPort):
     """Async wrapper over a SearXNG instance's JSON search endpoint.
@@ -60,7 +80,7 @@ class SearXNGSearchClient(SearchClientPort):
         params: dict[str, str] = {"q": query, "format": "json"}
         if self._language:
             params["language"] = self._language
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(_BROWSER_HEADERS)
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         url = f"{self._base_url}/search"
@@ -78,8 +98,20 @@ class SearXNGSearchClient(SearchClientPort):
                 "searxng search failed: status=%s body=%s",
                 response.status_code, body_preview,
             )
-            # 403 is the classic symptom of an instance that hasn't
-            # whitelisted the json format for the caller.
+            if response.status_code == 403:
+                # 403 has two common causes on a JSON API call; we already
+                # send browser-like headers to clear the bot-detection one,
+                # so name BOTH rather than asserting the json-format cause:
+                #   (1) the instance's limiter / bot-detection blocked the
+                #       request (allowlist the caller IP or relax the
+                #       limiter), or
+                #   (2) json is not enabled under search.formats.
+                raise SearchError(
+                    "SearXNG 回應 403；可能原因："
+                    "(1) 實例的 limiter / bot-detection 阻擋了此請求"
+                    "（請將來源 IP 加入白名單或放寬 limiter），或 "
+                    "(2) 尚未在 settings.yml 的 search.formats 開啟 json 格式",
+                )
             raise SearchError(
                 f"SearXNG 回應錯誤（{response.status_code}）"
                 "；請確認實例已在 settings.yml 的 search.formats 開啟 json 格式",

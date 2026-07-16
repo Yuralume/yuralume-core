@@ -83,7 +83,22 @@ def _parse_event(event: Any) -> ParsedInbound | None:
         platform_message_id=str(message_id),
         received_at=_parse_timestamp(event.get("timestamp")),
         photo_refs=photo_refs,
+        reply_context=_build_reply_context(event),
     )
+
+
+def _build_reply_context(event: dict[str, Any]) -> dict[str, str]:
+    """Carry the event's one-time ``replyToken`` towards the outbound side.
+
+    Replying with it is free on LINE's billing model while push burns the
+    monthly quota, so losing the token here would silently cost money.
+    Webhook redeliveries may omit the token — an empty context simply
+    means the adapter goes straight to push.
+    """
+    reply_token = event.get("replyToken")
+    if isinstance(reply_token, str) and reply_token:
+        return {"reply_token": reply_token}
+    return {}
 
 
 def _resolve_chat_ref(source: Any) -> str | None:

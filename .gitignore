@@ -69,3 +69,6 @@ tts/*.wav
 
 /.env.demo
 /docs/x-posts/
+/docs/zenn-posts/
+/docs/note-posts/
+/docs/fanbox-posts/

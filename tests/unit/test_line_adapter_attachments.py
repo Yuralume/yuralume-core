@@ -68,11 +68,13 @@ async def test_text_and_image_bundled_in_one_push() -> None:
 
 
 @pytest.mark.asyncio
-async def test_multiple_images_capped_at_five_messages() -> None:
+async def test_more_than_five_objects_overflow_into_second_call() -> None:
     captured: list[httpx.Request] = []
     adapter = LineAdapter(transport=_ok_transport(captured))
 
-    # 1 text + 5 images → should be truncated to 5 messages total.
+    # 1 text + 5 images = 6 message objects. LINE takes 5 per call, so
+    # the sixth must go out in a follow-up push instead of being
+    # silently dropped (pre-batching behaviour).
     await adapter.send(_outbound(
         text="多張",
         attachments=tuple(
@@ -84,13 +86,18 @@ async def test_multiple_images_capped_at_five_messages() -> None:
         ),
     ))
 
-    body = json.loads(captured[0].content.decode())
-    assert len(body["messages"]) == 5
-    # The 5th attachment must have been dropped — the text already
-    # consumed one slot.
-    assert body["messages"][0]["type"] == "text"
-    image_urls = [m.get("originalContentUrl") for m in body["messages"][1:]]
-    assert image_urls == [f"https://ex.com/{i}.png" for i in range(4)]
+    assert len(captured) == 2
+    first = json.loads(captured[0].content.decode())
+    second = json.loads(captured[1].content.decode())
+    assert len(first["messages"]) == 5
+    assert first["messages"][0]["type"] == "text"
+    assert [m.get("originalContentUrl") for m in first["messages"][1:]] == [
+        f"https://ex.com/{i}.png" for i in range(4)
+    ]
+    assert second["to"] == "U42"
+    assert [m.get("originalContentUrl") for m in second["messages"]] == [
+        "https://ex.com/4.png",
+    ]
 
 
 @pytest.mark.asyncio

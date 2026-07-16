@@ -48,6 +48,11 @@ def segment_outbound_message(
     Attachments stay on the final segment so external platforms do not
     duplicate images/files while the text still arrives as multiple chat
     bubbles. Attachment-only messages remain one send.
+
+    ``reply_context`` rides the *first* segment only: reply affinity is
+    single-use (LINE's replyToken dies after one call), so the opening
+    bubble may go out on the platform's free reply path while the rest
+    fall back to the normal send.
     """
     segments = split_outbound_text_segments(message.text)
     if not segments:
@@ -61,6 +66,7 @@ def segment_outbound_message(
                 credentials=message.credentials,
                 attachments=message.attachments,
                 locale=message.locale,
+                reply_context=message.reply_context,
             ),
         )
 
@@ -73,6 +79,7 @@ def segment_outbound_message(
             credentials=message.credentials,
             attachments=message.attachments if index == last_index else (),
             locale=message.locale,
+            reply_context=message.reply_context if index == 0 else {},
         )
         for index, segment in enumerate(segments)
     )
@@ -82,6 +89,15 @@ async def send_segmented_outbound(
     adapter: ChannelAdapterPort,
     message: OutboundMessage,
 ) -> None:
-    """Send each segmented outbound message through the same adapter."""
-    for segment in segment_outbound_message(message):
-        await adapter.send(segment)
+    """Hand the whole segmented reply to the adapter as one batch.
+
+    Batch-capable platforms (LINE) pack several bubbles into a single
+    API call — the free reply call fits 5 message objects, so splitting
+    the hand-over per bubble would burn push quota for every bubble
+    past the first. Adapters without a batch endpoint deliver the
+    batch sequentially, identical to the old per-segment loop.
+    """
+    segments = segment_outbound_message(message)
+    if not segments:
+        return
+    await adapter.send_many(segments)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import httpx
 
@@ -28,6 +29,12 @@ class DiscordAdapter(ChannelAdapterPort):
     @property
     def platform(self) -> Platform:
         return Platform.DISCORD
+
+    async def send_many(self, messages: Sequence[OutboundMessage]) -> None:
+        # Discord has no multi-message endpoint — deliver the batch
+        # sequentially, identical to the old per-bubble loop.
+        for message in messages:
+            await self.send(message)
 
     async def send(self, message: OutboundMessage) -> None:
         if message.platform != Platform.DISCORD:

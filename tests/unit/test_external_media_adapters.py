@@ -411,3 +411,77 @@ async def test_external_tts_adapter_lists_voices_and_synthesizes(
     assert captured["auth"] == "Bearer tts-token"
     assert captured["body"]["voice_id"] == "marin"
     assert captured["body"]["text"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_tts_adapter_defaults_and_dynamic_voices(
+    restore_httpx: None,
+) -> None:
+    """OpenRouter TTS defaults + per-model voice discovery.
+
+    * /audio/speech only accepts response_format mp3|pcm (wav is rejected
+      with a ZodError before auth) → the adapter defaults to mp3
+      (https://openrouter.ai/docs/guides/overview/multimodal/tts).
+    * Voices are provider-namespaced per model; the authoritative catalog
+      is GET /models?output_modalities=speech whose entries carry a
+      supported_voices array — the static OpenAI voice list is wrong for
+      every non-OpenAI TTS model.
+    """
+    from kokoro_link.infrastructure.tts.external_api import OpenRouterTTSAdapter
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/models"):
+            assert request.url.params["output_modalities"] == "speech"
+            return httpx.Response(200, json={
+                "data": [
+                    {
+                        "id": "x-ai/grok-voice-tts-1.0",
+                        "supported_voices": ["eve", "ara", "rex", "sal", "leo"],
+                    },
+                    {
+                        "id": "hexgrad/kokoro-82m",
+                        "supported_voices": ["af_bella"],
+                    },
+                ],
+            })
+        if request.url.path.endswith("/audio/speech"):
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(200, content=b"mp3-bytes", headers={
+                "content-type": "audio/mpeg",
+            })
+        raise AssertionError(f"unexpected request {request.url}")
+
+    _patch_httpx(handler)
+    adapter = OpenRouterTTSAdapter(api_key="sk-or-test")
+
+    voices = await adapter.list_voices()
+    result = await adapter.synthesize(TTSRequest(text="hello", voice_id=""))
+
+    # Only the configured model's voices are surfaced.
+    assert [voice.id for voice in voices] == ["eve", "ara", "rex", "sal", "leo"]
+    assert result.media_type == "audio/mpeg"
+    assert captured["body"]["model"] == "x-ai/grok-voice-tts-1.0"
+    assert captured["body"]["voice"] == "eve"
+    assert captured["body"]["response_format"] == "mp3"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_tts_adapter_unknown_model_yields_no_voices(
+    restore_httpx: None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "data": [
+                {"id": "hexgrad/kokoro-82m", "supported_voices": ["af_bella"]},
+            ],
+        })
+
+    _patch_httpx(handler)
+    from kokoro_link.infrastructure.tts.external_api import OpenRouterTTSAdapter
+
+    adapter = OpenRouterTTSAdapter(
+        api_key="sk-or-test", model="openai/gpt-4o-mini-tts",
+    )
+    assert await adapter.list_voices() == []

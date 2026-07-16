@@ -49,6 +49,23 @@ async def test_send_posts_to_whatsapp_sidecar_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_many_delivers_bubbles_sequentially() -> None:
+    """The sidecar has no batch endpoint — a batched hand-over must
+    behave exactly like the old per-bubble loop, order preserved."""
+    captured: list[httpx.Request] = []
+    adapter = WhatsAppAdapter(transport=_ok_transport(captured))
+
+    await adapter.send_many([_outbound(text="第一則"), _outbound(text="第二則")])
+
+    assert [r.url.path for r in captured] == [
+        "/sessions/mio/messages",
+        "/sessions/mio/messages",
+    ]
+    texts = [json.loads(r.content.decode())["text"] for r in captured]
+    assert texts == ["第一則", "第二則"]
+
+
+@pytest.mark.asyncio
 async def test_send_includes_attachment_metadata() -> None:
     captured: list[httpx.Request] = []
     adapter = WhatsAppAdapter(transport=_ok_transport(captured))

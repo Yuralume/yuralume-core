@@ -122,7 +122,36 @@ async def test_403_maps_to_readable_error() -> None:
         await _run_with_transport(
             lambda: client.search(query="q", max_results=5), transport,
         )
-    assert "json" in str(excinfo.value)
+    message = str(excinfo.value)
+    # 403 now names BOTH plausible causes: the limiter/bot-detection block
+    # (now that we send browser headers) and the json-format one.
+    assert "json" in message
+    assert "limiter" in message or "bot-detection" in message
+
+
+@pytest.mark.asyncio
+async def test_sends_browser_like_headers_for_botdetection() -> None:
+    """SearXNG's limiter/botdetection flags non-browser requests. The client
+    must send a browser User-Agent + Accept(text/html) + Accept-Language +
+    Accept-Encoding(gzip/deflate) so those header methods pass, while still
+    getting JSON via the ``format=json`` query param."""
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        for name in ("user-agent", "accept", "accept-language", "accept-encoding"):
+            seen[name] = request.headers.get(name, "")
+        return httpx.Response(200, json={"results": []})
+
+    transport = httpx.MockTransport(handler)
+    client = _client_with(transport)
+    await _run_with_transport(
+        lambda: client.search(query="q", max_results=5), transport,
+    )
+    assert "python-httpx" not in seen["user-agent"].lower()
+    assert "mozilla" in seen["user-agent"].lower()
+    assert "text/html" in seen["accept"]
+    assert seen["accept-language"] != ""
+    assert "gzip" in seen["accept-encoding"] or "deflate" in seen["accept-encoding"]
 
 
 @pytest.mark.asyncio

@@ -83,7 +83,10 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
     voice_id = ProviderFieldSpec(
         key="voice_id",
         label="Default voice",
-        placeholder="alloy",
+        # Voices are provider- (and on OpenRouter, model-) specific:
+        # OpenAI ships marin/alloy/..., OpenRouter models each publish
+        # their own supported_voices — blank resolves the provider default.
+        placeholder="provider default",
     )
     image_model = ProviderFieldSpec(
         key="image_model",
@@ -128,7 +131,10 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
     response_format = ProviderFieldSpec(
         key="response_format",
         label="Response format",
-        placeholder="wav",
+        # Provider-scoped: direct OpenAI supports wav; OpenRouter's
+        # /audio/speech only accepts mp3|pcm — blank resolves the
+        # provider default (runtime_sync._TTS_DEFAULTS).
+        placeholder="wav (OpenAI) / mp3 (OpenRouter)",
         advanced=True,
     )
     embedding_model = ProviderFieldSpec(
@@ -169,11 +175,22 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
         advanced=True,
     )
     # Reasoning / thinking controls (all opt-in, default absent = send
-    # nothing, behaviour identical to today). openai_compatible family
-    # gets disable_reasoning / reasoning_effort / extra_request_params /
-    # strip_think_tags; anthropic gets thinking_budget_tokens. Different
-    # adapter kinds surface different field sets so incompatible params
-    # are never offered to a provider that can't use them.
+    # nothing, behaviour identical to today). anthropic gets
+    # thinking_budget_tokens. Different adapter kinds surface different
+    # field sets so incompatible params are never offered to a provider
+    # that can't use them.
+    #
+    # ``disable_reasoning`` is DELIBERATELY scoped to the local/vLLM-class
+    # openai_compatible presets only (local_openai_compatible /
+    # custom_openai_compatible). It emits ``chat_template_kwargs=
+    # {enable_thinking: false}`` — a vLLM/llama.cpp server construct that is
+    # WRONG for the strict-cloud openai_compatible backends: Mistral hard
+    # 422s ("Extra inputs are not permitted") on every chat, and OpenAI /
+    # OpenRouter / NanoGPT / DeepSeek silently ignore it (a no-op that
+    # misleads the operator into thinking reasoning is off). So the knob is
+    # not offered on those cloud rows (audit 2026-07-16). ``reasoning_effort``
+    # stays on the cloud rows because it is live-validated at save time
+    # (validate_reasoning_effort) against the real provider/model.
     disable_reasoning = ProviderFieldSpec(
         key="disable_reasoning",
         label="Disable reasoning / thinking",
@@ -311,7 +328,6 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 supports_vision,
                 max_tokens,
                 response_format,
-                disable_reasoning,
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
@@ -354,7 +370,13 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 max_tokens,
             ),
             model_catalog_mode="manual",
-            default_models=("gemini-2.0-flash", "gemini-2.5-flash-image"),
+            # gemini-2.0-flash was hard shut down 2026-06-01 (404 on every
+            # call); ship gemini-3.5-flash — its live successor — rather than
+            # gemini-2.5-flash (itself retiring 2026-10-16) to skip a second
+            # migration (audit 2026-07-16). Image: gemini-2.5-flash-image
+            # shuts down 2026-10-02 → its announced replacement
+            # gemini-3.1-flash-image-preview (audit 2026-07-16).
+            default_models=("gemini-3.5-flash", "gemini-3.1-flash-image-preview"),
             adapter_kind="google_gemini",
             docs_url="https://ai.google.dev/gemini-api/docs",
         ),
@@ -365,7 +387,11 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
             auth_fields=(api_key,),
             config_fields=(base_url, default_model, timeout_seconds),
             model_catalog_mode="manual",
-            default_models=("grok-2-image-1212",),
+            # grok-2-image-1212 is legacy (dropped from docs.x.ai models
+            # page) and rejects aspect_ratio; grok-imagine is current.
+            # Keep the legacy id selectable for operators who want it —
+            # the adapter drops aspect_ratio on the server's 400 signal.
+            default_models=("grok-imagine-image-quality", "grok-2-image-1212"),
             adapter_kind="xai",
             docs_url="https://docs.x.ai",
         ),
@@ -426,7 +452,6 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 response_format,
                 supports_vision,
                 max_tokens,
-                disable_reasoning,
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
@@ -454,13 +479,16 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 supports_vision,
                 max_tokens,
                 timeout_seconds,
-                disable_reasoning,
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
             ),
             model_catalog_mode="remote",
-            default_models=("gpt-5.2",),
+            # NanoGPT's authoritative /api/v1/models list dropped the bare
+            # 'gpt-5.2' alias; the canonical callable id is 'openai/gpt-5.2'
+            # (audit 2026-07-16). Discovery is remote so only the fallback
+            # default constant needs the canonical slug.
+            default_models=("openai/gpt-5.2",),
             adapter_kind="openai_compatible",
             docs_url="https://docs.nano-gpt.com",
         ),
@@ -474,13 +502,16 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 default_model,
                 supports_vision,
                 max_tokens,
-                disable_reasoning,
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
             ),
             model_catalog_mode="manual",
-            default_models=("deepseek-chat",),
+            # 'deepseek-chat' fully retires 2026-07-24 (404 model-not-found
+            # after) and transparently aliases to 'deepseek-v4-flash'; ship
+            # the successor id (audit 2026-07-16). 'deepseek-reasoner' →
+            # 'deepseek-v4-pro' if a reasoner default is ever added.
+            default_models=("deepseek-v4-flash",),
             adapter_kind="openai_compatible",
             docs_url="https://api-docs.deepseek.com",
         ),
@@ -494,7 +525,6 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 default_model,
                 supports_vision,
                 max_tokens,
-                disable_reasoning,
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,

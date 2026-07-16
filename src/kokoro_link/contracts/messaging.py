@@ -6,7 +6,8 @@ accept ``OutboundMessage`` for delivery. Credentials live on the
 one adapter class can serve many accounts.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -39,6 +40,11 @@ class ParsedInbound:
     platform_message_id: str
     received_at: datetime
     photo_refs: tuple[str, ...] = ()
+    reply_context: Mapping[str, str] = field(default_factory=dict)
+    """Channel-generic hints for answering *this specific event* on the
+    platform's reply path (e.g. LINE's one-time ``replyToken`` under the
+    ``"reply_token"`` key). Parsers that have no such concept leave it
+    empty; the dispatcher threads it onto the outbound side untouched."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +57,7 @@ class InboundMessage:
     platform_message_id: str
     received_at: datetime
     attachment_urls: tuple[str, ...] = ()
+    reply_context: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_parsed(
@@ -69,6 +76,7 @@ class InboundMessage:
             platform_message_id=parsed.platform_message_id,
             received_at=parsed.received_at,
             attachment_urls=attachment_urls,
+            reply_context=parsed.reply_context,
         )
 
 
@@ -107,6 +115,14 @@ class OutboundMessage:
     reply text is untouched — it was already produced in the operator's
     language upstream. Defaults to the ship-first ``zh-TW`` so callers
     that don't know the operator language keep the prior behaviour."""
+    reply_context: Mapping[str, str] = field(default_factory=dict)
+    """Channel-generic, *single-use* hints tying this outbound to the
+    inbound event it answers (e.g. LINE's one-time ``replyToken`` under
+    ``"reply_token"``). Adapters that understand a hint may deliver on
+    the platform's cheaper reply path and must fall back to their normal
+    send when the platform rejects it; adapters without a reply concept
+    ignore it. Segmentation keeps the context on the first bubble only,
+    and proactive sends leave it empty — both then use the normal path."""
 
 
 class ChannelAdapterPort(Protocol):
@@ -114,6 +130,18 @@ class ChannelAdapterPort(Protocol):
     def platform(self) -> Platform: ...
 
     async def send(self, message: OutboundMessage) -> None: ...
+
+    async def send_many(self, messages: Sequence[OutboundMessage]) -> None:
+        """Deliver an ordered bubble batch from ONE logical reply.
+
+        All entries target the same chat with the same credentials —
+        they are the segments of a single assistant turn, in display
+        order. Platforms with a multi-message endpoint may pack several
+        bubbles into one API call (LINE fits 5 message objects per
+        reply/push); everyone else must deliver sequentially, exactly
+        as repeated ``send`` calls would. Order must be preserved
+        either way."""
+        ...
 
 
 class TelegramPollingPort(Protocol):

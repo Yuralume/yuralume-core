@@ -210,6 +210,24 @@ async def _video_bytes_from_operation(
 
 
 def _iter_video_objects(response: Mapping):
+    # Official Gemini API REST shape for a completed predictLongRunning
+    # operation (https://ai.google.dev/gemini-api/docs/veo — the docs' own
+    # extraction path is
+    # .response.generateVideoResponse.generatedSamples[0].video.uri).
+    generate_video_response = response.get("generateVideoResponse")
+    if isinstance(generate_video_response, Mapping):
+        samples = generate_video_response.get("generatedSamples")
+        if isinstance(samples, list):
+            for item in samples:
+                if not isinstance(item, Mapping):
+                    continue
+                video = item.get("video")
+                if isinstance(video, Mapping):
+                    yield video
+                else:
+                    yield item
+    # Fallbacks: google-genai SDK-normalized (generatedVideos) and
+    # gateway/legacy (predictions) shapes.
     generated = response.get("generatedVideos") or response.get("generated_videos")
     if isinstance(generated, list):
         for item in generated:
@@ -251,8 +269,16 @@ async def _download_video(
         f"{base_url}/",
         uri.lstrip("/"),
     )
-    response = await client.get(resolved, headers={"x-goog-api-key": api_key})
-    if response.status_code >= 400:
+    # The documented download flow requires following redirects (the
+    # official example is `curl -L -H "x-goog-api-key: ..."` —
+    # https://ai.google.dev/gemini-api/docs/veo); httpx does not follow
+    # them by default, and a 3xx body is HTML, not video bytes.
+    response = await client.get(
+        resolved,
+        headers={"x-goog-api-key": api_key},
+        follow_redirects=True,
+    )
+    if not response.is_success:
         raise VideoGenerationError(
             f"Google Veo video download failed: {response.status_code}",
         )

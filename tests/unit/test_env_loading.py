@@ -51,6 +51,36 @@ def test_app_settings_loads_values_from_dotenv(tmp_path: Path, monkeypatch) -> N
     assert lmstudio["base_url"] == "http://127.0.0.1:1234/v1"
 
 
+def test_legacy_cloud_provider_env_defaults_track_current_model_ids() -> None:
+    """The deprecated-env seed tuples must carry the SAME default model
+    ids as the catalog builders (``adapter_builders``): runtime_sync's
+    ``_legacy_provider_drafts`` persists these values into DB rows on
+    first boot, so a retired id here (deepseek-chat 404s after
+    2026-07-24; gemini-2.0-flash died 2026-06-01) becomes a dead
+    connection that outlives the env var."""
+    from kokoro_link.bootstrap.settings import (
+        _OPENAI_COMPATIBLE_CLOUD_PROVIDERS,
+    )
+    from kokoro_link.infrastructure.provider_settings.adapter_builders import (
+        _OPENAI_COMPATIBLE_DEFAULTS,
+    )
+
+    # Same rename map runtime_sync._legacy_provider_drafts applies when
+    # it seeds the rows.
+    legacy_to_catalog = {"gemini": "google_gemini"}
+    for provider_id, _prefix, _base_url, model in (
+        _OPENAI_COMPATIBLE_CLOUD_PROVIDERS
+    ):
+        catalog_id = legacy_to_catalog.get(provider_id, provider_id)
+        assert catalog_id in _OPENAI_COMPATIBLE_DEFAULTS, (
+            f"legacy env provider {provider_id!r} has no catalog builder"
+        )
+        assert model == _OPENAI_COMPATIBLE_DEFAULTS[catalog_id][1], (
+            f"legacy env default for {provider_id!r} drifted from the "
+            "catalog builder default"
+        )
+
+
 def test_app_settings_loads_http_storage_env(tmp_path: Path, monkeypatch) -> None:
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(

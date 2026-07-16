@@ -319,11 +319,59 @@ async def test_empty_data_maps_to_no_output_error(
 
 
 @pytest.mark.asyncio
-async def test_missing_b64_json_maps_to_no_output_error(
+async def test_url_item_is_downloaded_without_auth_header(
+    restore_httpx: None,
+) -> None:
+    """dall-e-2/3 default to time-limited ``data[].url`` items (we omit
+    ``response_format`` because gpt-image models reject it) — the adapter
+    must download them instead of raising ImageNoOutputError after a
+    billed generation. The pre-signed URL is fetched WITHOUT the
+    Authorization header.
+    https://developers.openai.com/api/reference/resources/images/methods/generate
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, json={
+                "data": [{"url": "https://oaidalle.blob.example/y.png?sig=tmp"}],
+            })
+        captured["download_url"] = str(request.url)
+        captured["download_auth"] = request.headers.get("authorization")
+        return httpx.Response(200, content=_PNG)
+
+    provider = _provider(handler)
+    images = await provider.generate(character=_character(), positive="x")
+
+    assert images == [_PNG]
+    assert captured["download_url"] == (
+        "https://oaidalle.blob.example/y.png?sig=tmp"
+    )
+    assert captured["download_auth"] is None
+
+
+@pytest.mark.asyncio
+async def test_url_item_download_failure_raises_generation_error(
     restore_httpx: None,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"url": "https://x/y.png"}]})
+        if request.method == "POST":
+            return httpx.Response(200, json={
+                "data": [{"url": "https://oaidalle.blob.example/expired.png"}],
+            })
+        return httpx.Response(403, text="signature expired")
+
+    provider = _provider(handler)
+    with pytest.raises(ImageGenerationError):
+        await provider.generate(character=_character(), positive="x")
+
+
+@pytest.mark.asyncio
+async def test_item_without_b64_or_url_maps_to_no_output_error(
+    restore_httpx: None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"revised_prompt": "x"}]})
 
     provider = _provider(handler)
     with pytest.raises(ImageNoOutputError):

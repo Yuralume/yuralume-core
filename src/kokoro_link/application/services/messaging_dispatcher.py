@@ -175,6 +175,10 @@ class MessagingDispatcher:
                     reply.assistant_message.attachments,
                 ),
                 locale=operator_language,
+                # Thread the inbound event's reply affinity through so
+                # the adapter can answer on the platform's free reply
+                # path (LINE) instead of burning push quota.
+                reply_context=message.reply_context,
             ),
         )
 

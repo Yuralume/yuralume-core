@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import httpx
 
@@ -24,6 +25,12 @@ class WhatsAppAdapter(ChannelAdapterPort):
     @property
     def platform(self) -> Platform:
         return Platform.WHATSAPP
+
+    async def send_many(self, messages: Sequence[OutboundMessage]) -> None:
+        # The sidecar has no multi-message endpoint — deliver the batch
+        # sequentially, identical to the old per-bubble loop.
+        for message in messages:
+            await self.send(message)
 
     async def send(self, message: OutboundMessage) -> None:
         if message.platform != Platform.WHATSAPP:
