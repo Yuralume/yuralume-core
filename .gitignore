@@ -1,0 +1,71 @@
+# ── Python ──
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Environment / Secrets ──
+.env
+.env.container
+*.local
+*.pem
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# ── Node (frontend) ──
+node_modules/
+
+# ── Test / Cache ──
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ── Runtime logs ──
+.runtime/
+*.log
+
+# ── Playwright MCP artifacts ──
+.playwright-mcp/
+
+# ── Claude Code local state ──
+.claude/scheduled_tasks.lock
+
+# ── Uploads (user-generated content) ──
+uploads/
+
+# ── Visual check screenshots ──
+_visual_check/*.png
+_visual_check/results.json
+frontend/*.png
+
+# ── Model weights / large binaries ──
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.onnx
+tts/GPT_weights_v2/
+tts/GPT_weights_v4/
+tts/SoVITS_weights_v2/
+tts/SoVITS_weights_v4/
+tts/pretrained/
+tts/refs/
+tts/*.wav
+/docs/x-devlog/
+
+/.env.demo
+/docs/x-posts/

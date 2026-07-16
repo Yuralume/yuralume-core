@@ -1,0 +1,140 @@
+# Fantasy-setting seeds.
+#
+# Generic high-fantasy flavour — magic, adventurers, medieval towns,
+# creatures, old runes. The expander adapts to the character's
+# specific world details via their summary + speaking style.
+pack_id: frame_fantasy
+language: zh-TW
+
+seeds:
+  # --- Magical mundane --------------------------------------------
+  - external_id: fantasy:daily:001
+    seed_text: 路邊一隻小精靈好奇地跟著走了好一段路
+    tags: [outdoor, gentle, magical]
+    world_frames: [fantasy]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: fantasy:daily:002
+    seed_text: 鎮上的市集今天出現了罕見的商品，多停留看了一會
+    tags: [outdoor, discovery]
+    world_frames: [fantasy]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: fantasy:daily:003
+    seed_text: 院子裡種的魔法花卉今天意外地開了
+    tags: [indoor, gentle, magical]
+    world_frames: [fantasy]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: fantasy:daily:004
+    seed_text: 買到的麵包比平常貴了一點，老闆說是最近糧食不穩
+    tags: [mundane, social]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 14
+
+  # --- Magical mishaps / discoveries ------------------------------
+  - external_id: fantasy:magic:001
+    seed_text: 嘗試的一個小咒語出了一點意料之外的效果
+    tags: [magical, mistake]
+    world_frames: [fantasy]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: fantasy:magic:002
+    seed_text: 在舊書裡看到一段一直想不通的咒文，今天好像有點頭緒
+    tags: [study, discovery]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: fantasy:magic:003
+    seed_text: 感覺到附近的魔力比平常活躍一點，說不上是好事還是壞事
+    tags: [magical, introspective]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: fantasy:magic:004
+    seed_text: 撿到一枚看起來有點來歷的舊硬幣
+    tags: [discovery, mystery]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 30
+
+  # --- Creatures / NPCs -------------------------------------------
+  - external_id: fantasy:creature:001
+    seed_text: 遇到一個長途跋涉的旅人，他說了個有趣的見聞
+    tags: [social, outdoor]
+    world_frames: [fantasy]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: fantasy:creature:002
+    seed_text: 一隻受傷的小獸闖進家門口，不知道要不要收留
+    tags: [animal, dilemma]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 30
+
+  - external_id: fantasy:creature:003
+    seed_text: 村子附近的農夫說最近牲畜有點怪
+    tags: [rumor, mystery]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 30
+
+  # --- Weather / nature (magical flavour) -------------------------
+  - external_id: fantasy:nature:001
+    seed_text: 夜空出現一個很久沒見過的星象
+    tags: [weather, mystery, magical]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 45
+
+  - external_id: fantasy:nature:002
+    seed_text: 森林的邊緣傳來一種平常沒聽過的聲音
+    tags: [outdoor, mystery]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 30
+
+  - external_id: fantasy:nature:003
+    seed_text: 井水的味道今天有點不一樣
+    tags: [mundane, mystery]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 30
+
+  # --- Training / daily life --------------------------------------
+  - external_id: fantasy:train:001
+    seed_text: 今天練習終於突破了一個瓶頸
+    tags: [achievement, satisfied]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: fantasy:train:002
+    seed_text: 劍（或法杖）保養時發現一道之前沒注意到的痕跡
+    tags: [introspective, nostalgia]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 21
+
+  # --- Village / town life ---------------------------------------
+  - external_id: fantasy:town:001
+    seed_text: 酒館的常客聊到一個有點離奇的傳言
+    tags: [rumor, social]
+    world_frames: [fantasy]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: fantasy:town:002
+    seed_text: 路過教堂（或神殿）時，鐘聲比平常多響了一次
+    tags: [mystery, gentle]
+    world_frames: [fantasy]
+    weight: 0.4
+    cooldown_days: 21

@@ -1,0 +1,2 @@
+"""Register-profile adapters."""
+

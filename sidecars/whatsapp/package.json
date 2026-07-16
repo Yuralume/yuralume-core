@@ -1,0 +1,20 @@
+{
+  "name": "@yuralume/whatsapp-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Baileys-compatible WhatsApp sidecar for Yuralume.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "pino": "^9.6.0",
+    "qrcode": "1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

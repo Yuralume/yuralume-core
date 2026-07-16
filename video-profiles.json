@@ -1,0 +1,26 @@
+[
+  {
+    "id": "veo",
+    "label": "Google Veo",
+    "kind": "external_api",
+    "api": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key": "${KOKORO_GEMINI_API_KEY}",
+      "model": "veo-3.1-generate-preview",
+      "provider": "google_veo",
+      "timeout_seconds": 1800
+    }
+  },
+  {
+    "id": "custom-video",
+    "label": "Custom video service",
+    "kind": "external_api",
+    "api": {
+      "base_url": "${KOKORO_VIDEO_API_BASE_URL}",
+      "api_key": "${KOKORO_VIDEO_API_KEY}",
+      "model": "custom",
+      "provider": "custom",
+      "timeout_seconds": 1800
+    }
+  }
+]

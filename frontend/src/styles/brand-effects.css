@@ -1,0 +1,81 @@
+.display-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.display-title--gradient {
+  background: var(--grad-text);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  text-shadow: 0 0 28px rgba(var(--color-primary-rgb), 0.28);
+}
+
+.glass-panel {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(18, 12, 42, 0.54);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.28),
+    0 0 0 1px rgba(var(--color-primary-rgb), 0.08) inset;
+  backdrop-filter: blur(12px) saturate(1.28);
+  -webkit-backdrop-filter: blur(12px) saturate(1.28);
+}
+
+.spark-label {
+  color: var(--color-spark);
+  font-size: var(--font-xs);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.sheen-hover {
+  position: relative;
+  overflow: hidden;
+}
+
+.sheen-hover::after {
+  content: "";
+  position: absolute;
+  inset: -70% auto -70% -45%;
+  width: 42%;
+  transform: translateX(-150%) rotate(18deg);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.22),
+    transparent
+  );
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sheen-hover:hover::after,
+.sheen-hover:focus-visible::after {
+  opacity: 1;
+  animation: brand-sheen 0.85s ease;
+}
+
+@keyframes brand-sheen {
+  from {
+    transform: translateX(-150%) rotate(18deg);
+  }
+  to {
+    transform: translateX(420%) rotate(18deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheen-hover::after {
+    display: none;
+    animation: none;
+  }
+
+  .ui-btn,
+  .sheen-hover {
+    transition: none !important;
+  }
+}

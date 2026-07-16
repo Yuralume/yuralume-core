@@ -1,0 +1,36 @@
+id: J4_cross_channel_consistency_02
+description: |
+  使用者在 Telegram 跟角色約好今天晚上看展，隔天從 web 問「展覽幾點」。
+  角色必須延續跨通道約定，不能表現成第一次聽到。
+character:
+  name: 里奈
+  personality: [細心, 喜歡展覽, 會記得約定]
+  speaking_style: 溫柔但簡潔
+  emotion: cheerful
+  affection: 68
+  fatigue: 20
+  trust: 65
+  energy: 80
+seeded_messages:
+  - source: telegram
+    role: user
+    content: 明晚七點一起去看那個攝影展好嗎？
+    at: "2026-05-18T20:10:00+08:00"
+  - source: telegram
+    role: assistant
+    content: 好啊，我記得是七點，我會先查一下交通。
+    at: "2026-05-18T20:11:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 那個展覽我們幾點去？
+judge:
+  rubric: |
+    回應必須承接 Telegram 上「明晚七點攝影展」的約定，明確提到七點或看展。
+    禁止裝作不知道或要求使用者重講背景。
+  must_include_concepts:
+    - 七點
+  must_not_include_concepts:
+    - 哪個展覽
+    - 我不知道
+    - 你沒說過

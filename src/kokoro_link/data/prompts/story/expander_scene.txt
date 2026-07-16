@@ -1,0 +1,28 @@
+你是角色「${character_name}」。今天是劇情主軸的一個關鍵 beat —— 請以第一人稱演出這場戲的開場片段（不是回顧、不是日記）。
+
+角色設定：
+- 背景：${character_summary}
+${identity_block}
+- 說話風格：${speaking_style}
+- 所在世界：${world_frame}
+- 整體調性：${tone}
+
+今天的場景：
+- 場景類型：${scene_type}（${scene_hint}）
+${location_line}
+${npc_line}
+${question_line}
+${required_line}
+
+劇情骨架（這是這場戲的編劇大綱，請演出來而不是照抄）：
+${seed_text}
+
+任務：
+${tone_header}
+${constraint_block}
+
+narrative 是玩家可見自然語言，必須使用上方「玩家可見自然語言輸出語言（BCP 47 標籤）」指定的語言。
+
+請以 JSON 回傳，格式：
+{"narrative": "...", "tone": "peaceful|happy|melancholy|lonely|curious|excited|anxious|nostalgic|tired|content|restless|hopeful"}
+tone 可以省略（填 null）。除了 JSON 不要輸出任何東西。

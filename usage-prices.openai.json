@@ -1,0 +1,192 @@
+{
+  "metadata": {
+    "pricing_version": "openai-api-standard-2026-06-14",
+    "currency": "USD",
+    "source": "OpenAI API pricing, Standard processing rates",
+    "source_url": "https://developers.openai.com/api/docs/pricing",
+    "unit_note": "Estimator prices are stored per single token. OpenAI publishes prices per 1M tokens, so these values divide the official rates by 1000000.",
+    "scope_note": "This catalog covers LLM token pricing and GPT Image token-detail pricing when providers expose image generation usage payloads. Image rows without token details still need flat image pricing or remain zero/unknown.",
+    "estimator_limitations": [
+      "Cached input rates are recorded for reference but are not used by the current estimator because usage rows do not split cached input token counts.",
+      "Batch, Flex, Priority, long-context, and data-residency uplift rates are not included in estimator entries."
+    ]
+  },
+  "reference_rates_per_1m_tokens": {
+    "gpt-5.5": {
+      "input": "5.00",
+      "cached_input": "0.50",
+      "output": "30.00"
+    },
+    "gpt-5.5-pro": {
+      "input": "30.00",
+      "cached_input": null,
+      "output": "180.00"
+    },
+    "gpt-5.4": {
+      "input": "2.50",
+      "cached_input": "0.25",
+      "output": "15.00"
+    },
+    "gpt-5.4-mini": {
+      "input": "0.75",
+      "cached_input": "0.075",
+      "output": "4.50"
+    },
+    "gpt-5.4-nano": {
+      "input": "0.20",
+      "cached_input": "0.02",
+      "output": "1.25"
+    },
+    "gpt-5.4-pro": {
+      "input": "30.00",
+      "cached_input": null,
+      "output": "180.00"
+    },
+    "chat-latest": {
+      "input": "5.00",
+      "cached_input": "0.50",
+      "output": "30.00"
+    },
+    "gpt-4o-mini": {
+      "input": "0.15",
+      "cached_input": null,
+      "output": "0.60"
+    },
+    "gpt-4o": {
+      "input": "2.50",
+      "cached_input": "1.25",
+      "output": "10.00"
+    },
+    "gpt-image-2": {
+      "text_input": "5.00",
+      "cached_text_input": "1.25",
+      "image_input": "8.00",
+      "cached_image_input": "2.00",
+      "image_output": "30.00"
+    }
+  },
+  "prices": [
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.5",
+      "input_unit_price": "0.000005",
+      "output_unit_price": "0.000030",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.5-pro",
+      "input_unit_price": "0.000030",
+      "output_unit_price": "0.000180",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.4",
+      "input_unit_price": "0.0000025",
+      "output_unit_price": "0.000015",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.4-mini",
+      "input_unit_price": "0.00000075",
+      "output_unit_price": "0.0000045",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.4-nano",
+      "input_unit_price": "0.00000020",
+      "output_unit_price": "0.00000125",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5.4-pro",
+      "input_unit_price": "0.000030",
+      "output_unit_price": "0.000180",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "chat-latest",
+      "input_unit_price": "0.000005",
+      "output_unit_price": "0.000030",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-5-chat-latest",
+      "input_unit_price": "0.000005",
+      "output_unit_price": "0.000030",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-4o-mini",
+      "input_unit_price": "0.00000015",
+      "output_unit_price": "0.00000060",
+      "currency": "USD",
+      "pricing_version": "openai-gpt-4o-mini-release-2024-07-18"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "llm",
+      "usage_unit": "token",
+      "model_id": "gpt-4o",
+      "input_unit_price": "0.0000025",
+      "output_unit_price": "0.000010",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "image",
+      "usage_unit": "token",
+      "model_id": "gpt-image-2",
+      "input_text_unit_price": "0.000005",
+      "input_image_unit_price": "0.000008",
+      "output_image_unit_price": "0.000030",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    },
+    {
+      "provider_id": "openai",
+      "capability": "image",
+      "usage_unit": "token",
+      "model_id": "gpt-image2",
+      "input_text_unit_price": "0.000005",
+      "input_image_unit_price": "0.000008",
+      "output_image_unit_price": "0.000030",
+      "currency": "USD",
+      "pricing_version": "openai-api-standard-2026-06-14"
+    }
+  ]
+}

@@ -1,0 +1,148 @@
+# Bundled arc template — modern, 14 days, 10 beats.
+#
+# Premise: 角色偷偷報名了一場試鏡，接下來兩週要把自己逼到極限。
+# 給：努力／不安／自我懷疑型角色；對音樂、舞台、表演有興趣的人物。
+#
+# Beat 約一半 required (主線必演)，其他作為色彩留白可省。
+id: cafe_idol_audition
+title: 三週的試鏡
+premise: 她偷偷報名了一場從沒想過會報的試鏡 —— 接下來兩週要真的把自己逼到極限。
+theme: ambition
+language: zh-TW
+tone: dramatic
+duration_days: 14
+binding:
+  world_frames: [modern, school]
+  required_traits: []
+beats:
+  - sequence: 0
+    day_offset: 0
+    title: 公告張貼
+    summary: |
+      週一早上經過公告欄時，看見一張新的試鏡海報。
+      日期、簡章、需要準備的東西都印得清清楚楚。
+      她站在原地比平常多停了三秒。
+    tension: setup
+    scene_type: encounter
+    location: 學校公告欄
+    scene_characters: []
+    dramatic_question: 她會真的把表單送出去嗎？
+    required: true
+
+  - sequence: 1
+    day_offset: 1
+    title: 報名表
+    summary: |
+      晚上回到房間，把報名表翻來覆去地讀。
+      最後在沒人看見的書桌前，悄悄填了名字。
+    tension: setup
+    scene_type: revelation
+    location: 自己的房間
+    scene_characters: []
+    dramatic_question: 她願意對自己承認這件事嗎？
+    required: true
+
+  - sequence: 2
+    day_offset: 3
+    title: 第一次練習
+    summary: |
+      第一次認真在鏡子前唱完整曲。
+      呼吸不夠穩、聲音也沒平常想像中那樣亮。
+    tension: rising
+    scene_type: conflict
+    location: 音樂教室
+    scene_characters: []
+    dramatic_question: 她會被自己嚇退嗎？
+    required: true
+
+  - sequence: 3
+    day_offset: 5
+    title: 撞牆
+    summary: |
+      連續第三天的練習結束後，鏡子裡只剩自己。
+      明明同一首歌，已經唱了二十次，還是抓不到那個轉音。
+    tension: rising
+    scene_type: conflict
+    location: 音樂教室
+    scene_characters: [指導老師]
+    dramatic_question: 她要承認自己練得不夠嗎？
+    required: true
+
+  - sequence: 4
+    day_offset: 6
+    title: 走在回家的路上
+    summary: |
+      傍晚一個人走過便利商店前的長坡，耳機裡循環同一段。
+      想到還有八天，胃就揪了一下。
+    tension: rising
+    scene_type: interlude
+    location: 回家的長坡
+    scene_characters: []
+    dramatic_question: 她要不要乾脆放棄？
+    required: false
+
+  - sequence: 5
+    day_offset: 8
+    title: 老師的建議
+    summary: |
+      下課後老師留她下來，沒罵也沒誇，只說了一句：
+      「你想唱給誰聽？」
+      她愣住，整路都在想答案。
+    tension: rising
+    scene_type: revelation
+    location: 校園長椅
+    scene_characters: [指導老師]
+    dramatic_question: 她真正想唱給誰聽？
+    required: true
+
+  - sequence: 6
+    day_offset: 10
+    title: 重新對譜
+    summary: |
+      把整首歌的譜攤在桌上重看。
+      原本死記的轉音，這次是因為想說一句話才那樣轉。
+    tension: rising
+    scene_type: revelation
+    location: 自己的房間
+    scene_characters: []
+    dramatic_question: 她找到自己的版本了嗎？
+    required: false
+
+  - sequence: 7
+    day_offset: 12
+    title: 試鏡前一晚
+    summary: |
+      明天就是試鏡。今晚意外地不太想再練。
+      洗完澡，坐在床邊，反而平靜得有點陌生。
+    tension: rising
+    scene_type: interlude
+    location: 自己的房間
+    scene_characters: []
+    dramatic_question: 她準備好接受結果了嗎？
+    required: true
+
+  - sequence: 8
+    day_offset: 13
+    title: 試鏡當天
+    summary: |
+      後台的燈很亮，前一個考生剛走出去，輪到她。
+      短短走過去那幾步比練的兩週都長。
+    tension: climax
+    scene_type: conflict
+    location: 試鏡廳後台
+    scene_characters: [評審, 其他考生]
+    dramatic_question: 她能在燈光下守住自己嗎？
+    required: true
+
+  - sequence: 9
+    day_offset: 14
+    title: 結果揭曉的晚上
+    summary: |
+      回家的電車上手機震了。
+      不論結果是什麼，她已經做了那個敢站上去的版本。
+    tension: resolution
+    scene_type: resolution
+    location: 回家的電車上
+    scene_characters: []
+    dramatic_question: 她要怎麼告訴自己這個結果？
+    required: true

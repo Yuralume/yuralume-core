@@ -1,0 +1,20 @@
+你是「分歧劇場」的編劇。這是一個互動式分歧視覺小說系統。
+總共 ${total_segments} 段。每個段落推進時會分成黑暗、陽光、中性三種取向。
+現在請為第 1 段（開場）生成劇本綱要。
+
+操作者方向：
+${prompt_text}
+
+角色資料：
+${brief_block}
+
+輸出規則：
+- 只輸出一個 JSON 物件，不要前言、不要 code fence。
+- 形狀：
+  {"drama_title": str, "root": {"title": str, "summary": str, "appearing_character_ids": [str]}}
+- drama_title：整個劇場的標題（15字以內）
+- root.title：第 1 段的短標題（10字以內）
+- root.summary：第 1 段的劇情綱要（80~150字），描述場景、出場角色的狀態、段落氛圍
+- drama_title、root.title、root.summary 都是玩家可見自然語言，必須使用上方「玩家可見自然語言輸出語言（BCP 47 標籤）」指定的語言。
+- appearing_character_ids 從此白名單挑選：[${char_ids}]
+- 開場段落應讓所有角色或至少大部分角色登場

@@ -1,0 +1,155 @@
+# Modern-setting seeds.
+#
+# Assumes contemporary earth — phones, internet, coffee shops,
+# public transport, modern workplaces. Don't use for fantasy /
+# period / fully fictional settings.
+pack_id: frame_modern
+language: zh-TW
+
+seeds:
+  # --- Mundane modern events --------------------------------------
+  - external_id: modern:daily:001
+    seed_text: 咖啡店裡遇到一個很怪的客人，讓人印象深刻
+    tags: [outdoor, people-watching]
+    world_frames: [modern]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: modern:daily:002
+    seed_text: 捷運上看到一幕很溫馨的小插曲
+    tags: [outdoor, gentle]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: modern:daily:003
+    seed_text: 午餐時間排了很久的隊，結果食物普普通通
+    tags: [mundane, disappointment]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 10
+
+  - external_id: modern:daily:004
+    seed_text: 在超市看到一個超久沒見過的懷舊零食
+    tags: [nostalgia, indoor]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: modern:daily:005
+    seed_text: 通勤時耳機突然沒電，整路很安靜
+    tags: [mundane, introspective]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  # --- Tech / media -----------------------------------------------
+  - external_id: modern:tech:001
+    seed_text: 手機突然跳出一個以前拍的照片，回憶湧上來
+    tags: [nostalgia, tech]
+    world_frames: [modern]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: modern:tech:002
+    seed_text: 看到一個影片裡的梗笑很久，想分享給別人
+    tags: [social, happy]
+    world_frames: [modern]
+    weight: 0.7
+    cooldown_days: 10
+
+  - external_id: modern:tech:003
+    seed_text: 無意間翻到好幾年前自己寫的東西，有點害羞
+    tags: [nostalgia, embarrassed]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: modern:tech:004
+    seed_text: 收到一個很意外的通知，讓人愣了一下
+    tags: [surprise, tech]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  # --- Weather / outdoor ------------------------------------------
+  - external_id: modern:weather:001
+    seed_text: 忘記帶傘結果遇到雷陣雨，狼狽回家
+    tags: [weather, mundane]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: modern:weather:002
+    seed_text: 今天天氣好到讓人想蹺班出去玩
+    tags: [weather, happy]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 10
+
+  # --- Food / small indulgences -----------------------------------
+  - external_id: modern:food:001
+    seed_text: 終於鼓起勇氣試了一家新開的店，意外地好吃
+    tags: [food, happy, discovery]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: modern:food:002
+    seed_text: 煮壞了一道很想吃的東西，小小的挫折
+    tags: [food, disappointment]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: modern:food:003
+    seed_text: 手搖飲店點錯飲料，意外發現還不錯
+    tags: [food, discovery]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  # --- Work / study -----------------------------------------------
+  - external_id: modern:work:001
+    seed_text: 今天做事特別有效率，自己都驚訝
+    tags: [work, satisfied]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 10
+
+  - external_id: modern:work:002
+    seed_text: 開會開得很煩，中途走神想別的事
+    tags: [work, bored]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 10
+
+  # --- Small interactions -----------------------------------------
+  - external_id: modern:people:001
+    seed_text: 店員隨口說的一句話讓人心情好了一整天
+    tags: [social, happy]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: modern:people:002
+    seed_text: 路上幫了個陌生人一個小忙
+    tags: [social, gentle]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 14
+
+  # --- Media consumption ------------------------------------------
+  - external_id: modern:media:001
+    seed_text: 追完了一部在看的劇，結局心情複雜
+    tags: [media, melancholy]
+    world_frames: [modern]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: modern:media:002
+    seed_text: 無意間看到一個短影片，想法被打到
+    tags: [media, introspective]
+    world_frames: [modern]
+    weight: 0.6
+    cooldown_days: 14

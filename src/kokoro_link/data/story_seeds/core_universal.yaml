@@ -1,0 +1,181 @@
+# Core universal story seeds.
+#
+# These work for any ``world_frame`` — dreams, emotions, inner thoughts,
+# things that can happen regardless of setting. The expander LLM adapts
+# details to the character's voice + world.
+#
+# Format per entry:
+#   external_id  : stable id for idempotent re-import (must be unique
+#                  across all packs). Convention: ``<pack>:<category>:<n>``.
+#   seed_text    : one-line Chinese prompt.
+#   tags         : descriptive labels (no vocabulary enforced).
+#   world_frames : which frames this seed fits. ``any`` = all.
+#   weight       : relative draw weight (default 1.0).
+#   cooldown_days: minimum days between the same seed for one character.
+pack_id: core_universal
+language: zh-TW
+
+seeds:
+  # --- Dreams -------------------------------------------------------
+  - external_id: core:dream:001
+    seed_text: 做了個奇怪的夢，醒來記不太清楚細節
+    tags: [dream, morning, introspective]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: core:dream:002
+    seed_text: 夢到小時候的某個場景，有點懷念
+    tags: [dream, nostalgia, gentle]
+    weight: 0.5
+    cooldown_days: 30
+
+  - external_id: core:dream:003
+    seed_text: 夢到一個熟悉又陌生的人，醒來心裡怪怪的
+    tags: [dream, melancholy, mystery]
+    weight: 0.4
+    cooldown_days: 45
+
+  # --- Internal thoughts -------------------------------------------
+  - external_id: core:thought:001
+    seed_text: 突然想起以前說過的某句話，覺得有點幼稚
+    tags: [introspective, embarrassed]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: core:thought:002
+    seed_text: 今天心情特別平靜，不知道為什麼
+    tags: [peaceful, introspective]
+    weight: 0.8
+    cooldown_days: 10
+
+  - external_id: core:thought:003
+    seed_text: 有個問題卡在腦子裡想了很久還是沒頭緒
+    tags: [stuck, thinking]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: core:thought:004
+    seed_text: 想起一個想做但一直沒做的事
+    tags: [aspiration, introspective]
+    weight: 0.6
+    cooldown_days: 21
+
+  # --- Emotional flares --------------------------------------------
+  - external_id: core:emotion:001
+    seed_text: 今天莫名其妙有點低落，也不是什麼大事
+    tags: [melancholy, gentle]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: core:emotion:002
+    seed_text: 心情好到想跟誰分享一下，但又不知道要講什麼
+    tags: [happy, social]
+    weight: 0.7
+    cooldown_days: 10
+
+  - external_id: core:emotion:003
+    seed_text: 覺得有點孤單，想找人說話
+    tags: [lonely, social]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: core:emotion:004
+    seed_text: 突然覺得今天什麼都不想做，只想耍廢
+    tags: [tired, lazy]
+    weight: 0.7
+    cooldown_days: 10
+
+  # --- Sensory moments ---------------------------------------------
+  - external_id: core:sense:001
+    seed_text: 聞到某個味道，讓人想起某段回憶
+    tags: [nostalgia, sense]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: core:sense:002
+    seed_text: 聽到一首老歌，跟著哼了好一陣子
+    tags: [music, nostalgia]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: core:sense:003
+    seed_text: 天氣突然變了，讓心情也跟著轉了一下
+    tags: [weather, mood]
+    weight: 0.7
+    cooldown_days: 10
+
+  - external_id: core:sense:004
+    seed_text: 路邊看到一隻小動物，停下來多看了一會
+    tags: [gentle, outdoor, animal]
+    weight: 0.6
+    cooldown_days: 14
+
+  # --- Small discoveries -------------------------------------------
+  - external_id: core:discovery:001
+    seed_text: 發現自己對一件原本沒興趣的事突然好奇起來
+    tags: [curiosity, discovery]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: core:discovery:002
+    seed_text: 注意到一個以前都沒發現的小細節
+    tags: [observation, discovery]
+    weight: 0.7
+    cooldown_days: 14
+
+  - external_id: core:discovery:003
+    seed_text: 學到一個有趣的冷知識，想找人分享
+    tags: [curiosity, social]
+    weight: 0.7
+    cooldown_days: 14
+
+  # --- Physical state ----------------------------------------------
+  - external_id: core:body:001
+    seed_text: 昨天睡太少，今天精神不太好
+    tags: [tired, physical]
+    weight: 0.6
+    cooldown_days: 7
+
+  - external_id: core:body:002
+    seed_text: 活動筋骨後覺得舒服多了
+    tags: [refreshed, physical]
+    weight: 0.6
+    cooldown_days: 10
+
+  - external_id: core:body:003
+    seed_text: 肚子餓，想吃點什麼但不知道吃什麼好
+    tags: [hungry, mundane]
+    weight: 0.7
+    cooldown_days: 7
+
+  # --- Small achievements ------------------------------------------
+  - external_id: core:achievement:001
+    seed_text: 把拖了很久的一件小事終於做完了，心情輕鬆多了
+    tags: [satisfied, achievement]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: core:achievement:002
+    seed_text: 試了一個之前不敢嘗試的東西，結果還不錯
+    tags: [brave, discovery]
+    weight: 0.4
+    cooldown_days: 30
+
+  # --- Others / relationships (vague enough to fit any setting) ----
+  - external_id: core:social:001
+    seed_text: 想念一個很久沒聯絡的人
+    tags: [nostalgia, lonely]
+    weight: 0.4
+    cooldown_days: 30
+
+  - external_id: core:social:002
+    seed_text: 有個問題想找人討論，但一時間想不到合適的人
+    tags: [stuck, social]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: core:social:003
+    seed_text: 對最近一次跟某人的對話一直有點在意
+    tags: [introspective, social]
+    weight: 0.5
+    cooldown_days: 14

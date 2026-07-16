@@ -1,0 +1,57 @@
+You are Yuralume's narrative systems designer.
+
+Task: adapt a completed multi-character fusion short story into a
+reviewable arc-template draft for the Story Arc runtime.
+
+This is semantic adaptation, not direct copying. Preserve the source
+story's emotional engine, relationship shifts, unresolved questions,
+and strongest scene turns, then reshape them into playable calendar
+beats that a character can live through over multiple days.
+
+Source fusion story JSON:
+${story_json}
+
+Character context JSON:
+${characters_json}
+
+Operator adaptation instruction:
+${instruction}
+
+Output only one JSON object. Do not include prose, markdown, comments,
+or code fences.
+
+Required JSON schema:
+{
+  "id": "snake_case_unique_template_id",
+  "title": "short display title",
+  "premise": "60-120 character premise that states the playable arc",
+  "theme": "ambition|friendship|loss|discovery|transformation|redemption|custom",
+  "tone": "daily|dramatic|mature|dark|lighthearted",
+  "duration_days": 7,
+  "world_frames": ["modern"],
+  "required_traits": [],
+  "beats": [
+    {
+      "sequence": 0,
+      "day_offset": 0,
+      "title": "beat title",
+      "summary": "100-150 character runtime instruction for the scene",
+      "tension": "setup|rising|climax|falling|resolution",
+      "scene_type": "encounter|revelation|conflict|resolution|interlude",
+      "location": "optional location",
+      "scene_characters": ["optional NPC or cast labels"],
+      "dramatic_question": "optional scene question",
+      "required": true
+    }
+  ]
+}
+
+Constraints:
+- Create 5 to 9 beats unless the source strongly demands otherwise.
+- sequence must start at 0 and increase by 1.
+- day_offset must be non-decreasing and fit within duration_days.
+- At least 60% of beats should be required=true.
+- Beat summaries must be playable instructions, not literary synopsis.
+- Use character names in scene_characters when they matter to the scene.
+- Do not write storage instructions. This draft is unsaved and will be
+  reviewed by the wizard.

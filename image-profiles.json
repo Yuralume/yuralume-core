@@ -1,0 +1,50 @@
+[
+  {
+    "id": "openai-image",
+    "label": "GPT Image",
+    "kind": "external_api",
+    "api": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${KOKORO_OPENAI_API_KEY}",
+      "model": "gpt-image-2",
+      "provider": "openai",
+      "timeout_seconds": 180
+    }
+  },
+  {
+    "id": "nano-banana",
+    "label": "Nano Banana",
+    "kind": "external_api",
+    "api": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key": "${KOKORO_GEMINI_API_KEY}",
+      "model": "gemini-2.5-flash-image",
+      "provider": "gemini",
+      "timeout_seconds": 180
+    }
+  },
+  {
+    "id": "grok-image",
+    "label": "Grok Image",
+    "kind": "external_api",
+    "api": {
+      "base_url": "https://api.x.ai/v1",
+      "api_key": "${KOKORO_XAI_API_KEY}",
+      "model": "grok-imagine-image-quality",
+      "provider": "xai",
+      "timeout_seconds": 180
+    }
+  },
+  {
+    "id": "custom-image",
+    "label": "Custom image service",
+    "kind": "external_api",
+    "api": {
+      "base_url": "${KOKORO_IMAGE_API_BASE_URL}",
+      "api_key": "${KOKORO_IMAGE_API_KEY}",
+      "model": "custom",
+      "provider": "custom",
+      "timeout_seconds": 300
+    }
+  }
+]

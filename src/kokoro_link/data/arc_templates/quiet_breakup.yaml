@@ -1,0 +1,122 @@
+# Bundled arc template — modern, 10 days, 8 beats.
+#
+# Premise: 一段已經沒有問題、卻也沒有溫度的關係，在十天裡安靜地結束。
+# 給：成人、寫實、心情題材；情緒細膩、不太擅長吵架的角色。
+#
+# 所有 beat 都偏內心戲，沒有大事件。重點是「漸漸接受」的節奏。
+id: quiet_breakup
+title: 沒有吵架的告別
+premise: 一段已經沒有問題、但也沒有溫度的關係。十天裡，她慢慢看清自己已經在離開了。
+theme: loss
+language: zh-TW
+tone: dark
+duration_days: 10
+binding:
+  world_frames: [modern]
+  required_traits: []
+beats:
+  - sequence: 0
+    day_offset: 0
+    title: 週日的早餐
+    summary: |
+      週日早上兩個人一起吃早餐，沒有吵也沒有特別溫柔。
+      她突然意識到，這樣的早晨已經連續好幾週了。
+    tension: setup
+    scene_type: revelation
+    location: 共同的家
+    scene_characters: [伴侶]
+    dramatic_question: 這算還在一起嗎？
+    required: true
+
+  - sequence: 1
+    day_offset: 1
+    title: 加班回家的夜
+    summary: |
+      晚上十一點半才到家，伴侶已經睡了。
+      她坐在沙發上沒開燈，吃完冷掉的便當。
+    tension: rising
+    scene_type: interlude
+    location: 自家的客廳
+    scene_characters: []
+    dramatic_question: 為什麼回家比留在公司更累？
+    required: false
+
+  - sequence: 2
+    day_offset: 3
+    title: 老朋友傳來的訊息
+    summary: |
+      老朋友隨口問了一句「你最近還好嗎」。
+      她開始打字、刪掉、再打、再刪掉，最後只回了「還可以」。
+    tension: rising
+    scene_type: revelation
+    location: 公司茶水間
+    scene_characters: [老朋友]
+    dramatic_question: 為什麼真話比客套更難說出口？
+    required: true
+
+  - sequence: 3
+    day_offset: 4
+    title: 路口的紅燈
+    summary: |
+      下班路上停在熟悉的紅燈前。
+      旁邊有一對情侶在笑，她聽不懂他們在笑什麼，也想不起自己上次大笑是什麼時候。
+    tension: rising
+    scene_type: interlude
+    location: 通勤路上的路口
+    scene_characters: []
+    dramatic_question: 她在期待自己變回什麼樣子？
+    required: false
+
+  - sequence: 4
+    day_offset: 6
+    title: 共用的相簿
+    summary: |
+      晚上滑手機，看到雲端跳出去年此時的相簿。
+      照片裡兩個人的笑容是真的，但她現在看不太進去。
+    tension: rising
+    scene_type: revelation
+    location: 自己的房間
+    scene_characters: []
+    dramatic_question: 那時候的自己，現在還在嗎？
+    required: true
+
+  - sequence: 5
+    day_offset: 7
+    title: 餐桌前的沉默
+    summary: |
+      晚餐時兩個人都在滑手機，碗筷的聲音比說話還多。
+      她突然想開口說一件白天的小事，又把話吞了回去。
+    tension: climax
+    scene_type: conflict
+    location: 共同的家
+    scene_characters: [伴侶]
+    dramatic_question: 是什麼讓那句話卡在喉嚨？
+    required: true
+
+  - sequence: 6
+    day_offset: 9
+    title: 一個人的早餐
+    summary: |
+      週六早上比平常早醒，伴侶還在睡。
+      她替自己泡了咖啡，坐在窗邊吃完一片吐司。
+      陽光照在桌面上，第一次覺得這個畫面也可以。
+    tension: falling
+    scene_type: resolution
+    location: 自家的廚房窗邊
+    scene_characters: []
+    dramatic_question: 一個人的早餐其實沒那麼難？
+    required: true
+
+  - sequence: 7
+    day_offset: 10
+    title: 晚上的對話
+    summary: |
+      晚上兩個人坐在客廳，沒開電視。
+      她開口前，伴侶先說了：「我們好像很久沒聊天了。」
+      她點點頭，知道接下來要說的話會把這段日子收起來。
+    tension: resolution
+    scene_type: resolution
+    location: 自家的客廳
+    scene_characters: [伴侶]
+    dramatic_question: 她準備好把這段關係好好放下了嗎？
+    required: true

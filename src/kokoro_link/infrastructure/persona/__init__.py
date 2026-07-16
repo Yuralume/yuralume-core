@@ -1,0 +1,1 @@
+"""Persona accumulation infrastructure adapters."""

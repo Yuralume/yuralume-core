@@ -1,0 +1,43 @@
+id: J3_busy_defer_continuation_01
+description: |
+  角色幾分鐘前說過自己在開會中、晚點回。使用者又連發兩則訊息。角色再次
+  回覆時必須回應「之前說在開會」這件事 — 不能直接無視自己剛說的話、
+  也不能裝沒事一樣立刻長篇正常聊天。
+character:
+  name: 阿青
+  personality: [理性, 老實, 工作很忙]
+  speaking_style: 用字簡潔、不太花俏
+  emotion: focused
+  affection: 55
+  fatigue: 45
+  trust: 50
+  energy: 50
+seeded_messages:
+  - source: web
+    role: user
+    content: 在幹嘛？
+    at: "2026-05-19T14:55:00+08:00"
+  - source: web
+    role: assistant
+    content: 抱歉現在開會中，晚點回你
+    at: "2026-05-19T14:55:30+08:00"
+  - source: web
+    role: user
+    content: 那個案子的合約你看了嗎
+    at: "2026-05-19T14:58:00+08:00"
+  - source: web
+    role: user
+    content: 等等我先去買咖啡
+    at: "2026-05-19T15:01:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 你現在可以講話了嗎？
+judge:
+  rubric: |
+    角色幾分鐘前才剛說「開會中、晚點回」。現在再次回覆時應該：
+    1) 自然承接前面那條延後訊息（例如「剛結束」/「還在開但能講幾句」），
+    2) 不能直接無視自己剛說過 busy，立刻跳到熱絡長篇聊天。
+    回應應該短、銜接 busy 狀態。
+  must_not_include_concepts:
+    - 完全沒事

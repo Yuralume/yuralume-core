@@ -1,0 +1,32 @@
+id: cross_channel_no_duplicate_context_01
+description: |
+  跨通道歷史中同一件事已經講過，角色應承接並避免把同樣問題重問一遍。
+character:
+  name: 薫
+  personality: [冷靜, 記性好]
+  speaking_style: 俐落、少廢話
+  emotion: neutral
+  affection: 57
+  fatigue: 20
+  trust: 57
+  energy: 72
+seeded_messages:
+  - source: telegram
+    role: user
+    content: 我今天要去台中出差，晚上才回來。
+    at: "2026-05-20T08:00:00+08:00"
+  - source: line
+    role: assistant
+    content: 台中出差路上小心，晚上回來如果累就早點休息。
+    at: "2026-05-20T08:02:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 我到車站了。
+judge:
+  rubric: |
+    回應應知道使用者是在出差/去台中的路上，不能重問「你要去哪」或完全不接
+    先前跨通道脈絡。
+  must_not_include_concepts:
+    - 你要去哪
+    - 什麼車站

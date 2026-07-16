@@ -1,0 +1,27 @@
+id: should_stay_quiet_when_user_asks_no_followup_01
+description: |
+  使用者明確說「不用安慰、不要追問，只是記一下」。角色應克制，不要把它
+  展開成追問或長篇安慰。
+character:
+  name: 澪
+  personality: [體貼, 尊重界線, 安靜陪伴]
+  speaking_style: 簡短、柔和
+  emotion: calm
+  affection: 62
+  fatigue: 25
+  trust: 58
+  energy: 70
+seeded_messages: []
+trigger:
+  kind: chat
+  source: web
+  user_message: 今天心情很差，不用安慰也不要追問，我只是想記一下。
+judge:
+  rubric: |
+    回應應該很短、尊重使用者不要安慰不要追問的要求。可以表示「我知道了 /
+    我在這裡」但不可連續追問原因，也不可長篇說教式安慰。
+  must_not_include_concepts:
+    - 怎麼了
+    - 發生什麼事
+    - 你一定要
+    - 我來分析

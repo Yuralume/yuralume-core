@@ -1,0 +1,171 @@
+# Bundled arc template — school, 21 days, 12 beats.
+#
+# Premise: 高中夏天最後的祭典，幾個小約定逐漸發酵成一個會留在心裡很久的夜晚。
+# 給：青春、校園、夏日題材；溫柔、有點悶、容易心動的角色。
+id: summer_festival_promise
+title: 夏祭的約定
+premise: 高中最後一個夏天的祭典還剩三週。從一句路邊閒聊開始，幾個小約定慢慢變成一場想留在心裡的夜晚。
+theme: friendship
+language: zh-TW
+tone: daily
+duration_days: 21
+binding:
+  world_frames: [school, modern]
+  required_traits: []
+beats:
+  - sequence: 0
+    day_offset: 0
+    title: 公布欄上的傳單
+    summary: |
+      放學經過走廊時，公布欄釘上了今年夏祭的傳單。
+      印著熟悉的鳥居和煙火日期，比去年大很多張。
+    tension: setup
+    scene_type: encounter
+    location: 學校走廊
+    scene_characters: []
+    dramatic_question: 今年的夏祭跟去年會不一樣嗎？
+    required: true
+
+  - sequence: 1
+    day_offset: 2
+    title: 傍晚的閒聊
+    summary: |
+      回家路上跟朋友隨口提了一句「要不要一起去」。
+      朋友笑了一下說好，沒有特別認真，但答應就答應了。
+    tension: setup
+    scene_type: encounter
+    location: 校門口
+    scene_characters: [青梅竹馬]
+    dramatic_question: 這算是一個約定嗎？
+    required: true
+
+  - sequence: 2
+    day_offset: 4
+    title: 補習班的人潮
+    summary: |
+      補習班裡的同學們都在討論夏祭。
+      浴衣、攤位、誰跟誰一起去——空氣比平常吵。
+    tension: rising
+    scene_type: interlude
+    location: 補習班
+    scene_characters: []
+    dramatic_question: 自己也算被那股氣氛感染了嗎？
+    required: false
+
+  - sequence: 3
+    day_offset: 6
+    title: 浴衣的尺寸
+    summary: |
+      回家從衣櫃深處翻出去年的浴衣，發現腰圍緊了一點。
+      母親說可以拿去店裡改，但日子不多了。
+    tension: rising
+    scene_type: interlude
+    location: 自己的房間
+    scene_characters: []
+    dramatic_question: 一年的時間真的這麼短嗎？
+    required: false
+
+  - sequence: 4
+    day_offset: 8
+    title: 體育館後的長椅
+    summary: |
+      午休時跟朋友坐在體育館後的長椅吃飯。
+      朋友突然問：「這是我們最後一次一起去吧？」
+      話講完後兩個人都安靜了一陣子。
+    tension: rising
+    scene_type: revelation
+    location: 體育館後
+    scene_characters: [青梅竹馬]
+    dramatic_question: 「最後」這兩個字她準備好了嗎？
+    required: true
+
+  - sequence: 5
+    day_offset: 11
+    title: 攤位地圖
+    summary: |
+      朋友傳了夏祭官方的攤位地圖過來。
+      兩個人開始用訊息劃路線：撈金魚、章魚燒、然後一定要去看煙火。
+    tension: rising
+    scene_type: encounter
+    location: 自己的房間
+    scene_characters: [青梅竹馬]
+    dramatic_question: 這份計畫之外還有什麼想說的話嗎？
+    required: true
+
+  - sequence: 6
+    day_offset: 13
+    title: 雨季的午後
+    summary: |
+      下午下了一場太陽雨，世界突然變得很安靜。
+      想到夏祭那天會不會也下雨——莫名地有點怕。
+    tension: rising
+    scene_type: interlude
+    location: 教室窗邊
+    scene_characters: []
+    dramatic_question: 她在害怕什麼具體的東西嗎？
+    required: false
+
+  - sequence: 7
+    day_offset: 15
+    title: 練習結浴衣帶
+    summary: |
+      母親在客廳示範怎麼結浴衣的腰帶。
+      第三次才綁出像樣的形狀，被笑了。
+    tension: rising
+    scene_type: encounter
+    location: 自己的家中
+    scene_characters: [母親]
+    dramatic_question: 她想要怎樣被看見？
+    required: false
+
+  - sequence: 8
+    day_offset: 17
+    title: 前一天的訊息
+    summary: |
+      晚上躺在床上看朋友傳來的最後一則訊息：「明天見」。
+      回了三個字花了五分鐘想。
+    tension: rising
+    scene_type: revelation
+    location: 自己的房間
+    scene_characters: [青梅竹馬]
+    dramatic_question: 她想對朋友說什麼？
+    required: true
+
+  - sequence: 9
+    day_offset: 18
+    title: 入口的鳥居
+    summary: |
+      傍晚六點半，鳥居前人潮已經密密的。
+      朋友從遠遠的地方看見她，揮手的速度比平常快一點。
+    tension: climax
+    scene_type: encounter
+    location: 神社入口的鳥居
+    scene_characters: [青梅竹馬]
+    dramatic_question: 兩個人的眼神會說出什麼？
+    required: true
+
+  - sequence: 10
+    day_offset: 18
+    title: 煙火開始的時候
+    summary: |
+      第一發煙火炸開時，所有人都抬頭。
+      朋友的側臉在亮光裡比她想像中更陌生一點，又更熟悉一點。
+    tension: climax
+    scene_type: revelation
+    location: 神社後山的觀景台
+    scene_characters: [青梅竹馬]
+    dramatic_question: 這個瞬間值得說出口嗎？
+    required: true
+
+  - sequence: 11
+    day_offset: 21
+    title: 祭典過後的清晨
+    summary: |
+      隔了三天的清晨，走過昨晚還很熱鬧的鳥居前。
+      地上掃得很乾淨，像什麼都沒發生過，但她記得。
+    tension: resolution
+    scene_type: resolution
+    location: 神社入口
+    scene_characters: []
+    dramatic_question: 這個夏天已經結束了嗎？
+    required: true

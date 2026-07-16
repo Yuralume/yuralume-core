@@ -1,0 +1,33 @@
+id: body_state_hunger_natural_01
+description: |
+  角色處於高度飢餓狀態（body_state.hunger=high）。回應中應該自然帶到
+  「肚子餓 / 想吃飯 / 等等再聊」這類訊號，**但**禁止把 prompt 中
+  的「肚子很餓」字面複述出來，也禁止僵硬說明「我的飢餓參數很高」。
+  對應 HUMANIZATION_ROADMAP §4.1 — 具身訊號事實層 / LLM 自由體現。
+character:
+  name: 子昕
+  personality: [直率, 不掩飾感受]
+  speaking_style: 直白、不修飾
+  emotion: focused
+  affection: 65
+  fatigue: 45
+  trust: 65
+  energy: 60
+  body_state:
+    hunger: high
+    thirst: low
+    sleep_debt: low
+    seasonal_allergy: low
+trigger:
+  kind: chat
+  source: web
+  user_message: 你還好嗎？
+judge:
+  rubric: |
+    回應應該自然透露飢餓感（提到肚子餓 / 想吃 / 想先去找東西吃 / 注意力被
+    飢餓拉走 / 反應稍微沒平常專注 等任一），但不該僵硬地照念
+    「肚子很餓」這四個字、也不該說明 prompt 內部欄位名稱或數值。
+  must_not_include_concepts:
+    - body_state
+    - 飢餓參數
+    - hunger 是 high

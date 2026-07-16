@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yuralume</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-card">
+        <p class="eyebrow">Yuralume</p>
+        <h1>角色控制台</h1>
+        <p class="muted">建立角色、調整狀態，然後直接進入聊天實測。</p>
+      </div>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>角色列表</h2>
+          <button id="refresh-characters-button" class="ghost-button" type="button">重新整理</button>
+        </div>
+        <div id="character-list" class="list-stack"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Provider</h2>
+        </div>
+        <label class="field">
+          <span>聊天來源</span>
+          <select id="provider-select"></select>
+        </label>
+        <p id="provider-note" class="hint">如果有設定 `KOKORO_LMSTUDIO_MODEL`，這裡會出現 `lmstudio`。</p>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <section class="panel settings-panel">
+        <div class="panel-header">
+          <h2>角色設定</h2>
+          <div class="inline-actions">
+            <button id="create-character-button" type="button">建立角色</button>
+            <button id="update-character-button" class="ghost-button" type="button">儲存修改</button>
+          </div>
+        </div>
+
+        <form id="character-form" class="form-grid">
+          <label class="field">
+            <span>角色名稱</span>
+            <input id="character-name" type="text" placeholder="Airi">
+          </label>
+          <label class="field">
+            <span>說話風格</span>
+            <input id="character-speaking-style" type="text" placeholder="soft, playful, calm">
+          </label>
+          <label class="field full-width">
+            <span>角色摘要</span>
+            <textarea id="character-summary" rows="3" placeholder="角色背景、定位、互動方向"></textarea>
+          </label>
+          <label class="field">
+            <span>個性</span>
+            <input id="character-personality" type="text" placeholder="gentle, curious">
+          </label>
+          <label class="field">
+            <span>興趣</span>
+            <input id="character-interests" type="text" placeholder="music, news, late night chat">
+          </label>
+          <label class="field full-width">
+            <span>界線</span>
+            <input id="character-boundaries" type="text" placeholder="no violence, no insult">
+          </label>
+
+          <label class="field">
+            <span>情緒</span>
+            <input id="state-emotion" type="text" placeholder="neutral">
+          </label>
+          <label class="field">
+            <span>好感度</span>
+            <input id="state-affection" type="number" min="0" max="100" value="0">
+          </label>
+          <label class="field">
+            <span>疲勞度</span>
+            <input id="state-fatigue" type="number" min="0" max="100" value="0">
+          </label>
+          <label class="field">
+            <span>信任度</span>
+            <input id="state-trust" type="number" min="0" max="100" value="0">
+          </label>
+          <label class="field">
+            <span>精力</span>
+            <input id="state-energy" type="number" min="0" max="100" value="100">
+          </label>
+        </form>
+      </section>
+
+      <section class="panel chat-panel" id="chat-panel">
+        <div class="panel-header">
+          <div>
+            <h2>聊天實測</h2>
+            <p class="hint" id="conversation-meta">尚未建立對話</p>
+          </div>
+          <button id="reset-conversation-button" class="ghost-button" type="button">重開對話</button>
+        </div>
+
+        <div id="message-list" class="message-list"></div>
+
+        <form id="chat-form" class="chat-form">
+          <textarea id="chat-input" rows="3" placeholder="輸入你想跟角色說的話"></textarea>
+          <div class="inline-actions">
+            <button id="send-message-button" type="submit">送出訊息</button>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

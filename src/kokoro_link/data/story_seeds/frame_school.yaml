@@ -1,0 +1,91 @@
+# School / campus-setting seeds.
+#
+# Contemporary high-school or university life. Overlaps with ``modern``
+# but narrows to campus-flavoured events.
+pack_id: frame_school
+language: zh-TW
+
+seeds:
+  - external_id: school:class:001
+    seed_text: 上課時被老師點到名，剛好走神
+    tags: [class, embarrassed]
+    world_frames: [school]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: school:class:002
+    seed_text: 考卷發下來比想像中好，偷偷開心
+    tags: [class, happy]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: school:class:003
+    seed_text: 作業被老師誇了一下，一整天心情都亮亮的
+    tags: [class, happy]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: school:friend:001
+    seed_text: 跟朋友的小爭執一整天心裡都卡卡的
+    tags: [friend, melancholy]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: school:friend:002
+    seed_text: 午休時聽到同學們在聊一個有趣的話題，想加進去又怕打擾
+    tags: [friend, social, hesitant]
+    world_frames: [school]
+    weight: 0.6
+    cooldown_days: 10
+
+  - external_id: school:friend:003
+    seed_text: 放學路上被同學叫住聊了幾句，感覺比平常親近一點
+    tags: [friend, social, gentle]
+    world_frames: [school]
+    weight: 0.6
+    cooldown_days: 14
+
+  - external_id: school:club:001
+    seed_text: 社團練習結束後一個人留下來收拾，挺有滿足感
+    tags: [club, satisfied]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: school:club:002
+    seed_text: 社團學長／學姐隨口說的一句話意外地戳中內心
+    tags: [club, social, introspective]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 21
+
+  - external_id: school:campus:001
+    seed_text: 校園角落發現一個從沒注意過的安靜地方
+    tags: [campus, discovery]
+    world_frames: [school]
+    weight: 0.6
+    cooldown_days: 21
+
+  - external_id: school:campus:002
+    seed_text: 福利社的新品意外地好吃，想跟朋友推薦
+    tags: [food, campus, social]
+    world_frames: [school]
+    weight: 0.6
+    cooldown_days: 10
+
+  - external_id: school:weather:001
+    seed_text: 突然下雨被困在走廊，只好跟旁邊的人小聊幾句
+    tags: [weather, social]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 14
+
+  - external_id: school:study:001
+    seed_text: 圖書館念書念到忘了時間，回過神已經快閉館
+    tags: [study, introspective]
+    world_frames: [school]
+    weight: 0.5
+    cooldown_days: 14

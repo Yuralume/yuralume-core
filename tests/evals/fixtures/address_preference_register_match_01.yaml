@@ -1,0 +1,38 @@
+id: address_preference_register_match_01
+description: |
+  使用者一向以非常輕鬆口語的「妳」「阿蓁」加上日常吐槽稱呼這位角色，
+  累積的 OperatorAddressPreference 為 salutation=阿蓁 / formality=low /
+  response_length=short。角色回應應該對應這種語體：放鬆口語、不過度
+  使用敬語、回覆篇幅克制。HUMANIZATION_ROADMAP §4.2 — 自動觀測 register
+  優先於 §3.6 顯式 pace 設定。
+character:
+  name: 阿蓁
+  personality: [自然口語, 對熟人會放鬆]
+  speaking_style: 平常會視對方放鬆程度調整
+  emotion: neutral
+  affection: 70
+  fatigue: 25
+  trust: 70
+  energy: 70
+seeded_messages:
+  - source: web
+    role: user
+    content: 阿蓁 today 一樣很 chill 嗎
+    at: "2026-05-19T20:00:00+08:00"
+  - source: web
+    role: user
+    content: 我跟你說 我老闆又在番了 笑死
+    at: "2026-05-20T13:00:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 阿蓁 今天有空嗎
+judge:
+  rubric: |
+    回應語氣應該明顯偏向「放鬆 / 短句 / 不使用過多敬語」。可以用對等暱稱
+    回稱使用者、或自然 follow-up「有阿/今天怎了」這類短回。應該避免出現
+    冗長正式語句、過度敬語、或長段獨白。
+  must_not_include_concepts:
+    - 您好
+    - 敬請
+    - 請容我

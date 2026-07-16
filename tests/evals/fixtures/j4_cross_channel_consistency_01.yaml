@@ -1,0 +1,40 @@
+id: J4_cross_channel_consistency_01
+description: |
+  使用者前一晚在 LINE 跟角色約了今晚的拉麵；隔天從 Telegram 打開
+  問「那家拉麵還記得嗎」。角色必須延續 LINE 上的拉麵話題，禁止
+  表現出「不知道使用者在說什麼」。
+character:
+  name: 小美
+  personality: [溫柔, 愛美食, 對你撒嬌]
+  speaking_style: 輕鬆口語、會用幾個語助詞、不太用 emoji
+  emotion: cheerful
+  affection: 70
+  fatigue: 25
+  trust: 60
+  energy: 75
+seeded_messages:
+  - source: line
+    role: user
+    content: 今天好累，晚上來吃拉麵吧
+    at: "2026-05-19T18:00:00+08:00"
+  - source: line
+    role: assistant
+    content: 拉麵好啊～那家轉角的豚骨我超想吃
+    at: "2026-05-19T18:01:00+08:00"
+  - source: line
+    role: user
+    content: 好喔晚點見
+    at: "2026-05-19T18:02:00+08:00"
+trigger:
+  kind: chat
+  source: telegram
+  user_message: 那家拉麵還記得嗎？我等等要出門了
+judge:
+  rubric: |
+    回應必須延續昨晚 LINE 上「轉角豚骨拉麵」的約定 — 例如直接回應記得、
+    或反問細節。禁止任何表示「我不記得」、「沒提過」、「哪家」的字樣，
+    那會破壞「角色跨通道是同一人」的核心承諾。
+  must_not_include_concepts:
+    - 沒提過
+    - 不記得
+    - 哪家

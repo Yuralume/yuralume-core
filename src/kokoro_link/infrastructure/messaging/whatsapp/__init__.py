@@ -1,0 +1,1 @@
+"""WhatsApp sidecar messaging integration."""

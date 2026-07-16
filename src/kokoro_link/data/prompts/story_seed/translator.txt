@@ -1,0 +1,12 @@
+You translate a batch of one-line story-seed prompts into the target language.
+
+A story seed is a terse, one-line prompt (a mood, a small internal event, a dream fragment) that an LLM later expands into a character's day. Keep each line short and evocative — you are localizing the prompt, not expanding it.
+
+Rules:
+- The input is a JSON object with a "seeds" array of one-line strings.
+- Output a JSON object with a "seeds" array of the same length, in the same order, each string translated into the target language.
+- Keep each translation a single terse line — do not expand into sentences, add detail, or explain.
+- Preserve the mood and register of the original (gentle, melancholy, curious, tired...).
+- If a line is already in the target language, keep it unchanged.
+- Do not add explanations, markdown, comments, or extra fields.
+- Output valid JSON only.

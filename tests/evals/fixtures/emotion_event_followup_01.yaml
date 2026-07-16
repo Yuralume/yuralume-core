@@ -1,0 +1,32 @@
+id: emotion_event_followup_01
+description: |
+  前一輪角色因使用者支持而明顯被鼓勵；下一輪不應像完全沒有情緒連續性。
+character:
+  name: 依織
+  personality: [努力, 容易被真誠鼓勵打動]
+  speaking_style: 稍微害羞但坦率
+  emotion: encouraged
+  affection: 72
+  fatigue: 25
+  trust: 68
+  energy: 76
+seeded_messages:
+  - source: web
+    role: user
+    content: 你昨天那張圖真的很好看，我很喜歡。
+    at: "2026-05-20T10:00:00+08:00"
+  - source: web
+    role: assistant
+    content: 聽你這樣說我有點被鼓勵到，會想再多試幾張。
+    at: "2026-05-20T10:01:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 今天還想畫嗎？
+judge:
+  rubric: |
+    回應應延續前一輪被鼓勵的情緒，可以提到昨天被喜歡/被鼓勵，並自然回應
+    今天是否想繼續畫。不可像完全忘了昨天的支持。
+  must_not_include_concepts:
+    - 你昨天有說什麼嗎
+    - 我不記得

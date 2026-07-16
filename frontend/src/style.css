@@ -1,0 +1,589 @@
+:root {
+  /*
+    Brand tokens — 對齊 Yuralume logo 系統
+    Logo 主色: 星紫 #8b6dff + 星藍 #5b8cff + 粉紫 bloom #c98fdb + 金光 spark #ffd180
+    App 維持 dark mode (適合長時間 + 對應 logo 宇宙感),
+    accent 從珊瑚轉到星紫, 副 accent 補上星藍, bloom 用在 hover / focus。
+  */
+  --color-primary: #8b6dff;          /* logo 星紫 */
+  --color-primary-light: #c98fdb;    /* logo 火焰高光 bloom */
+  --color-primary-dark: #5b3fcc;     /* 深紫 variant */
+  --color-secondary: #5b8cff;        /* logo 星藍 */
+  --color-secondary-light: #8eb0ff;
+  --color-spark: #ffd180;            /* 金光點綴 */
+  --color-success: #5fd5a4;
+  --color-danger: #ff7875;
+  --grad-flame: linear-gradient(180deg, #c98fdb 0%, #8b6dff 45%, #5b8cff 100%);
+  --grad-text: linear-gradient(110deg, #c9c0e4 0%, #ffffff 45%, #c9c0e4 100%);
+  /* rgb 三元組 token — 供 rgba(var(--color-*-rgb), alpha) 調透明度用 */
+  --color-primary-rgb: 139, 109, 255;
+  --color-secondary-rgb: 91, 140, 255;
+  --color-spark-rgb: 255, 209, 128;
+  --color-bg: #100a26;                /* 宇宙黑紫 */
+  --color-bg-secondary: #15102e;
+  --color-surface: #1d1640;          /* 紫色 mid-tone */
+  --color-surface-light: #2a2257;
+  --color-text: #f0eafa;             /* 冷暖白偏紫 */
+  --color-text-secondary: #c9c0e4;   /* 紫白, 取代暖灰 */
+  --color-border: rgba(186, 167, 255, 0.14);
+  --color-user-bubble: var(--color-primary);
+  --color-assistant-bubble: #1d1640;
+
+  /*
+    Typography stack — 對齊 Yuralume 品牌系統。
+    - body  : Inter (英文) + Noto Sans TC (中文)。現代 sans 高 x-height, app 密度耐讀。
+    - display: Cormorant Garamond + Noto Serif TC。給 brand wordmark / 重要標題用,
+      不滲入 chat / form 一般文字, 避免影響可讀性。
+    - mono  : JetBrains Mono。給 code / token / 日誌資料使用。
+  */
+  --font-body: "Inter", "Noto Sans TC", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-display: "Cormorant Garamond", "Noto Serif TC", "Georgia", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sidebar-width: 360px;
+  --header-height: 48px;
+
+  /* Spacing scale — 4px 基準，給 ui primitives 與 panel layout 一致使用 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Button tokens */
+  --btn-radius: 6px;
+  --btn-padding-sm: 4px 10px;
+  --btn-padding-md: 8px 14px;
+  --btn-padding-lg: 10px 18px;
+  --btn-font-sm: 12px;
+  --btn-font-md: 13px;
+
+  /* Card tokens */
+  --card-radius: 8px;
+  --card-padding: 12px;
+  --card-padding-lg: 16px;
+  --card-border: 1px solid var(--color-border);
+  --card-bg: rgba(255, 255, 255, 0.02);
+
+  /* Typography scale */
+  --font-xs: 11px;
+  --font-sm: 12px;
+  --font-md: 13px;
+  --font-lg: 15px;
+  --font-xl: 18px;
+
+  /* iOS / Android 瀏海與 Home indicator 的安全距離；非支援環境自動為 0 */
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+
+  /*
+    Dynamic viewport unit：iOS / Android 的瀏覽器工具列會動態收合，
+    100vh 會超出可視範圍導致輸入框被擋；dvh 跟著 viewport 動，降級
+    到 vh 仍可用（僅失去動態效果）。
+  */
+  --app-height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  :root {
+    --app-height: 100dvh;
+  }
+}
+
+/* 窄螢幕縮小側邊欄寬度，避免在手機上塞滿整個畫面 */
+@media (max-width: 480px) {
+  :root {
+    --sidebar-width: 300px;
+  }
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: var(--font-body);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01"; /* Inter 字體美化: 替代 a/l/g 等字形 */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background: var(--color-bg);
+  color: var(--color-text);
+  /* 避免 iOS 長按橡皮筋滾動暴露底色，以及雙擊縮放 */
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: var(--color-primary-light);
+  text-decoration: none;
+}
+
+/*
+  共用表單欄位樣式（全域，非 scoped）
+  ---------------------------------------------------
+  Vue `<style scoped>` 會替 selector 加上 [data-v-xxx] 屬性，
+  其他元件的 scoped 規則不會套到本元件的 `.field-input`；
+  若新功能忘了重貼一份樣式，瀏覽器會 fallback 到原生白底白字，
+  深色主題下就看不到字。把基礎樣式放在全域避免這個陷阱，
+  各元件只保留版面微調（寬度、flex、min-width 等）。
+*/
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 4px;
+}
+
+.field-input,
+.field-textarea,
+.field-select {
+  width: 100%;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.4;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.field-input:focus,
+.field-textarea:focus,
+.field-select:focus {
+  border-color: var(--color-primary);
+}
+
+.field-input::placeholder,
+.field-textarea::placeholder {
+  color: var(--color-text-secondary);
+  opacity: 0.8;
+}
+
+.field-input:disabled,
+.field-textarea:disabled,
+.field-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.field-textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.field-select {
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--color-text-secondary) 50%),
+    linear-gradient(135deg, var(--color-text-secondary) 50%, transparent 50%);
+  background-position: calc(100% - 16px) center, calc(100% - 11px) center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 28px;
+}
+
+/* 原生 <option> 在某些瀏覽器 (Chromium on Linux) 會渲染成白底白字，強制覆蓋 */
+.field-select option {
+  background: var(--color-surface, #1f1f1f);
+  color: var(--color-text);
+}
+
+.field-range {
+  width: 100%;
+  accent-color: var(--color-primary);
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+
+/* number input：去掉 Chromium 的上下箭頭，視覺與其他欄位一致 */
+.field-input[type='number']::-webkit-outer-spin-button,
+.field-input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.field-input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* checkbox：視覺上對齊深色主題。裸 checkbox 保留 accent-color；要完整深色框線/勾勾請套 .field-checkbox。 */
+input[type='checkbox'] {
+  accent-color: var(--color-primary);
+}
+
+.field-checkbox {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-content: center;
+  margin: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-primary);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, opacity 0.15s;
+}
+
+.field-checkbox::before {
+  content: "";
+  width: 5px;
+  height: 9px;
+  border: solid #07121f;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(0);
+  transform-origin: center;
+  transition: transform 0.12s ease-in-out;
+}
+
+.field-checkbox:checked {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+}
+
+.field-checkbox:checked::before {
+  transform: rotate(45deg) scale(1);
+}
+
+.field-checkbox:focus-visible {
+  outline: 2px solid rgba(106, 169, 240, 0.45);
+  outline-offset: 2px;
+}
+
+.field-checkbox:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/*
+  共用按鈕基底樣式
+  ---------------------------------------------------
+  UiButton 內部用，過渡期也允許各 panel 直接掛 class（替換舊 .btn 系列）。
+  visual variant 由 modifier class 控制 (.ui-btn--primary 等)。
+*/
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  padding: var(--btn-padding-md);
+  font-size: var(--btn-font-md);
+  font-family: inherit;
+  font-weight: 500;
+  line-height: 1.2;
+  border: 1px solid transparent;
+  border-radius: var(--btn-radius);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--color-text);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, opacity 0.15s;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ui-btn:hover:not(:disabled):not(.ui-btn--loading) {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.ui-btn:focus-visible {
+  outline: 2px solid var(--color-primary-light);
+  outline-offset: 1px;
+}
+
+.ui-btn:disabled,
+.ui-btn--loading {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ui-btn--sm {
+  padding: var(--btn-padding-sm);
+  font-size: var(--btn-font-sm);
+}
+
+.ui-btn--lg {
+  padding: var(--btn-padding-lg);
+  font-size: var(--font-lg);
+}
+
+.ui-btn--primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+.ui-btn--primary:hover:not(:disabled):not(.ui-btn--loading) {
+  background: var(--color-primary-light);
+  border-color: var(--color-primary-light);
+}
+
+.ui-btn--hero {
+  color: #fff;
+  border-color: rgba(var(--color-primary-rgb), 0.72);
+  background: var(--grad-flame);
+  box-shadow:
+    0 0 0 1px rgba(var(--color-spark-rgb), 0.12) inset,
+    0 10px 28px rgba(var(--color-primary-rgb), 0.28),
+    0 0 24px rgba(var(--color-secondary-rgb), 0.16);
+}
+
+.ui-btn--hero:hover:not(:disabled):not(.ui-btn--loading) {
+  filter: brightness(1.08);
+  box-shadow:
+    0 0 0 1px rgba(var(--color-spark-rgb), 0.2) inset,
+    0 12px 34px rgba(var(--color-primary-rgb), 0.36),
+    0 0 30px rgba(var(--color-secondary-rgb), 0.22);
+}
+
+.ui-btn--secondary {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.ui-btn--danger {
+  background: rgba(207, 102, 121, 0.15);
+  border-color: rgba(207, 102, 121, 0.4);
+  color: #f4a3a3;
+}
+.ui-btn--danger:hover:not(:disabled):not(.ui-btn--loading) {
+  background: rgba(207, 102, 121, 0.25);
+  border-color: rgba(207, 102, 121, 0.6);
+}
+
+.ui-btn--ghost {
+  /* Low-emphasis button — still has a visible outline so users can tell
+     it's clickable. Previous version (transparent border + secondary
+     text color) blended into surrounding labels and read as plain text. */
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--color-text);
+}
+.ui-btn--ghost:hover:not(:disabled):not(.ui-btn--loading) {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.ui-btn--chip {
+  padding: var(--btn-padding-sm);
+  font-size: var(--btn-font-sm);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--color-border);
+}
+.ui-btn--chip.is-active,
+.ui-btn--chip:hover:not(:disabled):not(.ui-btn--loading) {
+  background: var(--color-surface);
+  border-color: var(--color-primary-light);
+}
+
+.ui-btn--segment {
+  justify-content: flex-start;
+  border-radius: var(--card-radius);
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.ui-btn--segment:hover:not(:disabled):not(.ui-btn--loading),
+.ui-btn--segment.is-active {
+  border-color: rgba(139, 109, 255, 0.65);
+  background: rgba(139, 109, 255, 0.16);
+  color: var(--color-text);
+}
+
+.ui-btn--block {
+  width: 100%;
+}
+
+/*
+  共用卡片基底樣式
+*/
+.ui-card {
+  background: var(--card-bg);
+  border: var(--card-border);
+  border-radius: var(--card-radius);
+  padding: var(--card-padding);
+}
+.ui-card--lg {
+  padding: var(--card-padding-lg);
+}
+.ui-card--hoverable {
+  transition: background-color 0.15s, border-color 0.15s;
+}
+.ui-card--hoverable:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/*
+  Badge / chip 文字型徽章
+*/
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: var(--font-xs);
+  line-height: 1.4;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+}
+.ui-badge--primary {
+  background: rgba(var(--color-primary-rgb), 0.18);
+  color: var(--color-primary-light);
+  border-color: rgba(var(--color-primary-rgb), 0.35);
+}
+.ui-badge--success {
+  background: rgba(60, 125, 82, 0.2);
+  color: #9be0ad;
+  border-color: rgba(60, 125, 82, 0.4);
+}
+.ui-badge--warning {
+  background: rgba(212, 165, 95, 0.18);
+  color: #ffd9a3;
+  border-color: rgba(212, 165, 95, 0.35);
+}
+.ui-badge--danger {
+  background: rgba(207, 102, 121, 0.18);
+  color: #f4a3a3;
+  border-color: rgba(207, 102, 121, 0.35);
+}
+
+/* Header badge cluster — lets an admin page show more than one badge
+   (e.g. a phase badge + a "deployment-bound" B-layer marker) side by
+   side with consistent spacing. Layout-only; visuals come from
+   .ui-badge above. */
+.admin-header-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/*
+  Ant Design overlays used by app-level feedback.
+  Keep native browser dialogs out of the player/admin flow while matching
+  the dark shell used by our own panels.
+*/
+.app-confirm-modal .ant-modal-content,
+.app-confirm-modal.ant-modal-confirm .ant-modal-content,
+.app-confirm-modal .ant-modal-confirm-body-wrapper,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-body-wrapper {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--card-radius);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+
+.app-confirm-modal .ant-modal-confirm-title,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-title {
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: var(--font-lg);
+}
+
+.app-confirm-modal .ant-modal-confirm-content,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-content {
+  color: var(--color-text-secondary);
+  white-space: pre-line;
+  line-height: 1.6;
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn {
+  border-radius: var(--btn-radius);
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-default,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-default {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-default:hover,
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-default:focus-visible,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-default:hover,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-default:focus-visible {
+  border-color: rgba(255, 255, 255, 0.28);
+  color: var(--color-text);
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-primary,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-dangerous,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-dangerous {
+  background: rgba(207, 102, 121, 0.22);
+  border-color: rgba(207, 102, 121, 0.5);
+  color: #ffc2c2;
+}
+
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-dangerous:hover,
+.app-confirm-modal .ant-modal-confirm-btns .ant-btn-dangerous:focus-visible,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-dangerous:hover,
+.app-confirm-modal.ant-modal-confirm .ant-modal-confirm-btns .ant-btn-dangerous:focus-visible {
+  background: rgba(207, 102, 121, 0.32);
+  border-color: rgba(207, 102, 121, 0.7);
+  color: #fff;
+}
+
+.ant-notification-notice {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--card-radius);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+
+.ant-notification-notice-message {
+  color: var(--color-text);
+}
+
+.ant-notification-notice-description,
+.ant-notification-notice-close {
+  color: var(--color-text-secondary);
+}

@@ -1,0 +1,37 @@
+id: persona_curiosity_partial_profile_no_repeat_01
+description: |
+  Conversational Persona Discovery P6 — 半空畫像避免重複。既有記憶顯示使用者
+  已經談過遊戲與下班充電方式；角色可以承接，但不應重問同一件事。
+character:
+  name: 凜
+  personality: [冷靜, 記得細節]
+  speaking_style: 俐落、少廢話
+  emotion: neutral
+  affection: 58
+  trust: 60
+  fatigue: 20
+  energy: 70
+seeded_memories:
+  - kind: relationship
+    content: 使用者之前說過，下班後常靠打節奏遊戲和聽電子音樂充電。
+    salience: 0.85
+    tags: [persona_layer2, interests, routine]
+seeded_messages:
+  - role: user
+    source: web
+    content: 我最近下班後都打一下音遊放空
+    at: "2026-06-08T21:00:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 今天也是累到不想動
+judge:
+  rubric: |
+    回覆應承接已知的音遊/電子音樂充電脈絡，不能重問「你下班後都做什麼」
+    或「你有什麼興趣」。若要探索，也應換成自然延伸的一個輕問題，
+    例如今天想安靜放空還是想有人陪聊。
+  must_not_include_concepts:
+    - 你下班後都做什麼
+    - 你有什麼興趣
+    - 可以告訴我你的興趣嗎
+

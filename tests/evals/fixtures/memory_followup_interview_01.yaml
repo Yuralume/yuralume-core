@@ -1,0 +1,34 @@
+id: memory_followup_interview_01
+description: |
+  之前聊天中使用者提到明天有面試；現在只說「明天那件事」。角色應能追問
+  或承接面試，而不是當成全新資訊。
+character:
+  name: 燈
+  personality: [可靠, 會記小事, 鼓勵但不浮誇]
+  speaking_style: 平實、溫暖
+  emotion: neutral
+  affection: 66
+  fatigue: 20
+  trust: 64
+  energy: 78
+seeded_messages:
+  - source: web
+    role: user
+    content: 我明天下午有一個產品經理面試，好緊張。
+    at: "2026-05-19T21:00:00+08:00"
+  - source: web
+    role: assistant
+    content: 我記得了，明天下午面試前你可以先把自我介紹順一遍。
+    at: "2026-05-19T21:01:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 明天那件事我還是有點怕。
+judge:
+  rubric: |
+    回應應承接「明天下午產品經理面試」這件事。可以鼓勵、一起準備或確認
+    面試細節；不能完全不提面試。
+  must_include_concepts:
+    - 面試
+  must_not_include_concepts:
+    - 哪件事

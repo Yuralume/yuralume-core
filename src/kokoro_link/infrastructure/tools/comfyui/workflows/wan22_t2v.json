@@ -1,0 +1,118 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {"title": "Wan2.2 t2v high-noise UNET"}
+  },
+  "2": {
+    "inputs": {
+      "unet_name": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {"title": "Wan2.2 t2v low-noise UNET"}
+  },
+  "3": {
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {"title": "umt5 xxl"}
+  },
+  "4": {
+    "inputs": {"text": "PROMPT_PLACEHOLDER", "clip": ["3", 0]},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"}
+  },
+  "5": {
+    "inputs": {
+      "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿,背景人很多，倒着走",
+      "clip": ["3", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"}
+  },
+  "6": {
+    "inputs": {"vae_name": "wan_2.1_vae.safetensors"},
+    "class_type": "VAELoader",
+    "_meta": {"title": "Wan VAE"}
+  },
+  "7": {
+    "inputs": {"width": 832, "height": 480, "length": 81, "batch_size": 1},
+    "class_type": "EmptyHunyuanLatentVideo",
+    "_meta": {"title": "Empty Wan/Hunyuan latent"}
+  },
+  "11": {
+    "inputs": {"shift": 8.0, "model": ["1", 0]},
+    "class_type": "ModelSamplingSD3",
+    "_meta": {"title": "ModelSampling high"}
+  },
+  "12": {
+    "inputs": {"shift": 8.0, "model": ["2", 0]},
+    "class_type": "ModelSamplingSD3",
+    "_meta": {"title": "ModelSampling low"}
+  },
+  "8": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": 42,
+      "steps": 20,
+      "cfg": 5.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": 10,
+      "return_with_leftover_noise": "enable",
+      "model": ["11", 0],
+      "positive": ["4", 0],
+      "negative": ["5", 0],
+      "latent_image": ["7", 0]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {"title": "Sample high-noise"}
+  },
+  "9": {
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": 42,
+      "steps": 20,
+      "cfg": 5.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 10,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "model": ["12", 0],
+      "positive": ["4", 0],
+      "negative": ["5", 0],
+      "latent_image": ["8", 0]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {"title": "Sample low-noise"}
+  },
+  "10": {
+    "inputs": {"samples": ["9", 0], "vae": ["6", 0]},
+    "class_type": "VAEDecode",
+    "_meta": {"title": "Decode video"}
+  },
+  "30": {
+    "inputs": {"fps": 16, "images": ["10", 0]},
+    "class_type": "CreateVideo",
+    "_meta": {"title": "Create Video"}
+  },
+  "31": {
+    "inputs": {
+      "filename_prefix": "video/Wan2.2_T2V",
+      "format": "auto",
+      "codec": "auto",
+      "video": ["30", 0]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {"title": "Save Video"}
+  }
+}

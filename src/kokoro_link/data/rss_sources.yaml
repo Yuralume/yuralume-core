@@ -1,0 +1,283 @@
+# Default RSS source registry.
+#
+# Synced into the ``rss_sources`` table on application startup
+# (RssSourceSyncService). Operator can disable / delete entries via
+# admin API; on next restart the seed file does NOT re-create
+# operator-deleted rows (id-based: missing-from-yaml leaves the DB row
+# alone; present-in-yaml UPSERTs the canonical fields). See
+# ``RssSourceSyncService`` for the exact merge rules.
+#
+# Categories must match ``RssCategory`` constants: news / emergency /
+# weather / tech / gaming / anime / entertainment / lifestyle / food /
+# travel / health / science / education / sports / culture / finance.
+#
+# locale is informational — used by prompt-fact rendering and (soon)
+# per-character locale preferences. Free-form, but use BCP-47
+# (zh-TW / ja-JP / en-US ...).
+#
+# region (optional) binds an ``emergency`` source to a deployment region
+# code (TW / JP / US ...). A region-bound emergency feed is seeded
+# ENABLED only when the deployment region matches; otherwise it lands
+# disabled (geographic alerts are meaningless to an overseas self-host).
+# The gate binds to region/timezone, NOT language — an en-US operator in
+# Taiwan still wants Taiwan alerts. Non-emergency sources ignore region.
+
+sources:
+  - id: bbc-world
+    name: BBC World
+    feed_url: https://feeds.bbci.co.uk/news/world/rss.xml
+    category: news
+    locale: en-GB
+    enabled: true
+
+  - id: cna-realtime
+    name: 中央社即時新聞
+    feed_url: https://feeds.feedburner.com/rsscna/intworld
+    category: news
+    locale: zh-TW
+    enabled: true
+
+  - id: nhk-easy
+    name: NHK ニュース
+    feed_url: https://www3.nhk.or.jp/rss/news/cat0.xml
+    category: news
+    locale: ja-JP
+    enabled: true
+
+  - id: ncdr-all-alerts
+    name: 民生示警公開資料平台
+    feed_url: https://alerts.ncdr.nat.gov.tw/RssAtomFeed.ashx
+    category: emergency
+    locale: zh-TW
+    # Geographic civil-alert feed — Taiwan-only. ``region`` binds it to
+    # the deployment region (not language): auto-enabled only when the
+    # deployment region is TW, otherwise seeded disabled (an overseas
+    # self-host gets no meaningless Taiwan alerts). Operator can enable
+    # it manually from the admin UI. See RssSourceSyncService.
+    region: TW
+    enabled: true
+
+  - id: ithome-news
+    name: iThome 新聞
+    feed_url: https://www.ithome.com.tw/rss
+    category: tech
+    locale: zh-TW
+    enabled: true
+
+  - id: hackernews-front
+    name: Hacker News
+    feed_url: https://hnrss.org/frontpage
+    category: tech
+    locale: en-US
+    enabled: true
+
+  # Social trend / meme sources. These are intentionally categorized as
+  # culture unless the source is specifically about technology, so
+  # downstream LLM prompts can treat them as social topics rather than
+  # authoritative news.
+  - id: kym-newsfeed
+    name: Know Your Meme Newsfeed
+    feed_url: https://knowyourmeme.com/newsfeed.rss
+    category: culture
+    locale: en-US
+    enabled: true
+
+  - id: kym-confirmed-memes
+    name: Know Your Meme Confirmed Memes
+    feed_url: https://knowyourmeme.com/memes.rss
+    category: culture
+    locale: en-US
+    enabled: true
+
+  - id: reddit-memes
+    name: Reddit r/memes
+    feed_url: https://www.reddit.com/r/memes/hot/.rss
+    category: culture
+    locale: en-US
+    enabled: true
+
+  - id: reddit-programmerhumor
+    name: Reddit r/ProgrammerHumor
+    feed_url: https://www.reddit.com/r/ProgrammerHumor/hot/.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: google-trends-tw
+    name: Google Trends Taiwan
+    feed_url: https://trends.google.com/trending/rss?geo=TW
+    category: culture
+    locale: zh-TW
+    enabled: true
+
+  - id: google-news-meme-tw
+    name: Google News 台灣網路迷因
+    feed_url: https://news.google.com/rss/search?q=%E7%B6%B2%E8%B7%AF%E8%BF%B7%E5%9B%A0&hl=zh-TW&gl=TW&ceid=TW:zh-Hant
+    category: culture
+    locale: zh-TW
+    enabled: true
+
+  - id: ptt-c-chat
+    name: PTT C_Chat
+    feed_url: https://www.ptt.cc/atom/C_Chat.xml
+    category: anime
+    locale: zh-TW
+    enabled: true
+
+  - id: ptt-mobilecomm
+    name: PTT MobileComm
+    feed_url: https://www.ptt.cc/atom/MobileComm.xml
+    category: tech
+    locale: zh-TW
+    enabled: true
+
+  - id: ptt-pc-shopping
+    name: PTT PC_Shopping
+    feed_url: https://www.ptt.cc/atom/PC_Shopping.xml
+    category: tech
+    locale: zh-TW
+    enabled: true
+
+  # Product launches, technology news, engineering communities, and
+  # service status feeds. Status feeds stay in tech rather than emergency:
+  # they are operational context for engineer/operator personas, not
+  # public safety alerts.
+  - id: reddit-technology
+    name: Reddit r/technology
+    feed_url: https://www.reddit.com/r/technology/hot/.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: reddit-apple
+    name: Reddit r/apple
+    feed_url: https://www.reddit.com/r/apple/hot/.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: apple-newsroom
+    name: Apple Newsroom
+    feed_url: https://www.apple.com/newsroom/rss-feed.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: the-verge
+    name: The Verge
+    feed_url: https://www.theverge.com/rss/index.xml
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: engadget
+    name: Engadget
+    feed_url: https://www.engadget.com/rss.xml
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: techcrunch
+    name: TechCrunch
+    feed_url: https://techcrunch.com/feed/
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: 9to5mac
+    name: 9to5Mac
+    feed_url: https://9to5mac.com/feed/
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: lobsters
+    name: Lobsters
+    feed_url: https://lobste.rs/rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: github-blog
+    name: GitHub Blog
+    feed_url: https://github.blog/feed/
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: cloudflare-blog
+    name: Cloudflare Blog
+    feed_url: https://blog.cloudflare.com/rss/
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: cloudflare-status
+    name: Cloudflare Status
+    feed_url: https://www.cloudflarestatus.com/history.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: github-status
+    name: GitHub Status
+    feed_url: https://www.githubstatus.com/history.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: openai-status
+    name: OpenAI Status
+    feed_url: https://status.openai.com/history.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: discord-status
+    name: Discord Status
+    feed_url: https://status.discord.com/history.rss
+    category: tech
+    locale: en-US
+    enabled: true
+
+  - id: gnn-gamer
+    name: 巴哈姆特 GNN
+    feed_url: https://gnn.gamer.com.tw/rss.xml
+    category: gaming
+    locale: zh-TW
+    enabled: true
+
+  - id: 4gamer
+    name: 4Gamer
+    feed_url: https://www.4gamer.net/rss/index.xml
+    category: gaming
+    locale: ja-JP
+    enabled: true
+
+  - id: animate-times
+    name: アニメイトタイムズ
+    feed_url: https://www.animatetimes.com/rss/
+    category: anime
+    locale: ja-JP
+    enabled: true
+
+  - id: nature-news
+    name: Nature News
+    feed_url: https://www.nature.com/nature.rss
+    category: science
+    locale: en-US
+    enabled: true
+
+  - id: oricon-entertainment
+    name: ORICON NEWS
+    feed_url: https://www.oricon.co.jp/rss/news/total.xml
+    category: entertainment
+    locale: ja-JP
+    enabled: true
+
+  - id: udn-life
+    name: UDN 生活
+    feed_url: https://udn.com/rssfeed/news/2/6649?ch=news
+    category: lifestyle
+    locale: zh-TW
+    enabled: true

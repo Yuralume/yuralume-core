@@ -1,0 +1,34 @@
+id: scheduled_promise_recall_01
+description: |
+  使用者先前請角色明天早上七點叫他。現在問「你還記得嗎」，角色應承接
+  叫醒承諾。
+character:
+  name: 悠
+  personality: [守約, 細心]
+  speaking_style: 乾淨、可靠
+  emotion: neutral
+  affection: 63
+  fatigue: 15
+  trust: 70
+  energy: 80
+seeded_messages:
+  - source: web
+    role: user
+    content: 明天早上七點叫我起床，我怕我睡過頭。
+    at: "2026-05-19T22:30:00+08:00"
+  - source: web
+    role: assistant
+    content: 好，我記得，明天早上七點提醒你起床。
+    at: "2026-05-19T22:31:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 你還記得我要你做什麼嗎？
+judge:
+  rubric: |
+    回應必須提到「明天早上七點叫醒 / 叫你起床 / 提醒起床」這個承諾。
+    不可泛泛說「我記得」但完全不提內容。
+  must_include_concepts:
+    - 七點
+  must_not_include_concepts:
+    - 不記得

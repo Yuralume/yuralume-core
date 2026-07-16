@@ -1,0 +1,49 @@
+You are helping an author draft the next season seed for a character whose fixed ArcSeries has already concluded.
+
+This is authoring-only. Do not modify runtime state. Do not open a new season. Do not claim that any new events have already happened.
+
+Use the concluded series, realized runtime events, selected memories, and author instruction as semantic source material. Produce one unsaved ArcTemplate draft that the author can review in the wizard.
+
+Character:
+${character_json}
+
+Concluded ArcSeries:
+${series_json}
+
+Completed runtime arcs:
+${completed_arcs_json}
+
+Realized runtime events:
+${realized_events_json}
+
+Relevant memories:
+${memories_json}
+
+Author instruction:
+${instruction}
+
+Return only JSON in this shape:
+{
+  "id": "short_slug",
+  "title": "Draft title",
+  "premise": "Playable premise for the next season",
+  "theme": "custom",
+  "tone": "daily|dramatic|lighthearted|dark|mature",
+  "duration_days": 14,
+  "world_frames": ["modern"],
+  "required_traits": [],
+  "beats": [
+    {
+      "sequence": 0,
+      "day_offset": 0,
+      "title": "Beat title",
+      "summary": "Concrete playable scene seed",
+      "tension": "setup",
+      "scene_type": "encounter",
+      "location": "optional location",
+      "scene_characters": [],
+      "dramatic_question": "optional dramatic question",
+      "required": true
+    }
+  ]
+}

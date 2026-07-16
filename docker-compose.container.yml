@@ -1,0 +1,156 @@
+# Self-host compose for Yuralume. Same file serves two use cases:
+#
+#   1. Pulling published images (no source checkout). Image references
+#      point at ghcr.io/yuralume/yuralume-core/*; ``docker compose pull``
+#      grabs them and ``docker compose up -d`` runs the stack.
+#
+#   2. Building from source (this repo). ``docker compose build`` or
+#      ``docker compose up --build`` runs the Dockerfiles below. The
+#      resulting images are tagged with the same ghcr.io path so a
+#      subsequent ``docker compose pull`` is a no-op until the registry
+#      ships something newer.
+#
+# Image tag is driven by ``YURALUME_IMAGE_TAG`` (default ``latest``) so
+# the operator can pin to a known-good build in ``.env.container``
+# without editing this file.
+#
+# Compose-file dialect is kept compatible with both modern ``docker
+# compose`` v2 and the older Python ``docker-compose`` v1 (which is
+# what podman's docker-emulation ships). That means:
+#   * no top-level ``name:`` field (project name defaults to the
+#     directory ``docker compose`` was invoked from; override with
+#     ``COMPOSE_PROJECT_NAME`` env if needed);
+#   * no ``depends_on: <svc>: required: false`` -- a profile-gated
+#     dependency would force the dependant to also activate the
+#     profile, so storage-local is deliberately *not* listed under
+#     app.depends_on. The app's HTTP storage client retries on
+#     boot, so a brief race during cold start is recoverable.
+
+x-yuralume-app: &yuralume-app
+  build:
+    context: .
+    dockerfile: docker/app/Dockerfile
+    args:
+      YURALUME_BUILD_TAG: ${YURALUME_IMAGE_TAG:-latest}
+      YURALUME_BUILD_SHA: ${YURALUME_BUILD_SHA:-}
+      YURALUME_BUILD_TIME: ${YURALUME_BUILD_TIME:-}
+      VITE_YURALUME_DEMO_DISCORD_CLIENT_ID: ${VITE_YURALUME_DEMO_DISCORD_CLIENT_ID:-}
+      VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID: ${VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID:-}
+      VITE_YURALUME_DEMO_TIER0_URL: ${VITE_YURALUME_DEMO_TIER0_URL:-}
+      VITE_YURALUME_DEMO_WAITLIST_URL: ${VITE_YURALUME_DEMO_WAITLIST_URL:-}
+      VITE_YURALUME_DEMO_DISCORD_URL: ${VITE_YURALUME_DEMO_DISCORD_URL:-}
+      VITE_YURALUME_DEMO_SELF_HOST_URL: ${VITE_YURALUME_DEMO_SELF_HOST_URL:-}
+  image: ghcr.io/yuralume/yuralume-core/app:${YURALUME_IMAGE_TAG:-latest}
+  env_file:
+    - .env.container
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    image: ghcr.io/yuralume/yuralume-core/postgres:${YURALUME_IMAGE_TAG:-latest}
+    container_name: yuralume-container-postgres
+    restart: unless-stopped
+    env_file:
+      - .env.container
+    ports:
+      - "5554:5432"
+    volumes:
+      - yuralume_container_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-kokoro} -d $${POSTGRES_DB:-kokoro_link}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  storage-local:
+    profiles: ["storage-local"]
+    build:
+      context: .
+      dockerfile: docker/storage-local/Dockerfile
+    image: ghcr.io/yuralume/yuralume-core/storage-local:${YURALUME_IMAGE_TAG:-latest}
+    container_name: yuralume-container-storage
+    restart: unless-stopped
+    env_file:
+      - .env.container
+    environment:
+      YURALUME_STORAGE_ROOT: /data
+    ports:
+      - "9012:9000"
+    volumes:
+      - ./uploads:/data/objects
+      - yuralume_container_storage_metadata:/data/metadata
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  whatsapp-sidecar:
+    build:
+      context: .
+      dockerfile: docker/whatsapp-sidecar/Dockerfile
+    image: ghcr.io/yuralume/yuralume-core/whatsapp-sidecar:${YURALUME_IMAGE_TAG:-latest}
+    container_name: yuralume-container-whatsapp-sidecar
+    restart: unless-stopped
+    env_file:
+      - .env.container
+    environment:
+      WHATSAPP_SIDECAR_HOST: 0.0.0.0
+      WHATSAPP_SIDECAR_PORT: 32190
+      WHATSAPP_SIDECAR_BASE_URL: http://whatsapp-sidecar:32190
+      WHATSAPP_SIDECAR_AUTH_DIR: /data/auth
+      WHATSAPP_SIDECAR_MEDIA_DIR: /data/media
+    ports:
+      - "32190:32190"
+    volumes:
+      - yuralume_container_whatsapp_auth:/data/auth
+      - yuralume_container_whatsapp_media:/data/media
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:32190/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  migrate:
+    <<: *yuralume-app
+    container_name: yuralume-container-migrate
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    <<: *yuralume-app
+    container_name: yuralume-container-app
+    restart: unless-stopped
+    ports:
+      - "8012:8002"
+    volumes:
+      # Optional self-host prompt pack overlay. Set
+      # YURALUME_PROMPT_PACK_DIR=/app/prompts/tuned in .env.container to enable.
+      - ./prompts/tuned:/app/prompts/tuned:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      whatsapp-sidecar:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  yuralume_container_postgres_data:
+    name: yuralume_container_postgres_data
+  yuralume_container_storage_metadata:
+    name: yuralume_container_storage_metadata
+  yuralume_container_whatsapp_auth:
+    name: yuralume_container_whatsapp_auth
+  yuralume_container_whatsapp_media:
+    name: yuralume_container_whatsapp_media

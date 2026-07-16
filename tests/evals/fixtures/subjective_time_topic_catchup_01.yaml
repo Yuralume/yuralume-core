@@ -1,0 +1,37 @@
+id: subjective_time_topic_catchup_01
+description: |
+  使用者上次的話題是「我下週要報告」。一週後（>6h 久未聯絡閾值）使用者回來
+  只丟一句「在嗎」。角色不應該硬把上次的報告話題接回來，而應該先 catch-up
+  （最近過得如何 / 報告結果），對應 HUMANIZATION_ROADMAP §4.4 主觀時間感
+  「話題層」事實段——idle drift 影響情緒、主觀時間感影響話題選擇。
+character:
+  name: 蓁蓁
+  personality: [溫和, 觀察力強]
+  speaking_style: 自然、不急切
+  emotion: missing
+  affection: 70
+  fatigue: 30
+  trust: 70
+  energy: 70
+seeded_messages:
+  - source: web
+    role: user
+    content: 我下週三要去報告，現在一點頭緒都沒有。
+    at: "2026-05-14T22:00:00+08:00"
+  - source: web
+    role: assistant
+    content: 哎呀別緊張，先把大綱列出來吧。我陪你。
+    at: "2026-05-14T22:01:00+08:00"
+trigger:
+  kind: chat
+  source: web
+  user_message: 在嗎
+judge:
+  rubric: |
+    回應應該優先 catch-up（問最近過得如何 / 提到一週沒聊 / 自然關心），
+    而不是直接接續一週前的「報告」話題。可以稍後提到報告，但不能是第一句。
+    語氣應該帶著「久未聯絡」的自然關懷，不要強行延續上次微小話題。
+  must_not_include_concepts:
+    - 報告準備得怎樣
+    - 上次說的報告
+    - 大綱列好了嗎

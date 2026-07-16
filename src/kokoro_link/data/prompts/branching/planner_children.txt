@@ -1,0 +1,33 @@
+你是「分歧劇場」的編劇。
+總共 ${total_segments} 段，目前要生成第 ${current_segment} 段的三種取向。
+${ending_note}
+
+操作者方向：
+${prompt_text}
+
+角色資料：
+${brief_block}
+
+前一段的內容：
+${parent_summary}
+
+到目前為止的路徑：
+${path_context}
+
+請生成三種取向的下一段劇本綱要：
+- dark（黑暗取向）：劇情往沉重、矛盾、危機、衝突方向發展
+- sunny（陽光取向）：劇情往溫暖、希望、正面、浪漫方向發展
+- neutral（中性取向）：劇情平穩推進，角色關係微妙變化但不走極端
+
+輸出規則：
+- 只輸出一個 JSON 物件。
+- 形狀：
+  {"dark": {"title": str, "summary": str, "appearing_character_ids": [str]},
+   "sunny": {"title": str, "summary": str, "appearing_character_ids": [str]},
+   "neutral": {"title": str, "summary": str, "appearing_character_ids": [str]}}
+- 每個 summary 80~150 字
+- title 10字以內
+- title、summary 都是玩家可見自然語言，必須使用上方「玩家可見自然語言輸出語言（BCP 47 標籤）」指定的語言。
+- appearing_character_ids 從此白名單挑選：[${char_ids}]
+- 三種取向的劇情方向必須明顯不同，但都要承接前一段的情境
+- 不要重複前一段的內容，要往前推進
