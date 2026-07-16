@@ -26,20 +26,27 @@
 #     app.depends_on. The app's HTTP storage client retries on
 #     boot, so a brief race during cold start is recoverable.
 
+# Only the `app` service declares this build. `migrate` shares the same
+# image tag but must NOT build it too: two services building/exporting the
+# same tag in one `compose build` run race under BuildKit's containerd
+# store and intermittently fail with `image "...app:latest": already
+# exists` on cold (first-clone) builds. `migrate` just reuses the tag that
+# `app`'s build produces in the same invocation.
+x-yuralume-app-build: &yuralume-app-build
+  context: .
+  dockerfile: docker/app/Dockerfile
+  args:
+    YURALUME_BUILD_TAG: ${YURALUME_IMAGE_TAG:-latest}
+    YURALUME_BUILD_SHA: ${YURALUME_BUILD_SHA:-}
+    YURALUME_BUILD_TIME: ${YURALUME_BUILD_TIME:-}
+    VITE_YURALUME_DEMO_DISCORD_CLIENT_ID: ${VITE_YURALUME_DEMO_DISCORD_CLIENT_ID:-}
+    VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID: ${VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID:-}
+    VITE_YURALUME_DEMO_TIER0_URL: ${VITE_YURALUME_DEMO_TIER0_URL:-}
+    VITE_YURALUME_DEMO_WAITLIST_URL: ${VITE_YURALUME_DEMO_WAITLIST_URL:-}
+    VITE_YURALUME_DEMO_DISCORD_URL: ${VITE_YURALUME_DEMO_DISCORD_URL:-}
+    VITE_YURALUME_DEMO_SELF_HOST_URL: ${VITE_YURALUME_DEMO_SELF_HOST_URL:-}
+
 x-yuralume-app: &yuralume-app
-  build:
-    context: .
-    dockerfile: docker/app/Dockerfile
-    args:
-      YURALUME_BUILD_TAG: ${YURALUME_IMAGE_TAG:-latest}
-      YURALUME_BUILD_SHA: ${YURALUME_BUILD_SHA:-}
-      YURALUME_BUILD_TIME: ${YURALUME_BUILD_TIME:-}
-      VITE_YURALUME_DEMO_DISCORD_CLIENT_ID: ${VITE_YURALUME_DEMO_DISCORD_CLIENT_ID:-}
-      VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID: ${VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID:-}
-      VITE_YURALUME_DEMO_TIER0_URL: ${VITE_YURALUME_DEMO_TIER0_URL:-}
-      VITE_YURALUME_DEMO_WAITLIST_URL: ${VITE_YURALUME_DEMO_WAITLIST_URL:-}
-      VITE_YURALUME_DEMO_DISCORD_URL: ${VITE_YURALUME_DEMO_DISCORD_URL:-}
-      VITE_YURALUME_DEMO_SELF_HOST_URL: ${VITE_YURALUME_DEMO_SELF_HOST_URL:-}
   image: ghcr.io/yuralume/yuralume-core/app:${YURALUME_IMAGE_TAG:-latest}
   env_file:
     - .env.container
@@ -124,6 +131,7 @@ services:
 
   app:
     <<: *yuralume-app
+    build: *yuralume-app-build
     container_name: yuralume-container-app
     restart: unless-stopped
     ports:
