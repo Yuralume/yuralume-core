@@ -208,6 +208,27 @@ export async function setChatAssistPreference(
   return data
 }
 
+export interface SceneAccessHintPreference {
+  enabled: boolean
+}
+
+export async function getSceneAccessHintPreference(): Promise<SceneAccessHintPreference> {
+  const { data } = await axios.get<SceneAccessHintPreference>(
+    '/api/v1/system/preferences/scene-access-hint',
+  )
+  return data
+}
+
+export async function setSceneAccessHintPreference(
+  preference: SceneAccessHintPreference,
+): Promise<SceneAccessHintPreference> {
+  const { data } = await axios.put<SceneAccessHintPreference>(
+    '/api/v1/system/preferences/scene-access-hint',
+    preference,
+  )
+  return data
+}
+
 export type VisualGenerationStyle = 'anime' | 'realistic'
 
 export interface VisualGenerationStylePreference {

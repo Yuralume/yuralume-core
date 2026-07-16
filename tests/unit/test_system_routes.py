@@ -803,6 +803,7 @@ def test_routing_preference_get_allowed_for_non_admin(monkeypatch, path) -> None
 
 _PLAYER_PUT_CASES = [
     ("/api/v1/system/preferences/chat-assist", {"enabled": False}),
+    ("/api/v1/system/preferences/scene-access-hint", {"enabled": False}),
     ("/api/v1/system/preferences/tts-pregeneration", {"enabled": True}),
     (
         "/api/v1/system/preferences/visual-generation-style",
@@ -940,6 +941,7 @@ def test_routing_get_global_scope_open_to_non_admin(
     [
         "/api/v1/system/preferences/active-model",
         "/api/v1/system/preferences/chat-assist",
+        "/api/v1/system/preferences/scene-access-hint",
     ],
 )
 def test_preference_scope_rejects_unknown_value(monkeypatch, path) -> None:

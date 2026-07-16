@@ -24,6 +24,7 @@ from kokoro_link.application.services.character_image_service import (
     ImageNotFoundError,
     ImageTooLargeError,
     MAX_IMAGES_PER_CHARACTER,
+    StorageUnavailableError,
     TooManyImagesError,
     UnsupportedImageTypeError,
 )
@@ -32,7 +33,10 @@ from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessLocked,
 )
 from kokoro_link.contracts.image_provider import ImageTokenUsage
-from kokoro_link.contracts.object_storage import StoredObject
+from kokoro_link.contracts.object_storage import (
+    ObjectStorageUnavailableError,
+    StoredObject,
+)
 from kokoro_link.infrastructure.repositories.in_memory_characters import (
     InMemoryCharacterRepository,
 )
@@ -117,6 +121,39 @@ class _FailingObjectStorage(InMemoryObjectStorage):
         metadata: Mapping[str, str] | None = None,
     ) -> StoredObject:
         raise RuntimeError("storage unavailable")
+
+
+_STORAGE_DOWN_MESSAGE = (
+    "object storage unreachable at http://storage-local:9000: "
+    "[Errno -2] Name or service not known"
+)
+
+
+class _UnreachableObjectStorage(InMemoryObjectStorage):
+    """Adapter-level 'storage host is down' — what HttpObjectStorage raises."""
+
+    async def put_bytes(
+        self,
+        *,
+        object_key: str,
+        content: bytes,
+        content_type: str,
+        metadata: Mapping[str, str] | None = None,
+    ) -> StoredObject:
+        raise ObjectStorageUnavailableError(_STORAGE_DOWN_MESSAGE)
+
+
+class _CopyUnreachableObjectStorage(InMemoryObjectStorage):
+    """Writes succeed; the commit-time copy hits a dead storage host."""
+
+    async def copy(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        metadata: Mapping[str, str] | None = None,
+    ) -> StoredObject:
+        raise ObjectStorageUnavailableError(_STORAGE_DOWN_MESSAGE)
 
 
 @pytest.mark.asyncio
@@ -384,6 +421,176 @@ async def test_generate_candidates_records_usage_when_storage_fails_after_provid
 
 
 @pytest.mark.asyncio
+async def test_add_image_reclassifies_storage_unavailable_and_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=_UnreachableObjectStorage(public_base_url="/uploads"),
+    )
+    character_id = await _seed_character(character_service)
+    caplog.set_level(
+        "ERROR",
+        logger="kokoro_link.application.services.character_image_service",
+    )
+
+    with pytest.raises(StorageUnavailableError) as exc_info:
+        await service.add_image(
+            character_id,
+            data=_PNG_BYTES,
+            mime_type="image/png",
+            original_filename="a.png",
+        )
+
+    assert "object storage unreachable" in str(exc_info.value)
+    assert "storage-local:9000" in str(exc_info.value)
+    assert "object storage unreachable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_reclassifies_storage_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dead storage host → StorageUnavailableError (not a generic 400-bound
+    CharacterImageError), logged, with the usage event still recorded."""
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    provider = _GeneratingProvider([_PNG_BYTES, _PNG_BYTES + b"2"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=_UnreachableObjectStorage(public_base_url="/uploads"),
+        image_provider=StaticActiveImageProvider(provider),
+        usage_recorder=usage_recorder,
+    )
+    character_id = await _seed_character(character_service)
+    caplog.set_level(
+        "ERROR",
+        logger="kokoro_link.application.services.character_image_service",
+    )
+
+    with pytest.raises(StorageUnavailableError) as exc_info:
+        await service.generate_candidates(
+            character_id,
+            positive="portrait",
+            aspect="square",
+            count=2,
+        )
+    await usage_recorder.flush()
+
+    assert "object storage unreachable" in str(exc_info.value)
+    assert "object storage unreachable" in caplog.text
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "failed"
+    assert row.error_code == "StorageUnavailableError"
+    assert row.quantity.billable_quantity == 2
+    assert row.artifact_count == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_portrait_preserves_storage_unavailable_type(
+    tmp_path: Path,
+) -> None:
+    """The blanket except in generate_portrait must not flatten the
+    reclassified error back to plain CharacterImageError."""
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    provider = _GeneratingProvider([_PNG_BYTES])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=_UnreachableObjectStorage(public_base_url="/uploads"),
+        image_provider=StaticActiveImageProvider(provider),
+        usage_recorder=usage_recorder,
+    )
+    character_id = await _seed_character(character_service)
+
+    with pytest.raises(StorageUnavailableError):
+        await service.generate_portrait(character_id, positive="portrait")
+    await usage_recorder.flush()
+
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    assert rows[0].status == "failed"
+    assert rows[0].error_code == "StorageUnavailableError"
+
+
+@pytest.mark.asyncio
+async def test_commit_candidates_reclassifies_storage_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    provider = _GeneratingProvider([_PNG_BYTES])
+    service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=_CopyUnreachableObjectStorage(public_base_url="/uploads"),
+        image_provider=StaticActiveImageProvider(provider),
+    )
+    character_id = await _seed_character(character_service)
+    _, urls = await service.generate_candidates(
+        character_id, positive="portrait", count=1,
+    )
+    caplog.set_level(
+        "ERROR",
+        logger="kokoro_link.application.services.character_image_service",
+    )
+
+    with pytest.raises(StorageUnavailableError) as exc_info:
+        await service.commit_candidates(character_id, keep_urls=[urls[0]])
+
+    assert "object storage unreachable" in str(exc_info.value)
+    assert "object storage unreachable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_commit_candidates_storage_outage_preserves_batch_for_retry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 503 tells the player to retry — so an outage mid-commit must
+    leave the unprocessed candidates in the batch instead of losing them
+    with the popped entry (retry would otherwise be a silent no-op)."""
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    provider = _GeneratingProvider([_PNG_BYTES, _PNG_BYTES])
+    service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=_CopyUnreachableObjectStorage(public_base_url="/uploads"),
+        image_provider=StaticActiveImageProvider(provider),
+    )
+    character_id = await _seed_character(character_service)
+    _, urls = await service.generate_candidates(
+        character_id, positive="portrait", count=2,
+    )
+    caplog.set_level(
+        "ERROR",
+        logger="kokoro_link.application.services.character_image_service",
+    )
+
+    with pytest.raises(StorageUnavailableError):
+        await service.commit_candidates(character_id, keep_urls=[urls[0]])
+
+    remaining = service._candidate_batches.get(character_id)
+    assert remaining, "candidate batch must survive a storage outage"
+    assert len(remaining) == 2
+
+
+@pytest.mark.asyncio
 async def test_remove_image_rejects_tampered_url(tmp_path: Path) -> None:
     """Path-traversal attempt should neither update DB nor touch disk."""
     service, character_service, _ = _build(tmp_path)
@@ -468,3 +675,123 @@ async def test_delete_route_removes_url(tmp_path: Path) -> None:
     )
     assert resp.status_code == 200
     assert resp.json()["image_urls"] == []
+
+
+def _client_with_storage(
+    tmp_path: Path,
+    storage: InMemoryObjectStorage,
+) -> tuple[TestClient, CharacterService]:
+    """Route harness whose image service uses the given storage adapter."""
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    provider = _GeneratingProvider([_PNG_BYTES])
+    image_service = CharacterImageService(
+        character_repository=char_repo,
+        uploads_dir=tmp_path,
+        object_storage=storage,
+        image_provider=StaticActiveImageProvider(provider),
+    )
+
+    class _Container:
+        pass
+
+    container = _Container()
+    container.character_service = character_service
+    container.character_image_service = image_service
+    container.character_draft_service = None
+
+    app = FastAPI()
+    app.state.container = container
+    app.include_router(character_router, prefix="/api/v1")
+    return TestClient(app), character_service
+
+
+@pytest.mark.asyncio
+async def test_candidates_route_returns_503_when_storage_down(
+    tmp_path: Path,
+) -> None:
+    """Unreachable storage is an ops problem → 503 with an actionable
+    detail, not the previous 400 echoing a bare OS error."""
+    client, character_service = _client_with_storage(
+        tmp_path, _UnreachableObjectStorage(public_base_url="/uploads"),
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Rei"),
+    )
+
+    resp = client.post(
+        f"/api/v1/characters/{created.id}/images/candidates",
+        json={"positive": "cafe", "count": 2},
+    )
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert "media object storage unreachable" in detail
+    assert "STORAGE_URL" in detail
+    assert "storage-local:9000" in detail
+
+
+@pytest.mark.asyncio
+async def test_upload_route_returns_503_when_storage_down(
+    tmp_path: Path,
+) -> None:
+    client, character_service = _client_with_storage(
+        tmp_path, _UnreachableObjectStorage(public_base_url="/uploads"),
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Rei"),
+    )
+
+    resp = client.post(
+        f"/api/v1/characters/{created.id}/images",
+        files={"image": ("a.png", io.BytesIO(_PNG_BYTES), "image/png")},
+    )
+
+    assert resp.status_code == 503
+    assert "media object storage unreachable" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_generate_route_returns_503_when_storage_down(
+    tmp_path: Path,
+) -> None:
+    client, character_service = _client_with_storage(
+        tmp_path, _UnreachableObjectStorage(public_base_url="/uploads"),
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Rei"),
+    )
+
+    resp = client.post(
+        f"/api/v1/characters/{created.id}/images/generate",
+        json={"positive": "cafe"},
+    )
+
+    assert resp.status_code == 503
+    assert "media object storage unreachable" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_commit_route_returns_503_when_storage_down(
+    tmp_path: Path,
+) -> None:
+    client, character_service = _client_with_storage(
+        tmp_path, _CopyUnreachableObjectStorage(public_base_url="/uploads"),
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Rei"),
+    )
+    resp = client.post(
+        f"/api/v1/characters/{created.id}/images/candidates",
+        json={"positive": "cafe", "count": 1},
+    )
+    assert resp.status_code == 201
+    candidate_url = resp.json()["candidates"][0]
+
+    resp = client.post(
+        f"/api/v1/characters/{created.id}/images/candidates/commit",
+        json={"keep_urls": [candidate_url], "album_urls": []},
+    )
+
+    assert resp.status_code == 503
+    assert "media object storage unreachable" in resp.json()["detail"]

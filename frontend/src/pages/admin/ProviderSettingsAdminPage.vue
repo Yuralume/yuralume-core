@@ -1,13 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { notification } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { UiBadge, UiButton, UiCard, UiCombobox } from '@/components/ui'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import {
+  formatLatency,
+  formatProbeLines,
+  orderProbes,
+  probeStatusMark,
+} from '@/utils/probeReportDisplay'
+import {
   providerConnectionLabel,
   providerDisplayNameLabel,
+  providerFieldHint,
   providerFieldLabel,
   providerFieldPlaceholder,
 } from '@/utils/catalogLabels'
@@ -21,94 +28,26 @@ import {
   testDraftProviderConnection,
   testProviderConnection,
   updateProviderConnection,
+  type ProbeReport,
   type ProviderCatalogEntry,
   type ProviderConnection,
   type ProviderConnectionPayload,
   type ProviderFieldSpec,
 } from '@/utils/api/providerSettings'
+import {
+  fieldsForCapability,
+  sharedFields,
+  splitRowConfig,
+} from '@/utils/providerFields'
 
 const { t } = useI18n()
 const confirmDialog = useConfirmDialog()
 
 // ---------------------------------------------------------------------------
-// Field categorisation
+// Field categorisation — shared/per-capability split lives in
+// utils/providerFields.ts (unit-tested; see providerFields.test.ts for the
+// base_url regression guard).
 // ---------------------------------------------------------------------------
-//
-// In the catalog all fields live in a flat ``config_fields`` array per
-// provider. To support "fill shared fields once, fill per-capability
-// fields per capability" we split them with these maps. Keys appearing
-// in ``CAPABILITY_FIELD_KEYS`` render inside the matching capability
-// card; everything else renders in the shared block.
-//
-// ``timeout_seconds`` intentionally lives in every capability set
-// because real-world timeouts differ per modality (image ~3 min, LLM
-// ~30 s, video ~30 min).
-
-const CAPABILITY_FIELD_KEYS: Record<string, ReadonlySet<string>> = {
-  llm: new Set([
-    'default_model',
-    'supports_vision',
-    'max_tokens',
-    'anthropic_version',
-    'timeout_seconds',
-  ]),
-  embedding: new Set([
-    'embedding_model',
-    'embedding_dimension',
-    'request_dimensions',
-    'timeout_seconds',
-  ]),
-  image: new Set(['image_model', 'default_model', 'timeout_seconds']),
-  video: new Set(['default_model', 'timeout_seconds']),
-  tts: new Set([
-    'tts_model',
-    'default_model',
-    'voice_id',
-    'response_format',
-    'timeout_seconds',
-  ]),
-  // `base_url` is search-specific here (SearXNG instance URL) so it must
-  // live in the capability set rather than the shared block. The
-  // `search_*` model knobs belong to the OpenAI Responses backend.
-  search: new Set([
-    'search_depth',
-    'search_model',
-    'search_context_size',
-    'search_tool_type',
-    'max_results',
-    'base_url',
-    'timeout_seconds',
-  ]),
-}
-
-const ALL_CAPABILITY_FIELD_KEYS: ReadonlySet<string> = new Set(
-  Object.values(CAPABILITY_FIELD_KEYS).flatMap(s => Array.from(s)),
-)
-
-function isSharedConfigField(field: ProviderFieldSpec): boolean {
-  return !ALL_CAPABILITY_FIELD_KEYS.has(field.key)
-}
-
-function fieldsForCapability(
-  entry: ProviderCatalogEntry,
-  capability: string,
-): ProviderFieldSpec[] {
-  const keys = CAPABILITY_FIELD_KEYS[capability] ?? new Set<string>()
-  let fields = entry.config_fields.filter(f => keys.has(f.key))
-  const hasImageModel = entry.config_fields.some(f => f.key === 'image_model')
-  const hasTtsModel = entry.config_fields.some(f => f.key === 'tts_model')
-  if (capability === 'image' && hasImageModel) {
-    fields = fields.filter(f => f.key !== 'default_model')
-  }
-  if (capability === 'tts' && hasTtsModel) {
-    fields = fields.filter(f => f.key !== 'default_model')
-  }
-  return fields
-}
-
-function sharedFields(entry: ProviderCatalogEntry): ProviderFieldSpec[] {
-  return entry.config_fields.filter(isSharedConfigField)
-}
 
 // ---------------------------------------------------------------------------
 // Reactive state
@@ -125,7 +64,19 @@ const loading = ref(false)
 const saving = ref(false)
 const testingId = ref<string | null>(null)
 const testingCapability = ref<string | null>(null)
+const deepTestingCapability = ref<string | null>(null)
 const editingId = ref<string | null>(null)
+
+// Per-capability live-probe results from the draft test-draft route.
+// Keyed by capability; cleared whenever the draft provider changes so a
+// stale card never shows probes from a previous provider.
+const capabilityProbes = reactive<Record<string, ProbeReport[]>>({})
+
+function clearCapabilityProbes(): void {
+  for (const key of Object.keys(capabilityProbes)) {
+    delete capabilityProbes[key]
+  }
+}
 
 // Per-(capability, field-key) cached model lists from
 // `/admin/providers/list-models`. The keys we ever fetch are bounded by
@@ -339,6 +290,7 @@ watch(
 
 function resetFormForCurrentProvider(): void {
   const entry = selectedCatalog.value
+  clearCapabilityProbes()
   form.shared = {}
   form.perCapability = {}
   form.secret = {}
@@ -416,6 +368,7 @@ function startCreate(providerId?: string): void {
 }
 
 function startEdit(row: ProviderConnection): void {
+  clearCapabilityProbes()
   editingId.value = row.id
   form.provider = row.provider
   form.enabled = row.enabled
@@ -424,26 +377,13 @@ function startEdit(row: ProviderConnection): void {
   form.clear_secret = false
 
   // Split row.config into shared vs per-capability buckets so the user
-  // sees the same layout as create mode.
-  const shared: Record<string, string | boolean> = {}
-  const perCap: Record<string, Record<string, string | boolean>> = {}
-  for (const cap of row.capabilities) perCap[cap] = {}
-
-  for (const [key, value] of Object.entries(row.config)) {
-    const coerced: string | boolean =
-      typeof value === 'boolean' ? value : String(value)
-    if (ALL_CAPABILITY_FIELD_KEYS.has(key)) {
-      // Same value lives in every connection row that shares this
-      // capability bundle; replicate into each ticked capability bucket.
-      for (const cap of row.capabilities) {
-        if (CAPABILITY_FIELD_KEYS[cap]?.has(key)) {
-          perCap[cap][key] = coerced
-        }
-      }
-    } else {
-      shared[key] = coerced
-    }
-  }
+  // sees the same layout as create mode. splitRowConfig never drops a
+  // stored value — unclaimed keys fall back to the shared bucket so an
+  // edit-save round-trip cannot silently wipe config.
+  const { shared, perCapability: perCap } = splitRowConfig(
+    row.config,
+    row.capabilities,
+  )
   form.shared = shared
   form.perCapability = {}
   for (const cap of row.capabilities) {
@@ -585,10 +525,23 @@ async function fetchModelsFor(capability: string, fieldKey: string): Promise<voi
   }
 }
 
-async function testCapabilityCard(capability: string): Promise<void> {
-  testingCapability.value = capability
+// Localized short label for a probe action token; falls back to the raw
+// token if the backend ever sends one outside the contract enum.
+function probeActionLabel(action: string): string {
+  const key = `admin.providerSettings.probeActions.${action}`
+  const label = t(key)
+  return label === key ? action : label
+}
+
+// Shared runner for the two capability-card test buttons (shallow + deep).
+// Stores the per-capability probe list for the inline results panel and
+// keeps the existing pass/fail notification.
+async function runCapabilityProbe(capability: string, deep: boolean): Promise<void> {
+  const busyRef = deep ? deepTestingCapability : testingCapability
+  busyRef.value = capability
   try {
-    const result = await testDraftProviderConnection(payloadFor(capability))
+    const result = await testDraftProviderConnection(payloadFor(capability), deep)
+    capabilityProbes[capability] = result.probes ?? []
     if (result.ok) {
       notification.success({
         message: t('admin.providerSettings.testPassed'),
@@ -608,8 +561,25 @@ async function testCapabilityCard(capability: string): Promise<void> {
       duration: 4,
     })
   } finally {
-    testingCapability.value = null
+    busyRef.value = null
   }
+}
+
+function testCapabilityCard(capability: string): Promise<void> {
+  return runCapabilityProbe(capability, false)
+}
+
+// Deep test really generates one small image through the provider, so it
+// gates behind a confirm dialog explaining the (tiny) cost before probing
+// with deep=true.
+async function deepTestCapabilityCard(capability: string): Promise<void> {
+  const confirmed = await confirmDialog({
+    title: t('admin.providerSettings.deepTest.confirmTitle'),
+    content: t('admin.providerSettings.deepTest.confirmBody'),
+    okText: t('admin.providerSettings.deepTest.button'),
+  })
+  if (!confirmed) return
+  await runCapabilityProbe(capability, true)
 }
 
 async function remove(row: ProviderConnection): Promise<void> {
@@ -632,11 +602,22 @@ async function test(row: ProviderConnection): Promise<void> {
     connections.value = connections.value.map(item =>
       item.id === updated.id ? updated : item,
     )
+    // Description = one line per probe (multi-line, ordered by capability);
+    // fall back to the stored validation error when no probes came back.
+    const probes = updated.probes ?? []
+    const description = probes.length
+      ? h(
+          'div',
+          { style: 'white-space: pre-line' },
+          formatProbeLines(probes, probeActionLabel),
+        )
+      : (updated.last_validation_error ?? undefined)
     notification.success({
       message: updated.last_validation_error
         ? t('admin.providerSettings.testSavedWithIssue')
         : t('admin.providerSettings.testPassed'),
-      duration: 3,
+      description,
+      duration: probes.length ? 6 : 3,
     })
   } catch (err) {
     notification.error({
@@ -687,6 +668,13 @@ function fieldLabel(field: ProviderFieldSpec): string {
 
 function fieldPlaceholder(field: ProviderFieldSpec): string {
   return providerFieldPlaceholder(t, field)
+}
+
+// Persistent helper text under an input (routed through the same
+// providerFields i18n namespace, keyed `<field.key>.hint`). Empty when
+// the catalog spec ships no hint.
+function fieldHint(field: ProviderFieldSpec): string {
+  return providerFieldHint(t, field)
 }
 
 function humanizeError(reason: unknown): string {
@@ -880,26 +868,29 @@ onMounted(loadAll)
                   </label>
                 </template>
 
-                <label
+                <div
                   v-for="field in visibleSharedFields"
                   :key="`shared-${field.key}`"
-                  class="field-label"
+                  class="provider-settings__field"
                 >
-                  {{ fieldLabel(field) }}
-                  <input
-                    v-if="field.kind === 'checkbox'"
-                    v-model="form.shared[field.key]"
-                    type="checkbox"
-                  />
-                  <input
-                    v-else
-                    v-model="form.shared[field.key]"
-                    class="field-input"
-                    :type="fieldInputType(field.kind)"
-                    :placeholder="fieldPlaceholder(field)"
-                    :required="field.required"
-                  />
-                </label>
+                  <label class="field-label">
+                    {{ fieldLabel(field) }}
+                    <input
+                      v-if="field.kind === 'checkbox'"
+                      v-model="form.shared[field.key]"
+                      type="checkbox"
+                    />
+                    <input
+                      v-else
+                      v-model="form.shared[field.key]"
+                      class="field-input"
+                      :type="fieldInputType(field.kind)"
+                      :placeholder="fieldPlaceholder(field)"
+                      :required="field.required"
+                    />
+                  </label>
+                  <p v-if="fieldHint(field)" class="field-hint">{{ fieldHint(field) }}</p>
+                </div>
               </div>
             </section>
 
@@ -925,15 +916,27 @@ onMounted(loadAll)
                         <h4 class="provider-settings__cap-card-title">
                           {{ t('admin.providerSettings.capabilityCardTitle', { capability: capabilityLabel(capability) }) }}
                         </h4>
-                        <UiButton
-                          size="sm"
-                          variant="ghost"
-                          :loading="testingCapability === capability"
-                          type="button"
-                          @click="testCapabilityCard(capability)"
-                        >
-                          {{ t('admin.providerSettings.actions.testDraft') }}
-                        </UiButton>
+                        <div class="provider-settings__cap-card-actions">
+                          <UiButton
+                            size="sm"
+                            variant="ghost"
+                            :loading="testingCapability === capability"
+                            type="button"
+                            @click="testCapabilityCard(capability)"
+                          >
+                            {{ t('admin.providerSettings.actions.testDraft') }}
+                          </UiButton>
+                          <UiButton
+                            v-if="capability === 'image'"
+                            size="sm"
+                            variant="ghost"
+                            :loading="deepTestingCapability === capability"
+                            type="button"
+                            @click="deepTestCapabilityCard(capability)"
+                          >
+                            {{ t('admin.providerSettings.deepTest.button') }}
+                          </UiButton>
+                        </div>
                       </div>
                     </template>
 
@@ -948,11 +951,12 @@ onMounted(loadAll)
                     </label>
 
                     <template v-if="selectedCatalog">
-                      <label
+                      <div
                         v-for="field in fieldsForCapability(selectedCatalog, capability)"
                         :key="`cap-${capability}-${field.key}`"
-                        class="field-label"
+                        class="provider-settings__field"
                       >
+                      <label class="field-label">
                         {{ fieldLabel(field) }}<span
                           v-if="isFieldRequired(field, capability)"
                           class="provider-settings__required-mark"
@@ -1022,7 +1026,44 @@ onMounted(loadAll)
                           :required="isFieldRequired(field, capability)"
                         />
                       </label>
+                      <p v-if="fieldHint(field)" class="field-hint">{{ fieldHint(field) }}</p>
+                      </div>
                     </template>
+
+                    <div
+                      v-if="capabilityProbes[capability]?.length"
+                      class="provider-settings__probes"
+                    >
+                      <p class="provider-settings__probes-title">
+                        {{ t('admin.providerSettings.probeResultsTitle') }}
+                      </p>
+                      <ul class="provider-settings__probe-list">
+                        <li
+                          v-for="(probe, index) in orderProbes(capabilityProbes[capability])"
+                          :key="`${probe.capability}-${probe.action}-${index}`"
+                          class="provider-settings__probe"
+                        >
+                          <UiBadge :variant="probe.ok ? 'success' : 'danger'">
+                            {{ probeStatusMark(probe.ok) }}
+                          </UiBadge>
+                          <span class="provider-settings__probe-action">
+                            {{ probeActionLabel(probe.action) }}
+                          </span>
+                          <span
+                            v-if="formatLatency(probe.latency_ms)"
+                            class="provider-settings__probe-latency"
+                          >
+                            {{ formatLatency(probe.latency_ms) }}
+                          </span>
+                          <span
+                            v-if="probe.detail"
+                            class="provider-settings__probe-detail"
+                          >
+                            {{ probe.detail }}
+                          </span>
+                        </li>
+                      </ul>
+                    </div>
                   </UiCard>
                 </div>
               </div>
@@ -1334,6 +1375,60 @@ onMounted(loadAll)
   font-size: var(--font-sm);
   font-weight: 600;
   color: var(--color-text);
+}
+.provider-settings__cap-card-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* Inline live-probe results under a capability card. Each row: ok/fail
+   badge · localized action label · latency · backend detail (muted). */
+.provider-settings__probes {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.provider-settings__probes-title {
+  margin: 0;
+  font-size: var(--font-xs);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.provider-settings__probe-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.provider-settings__probe {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--font-xs);
+}
+.provider-settings__probe-action {
+  color: var(--color-text);
+  font-weight: 600;
+}
+.provider-settings__probe-latency {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.provider-settings__probe-detail {
+  color: var(--color-text-secondary);
+  flex: 1 1 100%;
+  min-width: 0;
+  line-height: 1.5;
 }
 .provider-settings__required-mark {
   margin-left: 2px;

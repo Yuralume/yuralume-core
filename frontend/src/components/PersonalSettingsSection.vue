@@ -14,6 +14,7 @@ import {
 import { normalizeCoordinateInput } from '@/utils/coordinateInput'
 import { UiButton } from '@/components/ui'
 import ChatAssistSetting from './ChatAssistSetting.vue'
+import SceneAccessHintSetting from './SceneAccessHintSetting.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
 import NsfwModeSetting from './NsfwModeSetting.vue'
 import PlayerPasswordPanel from './PlayerPasswordPanel.vue'
@@ -427,6 +428,9 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <h3 class="settings-group__title">{{ t('playerSidebar.settings.personalPreferencesTitle') }}</h3>
     <section class="voice-pregen-section">
       <ChatAssistSetting />
+    </section>
+    <section class="voice-pregen-section">
+      <SceneAccessHintSetting />
     </section>
     <section class="voice-pregen-section">
       <TtsPregenSetting />

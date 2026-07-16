@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import Response
 
 from kokoro_link.api.dependencies import get_container
-from kokoro_link.contracts.object_storage import ObjectNotFoundError, ObjectStorageError
+from kokoro_link.contracts.object_storage import (
+    ObjectNotFoundError,
+    ObjectStorageError,
+    ObjectStorageUnavailableError,
+)
+
+_LOGGER = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -32,6 +40,14 @@ async def public_object(
         raise
     except ObjectNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Object not found") from exc
+    except ObjectStorageUnavailableError as exc:
+        # Unauthenticated surface: log the specific reason server-side but
+        # never echo it — the message names internal topology (STORAGE_URL).
+        _LOGGER.exception("public object fetch failed: storage unreachable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Object storage is unavailable",
+        ) from exc
     except ObjectStorageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -65,6 +65,7 @@ from kokoro_link.application.services.character_image_service import (
     ImageNotFoundError,
     ImageTooLargeError,
     MAX_IMAGE_BYTES,
+    StorageUnavailableError,
     TooManyImagesError,
     UnsupportedImageTypeError,
 )
@@ -846,6 +847,24 @@ async def export_character_card(
     )
 
 
+def _storage_unavailable_http_error(
+    exc: StorageUnavailableError,
+) -> HTTPException:
+    """503 mapping shared by every character-image route that hits storage.
+
+    The service-level message already names the storage host; prefix it
+    with an actionable hint so the operator knows this is a deployment
+    problem (storage service down), not a bad request.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            "media object storage unreachable — check that the storage "
+            f"service (STORAGE_URL) is running: {exc}"
+        ),
+    )
+
+
 @router.post(
     "/characters/{character_id}/images",
     response_model=CharacterResponse,
@@ -886,6 +905,8 @@ async def upload_character_image(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+    except StorageUnavailableError as exc:
+        raise _storage_unavailable_http_error(exc) from exc
     except CharacterImageError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -941,6 +962,8 @@ async def generate_character_portrait(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
         ) from exc
+    except StorageUnavailableError as exc:
+        raise _storage_unavailable_http_error(exc) from exc
     except CharacterImageError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -988,6 +1011,8 @@ async def generate_candidate_portraits(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc),
         ) from exc
+    except StorageUnavailableError as exc:
+        raise _storage_unavailable_http_error(exc) from exc
     except CharacterImageError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
@@ -1020,6 +1045,8 @@ async def commit_candidate_portraits(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    except StorageUnavailableError as exc:
+        raise _storage_unavailable_http_error(exc) from exc
     # Register album picks after the file-move succeeded. Failure here
     # leaves the file on disk but no album row — logged and swallowed
     # rather than raised, so a partial album registration doesn't

@@ -15,6 +15,11 @@ class ProviderFieldSpec:
     placeholder: str = ""
     secret: bool = False
     advanced: bool = False
+    # Persistent helper text rendered under the input (never truncated,
+    # unlike a placeholder that vanishes once the user types). Routed
+    # through the ``providerFields.<key>.hint`` i18n namespace with this
+    # English string as the fallback.
+    hint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,9 +207,10 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
     )
     # Web-search (`search` capability) fields. `max_results` caps snippets
     # per call; `search_depth` is Tavily-specific (basic/advanced).
-    # `searxng_base_url` carries the SearXNG operator gotcha in its
-    # label/placeholder because ProviderFieldSpec has no separate hint slot
-    # — same precedent as the reasoning / OpenRouter-embedding fields above.
+    # `searxng_base_url` uses its OWN field key (not the generic `base_url`)
+    # so the frontend i18n-by-field-key lookup resolves the SearXNG-specific
+    # guidance instead of the generic Base URL translation, and carries the
+    # operator gotcha in its persistent `hint`.
     search_max_results = ProviderFieldSpec(
         key="max_results",
         label="Max results",
@@ -219,10 +225,16 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
         advanced=True,
     )
     searxng_base_url = ProviderFieldSpec(
-        key="base_url",
-        label="Base URL (SearXNG instance; must enable json format)",
-        placeholder="https://searxng.example.com — settings.yml search.formats 需含 json",
+        key="searxng_base_url",
+        label="Base URL (SearXNG instance root)",
+        placeholder="https://searxng.example.com",
         required=True,
+        hint=(
+            "Enter the instance root only (e.g. https://searxng.example.com). "
+            "The app appends /search?q=…&format=json itself, so do not add a "
+            "/search path or a ?q= query template. The instance must also "
+            "enable \"json\" under search.formats in its settings.yml."
+        ),
     )
     # OpenAI Responses built-in web search (`search` capability, LLM-native).
     # `search_model` picks the (cheap) model that does the search+synthesis;

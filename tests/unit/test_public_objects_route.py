@@ -69,3 +69,27 @@ def test_public_object_route_rejects_unsafe_key() -> None:
     response = client.get("/v1/public/%2e%2e/secret.png")
 
     assert response.status_code == 400
+
+
+def test_public_object_route_hides_storage_outage_details() -> None:
+    """Storage down → 503 with a generic detail on this UNAUTHENTICATED
+    surface; the adapter message names internal topology (STORAGE_URL)
+    and must never be echoed."""
+    from kokoro_link.contracts.object_storage import (
+        ObjectStorageUnavailableError,
+    )
+
+    class _DownStorage(InMemoryObjectStorage):
+        async def stat(self, *, object_key):  # noqa: ANN001, ANN202
+            raise ObjectStorageUnavailableError(
+                "object storage unreachable at http://storage-local:9000: "
+                "[Errno -2] Name or service not known",
+            )
+
+    client = _client(_DownStorage())
+
+    response = client.get("/v1/public/characters/char-1/a.png")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Object storage is unavailable"
+    assert "storage-local" not in response.text

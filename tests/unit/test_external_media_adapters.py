@@ -144,6 +144,9 @@ async def test_external_image_api_sends_gateway_request(
     assert "sunlit room" in captured["body"]["prompt"]
     assert captured["body"]["size"] == "1024x1024"
     assert captured["body"]["n"] == 2
+    # Published Custom Media Gateway contract pins the body to exactly
+    # {model, prompt, size, n} — response_format must NOT sneak in.
+    assert "response_format" not in captured["body"]
 
 
 @pytest.mark.asyncio
@@ -221,6 +224,63 @@ async def test_external_image_api_downloads_artifact_url(
     )
 
     assert await provider.generate(character=_character(), positive="x") == [_PNG]
+
+
+@pytest.mark.asyncio
+async def test_external_image_api_artifact_download_error_names_host(
+    restore_httpx: None,
+) -> None:
+    """A failing artifact GET must say which host failed — not just a
+    bare status code — but never leak the full URL (may carry a
+    capability token)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/v1/images/generations"):
+            return httpx.Response(200, json={
+                "data": [{"url": "/artifacts/secret-token-abc.png"}],
+            })
+        return httpx.Response(404, content=b"gone")
+
+    _patch_httpx(handler)
+    provider = ExternalImageApiProvider(
+        base_url="https://gateway.example/v1",
+        api_key="image-token",
+        model="yuralume-anime",
+    )
+
+    with pytest.raises(ImageGenerationError) as exc_info:
+        await provider.generate(character=_character(), positive="x")
+
+    message = str(exc_info.value)
+    assert "image artifact download from https://gateway.example failed" in message
+    assert "HTTP 404" in message
+    assert "secret-token-abc" not in message
+
+
+@pytest.mark.asyncio
+async def test_external_image_api_artifact_download_network_error_names_host(
+    restore_httpx: None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/v1/images/generations"):
+            return httpx.Response(200, json={
+                "data": [{"url": "https://artifacts.example/a.png"}],
+            })
+        raise httpx.ConnectError("[Errno -2] Name or service not known")
+
+    _patch_httpx(handler)
+    provider = ExternalImageApiProvider(
+        base_url="https://gateway.example/v1",
+        api_key="image-token",
+        model="yuralume-anime",
+    )
+
+    with pytest.raises(ImageGenerationError) as exc_info:
+        await provider.generate(character=_character(), positive="x")
+
+    message = str(exc_info.value)
+    assert "image artifact download from https://artifacts.example failed" in message
+    assert "Name or service not known" in message
 
 
 @pytest.mark.asyncio

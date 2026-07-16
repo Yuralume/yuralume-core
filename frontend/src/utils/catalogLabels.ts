@@ -44,6 +44,7 @@ export interface ProviderFieldLike {
   key: string
   label: string
   placeholder: string
+  hint?: string
 }
 
 /** Namespace root for provider capability labels (llm / image / …). */
@@ -165,4 +166,16 @@ export function providerFieldLabel(t: TranslateFn, field: ProviderFieldLike): st
 export function providerFieldPlaceholder(t: TranslateFn, field: ProviderFieldLike): string {
   if (!field.placeholder) return ''
   return t(`${PROVIDER_FIELD_NAMESPACE}.${field.key}.placeholder`, field.placeholder)
+}
+
+/**
+ * Localized persistent hint for a provider dynamic-form field. Unlike a
+ * placeholder (which disappears once the user types) this renders as
+ * standing helper text under the input. Fields with no backend hint stay
+ * hintless (no namespace lookup) so we never surface a translation for a
+ * field the catalog left blank.
+ */
+export function providerFieldHint(t: TranslateFn, field: ProviderFieldLike): string {
+  if (!field.hint) return ''
+  return t(`${PROVIDER_FIELD_NAMESPACE}.${field.key}.hint`, field.hint)
 }

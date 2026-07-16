@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
-from kokoro_link.contracts.object_storage import ObjectNotFoundError, ObjectStorageError
+from kokoro_link.contracts.object_storage import (
+    ObjectNotFoundError,
+    ObjectStorageError,
+    ObjectStorageUnavailableError,
+)
 from kokoro_link.infrastructure.storage.http import HttpObjectStorage, _stored_from_json
 from kokoro_link.infrastructure.storage.in_memory import InMemoryObjectStorage
 from kokoro_link.infrastructure.storage.keys import validate_object_key
@@ -112,6 +117,73 @@ async def test_http_object_storage_public_url_uses_canonical_public_base() -> No
         )
         == "characters/char-1/tools/a.png"
     )
+
+
+def _patch_httpx_connect_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route every HTTP request to a transport whose connect always fails.
+
+    Simulates the storage host being down / unresolvable (e.g. the
+    docker ``storage-local`` service not running).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno -2] Name or service not known")
+
+    transport = httpx.MockTransport(handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def patched(self: httpx.AsyncClient, **kwargs) -> None:
+        kwargs["transport"] = transport
+        original_init(self, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    ["put_bytes", "get_bytes", "stat", "delete", "copy"],
+)
+async def test_http_object_storage_network_failure_names_storage_host(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """A dead storage host must not leak a bare OS error string.
+
+    Every network method wraps httpx transport failures in
+    ``ObjectStorageUnavailableError`` naming the storage base URL so
+    upstream layers can classify (503, not 400) and operators can see
+    *which* service is down.
+    """
+    _patch_httpx_connect_error(monkeypatch)
+    storage = HttpObjectStorage(
+        base_url="http://storage-local:9000",
+        api_key="secret",
+    )
+
+    calls = {
+        "put_bytes": lambda: storage.put_bytes(
+            object_key="characters/char-1/a.png",
+            content=b"PNG",
+            content_type="image/png",
+        ),
+        "get_bytes": lambda: storage.get_bytes(
+            object_key="characters/char-1/a.png",
+        ),
+        "stat": lambda: storage.stat(object_key="characters/char-1/a.png"),
+        "delete": lambda: storage.delete(object_key="characters/char-1/a.png"),
+        "copy": lambda: storage.copy(
+            source_key="characters/char-1/a.png",
+            destination_key="characters/char-1/b.png",
+        ),
+    }
+
+    with pytest.raises(ObjectStorageUnavailableError) as exc_info:
+        await calls[operation]()
+
+    message = str(exc_info.value)
+    assert "object storage unreachable at http://storage-local:9000" in message
+    assert "Name or service not known" in message
 
 
 def test_http_object_storage_stores_app_relative_url_from_upload_response() -> None:

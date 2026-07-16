@@ -45,7 +45,7 @@ const navItems: AdminNavItem[] = [
   { labelKey: 'admin.nav.followUps', to: '/admin/follow-ups', group: 'behavior', debugOnly: true },
   { labelKey: 'admin.nav.world', to: '/admin/world', group: 'behavior' },
 
-  { labelKey: 'admin.nav.observability', to: '/admin/observability', group: 'ops', debugOnly: true },
+  { labelKey: 'admin.nav.observability', to: '/admin/observability', group: 'ops' },
   { labelKey: 'admin.nav.channels', to: '/admin/channels', group: 'ops' },
   { labelKey: 'admin.nav.siteSettings', to: '/admin/site-settings', group: 'ops', cloudLocked: true },
   { labelKey: 'admin.nav.characterFreeze', to: '/admin/character-freeze', group: 'ops' },

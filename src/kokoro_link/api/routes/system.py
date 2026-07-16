@@ -60,6 +60,7 @@ _ACTIVE_VIDEO_KEY = "active_video_profile"
 _VIDEO_FEATURE_KEY = "video_feature_profiles"
 _TTS_PREGENERATION_KEY = TTS_PREGENERATION_PREFERENCE_KEY
 _CHAT_ASSIST_KEY = "chat_assist"
+_SCENE_ACCESS_HINT_KEY = "scene_access_hint"
 _VISUAL_GENERATION_STYLE_KEY = VISUAL_GENERATION_STYLE_PREFERENCE_KEY
 
 
@@ -158,6 +159,18 @@ class TTSPregenerationPreference(BaseModel):
 
 
 class ChatAssistPreference(BaseModel):
+    enabled: bool = True
+
+
+class SceneAccessHintPreference(BaseModel):
+    """Player toggle for the Stage (scene) access steering notice.
+
+    Orthogonal to ``chat_assist`` — this only governs whether the
+    "meeting in person feels off" notice presents itself prominently.
+    ``enabled`` never strips the phone-message / ask-to-meet / retry /
+    add-context affordances; when off the notice merely opens collapsed
+    and the player can expand it."""
+
     enabled: bool = True
 
 
@@ -730,6 +743,49 @@ async def set_chat_assist_preference(
         user_id=user_id,
     )
     return ChatAssistPreference(enabled=enabled)
+
+
+@router.get(
+    "/system/preferences/scene-access-hint",
+    response_model=SceneAccessHintPreference,
+)
+async def get_scene_access_hint_preference(
+    scope: str = Query(default="user"),
+    container: ServiceContainer = Depends(get_container),
+    current_user: OperatorProfile = Depends(get_current_user),
+) -> SceneAccessHintPreference:
+    user_id = _preference_user_id(scope, current_user)
+    raw = await _get_preference(
+        container,
+        _SCENE_ACCESS_HINT_KEY,
+        user_id=user_id,
+    )
+    if isinstance(raw, dict):
+        return SceneAccessHintPreference(enabled=bool(raw.get("enabled", True)))
+    if isinstance(raw, bool):
+        return SceneAccessHintPreference(enabled=raw)
+    return SceneAccessHintPreference()
+
+
+@router.put(
+    "/system/preferences/scene-access-hint",
+    response_model=SceneAccessHintPreference,
+)
+async def set_scene_access_hint_preference(
+    payload: SceneAccessHintPreference,
+    scope: str = Query(default="user"),
+    container: ServiceContainer = Depends(get_container),
+    current_user: OperatorProfile = Depends(get_current_user),
+) -> SceneAccessHintPreference:
+    user_id = _preference_user_id(scope, current_user)
+    enabled = bool(payload.enabled)
+    await _set_preference(
+        container,
+        _SCENE_ACCESS_HINT_KEY,
+        {"enabled": enabled},
+        user_id=user_id,
+    )
+    return SceneAccessHintPreference(enabled=enabled)
 
 
 @router.get(

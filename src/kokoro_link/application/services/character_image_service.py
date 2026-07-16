@@ -39,7 +39,10 @@ from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
 )
-from kokoro_link.contracts.object_storage import ObjectStoragePort
+from kokoro_link.contracts.object_storage import (
+    ObjectStoragePort,
+    ObjectStorageUnavailableError,
+)
 from kokoro_link.contracts.image_provider import (
     ImageGenerationError,
     ImageNoOutputError,
@@ -111,6 +114,16 @@ class GenerationFailedError(CharacterImageError):
     """ComfyUI / generator-level failure the route should forward verbatim."""
 
 
+class StorageUnavailableError(CharacterImageError):
+    """Object storage backend unreachable — an ops problem, not a bad request.
+
+    Reclassified from the storage adapter's
+    :class:`ObjectStorageUnavailableError` so the route layer can answer
+    503 (service unavailable) instead of the misleading 400 the generic
+    ``CharacterImageError`` mapping would produce.
+    """
+
+
 class CharacterImageService:
     def __init__(
         self,
@@ -170,12 +183,19 @@ class CharacterImageService:
         object_key = f"characters/{character_id}/{filename}"
         if self._object_storage is None:
             raise CharacterImageError("Object storage is not configured")
-        stored = await self._object_storage.put_bytes(
-            object_key=object_key,
-            content=data,
-            content_type=mime_type or "application/octet-stream",
-            metadata={"character_id": character_id, "kind": "stage"},
-        )
+        try:
+            stored = await self._object_storage.put_bytes(
+                object_key=object_key,
+                content=data,
+                content_type=mime_type or "application/octet-stream",
+                metadata={"character_id": character_id, "kind": "stage"},
+            )
+        except ObjectStorageUnavailableError as exc:
+            _LOGGER.exception(
+                "add_image: object storage unreachable (character=%s)",
+                character_id,
+            )
+            raise StorageUnavailableError(str(exc)) from exc
         url = stored.url
         new_urls = tuple([*character.image_urls, url])
         updated = character.with_image_urls(new_urls)
@@ -336,7 +356,31 @@ class CharacterImageService:
                     original_filename="generated.png",
                 )
                 stored_count += 1
+        except StorageUnavailableError as exc:
+            # Already logged (and reclassified) by add_image — keep the
+            # type so the route can answer 503 instead of 400.
+            await self._record_image_usage_safely(
+                character=character,
+                feature_key="character_portrait",
+                provider=provider,
+                profile_id=profile_id or "",
+                aspect=aspect,
+                requested=1,
+                returned=len(images),
+                artifact_count=stored_count,
+                status=STATUS_FAILED,
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+                started_at=started_at,
+                billable_quantity=len(images),
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception(
+                "generate_portrait: storing generated image failed "
+                "(character=%s)",
+                character_id,
+            )
             await self._record_image_usage_safely(
                 character=character,
                 feature_key="character_portrait",
@@ -521,7 +565,37 @@ class CharacterImageService:
                 )
                 urls.append(stored.url)
                 object_keys.append(stored.object_key)
+        except ObjectStorageUnavailableError as exc:
+            _LOGGER.exception(
+                "generate_candidates: object storage unreachable "
+                "(character=%s)",
+                character_id,
+            )
+            await self._record_image_usage_safely(
+                character=character,
+                feature_key="character_album_candidate",
+                provider=provider,
+                profile_id=profile_id or "",
+                aspect=aspect,
+                requested=clamped_count,
+                returned=len(images),
+                artifact_count=len(urls),
+                status=STATUS_FAILED,
+                # Normalized to the service-level type so the ledger shows
+                # one code for "storage down" regardless of which entry
+                # point hit it (generate_portrait records the same).
+                error_code=StorageUnavailableError.__name__,
+                error_message=str(exc),
+                started_at=started_at,
+                billable_quantity=len(images),
+            )
+            raise StorageUnavailableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception(
+                "generate_candidates: storing candidate image failed "
+                "(character=%s)",
+                character_id,
+            )
             await self._record_image_usage_safely(
                 character=character,
                 feature_key="character_album_candidate",
@@ -615,37 +689,57 @@ class CharacterImageService:
         headroom = MAX_IMAGES_PER_CHARACTER - len(character.image_urls)
         moved_urls: list[str] = []
         album_entries: list[CommittedAlbumCandidate] = []
+        processed_keys: set[str] = set()
 
-        for source_key in candidate_keys:
-            wants_stage = source_key in keep_keys and headroom > 0
-            wants_album = source_key in album_keys
-            if wants_stage or wants_album:
-                destination_key = self._candidate_destination_key(
-                    character.id,
-                    source_key,
-                )
-                stored = await self._object_storage.copy(
-                    source_key=source_key,
-                    destination_key=destination_key,
-                    metadata={
-                        "character_id": character.id,
-                        "kind": "stage" if wants_stage else "album",
-                        "source": "candidate",
-                    },
-                )
-                await self._object_storage.delete(object_key=source_key)
-                if wants_stage:
-                    moved_urls.append(stored.url)
-                    headroom -= 1
-                else:
-                    album_entries.append(
-                        CommittedAlbumCandidate(
-                            url=stored.url,
-                            byte_size=stored.size_bytes,
-                        ),
+        try:
+            for source_key in candidate_keys:
+                wants_stage = source_key in keep_keys and headroom > 0
+                wants_album = source_key in album_keys
+                if wants_stage or wants_album:
+                    destination_key = self._candidate_destination_key(
+                        character.id,
+                        source_key,
                     )
-            else:
-                await self._object_storage.delete(object_key=source_key)
+                    stored = await self._object_storage.copy(
+                        source_key=source_key,
+                        destination_key=destination_key,
+                        metadata={
+                            "character_id": character.id,
+                            "kind": "stage" if wants_stage else "album",
+                            "source": "candidate",
+                        },
+                    )
+                    await self._object_storage.delete(object_key=source_key)
+                    if wants_stage:
+                        moved_urls.append(stored.url)
+                        headroom -= 1
+                    else:
+                        album_entries.append(
+                            CommittedAlbumCandidate(
+                                url=stored.url,
+                                byte_size=stored.size_bytes,
+                            ),
+                        )
+                else:
+                    await self._object_storage.delete(object_key=source_key)
+                processed_keys.add(source_key)
+        except ObjectStorageUnavailableError as exc:
+            # The 503 this becomes tells the player to retry — so the
+            # not-yet-processed candidates must survive for that retry
+            # instead of vanishing with the popped batch.
+            remaining = tuple(
+                key for key in candidate_keys if key not in processed_keys
+            )
+            if remaining:
+                self._candidate_batches[character.id] = remaining
+            _LOGGER.exception(
+                "commit_candidates: object storage unreachable "
+                "(character=%s, %d/%d candidates uncommitted)",
+                character.id,
+                len(remaining),
+                len(candidate_keys),
+            )
+            raise StorageUnavailableError(str(exc)) from exc
 
         if not moved_urls:
             return character, album_entries

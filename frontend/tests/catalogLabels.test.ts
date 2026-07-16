@@ -14,6 +14,7 @@ import {
   featureKeyLabel,
   providerConnectionLabel,
   providerDisplayNameLabel,
+  providerFieldHint,
   providerFieldLabel,
   providerFieldPlaceholder,
 } from '@/utils/catalogLabels'
@@ -107,6 +108,7 @@ const PROVIDER_FIELD_KEYS = [
   'request_dimensions',
   'response_format',
   'search_depth',
+  'searxng_base_url',
   'server',
   'strip_think_tags',
   'supports_vision',
@@ -135,6 +137,7 @@ const PROVIDER_FIELD_KEYS_WITH_PLACEHOLDER = [
   'reasoning_effort',
   'response_format',
   'search_depth',
+  'searxng_base_url',
   'server',
   'thinking_budget_tokens',
   'timeout_seconds',
@@ -142,6 +145,9 @@ const PROVIDER_FIELD_KEYS_WITH_PLACEHOLDER = [
   'voice_id',
   'workflow_file',
 ] as const
+
+// Field keys whose backend spec ships a persistent, non-empty hint.
+const PROVIDER_FIELD_KEYS_WITH_HINT = ['searxng_base_url'] as const
 
 const LOCALES = [
   ['zh-TW', zhTW],
@@ -273,6 +279,41 @@ describe('providerFieldLabel / providerFieldPlaceholder', () => {
   })
 })
 
+describe('providerFieldHint', () => {
+  const t = (key: string, fallback: string) => i18n.global.t(key, fallback)
+
+  it('routes a known field hint through the providerFields namespace', () => {
+    i18n.global.locale.value = 'ja-JP'
+    const hint = providerFieldHint(t, {
+      key: 'searxng_base_url',
+      label: 'Base URL (SearXNG instance root)',
+      placeholder: 'https://searxng.example.com',
+      hint: 'English backend hint',
+    })
+    expect(hint).not.toBe('English backend hint')
+    expect(hint).toBe(nested(jaJP, `${PROVIDER_FIELD_NAMESPACE}.searxng_base_url.hint`))
+  })
+
+  it('keeps a blank hint blank without a namespace lookup', () => {
+    const hint = providerFieldHint(t, {
+      key: 'base_url',
+      label: 'Base URL',
+      placeholder: 'https://api.example.com/v1',
+    })
+    expect(hint).toBe('')
+  })
+
+  it('falls back to the backend hint when the field key is unknown', () => {
+    const hint = providerFieldHint(t, {
+      key: 'brand_new_field',
+      label: 'X',
+      placeholder: '',
+      hint: 'backend hint text',
+    })
+    expect(hint).toBe('backend hint text')
+  })
+})
+
 describe('providerConnectionLabel', () => {
   const t = (key: string, fallback: string) => i18n.global.t(key, fallback)
 
@@ -373,6 +414,14 @@ describe('catalog label i18n parity', () => {
     for (const key of PROVIDER_FIELD_KEYS_WITH_PLACEHOLDER) {
       const value = nested(catalog, `${PROVIDER_FIELD_NAMESPACE}.${key}.placeholder`)
       expect(typeof value, `missing providerFields.${key}.placeholder`).toBe('string')
+      expect((value as string).trim().length).toBeGreaterThan(0)
+    }
+  })
+
+  it.each(LOCALES)('%s translates every provider field hint', (_name, catalog) => {
+    for (const key of PROVIDER_FIELD_KEYS_WITH_HINT) {
+      const value = nested(catalog, `${PROVIDER_FIELD_NAMESPACE}.${key}.hint`)
+      expect(typeof value, `missing providerFields.${key}.hint`).toBe('string')
       expect((value as string).trim().length).toBeGreaterThan(0)
     }
   })

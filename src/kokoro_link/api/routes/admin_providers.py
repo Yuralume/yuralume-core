@@ -15,6 +15,7 @@ from kokoro_link.application.services.provider_connection_service import (
     ProviderConnectionTestResult,
     ProviderConnectionView,
 )
+from kokoro_link.infrastructure.provider_settings.live_probe import ProbeReport
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.infrastructure.provider_settings.catalog import (
@@ -26,10 +27,25 @@ from kokoro_link.infrastructure.provider_settings.model_discovery import (
     discover_models,
 )
 from kokoro_link.infrastructure.provider_settings.runtime_sync import (
+    default_base_url_for,
     sync_provider_connections,
 )
 
 router = APIRouter(prefix="/admin/providers", tags=["admin-providers"])
+
+
+def resolve_draft_base_url(config: dict[str, Any], provider_id: str) -> str:
+    """base_url for a draft connection's model-discovery probe.
+
+    Empty falls back to the provider's known default — the same rule the
+    runtime adapters apply — so built-in presets (NanoGPT, OpenRouter, …)
+    can list models with the field left blank, while custom providers keep
+    the explicit "base_url is required" discovery error.
+    """
+    return (
+        str(config.get("base_url") or "").strip()
+        or default_base_url_for(provider_id)
+    )
 
 
 class ProviderFieldSpecResponse(BaseModel):
@@ -41,6 +57,7 @@ class ProviderFieldSpecResponse(BaseModel):
     placeholder: str
     secret: bool
     advanced: bool
+    hint: str = ""
 
 
 class ProviderCatalogEntryResponse(BaseModel):
@@ -60,6 +77,16 @@ class ProviderSecretStateResponse(BaseModel):
     fingerprint: str = ""
 
 
+class ProbeReportResponse(BaseModel):
+    """One live capability check — mirrors the shared ProbeReport contract."""
+
+    capability: str
+    action: str
+    ok: bool
+    detail: str
+    latency_ms: int
+
+
 class ProviderConnectionResponse(BaseModel):
     id: str
     provider: str
@@ -72,6 +99,8 @@ class ProviderConnectionResponse(BaseModel):
     last_validation_error: str | None
     created_at: datetime | None
     updated_at: datetime | None
+    # Populated only by POST /{id}/test — CRUD/list responses leave it null.
+    probes: list[ProbeReportResponse] | None = None
 
 
 class ProviderConnectionCreateRequest(BaseModel):
@@ -93,10 +122,23 @@ class ProviderConnectionUpdateRequest(BaseModel):
     clear_secret: bool = False
 
 
+class ProviderDraftTestRequest(ProviderConnectionCreateRequest):
+    """test-draft body: the draft connection plus the deep-probe switch."""
+
+    deep: bool = False
+
+
+class ProviderConnectionTestRequest(BaseModel):
+    """Optional body for POST /{id}/test — absent body means deep=False."""
+
+    deep: bool = False
+
+
 class ProviderConnectionTestResponse(BaseModel):
     ok: bool
     last_validated_at: datetime | None
     last_validation_error: str | None
+    probes: list[ProbeReportResponse] = Field(default_factory=list)
 
 
 class ListModelsRequest(BaseModel):
@@ -204,7 +246,7 @@ async def list_provider_models(
     if entry is None:
         raise HTTPException(status_code=400, detail=f"unknown provider: {payload.provider}")
 
-    base_url = str(payload.config.get("base_url") or "").strip()
+    base_url = resolve_draft_base_url(payload.config, entry.id)
     api_key = str(payload.secret.get("api_key") or "").strip()
     if not api_key and payload.connection_id:
         try:
@@ -227,7 +269,7 @@ async def list_provider_models(
 
 @router.post("/test-draft", response_model=ProviderConnectionTestResponse)
 async def test_draft_connection(
-    payload: ProviderConnectionCreateRequest,
+    payload: ProviderDraftTestRequest,
     admin: OperatorProfile = Depends(require_admin),
     container: ServiceContainer = Depends(get_container),
     _unlocked: None = Depends(_require_provider_settings_unlocked),
@@ -239,6 +281,7 @@ async def test_draft_connection(
         capabilities=payload.capabilities,
         config=payload.config,
         secret=payload.secret,
+        deep=payload.deep,
     )
     return _test_result(result)
 
@@ -300,16 +343,21 @@ async def delete_connection(
 @router.post("/{connection_id}/test", response_model=ProviderConnectionResponse)
 async def test_connection(
     connection_id: str,
+    payload: ProviderConnectionTestRequest | None = None,
     admin: OperatorProfile = Depends(require_admin),
     container: ServiceContainer = Depends(get_container),
     _unlocked: None = Depends(_require_provider_settings_unlocked),
 ) -> ProviderConnectionResponse:
     del admin
+    deep = bool(payload.deep) if payload is not None else False
     try:
-        row = await _service(container).test_connection(connection_id)
+        outcome = await _service(container).test_connection(connection_id, deep=deep)
     except ProviderConnectionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _connection(row)
+    return _connection(
+        outcome.connection,
+        probes=[_probe(probe) for probe in outcome.probes],
+    )
 
 
 def _field(field: ProviderFieldSpec) -> ProviderFieldSpecResponse:
@@ -322,6 +370,7 @@ def _field(field: ProviderFieldSpec) -> ProviderFieldSpecResponse:
         placeholder=field.placeholder,
         secret=field.secret,
         advanced=field.advanced,
+        hint=field.hint,
     )
 
 
@@ -339,7 +388,11 @@ def _catalog_entry(entry: ProviderCatalogEntry) -> ProviderCatalogEntryResponse:
     )
 
 
-def _connection(row: ProviderConnectionView) -> ProviderConnectionResponse:
+def _connection(
+    row: ProviderConnectionView,
+    *,
+    probes: list[ProbeReportResponse] | None = None,
+) -> ProviderConnectionResponse:
     return ProviderConnectionResponse(
         id=row.id,
         provider=row.provider,
@@ -355,6 +408,17 @@ def _connection(row: ProviderConnectionView) -> ProviderConnectionResponse:
         last_validation_error=row.last_validation_error,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        probes=probes,
+    )
+
+
+def _probe(report: ProbeReport) -> ProbeReportResponse:
+    return ProbeReportResponse(
+        capability=report.capability,
+        action=report.action,
+        ok=report.ok,
+        detail=report.detail,
+        latency_ms=report.latency_ms,
     )
 
 
@@ -363,4 +427,5 @@ def _test_result(row: ProviderConnectionTestResult) -> ProviderConnectionTestRes
         ok=row.ok,
         last_validated_at=row.last_validated_at,
         last_validation_error=row.last_validation_error,
+        probes=[_probe(probe) for probe in row.probes],
     )

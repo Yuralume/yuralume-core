@@ -9,6 +9,7 @@ export interface ProviderFieldSpec {
   placeholder: string
   secret: boolean
   advanced: boolean
+  hint?: string
 }
 
 export interface ProviderCatalogEntry {
@@ -28,6 +29,30 @@ export interface ProviderSecretState {
   fingerprint: string
 }
 
+/**
+ * Per-capability live-probe result from a deep/shallow connection test.
+ * Mirrors the backend SHARED API CONTRACT exactly. `detail` arrives as
+ * backend English and is rendered as-is; `action` is one of the fixed enum
+ * tokens localized on the frontend.
+ */
+export interface ProbeReport {
+  capability: string
+  action:
+    | 'config_check'
+    | 'listed_models'
+    | 'chat_completion'
+    | 'embedded'
+    | 'listed_voices'
+    | 'synthesized_speech'
+    | 'searched'
+    | 'reachability'
+    | 'generated_image'
+    | 'not_probed'
+  ok: boolean
+  detail: string
+  latency_ms: number
+}
+
 export interface ProviderConnection {
   id: string
   provider: string
@@ -40,6 +65,8 @@ export interface ProviderConnection {
   last_validation_error: string | null
   created_at: string | null
   updated_at: string | null
+  // Populated only by POST /{id}/test (never by the list endpoint).
+  probes?: ProbeReport[]
 }
 
 export interface ProviderConnectionPayload {
@@ -55,6 +82,7 @@ export interface ProviderConnectionTestResult {
   ok: boolean
   last_validated_at: string | null
   last_validation_error: string | null
+  probes?: ProbeReport[]
 }
 
 export async function listProviderCatalog(): Promise<ProviderCatalogEntry[]> {
@@ -96,19 +124,24 @@ export async function deleteProviderConnection(id: string): Promise<void> {
   await axios.delete(`/api/v1/admin/providers/${encodeURIComponent(id)}`)
 }
 
-export async function testProviderConnection(id: string): Promise<ProviderConnection> {
+export async function testProviderConnection(
+  id: string,
+  deep = false,
+): Promise<ProviderConnection> {
   const { data } = await axios.post<ProviderConnection>(
     `/api/v1/admin/providers/${encodeURIComponent(id)}/test`,
+    { deep },
   )
   return data
 }
 
 export async function testDraftProviderConnection(
   payload: ProviderConnectionPayload,
+  deep = false,
 ): Promise<ProviderConnectionTestResult> {
   const { data } = await axios.post<ProviderConnectionTestResult>(
     '/api/v1/admin/providers/test-draft',
-    payload,
+    { ...payload, deep },
   )
   return data
 }

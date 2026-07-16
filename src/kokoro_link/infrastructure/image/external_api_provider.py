@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 from collections.abc import Mapping
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -90,6 +90,12 @@ class ExternalImageApiProvider:
         )
         if not prompt.strip():
             raise ImageGenerationError("image prompt is empty")
+        # NOTE: deliberately no ``response_format`` field. The published
+        # Custom Media Gateway contract (docs/CUSTOM_MEDIA_GATEWAY_SPEC.md)
+        # pins this body to exactly {model, prompt, size, n}, and this one
+        # payload serves every kind routed here (gateway / custom /
+        # openai_compatible — see runtime_sync). Gateways choose b64_json
+        # vs url per item in the response instead.
         payload = {
             "model": self._model,
             "prompt": prompt,
@@ -192,7 +198,19 @@ async def _download_bytes(
         f"{base_url}/",
         url.lstrip("/"),
     )
-    response = await client.get(resolved)
+    # Name only scheme://host in errors — artifact URLs may carry a
+    # capability token in the path/query, and the message surfaces in
+    # user-facing error details.
+    host = _host_of(resolved)
+    try:
+        response = await client.get(resolved)
+    except httpx.TimeoutException:
+        # Let the caller's timeout mapping (ImageTimeoutError) handle it.
+        raise
+    except httpx.HTTPError as exc:
+        raise ImageGenerationError(
+            f"image artifact download from {host} failed: {exc}",
+        ) from exc
     if response.status_code >= 400:
         log_http_error_response(
             _LOGGER,
@@ -200,9 +218,17 @@ async def _download_bytes(
             operation="image artifact download",
         )
         raise ImageGenerationError(
-            f"image artifact download failed: {response.status_code}",
+            "image artifact download from "
+            f"{host} failed: HTTP {response.status_code}",
         )
     return response.content
+
+
+def _host_of(url: str) -> str:
+    parts = urlsplit(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return url
 
 
 def _json_or_raise(response: httpx.Response, label: str) -> Mapping:

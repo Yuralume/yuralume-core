@@ -11,6 +11,7 @@ from kokoro_link.contracts.object_storage import (
     ObjectMetadata,
     ObjectNotFoundError,
     ObjectStorageError,
+    ObjectStorageUnavailableError,
     StoredObject,
 )
 from kokoro_link.infrastructure.storage.keys import validate_object_key
@@ -39,27 +40,25 @@ class HttpObjectStorage:
         metadata: Mapping[str, str] | None = None,
     ) -> StoredObject:
         key = validate_object_key(object_key)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                f"{self._base_url}/v1/objects",
-                headers=self._headers(),
-                data={
-                    "object_key": key,
-                    "content_type": content_type,
-                    "metadata": json.dumps(dict(metadata or {}), ensure_ascii=False),
-                },
-                files={"file": (key.rsplit("/", 1)[-1], content, content_type)},
-            )
+        response = await self._send(
+            "POST",
+            f"{self._base_url}/v1/objects",
+            data={
+                "object_key": key,
+                "content_type": content_type,
+                "metadata": json.dumps(dict(metadata or {}), ensure_ascii=False),
+            },
+            files={"file": (key.rsplit("/", 1)[-1], content, content_type)},
+        )
         data = self._parse_response(response)
         return _stored_from_json(data, public_base_url=self._public_base_url)
 
     async def get_bytes(self, *, object_key: str) -> bytes:
         key = validate_object_key(object_key)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(
-                f"{self._base_url}/v1/objects/content/{key}",
-                headers=self._headers(),
-            )
+        response = await self._send(
+            "GET",
+            f"{self._base_url}/v1/objects/content/{key}",
+        )
         if response.status_code == 404:
             raise ObjectNotFoundError(key)
         if response.status_code >= 400:
@@ -68,11 +67,10 @@ class HttpObjectStorage:
 
     async def stat(self, *, object_key: str) -> ObjectMetadata | None:
         key = validate_object_key(object_key)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(
-                f"{self._base_url}/v1/objects/metadata/{key}",
-                headers=self._headers(),
-            )
+        response = await self._send(
+            "GET",
+            f"{self._base_url}/v1/objects/metadata/{key}",
+        )
         if response.status_code == 404:
             return None
         data = self._parse_response(response)
@@ -80,11 +78,10 @@ class HttpObjectStorage:
 
     async def delete(self, *, object_key: str) -> None:
         key = validate_object_key(object_key)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.delete(
-                f"{self._base_url}/v1/objects/{key}",
-                headers=self._headers(),
-            )
+        response = await self._send(
+            "DELETE",
+            f"{self._base_url}/v1/objects/{key}",
+        )
         if response.status_code >= 400:
             raise ObjectStorageError(_error_text(response))
 
@@ -97,20 +94,38 @@ class HttpObjectStorage:
     ) -> StoredObject:
         source = validate_object_key(source_key)
         dest = validate_object_key(destination_key)
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                f"{self._base_url}/v1/objects/copy",
-                headers=self._headers(),
-                json={
-                    "source_key": source,
-                    "destination_key": dest,
-                    "metadata": dict(metadata or {}),
-                },
-            )
+        response = await self._send(
+            "POST",
+            f"{self._base_url}/v1/objects/copy",
+            json={
+                "source_key": source,
+                "destination_key": dest,
+                "metadata": dict(metadata or {}),
+            },
+        )
         if response.status_code == 404:
             raise ObjectNotFoundError(source)
         data = self._parse_response(response)
         return _stored_from_json(data, public_base_url=self._public_base_url)
+
+    async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Issue one storage request; translate transport failures.
+
+        A dead storage host (docker service down, DNS miss, timeout)
+        surfaces from httpx as a raw OS-level message ("[Errno -2] Name
+        or service not known") that says nothing about *which* service
+        failed. Wrap it in :class:`ObjectStorageUnavailableError` naming
+        the storage base URL so callers/logs can point at the right box.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                return await client.request(
+                    method, url, headers=self._headers(), **kwargs,
+                )
+        except httpx.HTTPError as exc:
+            raise ObjectStorageUnavailableError(
+                f"object storage unreachable at {self._base_url}: {exc}",
+            ) from exc
 
     async def public_url(self, *, object_key: str) -> str:
         key = validate_object_key(object_key)

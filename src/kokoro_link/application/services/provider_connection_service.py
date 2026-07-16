@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +16,13 @@ from kokoro_link.infrastructure.provider_settings.catalog import (
     ProviderCatalogEntry,
     catalog_by_id,
     list_provider_catalog,
+)
+from kokoro_link.infrastructure.provider_settings.live_probe import (
+    ProbeReport,
+    probe_connection,
+)
+from kokoro_link.infrastructure.security.error_sanitizer import (
+    sanitize_error as _sanitize_error,
 )
 from kokoro_link.infrastructure.security.provider_secret_cipher import (
     ProviderSecretCipher,
@@ -48,6 +54,73 @@ class ProviderConnectionTestResult:
     ok: bool
     last_validated_at: datetime | None
     last_validation_error: str | None
+    probes: tuple[ProbeReport, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderConnectionTestOutcome:
+    """Saved-row live-test result: the updated row view + probe reports."""
+
+    connection: ProviderConnectionView
+    probes: tuple[ProbeReport, ...] = ()
+
+
+def _config_check_failure(error: str) -> tuple[ProbeReport, ...]:
+    """Shared-contract shape for a local validation failure: a single
+    failed ``config_check`` probe and no network traffic at all."""
+    return (
+        ProbeReport(
+            capability="config",
+            action="config_check",
+            ok=False,
+            detail=error,
+            latency_ms=0,
+        ),
+    )
+
+
+def _first_probe_failure(probes: tuple[ProbeReport, ...]) -> str | None:
+    """``last_validation_error`` for a probe pass — the first failing
+    probe as ``capability: detail`` (keeps the existing UI contract
+    meaningful), or ``None`` when every probe passed."""
+    for probe in probes:
+        if not probe.ok:
+            return _sanitize_error(f"{probe.capability}: {probe.detail}")
+    return None
+
+
+# Legacy config-key aliases: rows saved before a catalog field rename still
+# carry the old key, and the admin UI round-trips stored config verbatim on
+# edit. Normalization runs before validation so those rows keep saving, and
+# the stored row self-heals to the new key on its next write.
+_LEGACY_CONFIG_ALIASES: dict[str, dict[str, str]] = {
+    # 2026-07-16: searxng base_url → searxng_base_url (field re-keyed so
+    # its i18n hint stops colliding with the generic Base URL entry).
+    "searxng": {"base_url": "searxng_base_url"},
+}
+
+
+def normalize_legacy_config(
+    provider_id: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Rename legacy config keys to their current catalog keys.
+
+    An explicit non-empty value under the new key wins; an empty/missing
+    new key inherits the legacy value so a stored setting never silently
+    vanishes on an edit round-trip.
+    """
+    aliases = _LEGACY_CONFIG_ALIASES.get(provider_id)
+    if not aliases:
+        return config
+    normalized = dict(config)
+    for old_key, new_key in aliases.items():
+        if old_key not in normalized:
+            continue
+        value = normalized.pop(old_key)
+        if normalized.get(new_key) in ("", None):
+            normalized[new_key] = value
+    return normalized
 
 
 class ProviderConnectionService:
@@ -98,7 +171,7 @@ class ProviderConnectionService:
         cleaned_capabilities = self._clean_capabilities(entry, capabilities)
         cleaned_config = self._clean_config(
             entry,
-            config or {},
+            self._normalize_legacy_config(entry, config or {}),
             fields=entry.config_fields,
             payload_name="config",
         )
@@ -155,7 +228,7 @@ class ProviderConnectionService:
         cleaned_config = (
             self._clean_config(
                 entry,
-                config,
+                self._normalize_legacy_config(entry, config),
                 fields=entry.config_fields,
                 payload_name="config",
             )
@@ -253,12 +326,14 @@ class ProviderConnectionService:
     async def test_connection(
         self,
         connection_id: str,
-    ) -> ProviderConnectionView:
+        *,
+        deep: bool = False,
+    ) -> ProviderConnectionTestOutcome:
         row = await self._get_required(connection_id)
-        error = None
+        probes: tuple[ProbeReport, ...]
         try:
             entry = self._require_catalog(row.provider)
-            self._clean_capabilities(entry, list(row.capabilities))
+            capabilities = self._clean_capabilities(entry, list(row.capabilities))
             secret = self._cipher.decrypt(row.encrypted_secret) if row.encrypted_secret else {}
             self._validate_required(
                 entry,
@@ -269,7 +344,18 @@ class ProviderConnectionService:
                 capabilities=row.capabilities,
             )
         except Exception as exc:
-            error = _sanitize_error(str(exc))
+            probes = _config_check_failure(_sanitize_error(str(exc)))
+        else:
+            probes = tuple(
+                await probe_connection(
+                    entry=entry,
+                    capabilities=capabilities,
+                    config=dict(row.config),
+                    secret=secret,
+                    deep=deep,
+                ),
+            )
+        error = _first_probe_failure(probes)
         updated = ProviderConnection(
             id=row.id,
             provider=row.provider,
@@ -285,7 +371,10 @@ class ProviderConnectionService:
             updated_at=datetime.now(timezone.utc),
         )
         saved = await self._repository.save(updated)
-        return self._redact(saved)
+        return ProviderConnectionTestOutcome(
+            connection=self._redact(saved),
+            probes=probes,
+        )
 
     async def test_draft_connection(
         self,
@@ -295,14 +384,15 @@ class ProviderConnectionService:
         capabilities: list[str],
         config: dict[str, Any] | None = None,
         secret: dict[str, Any] | None = None,
+        deep: bool = False,
     ) -> ProviderConnectionTestResult:
-        error = None
+        probes: tuple[ProbeReport, ...]
         try:
             entry = self._require_catalog(provider)
-            self._clean_capabilities(entry, capabilities)
+            cleaned_capabilities = self._clean_capabilities(entry, capabilities)
             cleaned_config = self._clean_config(
                 entry,
-                config or {},
+                self._normalize_legacy_config(entry, config or {}),
                 fields=entry.config_fields,
                 payload_name="config",
             )
@@ -321,11 +411,25 @@ class ProviderConnectionService:
                 capabilities=capabilities,
             )
         except Exception as exc:
-            error = _sanitize_error(str(exc))
+            # Local validation failed → single config_check probe, no
+            # network traffic (shared contract).
+            probes = _config_check_failure(_sanitize_error(str(exc)))
+        else:
+            probes = tuple(
+                await probe_connection(
+                    entry=entry,
+                    capabilities=cleaned_capabilities,
+                    config=cleaned_config,
+                    secret=cleaned_secret,
+                    deep=deep,
+                ),
+            )
+        error = _first_probe_failure(probes)
         return ProviderConnectionTestResult(
             ok=error is None,
             last_validated_at=None if error else datetime.now(timezone.utc),
             last_validation_error=error,
+            probes=probes,
         )
 
     async def _get_required(self, connection_id: str) -> ProviderConnection:
@@ -360,6 +464,13 @@ class ProviderConnectionService:
         if not cleaned:
             cleaned = [entry.capabilities[0]]
         return cleaned
+
+    def _normalize_legacy_config(
+        self,
+        entry: ProviderCatalogEntry,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        return normalize_legacy_config(entry.id, config)
 
     def _clean_config(
         self,
@@ -457,10 +568,3 @@ class ProviderConnectionService:
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
-
-
-_SECRET_PATTERN = re.compile(r"(sk|key|token|secret|bearer)[-_A-Za-z0-9]{8,}")
-
-
-def _sanitize_error(message: str) -> str:
-    return _SECRET_PATTERN.sub("[redacted]", message)[:500]

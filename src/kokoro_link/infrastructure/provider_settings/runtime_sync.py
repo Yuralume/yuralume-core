@@ -64,6 +64,21 @@ _OPENAI_COMPATIBLE_DEFAULTS: dict[str, tuple[str, str]] = {
     "yuralume_cloud": ("", ""),
 }
 
+
+def default_base_url_for(provider_id: str) -> str:
+    """Best-known API base for a catalog provider.
+
+    Model discovery uses this when a draft connection omits ``base_url``,
+    mirroring the runtime adapters above which apply the same default at
+    sync time — so "leave the field empty for the provider default" holds
+    for both saving and the fetch-models probe. Providers without a known
+    base (custom / yuralume_cloud) return ``""`` and keep the explicit
+    "base_url is required" discovery error.
+    """
+    defaults = _OPENAI_COMPATIBLE_DEFAULTS.get(provider_id)
+    return defaults[0] if defaults else ""
+
+
 _IMAGE_DEFAULTS: dict[str, tuple[str, str, str]] = {
     "openai": ("https://api.openai.com/v1", "gpt-image-2", "openai"),
     "google_gemini": (
@@ -905,7 +920,12 @@ def _build_search_client(
             timeout_seconds=timeout,
         )
     if row.provider == "searxng":
-        base_url = _config_str(row, "base_url", "")
+        # Catalog field key is ``searxng_base_url`` (so the admin form can
+        # surface SearXNG-specific i18n guidance); fall back to the legacy
+        # ``base_url`` key for rows saved before that rename.
+        base_url = _config_str(row, "searxng_base_url", "") or _config_str(
+            row, "base_url", ""
+        )
         if not base_url:
             raise ValueError("SearXNG search requires base_url")
         return SearXNGSearchClient(

@@ -133,7 +133,6 @@ const entries: AdminPanelEntry[] = [
     titleKey: 'admin.home.entries.observability.title',
     descriptionKey: 'admin.home.entries.observability.description',
     group: 'ops',
-    debugOnly: true,
   },
   {
     to: '/admin/users',

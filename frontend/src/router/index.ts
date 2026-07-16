@@ -109,7 +109,6 @@ const adminPlaceholderRoutes: RouteRecordRaw[] = [
     path: 'observability',
     name: 'admin-observability',
     component: () => import('@/pages/admin/ObservabilityAdminPage.vue'),
-    meta: { debugOnly: true },
   },
   {
     path: 'users',

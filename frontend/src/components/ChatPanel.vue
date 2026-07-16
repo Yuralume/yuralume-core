@@ -25,6 +25,7 @@ import ChatFirstTurnGuide from '@/components/ChatFirstTurnGuide.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
 import { UiButton } from '@/components/ui'
 import { useChatAssistPreference } from '@/composables/useChatAssistPreference'
+import { useSceneAccessHintPreference } from '@/composables/useSceneAccessHintPreference'
 import { useAuth } from '@/composables/useAuth'
 import { useNsfwMode } from '@/composables/useNsfwMode'
 import { useTimezone } from '@/composables/useTimezone'
@@ -33,6 +34,10 @@ import { formatTimeRange } from '@/i18n/formatters'
 import { characterDisplayRef } from '@/utils/characterDisplay'
 import { splitAssistantBubbles } from '@/utils/chatSegments'
 import { shouldSendChatInputOnKeydown } from '@/utils/chatInputKeys'
+import {
+  resolveStageAccessNotice,
+  shouldOpenStageAccessNotice,
+} from '@/utils/stageAccessNotice'
 import {
   isChatAssistDiscovered,
   isChatAssistHintDismissed,
@@ -45,6 +50,10 @@ const { t, locale } = useI18n()
 const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 const { chatAssistEnabled, loadChatAssistPreference } = useChatAssistPreference()
+const {
+  sceneAccessHintEnabled,
+  loadSceneAccessHintPreference,
+} = useSceneAccessHintPreference()
 const { cloudMode } = useAuth()
 const {
   active: nsfwModeActive,
@@ -211,20 +220,23 @@ const stageTabSubtitle = computed(() => {
   return t('chat.mode.stageHint')
 })
 
-const shouldShowStageAccessNotice = computed(() => (
-  stageAccessNoticeOpen.value
-  && stageAccessVerdict.value !== null
-  && stageAccessVerdict.value.decision !== 'allow'
-))
+// Single source of truth for the notice's visible/collapsed/details
+// booleans. The scene-access-hint preference gates only the AMBIENT
+// trigger (see shouldOpenStageAccessNotice); explicit Stage attempts and
+// retries always open the notice, so the phone/meet/retry/add-context
+// affordances stay reachable in both preference states. The notice
+// always opens collapsed — expansion is the player's per-notice toggle.
+const stageAccessNoticeState = computed(() => resolveStageAccessNotice({
+  noticeOpen: stageAccessNoticeOpen.value,
+  decision: stageAccessVerdict.value?.decision ?? null,
+  expanded: stageAccessNoticeExpanded.value,
+}))
 
-const isStageAccessNoticeCollapsed = computed(() => (
-  shouldShowStageAccessNotice.value
-  && !stageAccessNoticeExpanded.value
-))
+const shouldShowStageAccessNotice = computed(() => stageAccessNoticeState.value.visible)
 
-const shouldShowStageAccessNoticeDetails = computed(() => (
-  shouldShowStageAccessNotice.value && !isStageAccessNoticeCollapsed.value
-))
+const isStageAccessNoticeCollapsed = computed(() => stageAccessNoticeState.value.collapsed)
+
+const shouldShowStageAccessNoticeDetails = computed(() => stageAccessNoticeState.value.showDetails)
 
 const shouldShowStageAccessContextForm = computed(() => (
   shouldShowStageAccessNoticeDetails.value && stageAccessContextFormOpen.value
@@ -235,8 +247,11 @@ async function selectInteractionMode(mode: ChatInteractionMode) {
     await refreshStageAccess({ applyMode: false })
   }
   if (mode === 'stage' && !canUseStageAccess(stageAccessVerdict.value)) {
+    // Explicit player action — the notice always opens so the refusal is
+    // explained and the phone/meet/retry affordances stay reachable.
     interactionMode.value = 'dm'
     stageAccessNoticeOpen.value = stageAccessVerdict.value !== null
+      && shouldOpenStageAccessNotice('explicit', sceneAccessHintEnabled.value)
     stageAccessNoticeExpanded.value = false
     stageAccessContextFormOpen.value = false
     focusInput()
@@ -280,7 +295,11 @@ async function retryStageAccess() {
   stageAccessContextFormOpen.value = false
   await refreshStageAccess({ applyMode: false })
   if (stageAccessVerdict.value && !canUseStageAccess(stageAccessVerdict.value)) {
-    stageAccessNoticeOpen.value = true
+    // Retry is an explicit player action — always explain the outcome.
+    stageAccessNoticeOpen.value = shouldOpenStageAccessNotice(
+      'explicit',
+      sceneAccessHintEnabled.value,
+    )
     stageAccessNoticeExpanded.value = false
   }
 }
@@ -324,8 +343,14 @@ function applyStageAccessMode(verdict: StageAccessVerdict | null) {
     return
   }
   if (!canUseStageAccess(verdict)) {
+    // Ambient trigger — the verdict resolved in the background while the
+    // player was just opening the chat. Respect the scene-access-hint
+    // preference: hint off means no unsolicited banner.
     interactionMode.value = 'dm'
-    stageAccessNoticeOpen.value = true
+    stageAccessNoticeOpen.value = shouldOpenStageAccessNotice(
+      'ambient',
+      sceneAccessHintEnabled.value,
+    )
     stageAccessNoticeExpanded.value = false
     stageAccessContextFormOpen.value = false
     return
@@ -701,6 +726,18 @@ watch(chatAssistEnabled, (enabled) => {
   }
 })
 
+// Turning the scene-access-hint preference OFF dismisses an ambient
+// notice that is already on screen so the change is felt immediately.
+// Turning it ON does not retroactively open anything — the next ambient
+// verdict will.
+watch(sceneAccessHintEnabled, (enabled) => {
+  if (!enabled && stageAccessNoticeOpen.value) {
+    stageAccessNoticeOpen.value = false
+    stageAccessNoticeExpanded.value = false
+    stageAccessContextFormOpen.value = false
+  }
+})
+
 onUnmounted(() => {
   if (activityTimer) clearInterval(activityTimer)
   if (pendingRevealResolve) {
@@ -970,6 +1007,7 @@ function updateAppHeight() {
 
 onMounted(() => {
   loadChatAssistPreference()
+  loadSceneAccessHintPreference()
   if (!cloudMode.value) {
     startNsfwModeClock()
     loadNsfwMode()
@@ -1089,6 +1127,9 @@ onUnmounted(() => {
               : t('chat.stageAccess.collapseDetails')"
             @click="stageAccessNoticeExpanded = !stageAccessNoticeExpanded"
           >
+            <span v-if="isStageAccessNoticeCollapsed" class="stage-access-toggle-label">
+              {{ t('chat.stageAccess.expandDetails') }}
+            </span>
             <span aria-hidden="true">{{ isStageAccessNoticeCollapsed ? '▾' : '▴' }}</span>
           </button>
           <div v-if="shouldShowStageAccessNoticeDetails" class="stage-access-actions">
@@ -1514,12 +1555,20 @@ onUnmounted(() => {
 }
 
 .stage-access-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   flex: 0 0 auto;
-  width: 30px;
+  min-width: 30px;
   min-height: 28px;
-  padding: 4px;
+  padding: 4px 8px;
   font-size: 14px;
   line-height: 1;
+}
+
+.stage-access-toggle-label {
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .stage-access-action {

@@ -84,6 +84,26 @@ async def discover_models(
 # ---------------------------------------------------------------------------
 
 
+def gateway_options_url(base_url: str, capability: str) -> str | None:
+    """URL of the Yuralume gateway ``/v1/{capability}-options`` endpoint.
+
+    The user usually pastes the gateway base with a trailing /v1 already,
+    because that's also what the image/llm clients expect. Tolerate both
+    forms so the UI never has to coach them. Returns ``None`` for
+    capabilities the gateway exposes no discovery endpoint for. Shared
+    with the live-probe engine so both features agree on the URL rule.
+    """
+    path = _CAPABILITY_TO_GATEWAY_PATH.get(capability)
+    if path is None:
+        return None
+    cleaned_base = (base_url or "").strip().rstrip("/")
+    return (
+        f"{cleaned_base}/{path}"
+        if cleaned_base.endswith("/v1")
+        else f"{cleaned_base}/v1/{path}"
+    )
+
+
 async def _yuralume_cloud(
     *,
     base_url: str,
@@ -91,20 +111,12 @@ async def _yuralume_cloud(
     capability: str,
     timeout_seconds: float,
 ) -> ModelDiscoveryResult:
-    path = _CAPABILITY_TO_GATEWAY_PATH.get(capability)
-    if path is None:
+    url = gateway_options_url(base_url, capability)
+    if url is None:
         return ModelDiscoveryResult(
             error=f"yuralume_cloud does not expose discovery for capability "
             f"{capability!r}",
         )
-    # The user usually pastes the gateway base with a trailing /v1 already,
-    # because that's also what the image/llm clients expect. Tolerate both
-    # forms so the UI never has to coach them.
-    url = (
-        f"{base_url}/{path}"
-        if base_url.endswith("/v1")
-        else f"{base_url}/v1/{path}"
-    )
     headers = _bearer_headers(api_key)
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.get(url, headers=headers)

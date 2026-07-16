@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 from fastapi.testclient import TestClient
 
 from kokoro_link.api.app import create_app
@@ -1019,10 +1020,18 @@ def test_search_catalog_entries_are_present() -> None:
     tavily = catalog["tavily"]
     assert any(f.key == "api_key" and f.required for f in tavily.auth_fields)
 
-    # searxng: base_url required, api_key optional.
+    # searxng: base URL required (under its OWN field key so the admin form
+    # resolves SearXNG-specific i18n guidance, not the generic base_url
+    # label), api_key optional.
     searxng = catalog["searxng"]
     assert any(f.key == "api_key" and not f.required for f in searxng.auth_fields)
-    assert any(f.key == "base_url" and f.required for f in searxng.config_fields)
+    assert not any(f.key == "base_url" for f in searxng.config_fields)
+    searxng_url_field = next(
+        f for f in searxng.config_fields if f.key == "searxng_base_url"
+    )
+    assert searxng_url_field.required
+    # The operator gotcha rides a persistent hint (not just the placeholder).
+    assert "json" in searxng_url_field.hint
 
     # duckduckgo: no auth at all.
     duckduckgo = catalog["duckduckgo"]
@@ -1089,7 +1098,7 @@ def test_search_provider_switch_replaces_and_disable_removes(monkeypatch) -> Non
             "label": "SearXNG",
             "enabled": True,
             "capabilities": ["search"],
-            "config": {"base_url": "https://searxng.example.test"},
+            "config": {"searxng_base_url": "https://searxng.example.test"},
             "secret": {},
         },
     )
@@ -1178,7 +1187,8 @@ def test_searxng_search_requires_base_url(monkeypatch) -> None:
     app = create_app()
     client = TestClient(app)
 
-    # Server-side field validation: base_url is required for searxng.
+    # Server-side field validation: the SearXNG base URL is required (now
+    # under the searxng_base_url field key).
     created = client.post(
         "/api/v1/admin/providers",
         json={
@@ -1191,7 +1201,68 @@ def test_searxng_search_requires_base_url(monkeypatch) -> None:
         },
     )
     assert created.status_code == 400
-    assert "base_url" in created.text
+    assert "searxng_base_url" in created.text
+
+
+def _searxng_row(config: dict[str, object]):
+    from kokoro_link.contracts.provider_settings import ProviderConnection
+
+    return ProviderConnection(
+        id="row-1",
+        provider="searxng",
+        label="SearXNG",
+        enabled=True,
+        capabilities=("search",),
+        config=config,
+    )
+
+
+def test_build_search_client_reads_new_searxng_base_url_key() -> None:
+    from kokoro_link.infrastructure.provider_settings.runtime_sync import (
+        _build_search_client,
+    )
+    from kokoro_link.infrastructure.tools.websearch import SearXNGSearchClient
+
+    client = _build_search_client(
+        _searxng_row({"searxng_base_url": "https://searxng.example.test/"}),
+        secret={},
+    )
+    assert isinstance(client, SearXNGSearchClient)
+    # base_url trailing slash is stripped by the client.
+    assert client._base_url == "https://searxng.example.test"  # noqa: SLF001
+
+
+def test_build_search_client_falls_back_to_legacy_base_url_key() -> None:
+    # Rows saved before the searxng_base_url rename stored the value under the
+    # generic ``base_url`` key; the runtime must still find it.
+    from kokoro_link.infrastructure.provider_settings.runtime_sync import (
+        _build_search_client,
+    )
+    from kokoro_link.infrastructure.tools.websearch import SearXNGSearchClient
+
+    client = _build_search_client(
+        _searxng_row({"base_url": "https://legacy.example.test"}),
+        secret={},
+    )
+    assert isinstance(client, SearXNGSearchClient)
+    assert client._base_url == "https://legacy.example.test"  # noqa: SLF001
+
+
+def test_build_search_client_prefers_new_key_over_legacy() -> None:
+    from kokoro_link.infrastructure.provider_settings.runtime_sync import (
+        _build_search_client,
+    )
+
+    client = _build_search_client(
+        _searxng_row(
+            {
+                "searxng_base_url": "https://new.example.test",
+                "base_url": "https://legacy.example.test",
+            },
+        ),
+        secret={},
+    )
+    assert client._base_url == "https://new.example.test"  # noqa: SLF001
 
 
 def test_legacy_tavily_env_seeds_search_connection(monkeypatch) -> None:
@@ -1240,3 +1311,207 @@ def test_legacy_custom_tts_env_seeds_single_tts_connection(monkeypatch) -> None:
     assert row["config"]["base_url"] == "https://tts.example.test/v1"
     # The offending field the custom_tts catalog rejects must not be present.
     assert "response_format" not in row["config"]
+
+
+def test_normalize_legacy_config_searxng_base_url() -> None:
+    """Legacy searxng rows (config key ``base_url``) must stay editable.
+
+    The 2026-07-16 re-key to ``searxng_base_url`` would otherwise make
+    ``_clean_config`` reject the round-tripped legacy key with a 400.
+    """
+    from kokoro_link.application.services.provider_connection_service import (
+        normalize_legacy_config,
+    )
+
+    # Plain legacy row: old key renamed so validation and storage self-heal.
+    assert normalize_legacy_config(
+        "searxng", {"base_url": "https://sx.example.com"},
+    ) == {"searxng_base_url": "https://sx.example.com"}
+
+    # An explicit non-empty new value wins over the legacy one.
+    assert normalize_legacy_config(
+        "searxng",
+        {
+            "base_url": "https://old.example.com",
+            "searxng_base_url": "https://new.example.com",
+        },
+    ) == {"searxng_base_url": "https://new.example.com"}
+
+    # An empty new key inherits the legacy value instead of clobbering it.
+    assert normalize_legacy_config(
+        "searxng",
+        {"base_url": "https://old.example.com", "searxng_base_url": ""},
+    ) == {"searxng_base_url": "https://old.example.com"}
+
+    # Providers whose catalog legitimately uses base_url are untouched.
+    cfg = {"base_url": "https://api.openai.com/v1"}
+    assert normalize_legacy_config("openai", cfg) == cfg
+
+
+# ---------------------------------------------------------------------------
+# Live probes on test-draft / saved test (shared ProbeReport contract).
+# ---------------------------------------------------------------------------
+
+
+def _patch_probe_transport(monkeypatch, handler):
+    """Route the service's live probes through a MockTransport.
+
+    Returns the list of kwargs the service passed to ``probe_connection``
+    so tests can assert the deep flag / capability pass-through.
+    """
+    import kokoro_link.application.services.provider_connection_service as pcs
+    from kokoro_link.infrastructure.provider_settings.live_probe import (
+        probe_connection as real_probe_connection,
+    )
+
+    calls: list[dict] = []
+    transport = httpx.MockTransport(handler)
+
+    async def probing(**kwargs):
+        calls.append(kwargs)
+        return await real_probe_connection(transport=transport, **kwargs)
+
+    monkeypatch.setattr(pcs, "probe_connection", probing)
+    return calls
+
+
+def _network_poison_handler(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(
+        f"live probe must not touch the network: {request.method} {request.url}",
+    )
+
+
+def test_test_draft_local_validation_failure_short_circuits_probes(
+    monkeypatch,
+) -> None:
+    _configure_env(monkeypatch)
+    _patch_probe_transport(monkeypatch, _network_poison_handler)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/v1/admin/providers/test-draft",
+        json={
+            "provider": "openai",
+            "enabled": True,
+            "capabilities": ["llm"],
+            "config": {},
+            "secret": {},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    # Exactly ONE probe — a failed config_check with zero network traffic.
+    # (A regression that ran live probes would trip the poison transport
+    # and surface extra failed probe rows here.)
+    assert len(body["probes"]) == 1
+    probe = body["probes"][0]
+    assert probe["capability"] == "config"
+    assert probe["action"] == "config_check"
+    assert probe["ok"] is False
+    assert probe["latency_ms"] == 0
+    assert "secret requires field: api_key" in probe["detail"]
+    assert "secret requires field: api_key" in body["last_validation_error"]
+
+
+def test_test_draft_runs_live_probes_and_reports(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gpt-4o-mini"}]})
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={"choices": []})
+        raise AssertionError(request.url.path)
+
+    calls = _patch_probe_transport(monkeypatch, handler)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/v1/admin/providers/test-draft",
+        json={
+            "provider": "openai",
+            "enabled": True,
+            "capabilities": ["llm"],
+            "config": {"default_model": "gpt-4o-mini"},
+            "secret": {"api_key": "sk-unit-secret"},
+            "deep": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["last_validation_error"] is None
+    assert body["last_validated_at"] is not None
+    assert [probe["action"] for probe in body["probes"]] == [
+        "listed_models",
+        "chat_completion",
+    ]
+    assert all(probe["ok"] for probe in body["probes"])
+    # The request's deep flag reaches the probe engine.
+    assert calls and calls[0]["deep"] is True
+    assert "sk-unit-secret" not in response.text
+
+
+def test_saved_connection_test_populates_probes_and_status(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+
+    state = {"models_status": 200}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            if state["models_status"] != 200:
+                return httpx.Response(
+                    state["models_status"],
+                    json={"error": "bad key"},
+                )
+            return httpx.Response(200, json={"data": [{"id": "gpt-4o-mini"}]})
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={"choices": []})
+        raise AssertionError(request.url.path)
+
+    _patch_probe_transport(monkeypatch, handler)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "openai",
+            "label": "OpenAI",
+            "enabled": True,
+            "capabilities": ["llm"],
+            "config": {"default_model": "gpt-4o-mini"},
+            "secret": {"api_key": "sk-unit-secret"},
+        },
+    )
+    assert created.status_code == 201
+    connection_id = created.json()["id"]
+    # CRUD responses never carry probes — only POST /{id}/test does.
+    assert created.json()["probes"] is None
+
+    # Body is optional on the saved-row test route (defaults deep=False).
+    tested = client.post(f"/api/v1/admin/providers/{connection_id}/test")
+    assert tested.status_code == 200
+    body = tested.json()
+    assert [probe["action"] for probe in body["probes"]] == [
+        "listed_models",
+        "chat_completion",
+    ]
+    assert all(probe["ok"] for probe in body["probes"])
+    assert body["last_validation_error"] is None
+    assert body["last_validated_at"] is not None
+
+    # Auth failure → failed probe; last_validation_error keeps the
+    # "capability: detail" shape of the first failing probe.
+    state["models_status"] = 401
+    failed = client.post(
+        f"/api/v1/admin/providers/{connection_id}/test",
+        json={"deep": False},
+    )
+    assert failed.status_code == 200
+    fail_body = failed.json()
+    assert fail_body["last_validated_at"] is None
+    assert fail_body["last_validation_error"].startswith("llm: ")
+    assert any(probe["ok"] is False for probe in fail_body["probes"])

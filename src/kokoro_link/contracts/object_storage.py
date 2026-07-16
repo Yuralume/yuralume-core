@@ -38,6 +38,16 @@ class ObjectStorageError(Exception):
     """Base error for storage adapter failures."""
 
 
+class ObjectStorageUnavailableError(ObjectStorageError):
+    """Raised when the storage backend itself cannot be reached.
+
+    Distinct from :class:`ObjectStorageError` (which also covers
+    validation and backend HTTP-level failures) so callers can map
+    "the storage service is down / DNS does not resolve" to a 503-style
+    response instead of blaming the request.
+    """
+
+
 class ObjectNotFoundError(ObjectStorageError):
     """Raised when an object key does not exist."""
 
