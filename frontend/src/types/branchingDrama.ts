@@ -47,6 +47,13 @@ export interface BranchingDrama {
   total_segments: number
   status: BranchingDramaStatus
   error_message: string | null
+  /**
+   * Machine-readable failure reason for a `failed` job (plan U4b), from
+   * an open set the backend forwards verbatim. `insufficient_credits`
+   * is the only value the SPA acts on; anything else (or `null`, for an
+   * ordinary crash) falls through to the generic failure copy.
+   */
+  error_code?: string | null
   expected_node_count: number
   generated_node_count: number
   first_scene_image_path: string | null
@@ -62,6 +69,7 @@ export interface BranchingDramaSummary {
   total_segments: number
   status: BranchingDramaStatus
   error_message: string | null
+  error_code?: string | null
   created_at: string
   updated_at: string
 }

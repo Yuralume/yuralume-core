@@ -185,6 +185,47 @@ class SAOperatorProfileRepository(OperatorProfileRepositoryPort):
             await session.commit()
             return int(result.rowcount or 0)
 
+    async def set_identity_locale(
+        self,
+        operator_id: str,
+        *,
+        timezone_id: str | None = None,
+        primary_language: str | None = None,
+    ) -> OperatorProfile | None:
+        """Write the two pinned locale columns ``save`` refuses to touch.
+
+        The general upsert leaves ``timezone_id`` / ``primary_language``
+        alone on purpose (see ``save``), so the hosted locale-change flow
+        needs this narrow, explicit path. Values are normalised the same
+        way the entity does on load, and a no-op call still returns the
+        current row so callers can treat it as a read-through."""
+        normalised = (operator_id or "").strip()
+        if not normalised:
+            return None
+        next_timezone = (
+            normalise_timezone_id(timezone_id) if timezone_id is not None else None
+        )
+        next_language = (
+            normalise_language_tag(primary_language)
+            if primary_language is not None
+            else None
+        )
+        async with self._session_factory() as session:
+            row = await session.get(OperatorProfileRow, normalised)
+            if row is None:
+                return None
+            changed = False
+            if next_timezone is not None and row.timezone_id != next_timezone:
+                row.timezone_id = next_timezone
+                changed = True
+            if next_language is not None and row.primary_language != next_language:
+                row.primary_language = next_language
+                changed = True
+            if changed:
+                row.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+            return _row_to_entity(row)
+
     async def list_all(self) -> list[OperatorProfile]:
         """List every operator profile — used by admin user CRUD."""
         from sqlalchemy import select

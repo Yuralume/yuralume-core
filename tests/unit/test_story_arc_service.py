@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from kokoro_link.application.services.beat_retry_policy import BeatRetryPolicy
 from kokoro_link.application.services.story_arc_service import (
     ArcAdjustment,
     StoryArcService,
@@ -406,6 +407,58 @@ async def test_next_beat_due_returns_earliest_overdue_or_today() -> None:
     # Day before any beat.
     miss = await svc.next_beat_due(character.id, today=start - timedelta(days=1))
     assert miss is None
+
+
+@pytest.mark.asyncio
+async def test_next_beat_due_applies_structured_retry_backoff_and_limit() -> None:
+    svc, _, _ = _service()
+    character = _character()
+    start = date(2026, 5, 1)
+    arc = await svc.start_new_arc(character, today=start)
+    beat = arc.beats[0]
+    policy = BeatRetryPolicy(
+        max_attempts=3,
+        initial_backoff=timedelta(hours=1),
+        maximum_backoff=timedelta(hours=4),
+    )
+    first_attempt = datetime(2026, 5, 1, 8, 0, tzinfo=timezone.utc)
+
+    await svc.mark_beat_play_attempted(
+        beat_id=beat.id,
+        attempted_at=first_attempt,
+        source="scene_simulation",
+        result="failed",
+        push_intensity="autonomous_scene",
+    )
+
+    assert await svc.next_beat_due(
+        character.id,
+        today=start,
+        retry_policy=policy,
+        retry_at=first_attempt + timedelta(minutes=59),
+    ) is None
+    assert await svc.next_beat_due(
+        character.id,
+        today=start,
+        retry_policy=policy,
+        retry_at=first_attempt + timedelta(hours=1),
+    ) is not None
+
+    for hour in (9, 11):
+        await svc.mark_beat_play_attempted(
+            beat_id=beat.id,
+            attempted_at=datetime(2026, 5, 1, hour, 0, tzinfo=timezone.utc),
+            source="scene_simulation",
+            result="failed",
+            push_intensity="autonomous_scene",
+        )
+
+    assert await svc.next_beat_due(
+        character.id,
+        today=start,
+        retry_policy=policy,
+        retry_at=datetime(2026, 5, 20, tzinfo=timezone.utc),
+    ) is None
 
 
 @pytest.mark.asyncio

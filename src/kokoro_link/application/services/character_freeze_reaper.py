@@ -113,6 +113,13 @@ class CharacterFreezeReaper:
             freeze_failures=failures,
         )
 
+    async def idle_days_threshold(self) -> int | None:
+        """Return the active freeze threshold for best-effort policy checks."""
+        config = await self._load_config()
+        if not config.auto_freeze_enabled:
+            return None
+        return config.idle_days_threshold
+
     async def _load_config(self) -> CharacterFreezeRuntimeConfig:
         try:
             config = await self._settings_service.get(

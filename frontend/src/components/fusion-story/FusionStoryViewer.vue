@@ -12,6 +12,8 @@ import {
   type FusionStoryExportFormat,
 } from '@/utils/api/fusionStory'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { isInsufficientCreditsFailure } from '@/utils/studioFailure'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import FusionStoryExitHub from './FusionStoryExitHub.vue'
 import FusionStoryShareCardModal from './FusionStoryShareCardModal.vue'
 import FusionStoryStatusBadge from './FusionStoryStatusBadge.vue'
@@ -37,6 +39,14 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { locale } = useLocale()
 const { timeZone } = useTimezone()
+
+/**
+ * A background run that died for lack of credits is the one failure the
+ * player can act on, so it gets the shared top-up card instead of the raw
+ * `error_message` line. Every other code — and an ordinary crash, which
+ * carries no code at all — keeps the existing generic wording.
+ */
+const outOfCredits = computed(() => isInsufficientCreditsFailure(props.story))
 
 const outlineHint = ref('')
 const beatHint = ref('')
@@ -232,7 +242,8 @@ async function handlePolish() {
         <span>{{ t('fusionStory.viewer.length', { count: totalChars }) }}</span>
       </div>
       <p class="viewer__premise">{{ story.premise }}</p>
-      <p v-if="story.error_message" class="viewer__error">
+      <InsufficientCreditsNotice v-if="outOfCredits" class="viewer__credits" />
+      <p v-else-if="story.error_message" class="viewer__error">
         {{ t('fusionStory.viewer.failureReason', { reason: story.error_message }) }}
       </p>
       <div v-if="isBusy" class="viewer__progress">
@@ -461,6 +472,9 @@ async function handlePolish() {
 .viewer__error {
   color: var(--color-danger);
   margin: 4px 0 0;
+}
+.viewer__credits {
+  margin-top: 8px;
 }
 .viewer__progress {
   display: flex;

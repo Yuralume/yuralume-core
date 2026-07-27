@@ -23,13 +23,19 @@ interface AdminNavItem {
   group: 'overview' | 'character' | 'media' | 'behavior' | 'ops'
   debugOnly?: boolean
   cloudLocked?: boolean
+  /**
+   * Operator-only in hosted: a self-host owner keeps the entry, while a
+   * cloud tenant only sees it when the deployment operator turned the
+   * debug UI flag on. Mirrors `meta.cloudOperatorOnly` in the router.
+   */
+  cloudOperatorOnly?: boolean
 }
 
 const navItems: AdminNavItem[] = [
   { labelKey: 'admin.nav.overview', to: '/admin', group: 'overview' },
 
-  { labelKey: 'admin.nav.characters', to: '/admin/characters', group: 'character' },
-  { labelKey: 'admin.nav.memories', to: '/admin/memories', group: 'character' },
+  { labelKey: 'admin.nav.characters', to: '/admin/characters', group: 'character', cloudOperatorOnly: true },
+  { labelKey: 'admin.nav.memories', to: '/admin/memories', group: 'character', cloudOperatorOnly: true },
   { labelKey: 'admin.nav.disposition', to: '/admin/dispositions', group: 'character', debugOnly: true },
 
   { labelKey: 'admin.nav.providers', to: '/admin/providers', group: 'media', cloudLocked: true },
@@ -38,17 +44,17 @@ const navItems: AdminNavItem[] = [
   { labelKey: 'admin.nav.videoProfiles', to: '/admin/video-profiles', group: 'media', cloudLocked: true },
   { labelKey: 'admin.nav.voices', to: '/admin/voice', group: 'media', cloudLocked: true },
   { labelKey: 'admin.nav.loras', to: '/admin/loras', group: 'media', cloudLocked: true },
-  { labelKey: 'admin.nav.devDocs', to: '/admin/dev-docs', group: 'media' },
+  { labelKey: 'admin.nav.devDocs', to: '/admin/dev-docs', group: 'media', cloudLocked: true },
 
   { labelKey: 'admin.nav.proactive', to: '/admin/proactive', group: 'behavior', debugOnly: true },
-  { labelKey: 'admin.nav.schedule', to: '/admin/schedule', group: 'behavior' },
+  { labelKey: 'admin.nav.schedule', to: '/admin/schedule', group: 'behavior', cloudOperatorOnly: true },
   { labelKey: 'admin.nav.followUps', to: '/admin/follow-ups', group: 'behavior', debugOnly: true },
-  { labelKey: 'admin.nav.world', to: '/admin/world', group: 'behavior' },
+  { labelKey: 'admin.nav.world', to: '/admin/world', group: 'behavior', cloudOperatorOnly: true },
 
-  { labelKey: 'admin.nav.observability', to: '/admin/observability', group: 'ops' },
-  { labelKey: 'admin.nav.channels', to: '/admin/channels', group: 'ops' },
+  { labelKey: 'admin.nav.observability', to: '/admin/observability', group: 'ops', cloudLocked: true },
+  { labelKey: 'admin.nav.channels', to: '/admin/channels', group: 'ops', cloudOperatorOnly: true },
   { labelKey: 'admin.nav.siteSettings', to: '/admin/site-settings', group: 'ops', cloudLocked: true },
-  { labelKey: 'admin.nav.characterFreeze', to: '/admin/character-freeze', group: 'ops' },
+  { labelKey: 'admin.nav.characterFreeze', to: '/admin/character-freeze', group: 'ops', cloudOperatorOnly: true },
   { labelKey: 'admin.nav.users', to: '/admin/users', group: 'ops', cloudLocked: true },
 ]
 
@@ -75,6 +81,7 @@ const groupedNav = computed(() => {
   for (const item of navItems) {
     if (item.debugOnly && !debugUiEnabled.value) continue
     if (item.cloudLocked && cloudMode.value) continue
+    if (item.cloudOperatorOnly && cloudMode.value && !debugUiEnabled.value) continue
     groups[item.group].push(item)
   }
   return groups
@@ -120,28 +127,28 @@ const breadcrumb = computed(() => {
       />
 
       <nav class="admin-layout__nav">
-        <div
-          v-for="(items, group) in groupedNav"
-          :key="group"
-          class="admin-layout__nav-group"
-        >
-          <div class="admin-layout__nav-label">{{ t(groupLabelKeys[group]) }}</div>
-          <RouterLink
-            v-for="item in items"
-            :key="item.to"
-            :to="item.to"
-            class="admin-layout__nav-link"
-            :class="{ 'is-active': route.path === item.to || (item.to !== '/admin' && route.path.startsWith(item.to + '/')) }"
-          >
-            {{ t(item.labelKey) }}
-            <span
-              v-if="item.to === '/admin/models' && !modelRoutingDiscovered"
-              class="admin-layout__nav-dot"
-              :title="t('admin.nav.modelsDiscoveryHint')"
-              :aria-label="t('admin.nav.modelsDiscoveryHint')"
-            />
-          </RouterLink>
-        </div>
+        <!-- A group whose every entry is filtered out (hosted hides most of
+             the ops tooling) must not leave a lonely heading behind. -->
+        <template v-for="(items, group) in groupedNav" :key="group">
+          <div v-if="items.length > 0" class="admin-layout__nav-group">
+            <div class="admin-layout__nav-label">{{ t(groupLabelKeys[group]) }}</div>
+            <RouterLink
+              v-for="item in items"
+              :key="item.to"
+              :to="item.to"
+              class="admin-layout__nav-link"
+              :class="{ 'is-active': route.path === item.to || (item.to !== '/admin' && route.path.startsWith(item.to + '/')) }"
+            >
+              {{ t(item.labelKey) }}
+              <span
+                v-if="item.to === '/admin/models' && !modelRoutingDiscovered"
+                class="admin-layout__nav-dot"
+                :title="t('admin.nav.modelsDiscoveryHint')"
+                :aria-label="t('admin.nav.modelsDiscoveryHint')"
+              />
+            </RouterLink>
+          </div>
+        </template>
       </nav>
     </aside>
 

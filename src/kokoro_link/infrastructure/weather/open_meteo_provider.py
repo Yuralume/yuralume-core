@@ -21,7 +21,7 @@ container 在沒設定時 fallback 到 :class:`NullWeatherProvider`。
 from __future__ import annotations
 
 import logging
-import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,6 +45,18 @@ _DEFAULT_CACHE_TTL_SECONDS = 15 * 60
 
 _OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
+_DEFAULT_MAX_CACHED_LOCATIONS = 512
+"""LRU bound on the per-location payload cache.
+
+Self-host asks about one or two locations forever, so the cache was originally
+an unbounded dict and that was fine. Hosted resolves weather **per player**
+(``describe(location=...)`` with each operator's own coordinates), which makes
+the key space grow with the player base — an unbounded dict there is a slow leak
+in every process that renders a prompt (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §0.2
+G-6). 512 entries of one small forecast payload is a few hundred KB at worst and
+comfortably covers an active cohort; evicting the least-recently-used one costs
+a single upstream fetch, which is exactly what an expired TTL costs anyway."""
+
 
 class OpenMeteoWeatherProvider(WeatherContextPort):
     """Open-Meteo forecast adapter。"""
@@ -58,6 +70,7 @@ class OpenMeteoWeatherProvider(WeatherContextPort):
         timezone_id: str = "auto",
         cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS,
         http_client: httpx.AsyncClient | None = None,
+        max_cached_locations: int = _DEFAULT_MAX_CACHED_LOCATIONS,
     ) -> None:
         # Default coordinates come from deployment env and are now a
         # fallback only. Per-operator coordinates can be passed to
@@ -70,9 +83,12 @@ class OpenMeteoWeatherProvider(WeatherContextPort):
         self._cache_ttl = max(60, int(cache_ttl_seconds))
         # 注入 client 供測試替換；正式環境每次自己建短生命週期 client。
         self._client = http_client
-        self._cache_payloads: dict[
-            tuple[float, float, str], tuple[dict[str, Any], float]
-        ] = {}
+        self._max_cached_locations = max(1, int(max_cached_locations))
+        # Insertion-ordered = LRU order; the newest / most recently read key is
+        # always at the end, so eviction pops from the front.
+        self._cache_payloads: "OrderedDict[tuple[float, float, str], tuple[dict[str, Any], float]]" = (
+            OrderedDict()
+        )
 
     async def describe(
         self,
@@ -104,7 +120,12 @@ class OpenMeteoWeatherProvider(WeatherContextPort):
             payload, cached_at = cached
             elapsed = moment.timestamp() - cached_at
             if elapsed < self._cache_ttl:
+                # A fresh read is a use: keep it out of the eviction line.
+                self._cache_payloads.move_to_end(cache_key)
                 return payload
+            # Expired — drop it now rather than leaving a dead entry occupying
+            # a slot until it happens to be re-fetched.
+            del self._cache_payloads[cache_key]
         try:
             payload = await self._http_get(location)
         except (httpx.HTTPError, ValueError) as exc:
@@ -116,6 +137,9 @@ class OpenMeteoWeatherProvider(WeatherContextPort):
             )
             return None
         self._cache_payloads[cache_key] = (payload, moment.timestamp())
+        self._cache_payloads.move_to_end(cache_key)
+        while len(self._cache_payloads) > self._max_cached_locations:
+            self._cache_payloads.popitem(last=False)
         return payload
 
     async def _http_get(self, location: WeatherLocation) -> dict[str, Any]:

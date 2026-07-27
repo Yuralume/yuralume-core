@@ -10,6 +10,10 @@ from kokoro_link.application.services.operator_persona_service import (
     OperatorPersonaService,
 )
 from kokoro_link.application.services.memory_embedding import attach_embeddings
+from kokoro_link.contracts.background_activity_gate import (
+    BackgroundActivityClass,
+    BackgroundActivityGatePort,
+)
 from kokoro_link.contracts.character_peer_profile import (
     CharacterPeerProfileRepositoryPort,
 )
@@ -318,12 +322,25 @@ class CharacterSocialKnowledgeService:
         character_id: str,
         peer_character_id: str,
         relationship: CharacterRelationship | None = None,
+        *,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> CharacterPeerProfile | None:
         if self._consolidator is None:
             return None
         observer = await self._characters.get(character_id)
         peer = await self._characters.get(peer_character_id)
         if observer is None or peer is None:
+            return None
+        if observer.user_id != peer.user_id:
+            _LOGGER.warning(
+                "peer knowledge skipped cross-operator pair=%s->%s",
+                character_id,
+                peer_character_id,
+            )
+            return None
+        if gate is not None and not await gate.allows(
+            observer, BackgroundActivityClass.PEER_KNOWLEDGE,
+        ):
             return None
         # A frozen character halts all background consolidation
         # (CHARACTER_FREEZE_PLAN) — skip the peer-knowledge LLM call when
@@ -363,6 +380,7 @@ class CharacterSocialKnowledgeService:
         self,
         *,
         limit: int = _CONSOLIDATION_PAIR_LIMIT,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> PeerKnowledgeTickResult:
         if self._consolidator is None:
             return PeerKnowledgeTickResult()
@@ -388,6 +406,7 @@ class CharacterSocialKnowledgeService:
                         character_id=character_id,
                         peer_character_id=perspective.peer_character_id,
                         relationship=relationship,
+                        gate=gate,
                     )
                 except Exception:
                     failed += 1
@@ -400,6 +419,66 @@ class CharacterSocialKnowledgeService:
                     skipped += 1
                 else:
                     consolidated.append((character_id, perspective.peer_character_id))
+        return PeerKnowledgeTickResult(
+            consolidated=len(consolidated),
+            skipped=skipped,
+            failed=failed,
+            consolidated_pairs=tuple(consolidated),
+        )
+
+    async def consolidate_for(
+        self,
+        character_id: str,
+        *,
+        gate: BackgroundActivityGatePort | None = None,
+    ) -> PeerKnowledgeTickResult:
+        """Consolidate *one* character's peer profiles across its relationships.
+
+        The per-character ``peer_knowledge`` due chain (§13 split) drives this
+        instead of the whole-table ``consolidate_due`` sweep: each character's own
+        chain refreshes only its own side of every enabled relationship, so the
+        peer's side is owned by the peer's own chain (no double work, no cross
+        -character fan-out). Delegates to the SAME :meth:`consolidate` used by the
+        sweep — the per-pair gate / freeze / novelty logic is shared, not copied.
+        """
+        if self._consolidator is None:
+            return PeerKnowledgeTickResult()
+        try:
+            relationships = await self._relationships.list_for_character(character_id)
+        except Exception:
+            _LOGGER.exception(
+                "peer knowledge per-character relationship lookup failed character=%s",
+                character_id,
+            )
+            return PeerKnowledgeTickResult()
+        consolidated: list[tuple[str, str]] = []
+        skipped = 0
+        failed = 0
+        for relationship in relationships:
+            if not relationship.enabled:
+                continue
+            try:
+                perspective = relationship.perspective_for(character_id)
+            except ValueError:
+                continue
+            try:
+                profile = await self.consolidate(
+                    character_id=character_id,
+                    peer_character_id=perspective.peer_character_id,
+                    relationship=relationship,
+                    gate=gate,
+                )
+            except Exception:
+                failed += 1
+                _LOGGER.exception(
+                    "peer knowledge consolidation failed character=%s peer=%s",
+                    character_id, perspective.peer_character_id,
+                )
+                continue
+            if profile is None:
+                skipped += 1
+            else:
+                consolidated.append((character_id, perspective.peer_character_id))
         return PeerKnowledgeTickResult(
             consolidated=len(consolidated),
             skipped=skipped,

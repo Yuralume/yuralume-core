@@ -120,8 +120,8 @@ def test_merge_requires_all_candidates_same_layer_and_key():
 
 def test_supersede_must_match_confirmed_field_and_candidates():
     existing = _field("field-1", field_key="occupation", layer=1)
-    c1 = _candidate("c1", field_key="name", layer=1, value="丹尼")
-    c2 = _candidate("c2", field_key="name", layer=1, value="丹尼")
+    c1 = _candidate("c1", field_key="name", layer=1, value="艾力")
+    c2 = _candidate("c2", field_key="name", layer=1, value="艾力")
 
     result = _parse_response(
         _raw([
@@ -131,7 +131,7 @@ def test_supersede_must_match_confirmed_field_and_candidates():
                 "candidate_ids": ["c1", "c2"],
                 "field_key": "name",
                 "layer": 1,
-                "new_value": "丹尼",
+                "new_value": "艾力",
                 "new_confidence": 0.9,
                 "reason": "new evidence",
             },

@@ -12,6 +12,7 @@ from kokoro_link.api.dependencies import (
     get_owned_character,
     require_admin,
 )
+from kokoro_link.api.routes._cloud_errors import insufficient_credits_guard
 from kokoro_link.api.character_runtime import (
     ensure_character_primary_image,
     enqueue_character_runtime_initialization,
@@ -929,11 +930,12 @@ async def generate_character_portrait(
     """Render a portrait via ComfyUI and append it to the character's
     permanent image library (same store as manual uploads)."""
     try:
-        updated = await container.character_image_service.generate_portrait(
-            character_id,
-            positive=payload.positive,
-            aspect=payload.aspect,
-        )
+        with insufficient_credits_guard():
+            updated = await container.character_image_service.generate_portrait(
+                character_id,
+                positive=payload.positive,
+                aspect=payload.aspect,
+            )
     except GenerationDisabledError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -985,12 +987,13 @@ async def generate_candidate_portraits(
 ) -> GenerateCandidatesResponse:
     """Render a batch of candidate portraits (gacha flow)."""
     try:
-        _, urls = await container.character_image_service.generate_candidates(
-            character_id,
-            positive=payload.positive,
-            aspect=payload.aspect,
-            count=payload.count,
-        )
+        with insufficient_credits_guard():
+            _, urls = await container.character_image_service.generate_candidates(
+                character_id,
+                positive=payload.positive,
+                aspect=payload.aspect,
+                count=payload.count,
+            )
     except GenerationDisabledError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),

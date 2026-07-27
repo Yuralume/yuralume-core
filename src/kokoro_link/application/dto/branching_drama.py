@@ -127,6 +127,12 @@ class BranchingDramaResponse(BaseModel):
     total_segments: int
     status: str
     error_message: str | None = None
+    error_code: str | None = None
+    """Machine-readable failure reason for a ``failed`` drama (U4b).
+
+    Creation is 202 + poll, so this is the only channel by which a
+    player-actionable refusal (``insufficient_credits``) reaches the
+    client. ``None`` for ordinary crashes."""
     expected_node_count: int
     generated_node_count: int = 0
     first_scene_image_path: str | None = None
@@ -157,6 +163,7 @@ class BranchingDramaResponse(BaseModel):
             total_segments=drama.total_segments,
             status=drama.status,
             error_message=drama.error_message,
+            error_code=drama.error_code,
             expected_node_count=drama.expected_node_count(),
             generated_node_count=generated_node_count,
             first_scene_image_path=first_scene_image_path,
@@ -173,6 +180,7 @@ class BranchingDramaSummaryResponse(BaseModel):
     total_segments: int
     status: str
     error_message: str | None = None
+    error_code: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -187,6 +195,7 @@ class BranchingDramaSummaryResponse(BaseModel):
             total_segments=drama.total_segments,
             status=drama.status,
             error_message=drama.error_message,
+            error_code=drama.error_code,
             created_at=drama.created_at,
             updated_at=drama.updated_at,
         )

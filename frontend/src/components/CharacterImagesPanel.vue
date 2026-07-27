@@ -11,12 +11,26 @@ import {
   type PortraitAspect,
 } from '@/utils/api/characters'
 import { transferStageToAlbum } from '@/utils/api/album'
+import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { UiButton } from '@/components/ui'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
+import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   character: Character
-}>()
+  /**
+   * Operator-grade wording (which image channel is used, LoRA vs OpenAI
+   * behaviour). Defaulted to `true` — explicitly, because Vue would
+   * otherwise cast an absent Boolean prop to `false` — so the self-host
+   * panel stays byte-identical; the hosted player surface passes `false`
+   * and gets copy that says what happens rather than how it is wired
+   * (plan U1-A).
+   */
+  showTechnicalHints?: boolean
+}>(), {
+  showTechnicalHints: true,
+})
 
 const emit = defineEmits<{
   updated: [char: Character]
@@ -25,9 +39,19 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const confirmDialog = useConfirmDialog()
 
+const generateHint = computed(() => (
+  props.showTechnicalHints
+    ? t('characterImagesPanel.generate.hint')
+    : t('characterImagesPanel.generate.hintCloud')
+))
+
 const uploading = ref(false)
 const busyUrl = ref<string | null>(null)
 const errorMsg = ref<string | null>(null)
+// Generation refused for lack of credits: shown as the shared notice card
+// rather than in the generic error line, so the "nothing was charged" promise
+// and the top-up CTA travel with it.
+const creditsExhausted = ref(false)
 
 const generating = ref(false)
 const committing = ref(false)
@@ -114,16 +138,21 @@ async function handleArchive(url: string) {
 async function handleGenerate() {
   const positive = generatePrompt.value.trim()
   if (!positive) {
-    errorMsg.value = t('characterImagesPanel.errors.promptRequired')
+    errorMsg.value = props.showTechnicalHints
+      ? t('characterImagesPanel.errors.promptRequired')
+      : t('characterImagesPanel.errors.promptRequiredCloud')
     return
   }
   generating.value = true
   errorMsg.value = null
+  creditsExhausted.value = false
   try {
     const res = await generatePortraitCandidates(
       props.character.id, positive, generateAspect.value, generateCount.value,
     )
     candidateUrls.value = res.candidates
+    // Candidates are back, so the charge already happened — settle the badge.
+    refreshCloudCreditsAfterAction()
     // Default: every candidate pre-selected for stage — saves a click
     // when user wants to keep them all. Click cycles into album
     // or discard per-tile.
@@ -131,7 +160,11 @@ async function handleGenerate() {
     for (const url of res.candidates) fresh.set(url, 'stage')
     candidateTargets.value = fresh
   } catch (err) {
-    errorMsg.value = extractError(err) ?? t('characterImagesPanel.errors.generateFailed')
+    if (isInsufficientCreditsError(err)) {
+      creditsExhausted.value = true
+    } else {
+      errorMsg.value = extractError(err) ?? t('characterImagesPanel.errors.generateFailed')
+    }
   } finally {
     generating.value = false
   }
@@ -328,7 +361,7 @@ if (typeof window !== 'undefined') {
     <div class="generate-section">
       <div class="generate-title">{{ t('characterImagesPanel.generate.title') }}</div>
       <div class="generate-hint">
-        {{ t('characterImagesPanel.generate.hint') }}
+        {{ generateHint }}
       </div>
       <textarea
         v-model="generatePrompt"
@@ -369,6 +402,7 @@ if (typeof window !== 'undefined') {
     </div>
 
     <div v-if="errorMsg" class="images-error">{{ errorMsg }}</div>
+    <InsufficientCreditsNotice v-if="creditsExhausted" class="images-credits-notice" />
 
     <!-- 候選 modal：Teleport 到 body 才不會被側邊欄的窄版型擠到。
          背景點擊刻意不關閉（會搞丟剛生成的圖）；關閉動作走明確按鈕或 ESC。 -->
@@ -583,6 +617,10 @@ if (typeof window !== 'undefined') {
   border-radius: 6px;
   color: #ff8a75;
   font-size: 12px;
+}
+
+.images-credits-notice {
+  margin-top: 8px;
 }
 
 .generate-section {

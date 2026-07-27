@@ -31,6 +31,12 @@ if TYPE_CHECKING:
     )
 
 from kokoro_link.application.services.character_service import CharacterService
+from kokoro_link.application.services.studio_execution_lease import (
+    LEASE_ABANDONED,
+    StudioExecutionLease,
+    StudioLeaseLost,
+    StudioLeaseSession,
+)
 from kokoro_link.application.services.fusion_character_brief import (
     CharacterBrief,
     FusionCharacterBriefBuilder,
@@ -43,6 +49,9 @@ from kokoro_link.application.services.fusion_story_planner import (
 )
 from kokoro_link.application.services.fusion_story_polisher import (
     FusionStoryPolisher,
+)
+from kokoro_link.application.services.studio_failure import (
+    failure_error_code,
 )
 from kokoro_link.application.services.fusion_story_writer import (
     FusionStoryWriter,
@@ -123,6 +132,8 @@ class FusionStoryService:
         critic: FusionStoryCritic,
         jobs: StudioJobRepositoryPort | None = None,
         notifications: "NotificationService | None" = None,
+        execution_lease: StudioExecutionLease | None = None,
+        lease_heartbeat_interval_seconds: float | None = None,
     ) -> None:
         self._repository = repository
         self._character_service = character_service
@@ -134,6 +145,10 @@ class FusionStoryService:
         # Durable job ledger (C0). ``None`` keeps the pre-C0 fire-and-
         # forget behaviour for rigs that don't care about restarts.
         self._jobs = jobs
+        # Per-target cross-replica execution lease (Phase 4 前置). ``None`` →
+        # the historical lock-only path (self-host / lease-less rigs).
+        self._execution_lease = execution_lease
+        self._lease_heartbeat_interval = lease_heartbeat_interval_seconds
         # Web-push completion notify (C0 生成體驗). Fires from job
         # finalization so recovery-resumed pipelines notify too.
         self._notifications = notifications
@@ -396,27 +411,42 @@ class FusionStoryService:
         ctx: _PipelineContext,
         *,
         previous_outline: FusionOutline | None = None,
-    ) -> None:
+    ) -> str | None:
         async with self._lock_for(ctx.story_id):
-            try:
-                await self._stage_plan(
-                    ctx, previous_outline=previous_outline,
-                )
-                await self._stage_write_all(ctx)
-                await self._stage_polish(ctx)
-            except _PipelineAbort as abort:
-                _LOGGER.warning(
-                    "fusion pipeline aborted story=%s reason=%s",
-                    ctx.story_id, abort.reason,
-                )
-                await self._mark_failed(ctx.story_id, reason=abort.reason)
-            except Exception:
-                _LOGGER.exception(
-                    "fusion pipeline crashed story=%s", ctx.story_id,
-                )
-                await self._mark_failed(
-                    ctx.story_id, reason="pipeline crashed",
-                )
+            async with self._lease_session(ctx.story_id) as lease:
+                if not lease.acquired:
+                    self._log_lease_skip(ctx.story_id)
+                    return LEASE_ABANDONED
+                try:
+                    await self._stage_plan(
+                        ctx, previous_outline=previous_outline, lease=lease,
+                    )
+                    lease.raise_if_lost()
+                    await self._stage_write_all(ctx, lease=lease)
+                    lease.raise_if_lost()
+                    await self._stage_polish(ctx, lease=lease)
+                except StudioLeaseLost:
+                    self._log_lease_lost(ctx.story_id)
+                    return LEASE_ABANDONED
+                except _PipelineAbort as abort:
+                    _LOGGER.warning(
+                        "fusion pipeline aborted story=%s reason=%s",
+                        ctx.story_id, abort.reason,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason=abort.reason,
+                        error_code=failure_error_code(abort),
+                    )
+                except Exception as exc:
+                    _LOGGER.exception(
+                        "fusion pipeline crashed story=%s", ctx.story_id,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason="pipeline crashed",
+                        error_code=failure_error_code(exc),
+                    )
 
     async def _run_beat_iteration(
         self,
@@ -424,42 +454,69 @@ class FusionStoryService:
         *,
         beat_index: int,
         hint: str | None,
-    ) -> None:
+    ) -> str | None:
         async with self._lock_for(ctx.story_id):
-            try:
-                await self._stage_rewrite_beat(
-                    ctx, beat_index=beat_index, hint=hint,
-                )
-                await self._stage_polish(ctx)
-            except _PipelineAbort as abort:
-                _LOGGER.warning(
-                    "fusion beat iteration aborted story=%s reason=%s",
-                    ctx.story_id, abort.reason,
-                )
-                await self._mark_failed(ctx.story_id, reason=abort.reason)
-            except Exception:
-                _LOGGER.exception(
-                    "fusion beat iteration crashed story=%s", ctx.story_id,
-                )
-                await self._mark_failed(
-                    ctx.story_id, reason="iteration crashed",
-                )
+            async with self._lease_session(ctx.story_id) as lease:
+                if not lease.acquired:
+                    self._log_lease_skip(ctx.story_id)
+                    return LEASE_ABANDONED
+                try:
+                    await self._stage_rewrite_beat(
+                        ctx, beat_index=beat_index, hint=hint, lease=lease,
+                    )
+                    lease.raise_if_lost()
+                    await self._stage_polish(ctx, lease=lease)
+                except StudioLeaseLost:
+                    self._log_lease_lost(ctx.story_id)
+                    return LEASE_ABANDONED
+                except _PipelineAbort as abort:
+                    _LOGGER.warning(
+                        "fusion beat iteration aborted story=%s reason=%s",
+                        ctx.story_id, abort.reason,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason=abort.reason,
+                        error_code=failure_error_code(abort),
+                    )
+                except Exception as exc:
+                    _LOGGER.exception(
+                        "fusion beat iteration crashed story=%s", ctx.story_id,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason="iteration crashed",
+                        error_code=failure_error_code(exc),
+                    )
 
-    async def _run_polish_only(self, ctx: _PipelineContext) -> None:
+    async def _run_polish_only(self, ctx: _PipelineContext) -> str | None:
         async with self._lock_for(ctx.story_id):
-            try:
-                await self._stage_polish(ctx)
-            except _PipelineAbort as abort:
-                await self._mark_failed(ctx.story_id, reason=abort.reason)
-            except Exception:
-                _LOGGER.exception(
-                    "fusion polish crashed story=%s", ctx.story_id,
-                )
-                await self._mark_failed(
-                    ctx.story_id, reason="polish crashed",
-                )
+            async with self._lease_session(ctx.story_id) as lease:
+                if not lease.acquired:
+                    self._log_lease_skip(ctx.story_id)
+                    return LEASE_ABANDONED
+                try:
+                    await self._stage_polish(ctx, lease=lease)
+                except StudioLeaseLost:
+                    self._log_lease_lost(ctx.story_id)
+                    return LEASE_ABANDONED
+                except _PipelineAbort as abort:
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason=abort.reason,
+                        error_code=failure_error_code(abort),
+                    )
+                except Exception as exc:
+                    _LOGGER.exception(
+                        "fusion polish crashed story=%s", ctx.story_id,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason="polish crashed",
+                        error_code=failure_error_code(exc),
+                    )
 
-    async def _run_write_and_polish(self, ctx: _PipelineContext) -> None:
+    async def _run_write_and_polish(self, ctx: _PipelineContext) -> str | None:
         """Resume runner for a pipeline interrupted mid-``writing``.
 
         The persisted outline is the checkpoint — ``_stage_write_all``
@@ -467,22 +524,36 @@ class FusionStoryService:
         beats cost LLM calls before the polish stage locks in the text.
         """
         async with self._lock_for(ctx.story_id):
-            try:
-                await self._stage_write_all(ctx)
-                await self._stage_polish(ctx)
-            except _PipelineAbort as abort:
-                _LOGGER.warning(
-                    "fusion resume aborted story=%s reason=%s",
-                    ctx.story_id, abort.reason,
-                )
-                await self._mark_failed(ctx.story_id, reason=abort.reason)
-            except Exception:
-                _LOGGER.exception(
-                    "fusion resume crashed story=%s", ctx.story_id,
-                )
-                await self._mark_failed(
-                    ctx.story_id, reason="pipeline crashed",
-                )
+            async with self._lease_session(ctx.story_id) as lease:
+                if not lease.acquired:
+                    self._log_lease_skip(ctx.story_id)
+                    return LEASE_ABANDONED
+                try:
+                    await self._stage_write_all(ctx, lease=lease)
+                    lease.raise_if_lost()
+                    await self._stage_polish(ctx, lease=lease)
+                except StudioLeaseLost:
+                    self._log_lease_lost(ctx.story_id)
+                    return LEASE_ABANDONED
+                except _PipelineAbort as abort:
+                    _LOGGER.warning(
+                        "fusion resume aborted story=%s reason=%s",
+                        ctx.story_id, abort.reason,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason=abort.reason,
+                        error_code=failure_error_code(abort),
+                    )
+                except Exception as exc:
+                    _LOGGER.exception(
+                        "fusion resume crashed story=%s", ctx.story_id,
+                    )
+                    await self._mark_failed(
+                        ctx.story_id,
+                        reason="pipeline crashed",
+                        error_code=failure_error_code(exc),
+                    )
 
     # ---- internal: durable job ledger (C0) ---------------------------
 
@@ -523,7 +594,12 @@ class FusionStoryService:
     async def _run_tracked(
         self, job: StudioGenerationJob, runner,
     ) -> None:
-        await runner
+        result = await runner
+        if result == LEASE_ABANDONED:
+            # The target's lease is held by / was reclaimed by another replica —
+            # that owner finalizes the job. Do NOT touch it here or we would race
+            # the legitimate writer.
+            return
         await self._finalize_job(job)
 
     async def _finalize_job(self, job: StudioGenerationJob) -> None:
@@ -703,6 +779,7 @@ class FusionStoryService:
         ctx: _PipelineContext,
         *,
         previous_outline: FusionOutline | None,
+        lease: StudioLeaseSession | None = None,
     ) -> None:
         outline = await self._plan_with_language(
             prompt=ctx.prompt,
@@ -710,11 +787,20 @@ class FusionStoryService:
             previous_outline=previous_outline,
             operator_primary_language=ctx.operator_primary_language,
         )
+        # Lease re-verify after the planner await, before persisting the outline —
+        # a stolen lease must not clobber the reclaiming owner's outline / status.
+        if lease is not None:
+            lease.raise_if_lost()
         story = await self._must_load(ctx.story_id)
         story = story.with_outline(outline)
         await self._repository.save(story)
 
-    async def _stage_write_all(self, ctx: _PipelineContext) -> None:
+    async def _stage_write_all(
+        self,
+        ctx: _PipelineContext,
+        *,
+        lease: StudioLeaseSession | None = None,
+    ) -> None:
         story = await self._must_load(ctx.story_id)
         outline = story.outline
         if outline is None:
@@ -727,6 +813,11 @@ class FusionStoryService:
         running_summary_parts: list[str] = []
         last_tail: str = ""
         for plan in outline.beats:
+            # Bounded cross-replica abort: a lease stolen mid-run stops the loop
+            # before the next beat's LLM call, so the reclaiming replica owns the
+            # writes from here on (at most one beat overlaps).
+            if lease is not None:
+                lease.raise_if_lost()
             beat_id = _find_beat_id(story.beats, plan)
             existing = _beat_content(story.beats, beat_id)
             if existing.strip():
@@ -751,6 +842,12 @@ class FusionStoryService:
             )
             running_summary_parts.append(_summarise_beat(plan, content))
             last_tail = _extract_tail(content)
+            # Re-verify the lease AFTER the writer's provider await and BEFORE the
+            # save: a lease stolen during the (long) beat-writing round-trip must
+            # not let this losing replica overwrite the reclaiming owner's beat.
+            # The loop-top check only covers a lease lost between beats.
+            if lease is not None:
+                lease.raise_if_lost()
             story = await self._must_load(ctx.story_id)
             story = story.with_beat_content(beat_id=beat_id, content=content)
             await self._repository.save(story)
@@ -761,6 +858,7 @@ class FusionStoryService:
         *,
         beat_index: int,
         hint: str | None,
+        lease: StudioLeaseSession | None = None,
     ) -> None:
         story = await self._must_load(ctx.story_id)
         outline = story.outline
@@ -799,13 +897,19 @@ class FusionStoryService:
             regenerate_hint=hint,
             operator_primary_language=ctx.operator_primary_language,
         )
+        # Lease re-verify after the writer await, before persisting the beat.
+        if lease is not None:
+            lease.raise_if_lost()
         story = await self._must_load(ctx.story_id)
         story = story.with_beat_content(
             beat_id=target_beat.id, content=content,
         )
         await self._repository.save(story)
 
-    async def _stage_polish(self, ctx: _PipelineContext) -> None:
+    async def _stage_polish(
+        self, ctx: _PipelineContext, *,
+        lease: StudioLeaseSession | None = None,
+    ) -> None:
         story = await self._must_load(ctx.story_id)
         if story.outline is None or not story.beats:
             raise _PipelineAbort("missing outline or beats")
@@ -842,6 +946,10 @@ class FusionStoryService:
                 operator_primary_language=ctx.operator_primary_language,
             )
 
+        # Lease re-verify after the critic/polish awaits, before locking in the
+        # final text — a stolen lease must not overwrite the reclaiming owner.
+        if lease is not None:
+            lease.raise_if_lost()
         story = await self._must_load(ctx.story_id)
         story = story.with_full_text(draft_text)
         await self._repository.save(story)
@@ -983,7 +1091,20 @@ class FusionStoryService:
             raise _PipelineAbort(f"story {story_id} disappeared mid-pipeline")
         return story
 
-    async def _mark_failed(self, story_id: str, *, reason: str) -> None:
+    async def _mark_failed(
+        self,
+        story_id: str,
+        *,
+        reason: str,
+        error_code: str | None = None,
+    ) -> None:
+        """Persist the terminal ``failed`` state for ``story_id``.
+
+        ``error_code`` carries the cloud gateway's machine-readable refusal
+        (see :mod:`~kokoro_link.application.services.studio_failure`) so the
+        polling client can distinguish "you're out of 螢火" from a genuine
+        fault; it stays ``None`` for ordinary crashes.
+        """
         try:
             story = await self._repository.get(story_id)
         except Exception:
@@ -996,7 +1117,11 @@ class FusionStoryService:
             return
         try:
             await self._repository.save(
-                story.with_status(STATUS_FAILED, error_message=reason),
+                story.with_status(
+                    STATUS_FAILED,
+                    error_message=reason,
+                    error_code=error_code,
+                ),
             )
         except Exception:
             _LOGGER.exception(
@@ -1022,6 +1147,29 @@ class FusionStoryService:
             lock = asyncio.Lock()
             self._locks[story_id] = lock
         return lock
+
+    def _lease_session(self, story_id: str) -> StudioLeaseSession:
+        return StudioLeaseSession(
+            self._execution_lease,
+            story_id,
+            heartbeat_interval_seconds=self._lease_heartbeat_interval,
+        )
+
+    def _log_lease_skip(self, story_id: str) -> None:
+        # Another replica holds the target's lease → do NOT drive or clobber it;
+        # the owner finalizes both story and job. (Distributed-only; the
+        # in-memory lease in a single process always acquires.)
+        _LOGGER.info(
+            "fusion: target leased by another replica, skipping story=%s",
+            story_id,
+        )
+
+    def _log_lease_lost(self, story_id: str) -> None:
+        _LOGGER.warning(
+            "fusion: lease lost mid-run story=%s — abandoning to the "
+            "reclaiming replica (no story/job write)",
+            story_id,
+        )
 
 
 # --- module-level helpers --------------------------------------------

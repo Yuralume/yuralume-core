@@ -250,6 +250,15 @@ inner motive and conversational purpose worth spending today's proactive
 slot now. This is a reasoning-heavy call; operators often pin it to a
 stronger model than ordinary short-form composers."""
 
+FEATURE_PROACTIVE_MESSAGE = "proactive_message"
+"""Autonomous proactive message composition.
+
+Distinct from FEATURE_PROACTIVE_INTENTION: the intention judge decides whether
+a message is warranted, while this feature writes the player-visible message
+(and may request an allowed tool). It is always autonomous background work, so
+hosted billing and routing must never let it fall back to the chat key.
+"""
+
 FEATURE_TTS_TRANSLATE = "tts_translate"
 """Pre-TTS dubbing translator. When the character voice is native to
 language A but the chat reply is in language B, the translator
@@ -510,6 +519,7 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_BUSY_FOLLOW_UP,
     FEATURE_SCHEDULED_PROMISE,
     FEATURE_PROACTIVE_INTENTION,
+    FEATURE_PROACTIVE_MESSAGE,
     FEATURE_TTS_TRANSLATE,
     FEATURE_CARD_TRANSLATE,
     FEATURE_ARC_TEMPLATE_TRANSLATE,
@@ -612,6 +622,7 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_BUSY_FOLLOW_UP: "忙碌延遲：補回完整回覆",
     FEATURE_SCHEDULED_PROMISE: "排程承諾：依約定時間主動發訊息",
     FEATURE_PROACTIVE_INTENTION: "主動訊息：內心動機審核",
+    FEATURE_PROACTIVE_MESSAGE: "主動訊息：角色訊息生成",
     FEATURE_TTS_TRANSLATE: "語音翻譯（dubbing）",
     FEATURE_CARD_TRANSLATE: "角色卡翻譯",
     FEATURE_ARC_TEMPLATE_TRANSLATE: "劇本範本翻譯",
@@ -738,6 +749,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_CHAT,
         FEATURE_BUSY_FOLLOW_UP,
         FEATURE_SCHEDULED_PROMISE,
+        FEATURE_PROACTIVE_MESSAGE,
         FEATURE_FEED_COMPOSE,
         FEATURE_FEED_COMMENT_REPLY,
         FEATURE_CHARACTER_DRAFT,

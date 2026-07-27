@@ -1,5 +1,7 @@
 import axios from 'axios'
 
+import type { LocationHint } from '@/types/playerLocale'
+
 const BASE = '/api/v1/auth'
 
 export interface AuthUser {
@@ -15,10 +17,12 @@ export interface AuthUser {
   email: string | null
   is_admin: boolean
   /**
-   * BCP 47 tag picked at registration / setup. Immutable on the
-   * backend (no PATCH endpoint). The frontend reads this to:
+   * BCP 47 tag picked at registration / setup. Immutable in self-host
+   * (repair CLI only); hosted players may change it through the guarded
+   * `PATCH /auth/me/locale` (plan G2). The frontend reads this to:
    *  1. switch the UI locale after login/token bootstrap,
-   *  2. display the "primary language" read-only field in settings.
+   *  2. render the "primary language" field in settings — read-only on
+   *     self-host, editable-with-a-warning in cloud mode.
    */
   primary_language: string
   /**
@@ -30,6 +34,14 @@ export interface AuthUser {
   latitude: number | null
   longitude: number | null
   location_label: string | null
+  /**
+   * Hosted locale lifecycle projection, served **only** by `GET /auth/me`
+   * (plan G2). Both are additive and always falsy in self-host, so every
+   * consumer must treat them as optional: login / setup / user-CRUD
+   * payloads keep their exact previous shape and never carry them.
+   */
+  needs_locale_confirmation?: boolean
+  location_hint?: LocationHint | null
 }
 
 export interface BuildMetadata {
@@ -59,6 +71,13 @@ export interface AuthConfig {
    * remain reachable either way.
    */
   debug_ui_enabled?: boolean
+  /**
+   * Absolute URL of the Yuralume account Portal, advertised only by hosted
+   * (cloud) deployments that configured `YURALUME_CLOUD_PORTAL_URL`.
+   * Self-host always returns null, so every consumer must treat the link as
+   * optional rather than assuming a Portal exists.
+   */
+  portal_url?: string | null
 }
 
 export interface AuthTokenResponse {

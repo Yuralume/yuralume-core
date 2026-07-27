@@ -73,6 +73,10 @@ if TYPE_CHECKING:
     from kokoro_link.application.services.subscription_access_guard import (
         SubscriptionAccessGuard,
     )
+    from kokoro_link.contracts.background_jobs import (
+        BackgroundCoordinatorLeasePort,
+        BackgroundJobQueuePort,
+    )
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -274,6 +278,11 @@ class CharacterService:
         ) = None,
         clock: ClockPort | None = None,
         subscription_access_guard: "SubscriptionAccessGuard | None" = None,
+        background_job_queue: "BackgroundJobQueuePort | None" = None,
+        background_coordinator_lease: (
+            "BackgroundCoordinatorLeasePort | None"
+        ) = None,
+        warmup_enqueue_enabled: bool = False,
     ) -> None:
         self._repository = repository
         self._conversation_repository = conversation_repository
@@ -303,6 +312,12 @@ class CharacterService:
         self._account_runtime_usage_repository = account_runtime_usage_repository
         self._clock = clock
         self._subscription_access_guard = subscription_access_guard
+        # P3-C durable warmup. Wired ONLY on the hosted opt-in (queue + lease
+        # present AND background_backend=='postgres'); on the self-host default
+        # all three stay unset and create_character is byte-identical.
+        self._background_job_queue = background_job_queue
+        self._background_coordinator_lease = background_coordinator_lease
+        self._warmup_enqueue_enabled = warmup_enqueue_enabled
 
     async def create_character(
         self,
@@ -384,7 +399,61 @@ class CharacterService:
         except Exception:
             await self._repository.delete(character.id)
             raise
+        await self._enqueue_character_warmup(character, now=now)
         return CharacterResponse.from_domain(character)
+
+    async def _enqueue_character_warmup(
+        self, character: Character, *, now: datetime,
+    ) -> None:
+        """Best-effort durable warmup enqueue (P3-C, distributed mode only).
+
+        Deviation from single-transaction creation: character creation already
+        spans multiple commits (save + seed + usage), so a same-transaction
+        enqueue is impossible today. This is at-least-once and NON-fatal — an
+        enqueue failure (no coordinator lease held, DB blip) is logged, not
+        raised; the self-heal path is the next bucket's ``character_tick``, which
+        does the same ensure_schedule + rest-recovery work. Fenced against the
+        current coordinator epoch: with no live leader the enqueue is a no-op
+        ``None``, same as any other stale-epoch enqueue."""
+        if (
+            not self._warmup_enqueue_enabled
+            or self._background_job_queue is None
+            or self._background_coordinator_lease is None
+        ):
+            return
+        try:
+            from kokoro_link.application.services.background_shadow_coordinator import (
+                CHARACTER_WARMUP_KIND,
+            )
+            from kokoro_link.contracts.background_jobs import (
+                COORDINATOR_LEASE_NAME,
+                BackgroundJobSpec,
+            )
+
+            current = await self._background_coordinator_lease.current(
+                COORDINATOR_LEASE_NAME,
+            )
+            if current is None:
+                return  # no leader → the enqueue would be fenced out anyway
+            _owner, epoch, _until = current
+            await self._background_job_queue.enqueue(
+                BackgroundJobSpec(
+                    kind=CHARACTER_WARMUP_KIND,
+                    idempotency_key=f"{CHARACTER_WARMUP_KIND}:{character.id}",
+                    due_at=now,
+                    fencing_epoch=epoch,
+                    priority=2,
+                    operator_id=character.user_id or None,
+                    character_id=character.id,
+                    payload={"character_id": character.id},
+                ),
+                now=now,
+            )
+        except Exception:
+            _LOGGER.warning(
+                "character warmup enqueue failed character=%s (self-heals on "
+                "next tick)", character.id, exc_info=True,
+            )
 
     async def _validate_runtime_profile_allows_character_create(
         self,

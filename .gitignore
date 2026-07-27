@@ -72,3 +72,5 @@ tts/*.wav
 /docs/zenn-posts/
 /docs/note-posts/
 /docs/fanbox-posts/
+/custom-tts-kokoro/
+/.claude/

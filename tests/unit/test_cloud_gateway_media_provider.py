@@ -10,7 +10,12 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudResourceContext,
 )
+from kokoro_link.contracts.generation_trigger import (
+    GenerationTrigger,
+    generation_trigger_scope,
+)
 from kokoro_link.contracts.image_provider import ImageTokenUsage
+from kokoro_link.contracts.tts import TTSRequest
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.image.cloud_gateway_provider import (
@@ -23,7 +28,6 @@ from kokoro_link.infrastructure.tts.cloud_gateway import CloudGatewayTTSAdapter
 from kokoro_link.infrastructure.video.cloud_gateway_provider import (
     CloudGatewayVideoProvider,
 )
-from kokoro_link.contracts.tts import TTSRequest
 
 
 class _MockAsyncClient(httpx.AsyncClient):
@@ -119,11 +123,12 @@ async def test_cloud_gateway_image_provider_sends_identity_headers(
         identity_resolver=_IdentityResolver(),
     )
 
-    result = await provider.generate(
-        character=_character(),
-        positive="at a cafe",
-        aspect="square",
-    )
+    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+        result = await provider.generate(
+            character=_character(),
+            positive="at a cafe",
+            aspect="square",
+        )
 
     assert result == [b"png"]
     assert seen["url"] == "https://gateway.example/v1/images/generations"
@@ -135,6 +140,7 @@ async def test_cloud_gateway_image_provider_sends_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "image_portrait"
     assert headers["x-yuralume-character"] == "chr_abc"
+    assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("img-")
     assert provider.last_request_id == headers["x-request-id"]
     payload = seen["payload"]
@@ -278,12 +284,13 @@ async def test_cloud_gateway_video_provider_sends_identity_headers(
         identity_resolver=_IdentityResolver(),
     )
 
-    result = await provider.generate(
-        character=_character(),
-        positive="walking through town",
-        aspect="landscape",
-        length_frames=80,
-    )
+    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+        result = await provider.generate(
+            character=_character(),
+            positive="walking through town",
+            aspect="landscape",
+            length_frames=80,
+        )
 
     assert result == b"mp4"
     assert seen["url"] == "https://gateway.example/v1/videos/generations"
@@ -295,6 +302,7 @@ async def test_cloud_gateway_video_provider_sends_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "feed_video"
     assert headers["x-yuralume-character"] == "chr_abc"
+    assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("vid-")
     assert provider.last_request_id == headers["x-request-id"]
     payload = seen["payload"]
@@ -335,11 +343,12 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
         identity_resolver=_IdentityResolver(),
     )
 
-    result = await adapter.synthesize(TTSRequest(
-        text="hello",
-        character_id=character.id,
-        text_lang="en",
-    ))
+    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+        result = await adapter.synthesize(TTSRequest(
+            text="hello",
+            character_id=character.id,
+            text_lang="en",
+        ))
 
     assert result.audio == b"wav"
     assert seen["url"] == "https://gateway.example/v1/tts/synthesize"
@@ -351,6 +360,7 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "tts"
     assert headers["x-yuralume-character"] == "chr_abc"
+    assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("tts-")
     assert adapter.last_request_id == headers["x-request-id"]
     payload = seen["payload"]

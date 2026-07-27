@@ -89,3 +89,109 @@ def test_bundled_rss_sources_include_tech_and_status_first_wave() -> None:
         source = sources[source_id]
         assert source["category"] == "tech"
         assert source["enabled"] is True
+
+
+def test_taiwan_bound_sources_declare_region_tw() -> None:
+    """Outlets whose reporting only lands for people living in Taiwan must
+    be tagged, or a hosted player abroad keeps getting local Taiwanese news
+    (the whole point of the region dimension)."""
+    sources = {source["id"]: source for source in _bundled_sources()}
+    taiwan_bound = {
+        "cna-realtime",
+        "ncdr-all-alerts",
+        "ithome-news",
+        "google-trends-tw",
+        "google-news-meme-tw",
+        "ptt-c-chat",
+        "ptt-mobilecomm",
+        "ptt-pc-shopping",
+        "gnn-gamer",
+        "udn-life",
+    }
+
+    for source_id in taiwan_bound:
+        assert sources[source_id].get("region") == "TW", source_id
+
+
+def test_globally_readable_sources_declare_no_region() -> None:
+    """Region is opt-in. Tagging a source that anyone could enjoy — an
+    international wire, or a Japanese outlet whose anime coverage has a
+    worldwide readership — would silently shrink every player's pool."""
+    sources = {source["id"]: source for source in _bundled_sources()}
+    global_ids = {
+        "bbc-world",
+        "hackernews-front",
+        "4gamer",
+        "animate-times",
+        "oricon-entertainment",
+        "nature-news",
+        "the-verge",
+        "techcrunch",
+        # Hosted global pack: en-US newsrooms, but the coverage is for
+        # readers anywhere — publishing language is not a region.
+        "npr-top-stories",
+        "ars-technica",
+    }
+
+    for source_id in global_ids:
+        assert sources[source_id].get("region") is None, source_id
+
+
+def test_japan_bound_sources_declare_region_jp() -> None:
+    """The hosted JP pack: outlets covering Japanese domestic life. A
+    player in Taiwan gets nothing from NHK's headline rundown, so these
+    are curated only into JP players' pools (mirror of the TW rule)."""
+    sources = {source["id"]: source for source in _bundled_sources()}
+    japan_bound = {
+        "nhk-easy",
+        "nhk-science",
+        "itmedia-news",
+    }
+
+    for source_id in japan_bound:
+        assert sources[source_id].get("region") == "JP", source_id
+
+
+def test_bundled_rss_sources_include_hosted_default_pack() -> None:
+    """The six feeds the owner picked as the hosted default. Two of them
+    (NHK 主要ニュース via ``nhk-easy``, BBC World) already shipped, so the
+    pack is asserted by feed URL — a second entry for the same URL would
+    poll it twice and is caught by the uniqueness test above."""
+    sources = {source["id"]: source for source in _bundled_sources()}
+    expected = {
+        "nhk-easy": (
+            "https://www3.nhk.or.jp/rss/news/cat0.xml", "news", "ja-JP",
+        ),
+        "nhk-science": (
+            "https://www3.nhk.or.jp/rss/news/cat3.xml", "science", "ja-JP",
+        ),
+        "itmedia-news": (
+            "https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml",
+            "tech", "ja-JP",
+        ),
+        "npr-top-stories": (
+            "https://feeds.npr.org/1001/rss.xml", "news", "en-US",
+        ),
+        "bbc-world": (
+            "https://feeds.bbci.co.uk/news/world/rss.xml", "news", "en-GB",
+        ),
+        "ars-technica": (
+            "https://feeds.arstechnica.com/arstechnica/index", "tech", "en-US",
+        ),
+    }
+
+    for source_id, (feed_url, category, locale) in expected.items():
+        source = sources[source_id]
+        assert source["feed_url"] == feed_url, source_id
+        assert source["category"] == category, source_id
+        assert source["locale"] == locale, source_id
+        assert source["enabled"] is True, source_id
+
+
+def test_bundled_region_codes_are_upper_case_two_letter() -> None:
+    for source in _bundled_sources():
+        region = source.get("region")
+        if region is None:
+            continue
+        assert region == region.upper()
+        assert len(region) == 2

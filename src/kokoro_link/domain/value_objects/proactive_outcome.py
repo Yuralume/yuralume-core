@@ -13,6 +13,7 @@ class ProactiveOutcome:
     NO_BINDING: "ClassVar[ProactiveOutcome]"      # no eligible channel binding
     INTENTION_SKIPPED: "ClassVar[ProactiveOutcome]" # LLM intention judge said "not now"
     DECIDER_SKIPPED: "ClassVar[ProactiveOutcome]" # LLM said "don't send"
+    SLOT_TAKEN: "ClassVar[ProactiveOutcome]"      # another runner owns this tick slot (P3-Dedup)
     SENT: "ClassVar[ProactiveOutcome]"            # message pushed to platform
     ERRORED: "ClassVar[ProactiveOutcome]"         # unexpected failure
 
@@ -34,5 +35,6 @@ ProactiveOutcome.GATE_BLOCKED = ProactiveOutcome("gate_blocked")
 ProactiveOutcome.NO_BINDING = ProactiveOutcome("no_binding")
 ProactiveOutcome.INTENTION_SKIPPED = ProactiveOutcome("intention_skipped")
 ProactiveOutcome.DECIDER_SKIPPED = ProactiveOutcome("decider_skipped")
+ProactiveOutcome.SLOT_TAKEN = ProactiveOutcome("slot_taken")
 ProactiveOutcome.SENT = ProactiveOutcome("sent")
 ProactiveOutcome.ERRORED = ProactiveOutcome("errored")

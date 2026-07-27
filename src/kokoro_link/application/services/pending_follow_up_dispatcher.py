@@ -95,6 +95,7 @@ class PendingFollowUpDispatcher:
         scheduled_promise_composer: ScheduledPromiseComposerPort | None = None,
         operator_persona_service=None,  # noqa: ANN001 - optional app service
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
+        visible_slot_port=None,  # noqa: ANN001 - VisibleSlotPort | None (avoid import cycle)
         local_tz: tzinfo | None = None,
         tick_limit: int = 25,
     ) -> None:
@@ -111,6 +112,12 @@ class PendingFollowUpDispatcher:
         # same operator language chat / proactive use. Optional so the
         # legacy single-user wiring keeps working with "zh-TW" default.
         self._operator_profile_service = operator_profile_service
+        # P3-Dedup — at-most-once visible send for the DISTRIBUTED release path. A
+        # reclaimed release job (worker crashed after the send, before marking the
+        # row resolved) would otherwise re-compose and re-send a duplicate promise.
+        # ``None`` (no DB / embedded no-op wiring) fails open, so the single-process
+        # embedded tick is byte-identical (its send always wins the claim first).
+        self._visible_slot_port = visible_slot_port
         self._local_tz = local_tz or timezone.utc
         self._tick_limit = max(1, tick_limit)
 
@@ -141,6 +148,17 @@ class PendingFollowUpDispatcher:
             if released:
                 resolved += 1
         return resolved
+
+    async def release_row(
+        self, row: PendingFollowUp, *, now: datetime,
+    ) -> bool:
+        """Public entry for the distributed event-driven release path.
+
+        The Phase 5 ``pending_follow_up_release`` worker handler hands one claimed
+        row here; the busy-score / frozen re-gating, compose and fan-out are the
+        SAME as the embedded tick (抽共用而非複製) — this only exposes the existing
+        per-row release as a callable so the handler need not re-implement it."""
+        return await self._maybe_release(row, now=now)
 
     async def _maybe_release(
         self, row: PendingFollowUp, *, now: datetime,
@@ -371,7 +389,24 @@ class PendingFollowUpDispatcher:
         now: datetime,
     ) -> bool:
         """Common tail for both kinds: fan out via deliver_pre_composed
-        and flip status to resolved/failed."""
+        and flip status to resolved/failed.
+
+        Guards the visible send with the at-most-once slot claim: claim BEFORE the
+        send, so a reclaimed job whose predecessor already sent finds the slot taken
+        and resolves WITHOUT re-sending; release the slot on a delivery failure so a
+        genuine retry can re-claim (embedded stays byte-identical — its single
+        runner always wins the claim, and a failure frees it exactly as before)."""
+        if not await self._claim_follow_up_slot(character_id, row.id):
+            # Another executor already committed this row's send (crash-after-send
+            # → reclaim). At-most-once: resolve without re-delivering.
+            _LOGGER.info(
+                "pending-follow-up: release slot already taken id=%s — "
+                "resolving without resend", row.id,
+            )
+            await self._repository.save(
+                row.marked_resolved(message_text=body, now=now),
+            )
+            return True
         try:
             attempt = await self._proactive_dispatcher.deliver_pre_composed(
                 character_id=character_id,
@@ -385,6 +420,7 @@ class PendingFollowUpDispatcher:
                 "pending-follow-up deliver_pre_composed crashed id=%s",
                 row.id,
             )
+            await self._release_follow_up_slot(character_id, row.id)
             await self._repository.save(
                 row.marked_failed(error="delivery raised", now=now),
             )
@@ -394,6 +430,7 @@ class PendingFollowUpDispatcher:
             outcome_text = (
                 f"deliver={attempt.outcome.value if attempt else 'none'}"
             )
+            await self._release_follow_up_slot(character_id, row.id)
             await self._repository.save(
                 row.marked_failed(error=outcome_text, now=now),
             )
@@ -403,6 +440,47 @@ class PendingFollowUpDispatcher:
             row.marked_resolved(message_text=body, now=now),
         )
         return True
+
+    async def _claim_follow_up_slot(
+        self, character_id: str, follow_up_id: str,
+    ) -> bool:
+        """Own this row's release slot. ``True`` when we own it (or the port is
+        unwired / errored — fail OPEN so a claim failure never suppresses a
+        legitimate single-runner send). ``False`` only when the slot is verifiably
+        already owned by another executor."""
+        if self._visible_slot_port is None:
+            return True
+        from kokoro_link.contracts.visible_slots import SLOT_KIND_FOLLOW_UP
+
+        try:
+            return await self._visible_slot_port.claim(
+                character_id, SLOT_KIND_FOLLOW_UP, follow_up_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: slot claim crashed; failing open id=%s",
+                follow_up_id,
+            )
+            return True
+
+    async def _release_follow_up_slot(
+        self, character_id: str, follow_up_id: str,
+    ) -> None:
+        """Free the release slot after a failed delivery so a retry can re-claim.
+        Never raises — a release failure only risks suppressing one retry, and the
+        row stays ``failed``/``queued`` for the next reconcile either way."""
+        if self._visible_slot_port is None:
+            return
+        from kokoro_link.contracts.visible_slots import SLOT_KIND_FOLLOW_UP
+
+        try:
+            await self._visible_slot_port.release(
+                character_id, SLOT_KIND_FOLLOW_UP, follow_up_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: slot release crashed id=%s", follow_up_id,
+            )
 
     async def _resolve_schedule(
         self, character: Character, *, now: datetime,

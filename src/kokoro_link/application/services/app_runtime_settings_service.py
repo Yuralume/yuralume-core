@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Awaitable, Callable
 
 from pydantic import BaseModel, ValidationError
 
@@ -26,14 +27,28 @@ from kokoro_link.infrastructure.app_runtime_settings.schemas import (
 
 _LOGGER = logging.getLogger(__name__)
 
+GroupChangeNotifier = Callable[[str], Awaitable[object]]
+"""Fires after a group is durably written, so other processes can re-read.
+
+Injected rather than reached for: this service knows the KV port, not the
+engine, and the notification transport (PostgreSQL ``NOTIFY``) is an
+infrastructure concern that must stay swappable and absent in tests.
+"""
+
 
 class AppRuntimeSettingsError(ValueError):
     """Raised for an unknown group or a schema validation failure."""
 
 
 class AppRuntimeSettingsService:
-    def __init__(self, repository: RuntimeSettingsRepositoryPort | None) -> None:
+    def __init__(
+        self,
+        repository: RuntimeSettingsRepositoryPort | None,
+        *,
+        on_changed: GroupChangeNotifier | None = None,
+    ) -> None:
         self._repository = repository
+        self._on_changed = on_changed
 
     @staticmethod
     def _schema(group: str) -> type[BaseModel]:
@@ -67,7 +82,14 @@ class AppRuntimeSettingsService:
             return default if default is not None else schema()
 
     async def set(self, group: str, payload: dict) -> BaseModel:
-        """Validate + persist a group. Returns the validated config."""
+        """Validate + persist a group, then wake the other processes.
+
+        The notification fires **after** the repository write returns, and the
+        repository commits its own transaction (``SARuntimeSettingsRepository``
+        opens a session, upserts and commits), so a listener that re-reads on
+        receipt is guaranteed to see the new row rather than racing an
+        uncommitted one.
+        """
         schema = self._schema(group)
         try:
             config = schema.model_validate(payload)
@@ -77,7 +99,26 @@ class AppRuntimeSettingsService:
             await self._repository.set(
                 key_for_group(group), config.model_dump_json(),
             )
+            await self._notify_changed(group)
         return config
+
+    async def _notify_changed(self, group: str) -> None:
+        """Best-effort cross-process wake hint. Never fails the admin write.
+
+        A dropped hint costs latency only: the durable state is the row that was
+        just committed, and every process's fingerprint poll re-converges within
+        one interval.
+        """
+        if self._on_changed is None:
+            return
+        try:
+            await self._on_changed(group)
+        except Exception:  # noqa: BLE001 — a save must not fail on a lost hint
+            _LOGGER.warning(
+                "app_runtime_settings change notification failed (group=%s)",
+                group,
+                exc_info=True,
+            )
 
     async def seed_if_absent(self, group: str, config: BaseModel) -> bool:
         """First-boot seed: write ``config`` only when the key is empty.

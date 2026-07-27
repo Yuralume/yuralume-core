@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, sessionmaker
 
@@ -14,6 +15,22 @@ from kokoro_link.infrastructure.persistence.models import (
     DailyScheduleRow,
     ScheduleActivityRow,
 )
+
+
+# Only a violation of THIS constraint (concurrent upsert on the same civil
+# day) is the benign race-recovery path; any other integrity failure is a
+# real defect and must surface.
+_SCHEDULE_DATE_CONSTRAINT = "uq_daily_schedules_character_date"
+
+
+def _is_schedule_date_violation(error: IntegrityError) -> bool:
+    return _SCHEDULE_DATE_CONSTRAINT in str(getattr(error, "orig", error))
+
+
+# A concurrent (character, date) insert is resolved on the retry (re-read the
+# winner, replace in place). Two passes suffice for a two-writer race; the cap
+# bounds any pathological ping-pong.
+_UPSERT_MAX_ATTEMPTS = 3
 from kokoro_link.infrastructure.persistence.sa_schedule_mapping import (
     apply_schedule_to_row,
     row_to_schedule,
@@ -42,17 +59,28 @@ class SAScheduleRepository(ScheduleRepositoryPort):
             return row_to_schedule(row)
 
     async def save(self, schedule: DailySchedule) -> None:
-        async with self._session_factory() as session:
-            stmt = (
-                select(DailyScheduleRow)
-                .where(DailyScheduleRow.id == schedule.id)
-                .options(selectinload(DailyScheduleRow.activities))
-            )
-            result = await session.execute(stmt)
-            row = result.scalar_one_or_none()
-            if row is None:
-                # upsert by (character_id, date) — allows regenerate without
-                # leaking old rows when a fresh schedule gets a new UUID.
+        # Upsert on (character_id, date). Single-runner behaviour is unchanged
+        # (the happy path never raises); the ``uq_daily_schedules_character_date``
+        # constraint added by P3-Dedup only bites when a concurrent runner
+        # inserts the same civil day between our read and commit. We recover
+        # from THAT race idempotently (re-read the winner, replace in place)
+        # so exactly one row survives instead of a 500 — a strictly-safer
+        # hardening of the pre-existing read-delete-insert upsert.
+        for attempt in range(_UPSERT_MAX_ATTEMPTS):
+            async with self._session_factory() as session:
+                stmt = (
+                    select(DailyScheduleRow)
+                    .where(DailyScheduleRow.id == schedule.id)
+                    .options(selectinload(DailyScheduleRow.activities))
+                )
+                result = await session.execute(stmt)
+                row = result.scalar_one_or_none()
+                if row is not None:
+                    apply_schedule_to_row(schedule, row)
+                    await session.commit()
+                    return
+                # No row by id — upsert by (character_id, date) so a regenerate
+                # with a fresh UUID replaces the day rather than leaking a dupe.
                 existing_stmt = (
                     select(DailyScheduleRow)
                     .where(
@@ -61,14 +89,26 @@ class SAScheduleRepository(ScheduleRepositoryPort):
                     )
                     .options(selectinload(DailyScheduleRow.activities))
                 )
-                existing = (await session.execute(existing_stmt)).scalar_one_or_none()
+                existing = (
+                    await session.execute(existing_stmt)
+                ).scalar_one_or_none()
                 if existing is not None:
                     await session.delete(existing)
                     await session.flush()
                 session.add(schedule_to_row(schedule))
-            else:
-                apply_schedule_to_row(schedule, row)
-            await session.commit()
+                try:
+                    await session.commit()
+                    return
+                except IntegrityError as exc:
+                    # A concurrent writer inserted this (character, date) after
+                    # our read. Any other integrity failure is a real defect.
+                    await session.rollback()
+                    if not _is_schedule_date_violation(exc):
+                        raise
+                    if attempt == _UPSERT_MAX_ATTEMPTS - 1:
+                        raise
+                    # Retry: the next pass re-reads the winner and replaces it.
+                    continue
 
     async def list_for_character(
         self,
@@ -107,3 +147,34 @@ class SAScheduleRepository(ScheduleRepositoryPort):
             )
             await session.commit()
             return len(ids)
+
+    async def claim_memorialize(self, activity_ids: list[str]) -> set[str]:
+        if not activity_ids:
+            return set()
+        async with self._session_factory() as session:
+            # RETURNING id tells us exactly which rows THIS caller flipped
+            # false → true — the atomic claim that gates the memory write so a
+            # racing runner cannot double-write the episodic memory.
+            result = await session.execute(
+                update(ScheduleActivityRow)
+                .where(
+                    ScheduleActivityRow.id.in_(activity_ids),
+                    ScheduleActivityRow.memorialized.is_(False),
+                )
+                .values(memorialized=True)
+                .returning(ScheduleActivityRow.id),
+            )
+            claimed = {row_id for (row_id,) in result.all()}
+            await session.commit()
+            return claimed
+
+    async def release_memorialize(self, activity_ids: list[str]) -> None:
+        if not activity_ids:
+            return
+        async with self._session_factory() as session:
+            await session.execute(
+                update(ScheduleActivityRow)
+                .where(ScheduleActivityRow.id.in_(activity_ids))
+                .values(memorialized=False),
+            )
+            await session.commit()

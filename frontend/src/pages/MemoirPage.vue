@@ -59,8 +59,11 @@ const portraitUrl = computed(() => character.value?.image_urls?.[0] ?? null)
             />
             <span class="memoir-page__char-name">{{ character.name }}</span>
           </div>
+          <!-- Until the character resolves, show a loading placeholder: the
+               raw UUID this used to print is meaningless to a player and
+               barely more useful to an operator (plan U1-D, neutral). -->
           <span v-else-if="characterId" class="memoir-page__char-id">
-            {{ t('memoir.characterIdLabel') }}<code>{{ characterId }}</code>
+            {{ t('memoir.loading') }}
           </span>
           <span v-else class="memoir-page__char-id">{{ t('memoir.noCharacter') }}</span>
         </div>

@@ -48,7 +48,13 @@ from kokoro_link.contracts.image_provider import (
     ImageNoOutputError,
     ImageTimeoutError,
 )
+from kokoro_link.contracts.character_image_candidate_batch import (
+    CharacterImageCandidateBatchRepositoryPort,
+)
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
+from kokoro_link.infrastructure.repositories.in_memory_character_image_candidate_batches import (  # noqa: E501
+    InMemoryCharacterImageCandidateBatchRepository,
+)
 from kokoro_link.domain.entities.generation_usage import (
     CAPABILITY_IMAGE,
     STATUS_FAILED,
@@ -139,6 +145,9 @@ class CharacterImageService:
             AccountRuntimeProfileResolverPort | None
         ) = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
+        candidate_batch_repository: (
+            CharacterImageCandidateBatchRepositoryPort | None
+        ) = None,
     ) -> None:
         self._character_repository = character_repository
         _ = uploads_dir, url_prefix
@@ -151,7 +160,15 @@ class CharacterImageService:
             or PermissiveAccountRuntimeProfileResolver()
         )
         self._subscription_access_guard = subscription_access_guard
-        self._candidate_batches: dict[str, tuple[str, ...]] = {}
+        # Shared, not per-process: generate and commit are two requests and
+        # hosted load-balances several api replicas, so a process-local map
+        # would drop the player's picks (and leak the objects) whenever the
+        # two landed on different replicas. The in-memory fallback is only
+        # for single-process dev / unit tests.
+        self._candidate_batches: CharacterImageCandidateBatchRepositoryPort = (
+            candidate_batch_repository
+            or InMemoryCharacterImageCandidateBatchRepository()
+        )
 
     def set_usage_recorder(self, recorder: UsageEventRecorderPort | None) -> None:
         self._usage_recorder = recorder
@@ -543,8 +560,27 @@ class CharacterImageService:
                 billable_quantity=len(images),
             )
             raise CharacterImageError("Object storage is not configured")
-        previous_keys = self._candidate_batches.pop(character_id, ())
-        await self._delete_candidate_objects(previous_keys)
+        # Read-then-clear before touching storage: the superseded batch must
+        # stop being commit-able the moment we start deleting its objects,
+        # otherwise a commit racing this generate could copy keys we are in
+        # the middle of removing. The clear is conditional on the batch we
+        # just read still being the live one — if another replica already
+        # superseded (or committed) it, those objects belong to whoever did,
+        # and deleting them here could yank the source out of its in-flight
+        # copy. Our own batch is written unconditionally at the end.
+        previous_keys = await self._candidate_batches.get(character_id)
+        if previous_keys:
+            if await self._candidate_batches.clear(
+                character_id, expected_keys=previous_keys,
+            ):
+                await self._delete_candidate_objects(previous_keys)
+            else:
+                _LOGGER.info(
+                    "generate_candidates: previous batch already superseded "
+                    "(character=%s, %d stale candidates left to its owner)",
+                    character_id,
+                    len(previous_keys),
+                )
         batch_id = uuid4().hex
         object_keys: list[str] = []
         try:
@@ -612,7 +648,7 @@ class CharacterImageService:
                 billable_quantity=len(images),
             )
             raise CharacterImageError(str(exc)) from exc
-        self._candidate_batches[character_id] = tuple(object_keys)
+        await self._candidate_batches.replace(character_id, object_keys)
         await self._record_image_usage_safely(
             character=character,
             feature_key="character_album_candidate",
@@ -673,7 +709,16 @@ class CharacterImageService:
         album_urls: list[str],
     ) -> tuple[Character, list[CommittedAlbumCandidate]]:
         assert self._object_storage is not None
-        candidate_keys = self._candidate_batches.pop(character.id, ())
+        # Read first, delete last: the batch row is the only record of which
+        # objects are in flight, so it must outlive every failure mode that
+        # leaves work undone (see the handlers at the end of the loop).
+        #
+        # ``candidate_keys`` is also this request's claim on the row: every
+        # write below passes it as ``expected_keys``, so a generate that lands
+        # on another replica while we work cannot have its brand-new batch
+        # deleted (success / non-retryable paths) or overwritten with our stale
+        # leftovers (outage path).
+        candidate_keys = await self._candidate_batches.get(character.id)
         if not candidate_keys:
             return character, []
 
@@ -725,13 +770,18 @@ class CharacterImageService:
                 processed_keys.add(source_key)
         except ObjectStorageUnavailableError as exc:
             # The 503 this becomes tells the player to retry — so the
-            # not-yet-processed candidates must survive for that retry
-            # instead of vanishing with the popped batch.
+            # not-yet-processed candidates must survive for that retry,
+            # and in the shared store rather than in this process, because
+            # the retry can be served by a different replica.
             remaining = tuple(
                 key for key in candidate_keys if key not in processed_keys
             )
-            if remaining:
-                self._candidate_batches[character.id] = remaining
+            shrunk = await self._candidate_batches.replace(
+                character.id, remaining, expected_keys=candidate_keys,
+            )
+            self._log_superseded_batch(
+                character.id, applied=shrunk, orphan_count=len(remaining),
+            )
             _LOGGER.exception(
                 "commit_candidates: object storage unreachable "
                 "(character=%s, %d/%d candidates uncommitted)",
@@ -740,7 +790,27 @@ class CharacterImageService:
                 len(candidate_keys),
             )
             raise StorageUnavailableError(str(exc)) from exc
+        except Exception:
+            # Any other failure is not retryable at the object level (a
+            # missing source key stays missing), so drop the batch instead
+            # of leaving a row that would make every retry fail the same
+            # way. Unprocessed objects become best-effort orphans.
+            dropped = await self._candidate_batches.clear(
+                character.id, expected_keys=candidate_keys,
+            )
+            self._log_superseded_batch(
+                character.id,
+                applied=dropped,
+                orphan_count=len(candidate_keys) - len(processed_keys),
+            )
+            raise
 
+        consumed = await self._candidate_batches.clear(
+            character.id, expected_keys=candidate_keys,
+        )
+        self._log_superseded_batch(
+            character.id, applied=consumed, orphan_count=0,
+        )
         if not moved_urls:
             return character, album_entries
 
@@ -852,6 +922,32 @@ class CharacterImageService:
     ) -> str:
         filename = source_key.rsplit("/", 1)[-1]
         return f"characters/{character_id}/{filename}"
+
+    def _log_superseded_batch(
+        self,
+        character_id: str,
+        *,
+        applied: bool,
+        orphan_count: int,
+    ) -> None:
+        """Note a batch write that a newer owner of the row refused.
+
+        Every commit-path write is conditional on the batch this request read
+        at its start. ``applied=False`` means another replica generated a fresh
+        batch in between: that batch keeps the row (deleting it would strand
+        candidates the player can see but never commit), this request walks
+        away, and whatever objects it had not consumed become orphans nobody
+        will reference again — cheap, and the alternative is losing a live
+        batch.
+        """
+        if applied:
+            return
+        _LOGGER.warning(
+            "commit_candidates: batch superseded mid-commit "
+            "(character=%s, %d candidate objects orphaned)",
+            character_id,
+            orphan_count,
+        )
 
     async def _delete_candidate_objects(self, object_keys: tuple[str, ...]) -> None:
         assert self._object_storage is not None

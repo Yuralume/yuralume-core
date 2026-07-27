@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from kokoro_link.bootstrap.process_settings import (
+    ProcessSettings,
+    load_process_settings,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 # Env vars that migrated into Admin-DB config (CORE_ENV_TO_ADMIN_CONFIG).
@@ -889,12 +894,21 @@ class CloudSettings:
     hosted_play_internal_token: str = ""
     # Versioned caller/audience/scope credential for User internal APIs.
     internal_service_credential: str = ""
+    # Hosted Official LINE Channel Hub (Line H / LH4). Base URL of the Channel
+    # internal delivery API and the versioned Core->Channel service credential
+    # (caller=core, audience=yuralume-channel, scopes delivery:eligibility-read,
+    # delivery:create). Blank leaves proactive delivery on the self-host local
+    # messaging adapter even when cloud mode is active.
+    channel_base_url: str = ""
+    channel_service_credential: str = ""
     introspect_timeout: float = 5.0
     session_ttl_seconds: int = 3600
     llm_model_presets: dict[str, str] = field(default_factory=dict)
     image_preset: str = "yuralume-anime"
     video_preset: str = "yuralume-anime"
     tts_voice_default: str = ""
+    # Logical Gateway preset used when the optional User embedding profile field is absent.
+    embedding_preset: str = "text-embedding-bge-m3"
     # When true (cloud mode), resolve feature_key -> preset from the control-plane
     # routing profile instead of the env preset map (which becomes a deprecated
     # one-release fallback). See docs/CLOUD_CONTROL_PLANE_CONFIG_PLAN.md Phase 3.
@@ -908,6 +922,14 @@ class CloudSettings:
     # Core login (H1). Default False keeps self-host / existing cloud behavior
     # where any active account may log in. ``demo`` is always allowed.
     require_paid_tier: bool = False
+    # Customer-facing Cloud Portal origin served to the SPA at runtime
+    # (HOSTED_PLAYER_UX_PLAN §3 / U2) so a hosted player always has a way back
+    # to the account centre. Runtime config, not a Vite build-time bake — the
+    # SPA image is shared across hosted environments. Deliberately NOT part of
+    # the cloud fail-fast required set: the Cloud-side deployment preflight
+    # enforces it, and keeping it optional here means existing hosted
+    # deployments keep booting. ``None`` in self-host, always.
+    portal_url: str | None = None
 
     @property
     def active(self) -> bool:
@@ -967,9 +989,25 @@ class WebPushSettings:
 class AppSettings:
     default_provider_id: str = "fake"
     database_url: str = ""
+    db_pool_size: int = 5
+    """Per-process SQLAlchemy pool size (YURALUME_DB_POOL_SIZE).
+
+    Applies only to the shared ``postgresql+asyncpg`` engine built once in
+    ``build_container``. Absent → 5 (historical value). Non-int or < 1 →
+    fail-fast at settings load."""
+    db_max_overflow: int = 10
+    """Per-process SQLAlchemy pool overflow (YURALUME_DB_MAX_OVERFLOW).
+
+    Companion to :attr:`db_pool_size`. Absent → 10 (historical value). ``0`` is
+    valid — it pins a fixed ``db_pool_size``/0 pool with no burst connections
+    (the HOSTED_CORE_SCALING §9.1 budget table uses X/0 pools deliberately).
+    Non-int or < 0 → fail-fast at settings load."""
     deployment_mode: str = "container"
     auth: AuthSettings = field(default_factory=AuthSettings)
     cloud: CloudSettings = field(default_factory=CloudSettings)
+    # Process role + Phase 1 realtime-relay wiring. Default = all + embedded
+    # (self-host zero-config red line); Hosted splits api/background via env.
+    process: ProcessSettings = field(default_factory=ProcessSettings)
     demo_oauth: DemoOAuthSettings = field(default_factory=DemoOAuthSettings)
     web_push: WebPushSettings = field(default_factory=WebPushSettings)
     config_encryption_key: str = ""
@@ -1502,7 +1540,37 @@ class AppSettings:
                 "KOKORO_STORAGE_PUBLIC_BASE_URL",
             )
 
-        cloud = _load_cloud_settings()
+        process = load_process_settings()
+        # Cloud credential validation is role-aware (see ``_load_cloud_settings``):
+        # the coordinator role holds no provider/federation credential, so it is
+        # exempted from the deployment-token requirement other roles enforce.
+        cloud = _load_cloud_settings(role=process.role)
+        # P2-B shadow runtime needs the durable PostgreSQL queue — refuse to
+        # boot a shadow-on process without a database rather than silently
+        # running a no-op coordinator/worker (HOSTED_CORE_SCALING §13 Phase 2).
+        if process.background_shadow == "postgres" and not database_url:
+            raise ValueError(
+                "YURALUME_BACKGROUND_SHADOW=postgres requires a database "
+                "(set DATABASE_URL); the shadow queue lives in PostgreSQL",
+            )
+        # P3-C hosted execution backend also lives in the durable PostgreSQL
+        # queue (coordinator enqueue + worker execute + execution-mode CAS) —
+        # refuse to boot ``postgres`` backend without a database rather than
+        # silently degrading to a no-op (HOSTED_CORE_SCALING §13 Phase 3).
+        if process.background_backend == "postgres" and not database_url:
+            raise ValueError(
+                "YURALUME_BACKGROUND_BACKEND=postgres requires a database "
+                "(set DATABASE_URL); the durable job queue lives in PostgreSQL",
+            )
+        # Phase 4 realtime outbox (§7.1) is a PostgreSQL transactional outbox +
+        # LISTEN/NOTIFY — refuse to boot the ``postgres`` realtime backend
+        # without a database rather than silently falling back to the in-process
+        # bus (which is invisible across an api/background split → dark SSE).
+        if process.realtime_backend == "postgres" and not database_url:
+            raise ValueError(
+                "YURALUME_REALTIME_BACKEND=postgres requires a database "
+                "(set DATABASE_URL); the realtime outbox lives in PostgreSQL",
+            )
         web_push = _load_web_push_settings()
         auth = AuthSettings.from_env()
         if cloud.active:
@@ -1519,9 +1587,16 @@ class AppSettings:
         return cls(
             default_provider_id=default_provider_id,
             database_url=database_url,
+            db_pool_size=_parse_positive_int_env(
+                "YURALUME_DB_POOL_SIZE", default=5,
+            ),
+            db_max_overflow=_parse_non_negative_int_env(
+                "YURALUME_DB_MAX_OVERFLOW", default=10,
+            ),
             deployment_mode=deployment_mode,
             auth=auth,
             cloud=cloud,
+            process=process,
             demo_oauth=DemoOAuthSettings.from_env(),
             web_push=web_push,
             config_encryption_key=(
@@ -1566,7 +1641,7 @@ class AppSettings:
         return _do_build_openai_compatible_models(self)
 
 
-def _load_cloud_settings() -> CloudSettings:
+def _load_cloud_settings(role: str = "all") -> CloudSettings:
     enabled = _parse_bool(os.getenv("YURALUME_CLOUD_ENABLED"), default=False)
     user_service_url = (
         os.getenv("YURALUME_CLOUD_USER_SERVICE_URL", "").strip().rstrip("/")
@@ -1589,6 +1664,15 @@ def _load_cloud_settings() -> CloudSettings:
     internal_service_credential = os.getenv(
         "YURALUME_CLOUD_USER_INTERNAL_CREDENTIAL", "",
     ).strip()
+    channel_base_url = (
+        os.getenv("KOKORO_CHANNEL_BASE_URL", "").strip().rstrip("/")
+    )
+    channel_service_credential = os.getenv(
+        "KOKORO_CHANNEL_SERVICE_CREDENTIAL", "",
+    ).strip()
+    portal_url = _parse_cloud_portal_url(
+        os.getenv("YURALUME_CLOUD_PORTAL_URL"), enabled=enabled,
+    )
     settings = CloudSettings(
         enabled=enabled,
         user_service_url=user_service_url,
@@ -1598,6 +1682,8 @@ def _load_cloud_settings() -> CloudSettings:
         deployment_audience=deployment_audience,
         hosted_play_internal_token=hosted_play_internal_token,
         internal_service_credential=internal_service_credential,
+        channel_base_url=channel_base_url,
+        channel_service_credential=channel_service_credential,
         introspect_timeout=max(
             0.5,
             _parse_float(
@@ -1624,6 +1710,10 @@ def _load_cloud_settings() -> CloudSettings:
             or "yuralume-anime"
         ),
         tts_voice_default=os.getenv("YURALUME_CLOUD_TTS_VOICE", "").strip(),
+        embedding_preset=(
+            os.getenv("YURALUME_CLOUD_EMBEDDING_PRESET", "").strip()
+            or "text-embedding-bge-m3"
+        ),
         runtime_config_enabled=_parse_bool(
             os.getenv("YURALUME_CLOUD_RUNTIME_CONFIG_ENABLED"),
             default=False,
@@ -1635,8 +1725,19 @@ def _load_cloud_settings() -> CloudSettings:
             os.getenv("YURALUME_CLOUD_REQUIRE_PAID_TIER"),
             default=False,
         ),
+        portal_url=portal_url,
     )
     if not settings.active:
+        return settings
+    # Role-aware credential requirement (§11 / sol #1). The dedicated
+    # ``coordinator`` role serves no public API and never calls the LLM gateway —
+    # it only runs the leader lease + due-discovery + enqueue loop against the
+    # durable queue, so it holds NO provider/federation credential and needs the
+    # database alone. Forcing it to carry the cloud deployment/gateway/introspect
+    # secrets would crash its boot with a RuntimeError for tokens it never uses.
+    # api / worker / connector / all / background still validate the full set
+    # (they serve routes or execute gateway-backed ticks).
+    if role == "coordinator":
         return settings
     missing = [
         name
@@ -1656,6 +1757,26 @@ def _load_cloud_settings() -> CloudSettings:
             + ", ".join(missing),
         )
     return settings
+
+
+def _parse_cloud_portal_url(raw: str | None, *, enabled: bool) -> str | None:
+    """Normalise ``YURALUME_CLOUD_PORTAL_URL`` (U2).
+
+    Blank / unset → ``None`` (the SPA then renders no portal link). Trailing
+    slashes are stripped so callers can concatenate deep links such as
+    ``{portal_url}/credits`` without doubling the separator. In cloud mode a
+    present-but-malformed value fails fast: a non-http(s) origin would render an
+    unusable link for every hosted player.
+    """
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return None
+    if enabled and not value.startswith(("http://", "https://")):
+        raise RuntimeError(
+            "YURALUME_CLOUD_PORTAL_URL must be an http(s) URL, got "
+            f"{value!r}",
+        )
+    return value
 
 
 def _load_web_push_settings() -> WebPushSettings:
@@ -2020,6 +2141,59 @@ def _parse_float(raw: str | None, *, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _parse_positive_int_env(env_name: str, *, default: int) -> int:
+    """Read a strictly-positive int env var, fail-fast on garbage.
+
+    Unlike :func:`_parse_int` (which silently falls back to the default on
+    bad input), the pool-budget knobs must not degrade to a surprising
+    value: a typo'd ``YURALUME_DB_POOL_SIZE=ten`` should stop the process
+    at boot with a clear message rather than quietly running the default
+    pool. Absent / blank → ``default``; non-int or < 1 → ``ValueError``
+    naming the env var.
+    """
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{env_name} must be a positive integer (got {raw!r})",
+        )
+    if value < 1:
+        raise ValueError(
+            f"{env_name} must be >= 1 (got {value})",
+        )
+    return value
+
+
+def _parse_non_negative_int_env(env_name: str, *, default: int) -> int:
+    """Read a non-negative int env var (>= 0), fail-fast on garbage.
+
+    Companion to :func:`_parse_positive_int_env` for knobs where 0 is a valid,
+    meaningful value. SQLAlchemy ``max_overflow=0`` is legal and pins a fixed
+    ``pool_size``/0 pool (no burst connections above ``pool_size``), which the
+    HOSTED_CORE_SCALING §9.1 per-role budget table uses deliberately for the
+    background role — so the overflow knob must accept 0 (rejecting it the way
+    ``_parse_positive_int_env`` does would be wrong). Absent / blank →
+    ``default``; non-int or < 0 → ``ValueError`` naming the env var.
+    """
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{env_name} must be a non-negative integer (got {raw!r})",
+        )
+    if value < 0:
+        raise ValueError(
+            f"{env_name} must be >= 0 (got {value})",
+        )
+    return value
 
 
 def _media_api_base_url(

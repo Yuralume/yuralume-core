@@ -3,7 +3,9 @@
 Runs once at application startup. Only inserts new rows; existing
 rows have their canonical fields (``name``, ``feed_url``, ``category``,
 ``locale``) refreshed but their *operator-controlled* fields
-(``enabled``) preserved. Operator deletions are not re-created —
+(``enabled``, and ``region`` once the operator touched it) preserved —
+``region`` is backfilled only while the row is unlocked and has none.
+Operator deletions are not re-created —
 deleting a source via admin API and restarting must not bring it
 back, so we never write rows whose id wasn't present in the DB
 already after the first sync (we use the operator's flag to detect
@@ -15,6 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -43,7 +46,7 @@ class RssSourceSyncService:
         *,
         repository: RssSourceRepositoryPort,
         seed_path: Path,
-        deployment_region: str | None = None,
+        deployment_region: str | Callable[[], str | None] | None = None,
     ) -> None:
         self._repository = repository
         self._seed_path = seed_path
@@ -56,7 +59,13 @@ class RssSourceSyncService:
         # en-US operator in Taiwan still wants Taiwan alerts). Operators
         # can still enable a disabled source from the admin UI; the flag
         # is only the shipped default, never overwritten on later syncs.
-        self._deployment_region = (deployment_region or "").strip().upper()
+        #
+        # Accepts a plain code OR a zero-arg accessor. The container passes the
+        # accessor so the region is resolved *when a sync runs* rather than
+        # captured at wiring time — a process that booted before the site
+        # calendar region was corrected would otherwise keep seeding the old
+        # region's defaults for its whole life (G0).
+        self._deployment_region = deployment_region
 
     async def sync(self) -> int:
         """Reconcile the YAML seed with the DB. Returns count touched."""
@@ -90,6 +99,7 @@ class RssSourceSyncService:
                     feed_url=feed_url,
                     category=(entry.get("category") or "news"),
                     locale=(entry.get("locale") or "zh-TW"),
+                    region=entry.get("region"),
                     enabled=default_enabled,
                 )
             except ValueError:
@@ -109,6 +119,24 @@ class RssSourceSyncService:
                 feed_url=seeded.feed_url,
                 category=seeded.category,
                 locale=seeded.locale,
+                # ``region`` is operator-controlled once set (it's editable
+                # from the admin World-events panel), so it follows the
+                # ``enabled`` convention rather than the canonical one:
+                # backfill only while the operator has never expressed an
+                # intent, and never overwrite one they did.
+                #
+                # "Never expressed an intent" cannot be read off ``region``
+                # alone: NULL means both "row predates the column" (backfill
+                # it) and "operator cleared it to global" (leave it). The
+                # admin API sets ``region_locked`` on any explicit set *or*
+                # clear, which is the only signal that separates the two —
+                # without it a cleared source silently got the YAML region
+                # back on the next boot.
+                region=(
+                    current.region
+                    if (current.region_locked or current.region)
+                    else seeded.region
+                ),
             )
             if merged != current:
                 await self._repository.upsert(merged)
@@ -164,7 +192,25 @@ class RssSourceSyncService:
         category = (entry.get("category") or "").strip().lower()
         if category != "emergency" or not source_region:
             return yaml_enabled
-        if not self._deployment_region:
+        deployment_region = self._current_deployment_region()
+        if not deployment_region:
             # Region unknown — keep the YAML default rather than guess.
             return yaml_enabled
-        return yaml_enabled and source_region == self._deployment_region
+        return yaml_enabled and source_region == deployment_region
+
+    def _current_deployment_region(self) -> str:
+        """Resolve the deployment region now (accessor or captured value)."""
+        source = self._deployment_region
+        if callable(source):
+            try:
+                value = source()
+            except Exception:  # noqa: BLE001 — seeding must never fail on this
+                logger.warning(
+                    "deployment region lookup failed; seeding region-bound "
+                    "sources with their YAML defaults",
+                    exc_info=True,
+                )
+                value = None
+        else:
+            value = source
+        return (value or "").strip().upper()

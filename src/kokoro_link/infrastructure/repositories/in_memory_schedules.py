@@ -32,3 +32,50 @@ class InMemoryScheduleRepository(ScheduleRepositoryPort):
     async def delete_for_character(self, character_id: str) -> int:
         bucket = self._by_character.pop(character_id, None)
         return len(bucket) if bucket else 0
+
+    async def claim_memorialize(self, activity_ids: list[str]) -> set[str]:
+        wanted = set(activity_ids)
+        if not wanted:
+            return set()
+        claimed: set[str] = set()
+        for bucket in self._by_character.values():
+            for date_, schedule in list(bucket.items()):
+                updated = []
+                changed = False
+                for activity in schedule.activities:
+                    if activity.id in wanted and not activity.memorialized:
+                        updated.append(
+                            activity.with_memory_state(
+                                memorialized=True,
+                                has_memory=activity.has_memory,
+                            ),
+                        )
+                        claimed.add(activity.id)
+                        changed = True
+                    else:
+                        updated.append(activity)
+                if changed:
+                    bucket[date_] = schedule.with_activities(updated)
+        return claimed
+
+    async def release_memorialize(self, activity_ids: list[str]) -> None:
+        wanted = set(activity_ids)
+        if not wanted:
+            return
+        for bucket in self._by_character.values():
+            for date_, schedule in list(bucket.items()):
+                updated = []
+                changed = False
+                for activity in schedule.activities:
+                    if activity.id in wanted and activity.memorialized:
+                        updated.append(
+                            activity.with_memory_state(
+                                memorialized=False,
+                                has_memory=activity.has_memory,
+                            ),
+                        )
+                        changed = True
+                    else:
+                        updated.append(activity)
+                if changed:
+                    bucket[date_] = schedule.with_activities(updated)

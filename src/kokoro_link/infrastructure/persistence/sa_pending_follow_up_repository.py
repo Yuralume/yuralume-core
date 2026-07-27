@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import asc, delete, desc, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -70,6 +70,28 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
                 )
                 .where(PendingFollowUpRow.scheduled_for <= now)
                 .order_by(asc(PendingFollowUpRow.scheduled_for))
+                .limit(max(0, limit))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [_row_to_domain(r) for r in rows]
+
+    async def list_stale_resolving(
+        self,
+        *,
+        now: datetime,
+        older_than_seconds: float,
+        limit: int = 50,
+    ) -> list[PendingFollowUp]:
+        cutoff = now - timedelta(seconds=max(0.0, older_than_seconds))
+        async with self._session_factory() as session:
+            stmt = (
+                select(PendingFollowUpRow)
+                .where(
+                    PendingFollowUpRow.status
+                    == PendingFollowUpStatus.RESOLVING.value,
+                )
+                .where(PendingFollowUpRow.updated_at < cutoff)
+                .order_by(asc(PendingFollowUpRow.updated_at))
                 .limit(max(0, limit))
             )
             rows = (await session.execute(stmt)).scalars().all()

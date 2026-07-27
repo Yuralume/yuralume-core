@@ -64,6 +64,28 @@ class PendingFollowUpRepositoryPort(Protocol):
         actually firing — this port is a coarse cursor.
         """
 
+    async def list_stale_resolving(
+        self,
+        *,
+        now: datetime,
+        older_than_seconds: float,
+        limit: int = 50,
+    ) -> list[PendingFollowUp]:
+        """Return ``resolving`` rows last touched more than
+        ``older_than_seconds`` ago (``updated_at < now - older_than_seconds``).
+
+        A ``resolving`` row is a release a worker claimed but never finished:
+        normally the worker flips it to ``resolved`` / back to ``queued`` within
+        seconds, so a row still ``resolving`` well past that age is a crashed
+        worker's orphan that ``list_due`` (``queued`` only) never rescues. The
+        **distributed** release reconciler sweeps these so the row is re-enqueued
+        and driven to a terminal state; the at-most-once visible-slot claim on the
+        release path keeps a rescue from re-sending an already-delivered message.
+
+        Ordered oldest-first, capped at ``limit``. Distributed-only — the embedded
+        tick's ``list_due`` is deliberately left untouched (byte-identical
+        self-host behaviour)."""
+
     async def list_open_for_character(
         self, character_id: str,
     ) -> list[PendingFollowUp]:

@@ -10,6 +10,8 @@ Status codes:
 * ``200`` — synth (or cache hit). Body has ``audio_url`` + ``cached``.
 * ``404`` — character id doesn't exist.
 * ``422`` — empty text.
+* ``402`` — hosted tenant is out of credits (structured
+  ``{"code": "insufficient_credits"}`` detail). Nothing was synthesised.
 * ``503`` — TTS not configured (env vars not set, or backend
   unreachable). UI greys out the play button on this code.
 * ``502`` — TTS backend reachable but synth failed.
@@ -25,6 +27,7 @@ from kokoro_link.api.dependencies import (
     get_container,
     get_current_user_id,
 )
+from kokoro_link.api.routes._cloud_errors import insufficient_credits_guard
 from kokoro_link.application.services.tts_service import TTSService
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.contracts.tts import TTSError, TTSUnavailable
@@ -112,9 +115,10 @@ async def synthesize_character_tts(
             detail="TTS is not configured",
         )
     try:
-        result = await service.synthesize(
-            character_id=character_id, text=payload.text,
-        )
+        with insufficient_credits_guard():
+            result = await service.synthesize(
+                character_id=character_id, text=payload.text,
+            )
     except TTSUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

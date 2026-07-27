@@ -36,7 +36,7 @@ _OP_ID = "default"
 
 def _candidate(
     *, candidate_id: str = "cand-1", field_key: str = "name",
-    layer: int = 1, value: str = "丹尼",
+    layer: int = 1, value: str = "艾力",
     content_mode: MessageContentMode = MessageContentMode.NORMAL,
 ) -> CandidateField:
     return CandidateField(
@@ -46,7 +46,7 @@ def _candidate(
         evidence_ref=EvidenceRef(
             turn_id="t",
             conversation_id="c",
-            quote="我叫丹尼",
+            quote="我叫艾力",
             extracted_at=datetime.now(timezone.utc),
         ),
         raw_extractor_confidence=0.85,
@@ -132,7 +132,7 @@ async def test_promote_layer1_name_does_not_sync_when_profile_unset():
                 candidate_id="cand-1",
                 field_key="name",
                 layer=1,
-                value="丹尼",
+                value="艾力",
                 new_confidence=0.9,
             ),
         ],
@@ -163,7 +163,7 @@ async def test_promote_still_skips_sync_when_profile_has_manual_name():
         ],
     )
     svc, profile = _build_service(
-        profile_returns=OperatorProfile(id="default", display_name="丹尼"),
+        profile_returns=OperatorProfile(id="default", display_name="艾力"),
         plan=plan,
         pending=[cand],
     )
@@ -207,7 +207,7 @@ async def test_promote_low_confidence_name_does_not_sync():
                 candidate_id="cand-1",
                 field_key="name",
                 layer=1,
-                value="丹尼",
+                value="艾力",
                 new_confidence=0.7,
             ),
         ],

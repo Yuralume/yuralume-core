@@ -26,6 +26,7 @@ import {
 } from '@/utils/api/messaging'
 import { UiButton } from '@/components/ui'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import ChannelSetupGuide from './ChannelSetupGuide.vue'
 import ChannelAccountNextStep from './ChannelAccountNextStep.vue'
 import ChannelProactiveAttemptLog from './ChannelProactiveAttemptLog.vue'
@@ -40,6 +41,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const { pt, cloudMode } = usePlayerCopy()
 const confirmDialog = useConfirmDialog()
 
 const PLATFORM_LABELS: Record<MessagingPlatform, string> = {
@@ -533,7 +535,7 @@ async function copyToClipboard(text: string, feedbackKey: string) {
 const copyFeedback = ref<string | null>(null)
 
 function platformHint(platform: MessagingPlatform): string {
-  return t(`channelBindingsPanel.platformHints.${platform}`)
+  return pt(`channelBindingsPanel.platformHints.${platform}`)
 }
 
 function splitLines(raw: string): string[] {
@@ -559,10 +561,14 @@ function readError(err: unknown, fallback: string): string {
     </div>
 
     <template v-else>
+      <!-- TODO(Line H / LH5): official LINE channel hub entry card goes here,
+           above the self-bind section (hosted only). Owner decision
+           2026-07-26 keeps both surfaces side by side; this plan only
+           reserves the slot. -->
       <div class="channels-header">
         <h3 class="section-title">{{ t('channelBindingsPanel.accounts.title') }}</h3>
         <p class="channels-hint">
-          {{ t('channelBindingsPanel.accounts.hint') }}
+          {{ pt('channelBindingsPanel.accounts.hint') }}
         </p>
       </div>
 
@@ -657,7 +663,21 @@ function readError(err: unknown, fallback: string): string {
                 :binding-count="bindingCount(account.id)"
               />
 
-              <div v-if="usesWebhookDelivery(account)" class="detail-section">
+              <!--
+                Hosted keeps the webhook plumbing working (owner decision
+                2026-07-26: self-binding survives in cloud) but folds it
+                behind an "advanced" disclosure so the default view is not
+                a wall of URLs. Self-host renders the same markup inline,
+                exactly as before.
+              -->
+              <component
+                :is="cloudMode ? 'details' : 'div'"
+                v-if="usesWebhookDelivery(account)"
+                :class="['detail-section', { 'advanced-block': cloudMode }]"
+              >
+                <summary v-if="cloudMode" class="advanced-summary">
+                  {{ t('channelBindingsPanel.advanced.title') }}
+                </summary>
                 <label class="field-label">{{ t('channelBindingsPanel.webhook.urlLabel') }}</label>
                 <div class="copy-row">
                   <code class="copy-text">{{ webhookUrlFor(account) }}</code>
@@ -686,7 +706,9 @@ function readError(err: unknown, fallback: string): string {
                     @click="handleCheckWebhookStatus(account)"
                   >{{ t('channelBindingsPanel.actions.checkStatus') }}</UiButton>
                 </div>
-                <p class="detail-hint">
+                <!-- Site-level plumbing: the hosted deployment owns this
+                     URL, so the player has nothing to act on. -->
+                <p v-if="!cloudMode" class="detail-hint">
                   {{ t('channelBindingsPanel.publicBaseUrl.effective', {
                     url: effectivePublicBaseUrl || t('common.fallback.notSet'),
                     source: publicBaseUrlSourceLabel,
@@ -698,10 +720,10 @@ function readError(err: unknown, fallback: string): string {
                 >
                   {{ webhookFeedback[account.id].message }}
                 </div>
-                <p v-if="!canRegisterWebhook" class="detail-hint">
+                <p v-if="!cloudMode && !canRegisterWebhook" class="detail-hint">
                   {{ t('channelBindingsPanel.publicBaseUrl.missingHint') }}
                 </p>
-              </div>
+              </component>
 
               <div v-if="account.platform === 'whatsapp'" class="detail-section">
                 <label class="field-label">{{ t('channelBindingsPanel.whatsappQr.label') }}</label>
@@ -730,7 +752,7 @@ function readError(err: unknown, fallback: string): string {
               </div>
 
               <div class="detail-section">
-                <label class="field-label">{{ t('channelBindingsPanel.allowlist.label') }}</label>
+                <label class="field-label">{{ pt('channelBindingsPanel.allowlist.label') }}</label>
                 <textarea
                   :value="account.allowed_sender_refs.join('\n')"
                   class="field-textarea"
@@ -746,9 +768,9 @@ function readError(err: unknown, fallback: string): string {
 
               <div class="detail-section">
                 <div class="bindings-header">
-                  <label class="field-label">{{ t('channelBindingsPanel.bindings.title') }}</label>
+                  <label class="field-label">{{ pt('channelBindingsPanel.bindings.title') }}</label>
                   <small class="detail-hint">
-                    {{ t('channelBindingsPanel.bindings.hint') }}
+                    {{ pt('channelBindingsPanel.bindings.hint') }}
                   </small>
                   <UiButton
                     size="sm"
@@ -913,7 +935,7 @@ function readError(err: unknown, fallback: string): string {
 
         <template v-else-if="createPlatform === 'whatsapp'">
           <p class="detail-hint">
-            {{ t('channelBindingsPanel.create.whatsappManagedByDeployment') }}
+            {{ pt('channelBindingsPanel.create.whatsappManagedByDeployment') }}
           </p>
         </template>
 
@@ -1089,6 +1111,24 @@ function readError(err: unknown, fallback: string): string {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* `<details>` must stay `display: block`; the flex layout `.detail-section`
+   normally applies stops the disclosure from collapsing its content. */
+.detail-section.advanced-block {
+  display: block;
+}
+
+.detail-section.advanced-block > * + * {
+  margin-top: 4px;
+}
+
+.advanced-summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary, #888);
+  margin-bottom: 4px;
+  user-select: none;
 }
 
 .copy-row {

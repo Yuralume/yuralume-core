@@ -84,7 +84,7 @@ def _seed(**kw) -> CharacterOperatorRelationshipSeed:
 def test_change_user_address_logs_player_and_reconciles_persona() -> None:
     change_log = _FakeChangeLog()
     persona = _FakePersona()
-    repo = _FakeSeedRepo(_seed(user_address_name="丹尼"))
+    repo = _FakeSeedRepo(_seed(user_address_name="艾力"))
     svc = RelationshipNamesService(
         seed_repository=repo,
         change_log_repository=change_log,
@@ -104,7 +104,7 @@ def test_change_user_address_logs_player_and_reconciles_persona() -> None:
     assert len(change_log.events) == 1
     ev = change_log.events[0]
     assert ev.direction == DIRECTION_PLAYER
-    assert ev.old_value == "丹尼"
+    assert ev.old_value == "艾力"
     assert ev.new_value == "阿丹"
     assert ev.character_id == "c1"
     # persona name reconciled to the new address name; a settings edit
@@ -148,7 +148,7 @@ def test_change_character_address_logs_character_no_persona() -> None:
 
 def test_clearing_name_writes_no_rename_log() -> None:
     change_log = _FakeChangeLog()
-    repo = _FakeSeedRepo(_seed(user_address_name="丹尼"))
+    repo = _FakeSeedRepo(_seed(user_address_name="艾力"))
     svc = RelationshipNamesService(
         seed_repository=repo,
         change_log_repository=change_log,
@@ -169,13 +169,13 @@ def test_clearing_name_writes_no_rename_log() -> None:
 def test_unchanged_value_writes_no_rename_log() -> None:
     change_log = _FakeChangeLog()
     svc = RelationshipNamesService(
-        seed_repository=_FakeSeedRepo(_seed(user_address_name="丹尼")),
+        seed_repository=_FakeSeedRepo(_seed(user_address_name="艾力")),
         change_log_repository=change_log,
         persona_service=_FakePersona(),
     )
     asyncio.run(
         svc.update_names(
-            character_id="c1", operator_id="op1", user_address_name="丹尼",
+            character_id="c1", operator_id="op1", user_address_name="艾力",
         )
     )
     assert change_log.events == []
@@ -206,7 +206,7 @@ def test_observed_source_stamps_rename_log() -> None:
     change_log = _FakeChangeLog()
     persona = _FakePersona()
     svc = RelationshipNamesService(
-        seed_repository=_FakeSeedRepo(_seed(user_address_name="丹尼")),
+        seed_repository=_FakeSeedRepo(_seed(user_address_name="艾力")),
         change_log_repository=change_log,
         persona_service=persona,
     )
@@ -225,7 +225,7 @@ def test_observed_source_stamps_rename_log() -> None:
 def test_invalid_source_falls_back_to_player_edit() -> None:
     change_log = _FakeChangeLog()
     svc = RelationshipNamesService(
-        seed_repository=_FakeSeedRepo(_seed(user_address_name="丹尼")),
+        seed_repository=_FakeSeedRepo(_seed(user_address_name="艾力")),
         change_log_repository=change_log,
         persona_service=_FakePersona(),
     )
@@ -240,7 +240,7 @@ def test_invalid_source_falls_back_to_player_edit() -> None:
 
 def test_persona_reconcile_failure_is_soft() -> None:
     change_log = _FakeChangeLog()
-    repo = _FakeSeedRepo(_seed(user_address_name="丹尼"))
+    repo = _FakeSeedRepo(_seed(user_address_name="艾力"))
     svc = RelationshipNamesService(
         seed_repository=repo,
         change_log_repository=change_log,

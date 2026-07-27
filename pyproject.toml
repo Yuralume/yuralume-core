@@ -31,8 +31,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "aiosqlite>=0.20.0,<1.0.0",
     "pytest>=8.3.0,<9.0.0",
     "pytest-asyncio>=0.24.0,<1.0.0",
+    "pytest-timeout>=2.3.0,<3.0.0",
     "testcontainers[postgres]>=4.9.0,<5.0.0",
 ]
 

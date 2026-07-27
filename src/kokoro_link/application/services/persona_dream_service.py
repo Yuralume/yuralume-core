@@ -52,6 +52,7 @@ from kokoro_link.domain.value_objects.timezone import timezone_for_id
 from kokoro_link.application.services.operator_persona_service import (
     OperatorPersonaService,
 )
+from kokoro_link.application.services.runtime_claim import RuntimeClaim
 from kokoro_link.application.services.operator_profile_service import (
     OperatorProfileService,
 )
@@ -87,6 +88,7 @@ class PersonaDreamService:
         behavioral_pattern_service: "BehavioralPatternObserverService | None" = None,
         character_repository=None,  # noqa: ANN001 - optional, only for name lookup
         clock: ClockPort | None = None,
+        cooldown_claim: RuntimeClaim | None = None,
     ) -> None:
         self._consolidator = consolidator
         self._repository = repository
@@ -136,8 +138,22 @@ class PersonaDreamService:
         # if they happen to fire on the same tick.
         self._priority_gate = None
         # Per (character_id, operator_id) — each character's dream
-        # cycle is independent.
+        # cycle is independent. Process-local by nature, so it is only the
+        # CHEAP first gate; the fleet-wide throttle is ``_cooldown_claim``.
+        # Stamped on ATTEMPT (see ``_reserve_local_window``), never only on
+        # success: the claim it pairs with is spent the moment it is taken, and
+        # a pass that dies halfway must not hand this process a free retry.
         self._last_run_at: dict[tuple[str, str], datetime] = {}
+        # Cross-worker cooldown (hosted 2×worker). ``_last_run_at`` lives in one
+        # process, so with the scheduler running on N replicas each replica kept
+        # its own "last run" map and ``dream_min_interval_hours`` throttled
+        # nothing — the pair could burn N dream passes (one full-staging-buffer
+        # LLM call each) per window, with only ``count_pending`` in between.
+        # The claim is taken and deliberately NEVER released: its TTL is set to
+        # the configured interval, so the TTL *is* the cooldown and a worker
+        # that dies mid-pass cannot wedge the pair (the claim just lapses).
+        # ``None`` → self-host / legacy tests keep the pre-existing behaviour.
+        self._cooldown_claim = cooldown_claim
 
     def set_behavioral_pattern_service(
         self, service: "BehavioralPatternObserverService | None",
@@ -221,15 +237,19 @@ class PersonaDreamService:
         *,
         now: datetime | None = None,
     ) -> bool:
-        """All three conditions must hold for the given pair:
+        """All four conditions must hold for the given pair:
 
         - currently in operator-local quiet hours
+        - at least ``dream_min_interval_hours`` since the last run
+          *of this process* (cheap, in-memory)
         - at least ``dream_min_pending`` pending candidates queued
           *for this character*
-        - at least ``dream_min_interval_hours`` since the last run
-          *of this character*
+        - the fleet-wide cooldown claim for the pair is free
 
-        Cheap by design — only the pending count touches the DB.
+        Ordered cheapest-first on purpose: the claim is the only step that
+        writes, and taking it during active hours (or with nothing to
+        consolidate) would silently eat the pair's whole cooldown window
+        without a dream pass ever running.
 
         ``operator_id`` is the character owner's user id under the
         multi-user rename (see MULTI_USER_AUTH_PLAN), so passing it
@@ -240,12 +260,9 @@ class PersonaDreamService:
         if not await self._is_quiet_now(user_id=operator_id, now=now):
             return False
         key = (character_id, operator_id)
-        last = self._last_run_at.get(key)
         ref = self._resolve_now(now)
-        if last is not None:
-            elapsed = ref - last
-            if elapsed.total_seconds() < self._settings.dream_min_interval_hours * 3600:
-                return False
+        if not self._local_window_open(key, ref):
+            return False
         try:
             pending_count = await self._repository.count_pending(
                 character_id, operator_id,
@@ -256,7 +273,65 @@ class PersonaDreamService:
                 character_id, operator_id,
             )
             return False
-        return pending_count >= self._settings.dream_min_pending
+        if pending_count < self._settings.dream_min_pending:
+            return False
+        return await self._claim_cooldown(character_id, operator_id, now=ref)
+
+    def _local_window_open(
+        self, key: tuple[str, str], now: datetime,
+    ) -> bool:
+        """Has ``dream_min_interval_hours`` elapsed since this process' attempt?"""
+        last = self._last_run_at.get(key)
+        if last is None:
+            return True
+        elapsed = (now - last).total_seconds()
+        return elapsed >= self._settings.dream_min_interval_hours * 3600
+
+    def _reserve_local_window(
+        self, key: tuple[str, str], now: datetime,
+    ) -> bool:
+        """Re-check the in-process window and stamp it in the SAME sync step.
+
+        The gate at the top of :meth:`should_run_now` has an ``await``
+        (``count_pending``) between its check and this point, so two coroutines
+        on this worker can both clear it and then both be told to dream — and
+        the fleet claim cannot catch that, because ``acquire`` renews for the
+        same owner over a still-live row. This reservation has no ``await``
+        inside it, so under asyncio exactly one caller can win it.
+        """
+        if not self._local_window_open(key, now):
+            return False
+        self._last_run_at[key] = now
+        return True
+
+    async def _claim_cooldown(
+        self, character_id: str, operator_id: str, *, now: datetime,
+    ) -> bool:
+        """Take the dream slot for this pair — acquire, never release.
+
+        Two layers, because they cover different duplicates:
+
+        - the in-process reservation below fences sibling coroutines on THIS
+          worker (the claim cannot: it renews for its own owner);
+        - the claim fences the other replicas. Its TTL is
+          ``dream_min_interval_hours``, so holding it *is* the cooldown: the
+          window ends by expiry rather than by anyone remembering to release.
+
+        The stamp lands here, on the attempt, not at the end of a successful
+        pass — same semantic as the claim, which is spent as soon as it is
+        taken. Losing the claim afterwards still leaves the stamp: the pair
+        genuinely is in cooldown, another replica is dreaming it right now.
+        """
+        if not self._reserve_local_window((character_id, operator_id), now):
+            return False
+        if self._cooldown_claim is None:
+            return True
+        return await self._cooldown_claim.acquire(
+            character_id,
+            operator_id,
+            ttl_seconds=max(1, int(self._settings.dream_min_interval_hours * 3600)),
+            now=now,
+        )
 
     async def run_consolidation(
         self,
@@ -355,6 +430,10 @@ class PersonaDreamService:
                 or applied_any
             )
 
+        # Idempotent refresh for the scheduler path (``_claim_cooldown`` already
+        # stamped this attempt with the same ``now``). It earns its keep for the
+        # direct callers that never pass through ``should_run_now`` — the admin
+        # dream-tick route — which would otherwise leave no window behind.
         self._last_run_at[(character_id, operator_id)] = ref
         if applied_any:
             self._persona_service.invalidate_cache(character_id, operator_id)

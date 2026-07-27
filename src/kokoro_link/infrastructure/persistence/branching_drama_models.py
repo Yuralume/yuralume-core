@@ -40,6 +40,11 @@ class BranchingDramaRow(Base):
     error_message: Mapped[str | None] = mapped_column(
         Text, nullable=True,
     )
+    error_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    """Gateway refusal code behind a ``failed`` status (U4b) — see
+    ``FusionStoryRow.error_code``. ``NULL`` for ordinary crashes."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )

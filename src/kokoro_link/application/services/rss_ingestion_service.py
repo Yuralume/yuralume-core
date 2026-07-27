@@ -3,7 +3,8 @@
 The service runs a single pass over every enabled ``RssSource``:
 
 1. Ask the fetcher port for raw events
-2. Skip URLs already present in ``world_events``
+2. Skip URLs already present in ``world_events`` (repairing their
+   denormalised ``source_region`` on the way past)
 3. Embed (best-effort — failure → null embedding, curator skips later)
 4. Upsert into ``world_events``
 5. Mark source success / error
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -43,6 +44,9 @@ class IngestionReport:
     events_skipped_dedup: int
     events_skipped_embed: int
     errors: tuple[str, ...]
+    events_region_corrected: int = 0
+    """Already-ingested events whose denormalised ``source_region`` was
+    brought back in line with the registry during this pass."""
 
 
 class RssIngestionService:
@@ -68,6 +72,7 @@ class RssIngestionService:
         persisted = 0
         skipped_dedup = 0
         skipped_embed = 0
+        region_corrected = 0
         errors: list[str] = []
 
         cutoff = datetime.now(timezone.utc).replace(microsecond=0)
@@ -106,13 +111,20 @@ class RssIngestionService:
                 continue
 
             new_events: list[RawWorldEvent] = []
+            known_urls: list[str] = []
             for raw in raws:
+                raw = _with_trusted_published_at(raw, fetched_at=now)
                 if raw.published_at.timestamp() < cutoff_age:
                     continue
                 if await self._events.has_url(raw.url):
                     skipped_dedup += 1
+                    known_urls.append(raw.url)
                     continue
                 new_events.append(raw)
+
+            region_corrected += await self._heal_source_region(
+                source_id=source.id, urls=known_urls, region=source.region,
+            )
 
             embeddings: list[tuple[float, ...] | None] = []
             if new_events and self._embedder.is_operational:
@@ -142,6 +154,10 @@ class RssIngestionService:
                     fetched_at=now,
                     category=raw.category or "news",
                     locale=raw.locale or source.locale or None,
+                    # Region is a property of the *registry entry*, never of
+                    # the feed payload — denormalised here so the curator can
+                    # narrow the pool in SQL without joining rss_sources.
+                    source_region=source.region,
                     topic_tags=raw.topic_tags,
                     embedding=list(vec) if vec is not None else None,
                 )
@@ -166,7 +182,41 @@ class RssIngestionService:
             events_skipped_dedup=skipped_dedup,
             events_skipped_embed=skipped_embed,
             errors=tuple(errors),
+            events_region_corrected=region_corrected,
         )
+
+    async def _heal_source_region(
+        self, *, source_id: str, urls: list[str], region: str | None,
+    ) -> int:
+        """Re-point de-duplicated events at the source's current region.
+
+        ``source_region`` is denormalised onto the event at ingest time and
+        the pool carries no back-link to ``rss_sources``, so an event the
+        de-dup probe skipped keeps the region it was first written with.
+        After a migration backfill or an admin re-tag that value is stale —
+        the event leaks into the wrong region's pool, or hides from every
+        pool — and nothing else would ever fix it before GC. Re-seeing the
+        URL is the one moment the pipeline knows which source owns it.
+
+        Fail-soft like the rest of the pass: a repair that fails must not
+        cost the source its fresh events.
+        """
+        if not urls:
+            return 0
+        try:
+            return await self._events.sync_source_region(
+                urls=urls, source_region=region,
+            )
+        except Exception as exc:  # noqa: BLE001 — repair is best-effort
+            logger.warning(
+                "world_event source_region repair failed",
+                extra={
+                    "source_id": source_id,
+                    "url_count": len(urls),
+                    "error": repr(exc),
+                },
+            )
+            return 0
 
     async def gc(self) -> int:
         """Delete events older than the retention window. The curator
@@ -175,6 +225,52 @@ class RssIngestionService:
         each ingest pass keeps it small."""
         cutoff = datetime.now(timezone.utc) - _days(self._max_age_days * 2)
         return await self._events.delete_older_than(cutoff)
+
+
+# A publish timestamp at or before this instant is a broken feed, not a
+# real date: RSS producers that fail to emit ``pubDate`` routinely serialise
+# the Unix epoch instead (observed across whole feeds, e.g. UDN's 即時 feed).
+# Anything from before RSS itself existed is in the same class.
+_IMPLAUSIBLE_PUBLISHED_BEFORE = datetime(1995, 1, 1, tzinfo=timezone.utc)
+
+# Feeds also emit dates far in the future (timezone maths bugs, templating
+# accidents). Those would pin an item to the top of every recency sort
+# forever, so they are treated as equally untrustworthy.
+_FUTURE_PUBLISHED_TOLERANCE_SECONDS = 2 * 86400
+
+
+def _with_trusted_published_at(
+    raw: RawWorldEvent, *, fetched_at: datetime,
+) -> RawWorldEvent:
+    """Replace an implausible ``published_at`` with the fetch time.
+
+    A general rule, deliberately not a per-source workaround: any feed
+    whose item dates are unusable gets the same treatment. Without it an
+    epoch-0 item is silently dropped by the freshness cutoff (the whole
+    feed disappears), and a far-future item would monopolise every
+    recency-ordered read.
+    """
+    published = raw.published_at
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    too_old = published <= _IMPLAUSIBLE_PUBLISHED_BEFORE
+    too_new = (
+        published.timestamp()
+        > fetched_at.timestamp() + _FUTURE_PUBLISHED_TOLERANCE_SECONDS
+    )
+    if not too_old and not too_new:
+        return raw if published is raw.published_at else replace(
+            raw, published_at=published,
+        )
+    logger.debug(
+        "rss entry published_at implausible; using fetch time",
+        extra={
+            "source_id": raw.source_id,
+            "url": raw.url,
+            "published_at": published.isoformat(),
+        },
+    )
+    return replace(raw, published_at=fetched_at)
 
 
 def _embed_text(raw: RawWorldEvent) -> str:

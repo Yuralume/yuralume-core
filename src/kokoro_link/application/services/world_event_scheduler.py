@@ -26,6 +26,10 @@ from kokoro_link.application.services.event_curator_service import (
 from kokoro_link.application.services.rss_ingestion_service import (
     RssIngestionService,
 )
+from kokoro_link.contracts.generation_trigger import (
+    GenerationTrigger,
+    generation_trigger_scope,
+)
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,6 +80,21 @@ class WorldEventScheduler:
             self._task = None
             self._stop_event = None
 
+    @property
+    def started(self) -> bool:
+        """Whether a background task currently exists — created by :meth:`start`,
+        cleared by :meth:`stop`. Stays ``True`` after the task crashes on its own
+        (``stop()`` was never reached to null the ref), so a liveness probe can
+        tell 'started then died' apart from 'never started'."""
+        return self._task is not None
+
+    @property
+    def is_running(self) -> bool:
+        """``True`` only while the background task exists AND has not finished. A
+        returned/crashed task reads ``False`` here while :attr:`started` stays
+        ``True`` — the signal the /health scheduler-liveness gate reads."""
+        return self._task is not None and not self._task.done()
+
     async def _run(self) -> None:
         assert self._stop_event is not None
         _LOGGER.info(
@@ -104,10 +123,12 @@ class WorldEventScheduler:
 
                 now_t = loop.time()
                 if now_t >= self._next_ingest_at:
-                    await self._safe_ingest()
+                    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+                        await self._safe_ingest()
                     self._next_ingest_at = now_t + self._ingest_interval
                 if now_t >= self._next_curate_at:
-                    await self._safe_curate()
+                    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+                        await self._safe_curate()
                     self._next_curate_at = now_t + self._curate_interval
         except asyncio.CancelledError:
             pass

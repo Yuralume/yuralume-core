@@ -32,6 +32,13 @@ from kokoro_link.application.services.account_runtime_profile import (
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
+from kokoro_link.application.services.chat_turn_lease import (
+    ChatTurnLease,
+    release_turn_lease,
+)
+from kokoro_link.application.services.studio_execution_lease import (
+    StudioLeaseSession,
+)
 from kokoro_link.application.services.cloud_identity_context import (
     bind_cloud_actor,
 )
@@ -83,6 +90,9 @@ from kokoro_link.application.services.tts_pregeneration_service import (
 )
 from kokoro_link.application.services.turn_snapshot_codec import (
     arc_to_dict, goal_to_dict, schedule_to_dict, state_to_dict,
+)
+from kokoro_link.application.services.post_turn_runner import (
+    PostTurnEnqueueOutcome,
 )
 from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_event_service import StoryEventService
@@ -186,6 +196,10 @@ from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
 )
+from kokoro_link.contracts.generation_trigger import (
+    GenerationTrigger,
+    generation_trigger_scope,
+)
 from kokoro_link.domain.entities.generation_usage import (
     CAPABILITY_LLM,
     STATUS_FAILED,
@@ -207,6 +221,14 @@ from kokoro_link.contracts.prompt import (
     PromptContextBuilderPort,
     PromptToolDescriptor,
     ToolOutcomeMessage,
+)
+from kokoro_link.application.services.external_chat.turn_support import (
+    run_with_lease_heartbeat,
+)
+from kokoro_link.contracts.external_chat_execution import (
+    ExternalChatTurnExecutionPort,
+    GeneratedTurnSnapshot,
+    AttachmentSnapshot,
 )
 from kokoro_link.contracts.repositories import CharacterRepositoryPort, ConversationRepositoryPort
 from kokoro_link.contracts.state import StateEnginePort
@@ -642,6 +664,30 @@ def _last_prompt_pack_hash(prompt_context_builder: object) -> str:
     return str(getattr(prompt_context_builder, "last_prompt_pack_hash", "") or "")
 
 
+@dataclass(frozen=True, slots=True)
+class TurnPrelude:
+    """Everything resolved BEFORE a turn claims its conversation.
+
+    The non-streaming and streaming entry points opened with the same ~30
+    lines of identity / access / conversation resolution. Hoisting it into one
+    step removed the duplication *and* gave the turn lease a place to stand:
+    the conversation id is only known once ``_load_conversation`` has run, and
+    the lease must be taken before the first write of the turn body.
+
+    Everything in here is either read-only or idempotent (the unfreeze-on-
+    interaction touch, the create-on-first-turn conversation row), so running
+    it outside the lease cannot corrupt a concurrent turn. Keeping the runtime
+    message-cap check out here also preserves the existing precedence: a demo
+    account over its cap still gets 429, never 409.
+    """
+
+    character: Character
+    operator: "OperatorProfile | None"
+    conversation: Conversation
+    content_mode: MessageContentMode
+    presence_frame: PresenceFrame
+
+
 class ChatService:
     def __init__(
         self,
@@ -727,6 +773,7 @@ class ChatService:
         event_seed_dispenser=None,  # noqa: ANN001 - optional EventSeedDispenser
         clock: ClockPort | None = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
+        turn_lease: ChatTurnLease | None = None,
     ) -> None:
         self._character_repository = character_repository
         self._conversation_repository = conversation_repository
@@ -775,6 +822,16 @@ class ChatService:
         self._idle_drift_threshold_minutes = max(0.0, idle_drift_threshold_minutes)
         self._busy_reply_decider = busy_reply_decider
         self._pending_follow_up_repository = pending_follow_up_repository
+        # Phase 5 §5 priority 1: optional event-driven release enqueuer. Wired via
+        # a setter only on the distributed (hosted) backend after the coordinator
+        # lease / queue exist; on embedded / self-host it stays None → the write
+        # points below add the row exactly as before with zero path difference.
+        self._pending_follow_up_release_enqueuer = None
+        # Phase 5 §5: optional event-driven post-turn enqueuer. Wired via a setter only
+        # on the distributed (hosted) backend after the coordinator lease / queue exist;
+        # on embedded / self-host it stays None → ``_run_post_turn`` runs the post-turn
+        # in-process exactly as before (§ red line — zero path difference).
+        self._post_turn_enqueuer = None
         self._character_encounter_intent_repository = (
             character_encounter_intent_repository
         )
@@ -819,6 +876,11 @@ class ChatService:
         self._event_seed_dispenser = event_seed_dispenser
         self._clock = clock
         self._subscription_access_guard = subscription_access_guard
+        # Per-conversation turn mutex. ``None`` → the historical unguarded
+        # behaviour (lease-less test rigs and any caller that opts out); the
+        # container always wires one, so both hosted replicas and a single
+        # self-host process serialize a conversation's player turns.
+        self._turn_lease = turn_lease
         self._pending_tasks: set[asyncio.Task] = set()
 
     def _resolve_now(self, now: datetime | None = None) -> datetime:
@@ -1431,12 +1493,17 @@ class ChatService:
     ) -> None:
         self._tts_pregenerator = pregenerator
 
-    async def send_message(
+    async def _begin_turn(
         self,
         payload: SendChatMessageRequest,
         *,
-        current_user_id: str | None = None,
-    ) -> ChatReplyResponse:
+        current_user_id: str | None,
+    ) -> TurnPrelude:
+        """Resolve identity, access and the target conversation for a turn.
+
+        Shared verbatim by the non-streaming and streaming entry points; see
+        :class:`TurnPrelude` for why this must stay outside the turn lease.
+        """
         character = await self._load_character_with_recovery(payload.character_id)
         owner_user_id = getattr(character, "user_id", DEFAULT_OPERATOR_ID)
         # Owner verification: the route already short-circuits, but the
@@ -1471,6 +1538,67 @@ class ChatService:
             character=character,
             conversation=conversation,
         )
+        return TurnPrelude(
+            character=character,
+            operator=operator,
+            conversation=conversation,
+            content_mode=content_mode,
+            presence_frame=presence_frame,
+        )
+
+    async def _acquire_turn_lease(
+        self, conversation_id: str,
+    ) -> "StudioLeaseSession | None":
+        """Claim ``conversation_id`` for this turn, or raise
+        ``ConversationBusyError``. ``None`` when no lease is wired."""
+        if self._turn_lease is None:
+            return None
+        return await self._turn_lease.acquire(conversation_id)
+
+    async def send_message(
+        self,
+        payload: SendChatMessageRequest,
+        *,
+        current_user_id: str | None = None,
+        external_turn: ExternalChatTurnExecutionPort | None = None,
+    ) -> ChatReplyResponse:
+        """Run one complete non-streaming turn under the conversation lease.
+
+        ``external_turn`` (LH2) already runs the turn inside the durable
+        external-chat state machine, which owns its own per-turn lease and
+        fencing; layering a second claim on top would only add a failure mode,
+        so that path stays exactly as it was.
+        """
+        prelude = await self._begin_turn(payload, current_user_id=current_user_id)
+        if external_turn is not None:
+            return await self._send_message_turn(
+                payload, prelude, external_turn=external_turn,
+            )
+        lease = await self._acquire_turn_lease(prelude.conversation.id)
+        try:
+            return await self._send_message_turn(
+                payload, prelude, external_turn=None,
+            )
+        finally:
+            await release_turn_lease(lease)
+
+    async def _send_message_turn(
+        self,
+        payload: SendChatMessageRequest,
+        prelude: TurnPrelude,
+        *,
+        external_turn: ExternalChatTurnExecutionPort | None = None,
+    ) -> ChatReplyResponse:
+        # ``external_turn`` (LH2 seam) drives this turn through the durable
+        # external-chat state machine: every conversation write and every
+        # stable-identity / anchor decision is delegated to the port. When it
+        # is ``None`` (the web / self-host path) the body below is bit-identical
+        # to the pre-LH2 flow — every hook fires only inside ``if external_turn``.
+        character = prelude.character
+        operator = prelude.operator
+        conversation = prelude.conversation
+        content_mode = prelude.content_mode
+        presence_frame = prelude.presence_frame
         # History is merged across every source (web / telegram / line / …)
         # — the character is a single person on every channel, so the
         # prompt should see one unified timeline rather than only this
@@ -1579,6 +1707,13 @@ class ChatService:
             today_local=today_local,
         )
 
+        # LH2 seam: the user turn is CAS-appended to the durable spine BEFORE
+        # the busy-defer decision so both the defer and the normal branch share
+        # one exactly-once user row (recovery reuses it, never rewrites). On the
+        # legacy path this stays deferred to the save() below the defer check.
+        if external_turn is not None:
+            await external_turn.persist_user_turn(conversation, user_message)
+
         # Busy-defer short-circuit: when the character is mid high-busy
         # activity and the decider says "send a brief ack now, real
         # reply later", we persist the ack inline and queue a
@@ -1600,6 +1735,7 @@ class ChatService:
             recent_proactive_messages=recent_proactive_messages,
             journal=journal,
             content_mode=content_mode,
+            external_turn=external_turn,
         )
         if defer is not None:
             _, defer_user_msg, defer_brief_msg, defer_state, _ = defer
@@ -1614,13 +1750,19 @@ class ChatService:
         # network drop can't lose it. The client refreshes → reads the
         # conversation → sees their own message and can retry the reply.
         conversation_with_user = conversation.append(user_message)
-        await self._conversation_repository.save(conversation_with_user)
+        if external_turn is None:
+            await self._conversation_repository.save(conversation_with_user)
+        # external path: the user row was already CAS-appended via
+        # ``persist_user_turn`` above; the whole-conversation replace is
+        # skipped so it never becomes an external concurrency primitive.
 
         model, model_id = await self._resolve_main_chat_model(
             character=character,
             payload=payload,
         )
-        generation = await self._generate_reply_with_tools(
+        if external_turn is not None:
+            await external_turn.heartbeat()
+        generation_coro = self._generate_reply_with_tools(
             character=character,
             conversation=conversation,
             recent_messages=prompt_recent_messages,
@@ -1663,6 +1805,17 @@ class ChatService:
                 content_mode,
             ),
         )
+        # H7: keep the lease alive for the whole (potentially long) LLM + tool
+        # run. The heartbeat loop refreshes the lease every lease/3 seconds and
+        # aborts (raises) the moment the lease is lost, so a takeover can never
+        # run concurrently with this generation.
+        if external_turn is not None:
+            generation = await run_with_lease_heartbeat(
+                external_turn, generation_coro,
+            )
+            await external_turn.heartbeat()
+        else:
+            generation = await generation_coro
         assistant_text = generation.text
         attachments = generation.attachments
         assistant_message = Message(
@@ -1683,8 +1836,40 @@ class ChatService:
         updated_character = character.with_state(final_state)
         updated_conversation = conversation_with_user.append(assistant_message)
 
+        # LH2 seam: resolve the stable turn id (from the durable receipt) up
+        # front so it stamps both the GENERATED snapshot and the post-turn job
+        # key, then durably checkpoint GENERATED BEFORE the assistant append so
+        # an expired-lease takeover finalises from the snapshot without ever
+        # re-running the LLM.
+        if external_turn is not None:
+            turn_record_id = external_turn.stable_turn_id()
+            await external_turn.checkpoint_generated(
+                GeneratedTurnSnapshot(
+                    turn_id=turn_record_id,
+                    assistant_text=assistant_text,
+                    attachments=tuple(
+                        AttachmentSnapshot(
+                            kind=a.kind,
+                            url=a.url,
+                            mime_type=a.mime_type,
+                            caption=a.caption,
+                        )
+                        for a in assistant_message.attachments
+                    ),
+                    assistant_kind=assistant_message.kind.value,
+                    content_mode=content_mode.value,
+                ),
+            )
+
         await self._character_repository.save(updated_character)
-        await self._conversation_repository.save(updated_conversation)
+        if external_turn is None:
+            await self._conversation_repository.save(updated_conversation)
+        else:
+            # Exactly-once CAS append of the assistant turn (GENERATED →
+            # COMMITTED); never the whole-conversation replace.
+            await external_turn.commit_assistant_turn(
+                conversation_with_user, assistant_message,
+            )
         self._schedule_nsfw_safe_summary_generation(
             character=character,
             conversation_id=updated_conversation.id,
@@ -1713,7 +1898,15 @@ class ChatService:
         # but with the marker stripped the user message often carries
         # real intent (e.g. ``我想看你在咖啡廳的樣子``) that's worth
         # capturing.
-        turn_record_id = str(uuid4())
+        if external_turn is None:
+            turn_record_id = str(uuid4())
+            assistant_index = len(updated_conversation.messages) - 1
+        else:
+            # ``turn_record_id`` was resolved from the stable receipt id above.
+            # Post-turn reads the EXACT durable anchor (assistant position) from
+            # the receipt rather than the in-memory ``len(...) - 1`` guess.
+            _anchors = external_turn.post_turn_anchors()
+            assistant_index = _anchors.assistant_position
         post_turn_refs = await self._run_post_turn(
             character=character,
             conversation_id=updated_conversation.id,
@@ -1721,6 +1914,11 @@ class ChatService:
             user_text=cleaned_user_message,
             assistant_text=assistant_text,
             prior_messages=recent_messages,
+            # The assistant reply is the last message on the just-saved conversation;
+            # its stable index anchors the distributed worker's id-only rebuild.
+            # On the legacy path this is the in-memory tail index; on the
+            # external path it is the exact durable position from the receipt.
+            assistant_index=assistant_index,
             persona_enabled=payload.operator_persona_enabled,
             content_mode=content_mode.value,
         )
@@ -1812,36 +2010,36 @@ class ChatService:
         Returns a (token_stream, finalizer) tuple.
         The caller should iterate the stream to get tokens, then call
         ``await finalizer.finish(full_text)`` to persist state.
-        """
-        character = await self._load_character_with_recovery(payload.character_id)
-        owner_user_id = getattr(character, "user_id", DEFAULT_OPERATOR_ID)
-        if (
-            current_user_id is not None
-            and owner_user_id != current_user_id
-        ):
-            raise ValueError("Character not found")
-        if self._subscription_access_guard is not None:
-            await self._subscription_access_guard.ensure_character_allowed(character)
-        character = await self._maybe_unfreeze_on_interaction(character)
-        operator = await self._load_operator(
-            user_id=current_user_id or owner_user_id,
-        )
-        # Bind the ambient cloud actor for this turn so every auxiliary LLM
-        # call it fans out to (persona / behaviour extraction, dialogue
-        # summarise, ...) resolves cloud identity without threading it. This
-        # is the transport-agnostic boundary: it covers the HTTP chat route,
-        # the messaging dispatcher, and proactive follow-ups alike. Each turn
-        # re-binds at its start, so the no-reset binding is safe even when a
-        # background task processes several turns sequentially.
-        bind_cloud_actor(character=character)
-        presence_frame = payload.resolved_presence_frame()
-        content_mode = await self._content_mode_for_character(character)
 
-        conversation = await self._load_conversation(payload.conversation_id, payload.character_id)
-        await self._ensure_runtime_message_session_available(
-            character=character,
-            conversation=conversation,
-        )
+        The conversation lease spans BOTH calls: it is claimed here, before the
+        user turn is persisted, and handed to the finalizer, which releases it
+        once the assistant message has landed. A turn that fails before the
+        finalizer exists releases here; the route additionally releases in a
+        ``finally`` so an abandoned stream (client disconnect, mid-stream
+        error) frees the conversation immediately instead of after the TTL.
+        """
+        prelude = await self._begin_turn(payload, current_user_id=current_user_id)
+        lease = await self._acquire_turn_lease(prelude.conversation.id)
+        try:
+            token_stream, finalizer = await self._start_message_stream(
+                payload, prelude,
+            )
+        except BaseException:
+            await release_turn_lease(lease)
+            raise
+        finalizer.attach_turn_lease(lease)
+        return token_stream, finalizer
+
+    async def _start_message_stream(
+        self,
+        payload: SendChatMessageRequest,
+        prelude: TurnPrelude,
+    ) -> tuple[AsyncIterator[str], "StreamFinalizer"]:
+        character = prelude.character
+        operator = prelude.operator
+        conversation = prelude.conversation
+        content_mode = prelude.content_mode
+        presence_frame = prelude.presence_frame
         # History is merged across every source (web / telegram / line / …)
         # — the character is a single person on every channel, so the
         # prompt should see one unified timeline rather than only this
@@ -2700,6 +2898,7 @@ class ChatService:
         recent_proactive_messages: tuple[ProactiveAttempt, ...] = (),
         journal: TurnJournal | None,
         content_mode: MessageContentMode = MessageContentMode.NORMAL,
+        external_turn: ExternalChatTurnExecutionPort | None = None,
     ) -> tuple[Conversation, Message, Message | None, CharacterState, PendingFollowUp] | None:
         """Ask the busy-reply decider whether to short-circuit this turn.
 
@@ -2820,14 +3019,31 @@ class ChatService:
         )
         conv_with_user = conversation.append(user_msg)
         conv_with_brief = conv_with_user.append(brief_msg)
-        try:
-            await self._conversation_repository.save(conv_with_brief)
-        except Exception:
-            _LOGGER.exception(
-                "failed to persist defer turn conversation=%s",
-                conversation.id,
+        if external_turn is None:
+            try:
+                await self._conversation_repository.save(conv_with_brief)
+            except Exception:
+                _LOGGER.exception(
+                    "failed to persist defer turn conversation=%s",
+                    conversation.id,
+                )
+                return None
+        else:
+            # LH2 seam: the sole conversation write-exit of the busy-defer
+            # branch. The user turn was already CAS-appended by the caller
+            # (persist_user_turn, idempotent); this GENERATED-checkpoints the
+            # brief ack and CAS-finalises user + assistant. Pending follow-up
+            # dedup is keyed on the stable turn_id by the adapter.
+            #
+            # B2: this path durably GENERATED-checkpoints the brief ack BEFORE
+            # the append. Once GENERATED exists the LLM must NEVER be re-run, so
+            # a failure here must NOT be swallowed into a ``return None`` (which
+            # would fall back to the main reply path and re-run the LLM after
+            # GENERATED). It propagates to the turn service, whose receipt
+            # recovery finalises from the checkpoint instead.
+            await external_turn.commit_deferred_reply(
+                conversation, user_msg, brief_msg,
             )
-            return None
 
         final_state = self._state_engine.on_assistant_reply(
             pending_state, brief,
@@ -3009,7 +3225,45 @@ class ChatService:
             now=now,
         )
         await repo.add(follow_up)
+        # Event-driven release (§5 priority 1): enqueue the due-time job right after
+        # the row lands. Only the new-row branch enqueues — a merge keeps the same
+        # id + scheduled_for, so its existing active release job still covers it.
+        await self._maybe_enqueue_follow_up_release(follow_up, now=now)
         return follow_up
+
+    def set_pending_follow_up_release_enqueuer(self, enqueuer) -> None:  # noqa: ANN001
+        """Wire the distributed event-driven release enqueuer (hosted only).
+
+        Called by the container after the coordinator lease + background queue are
+        built. Self-host / embedded never calls this, so the write points stay
+        byte-identical."""
+        self._pending_follow_up_release_enqueuer = enqueuer
+
+    def set_post_turn_enqueuer(self, enqueuer) -> None:  # noqa: ANN001
+        """Wire the distributed event-driven post-turn enqueuer (hosted only).
+
+        Called by the container after the coordinator lease + background queue are
+        built. Self-host / embedded never calls this, so ``_run_post_turn`` keeps
+        running the post-turn in-process (byte-identical)."""
+        self._post_turn_enqueuer = enqueuer
+
+    async def _maybe_enqueue_follow_up_release(
+        self, row: "PendingFollowUp", *, now: datetime,
+    ) -> None:
+        """Enqueue the due-time release job for a freshly-written follow-up row.
+
+        No-op on the embedded / self-host path (enqueuer unwired). Never raises —
+        the enqueuer fail-softs internally and the reconcile is the fallback for any
+        miss — so a queue hiccup can never break the chat turn."""
+        enqueuer = self._pending_follow_up_release_enqueuer
+        if enqueuer is None:
+            return
+        try:
+            await enqueuer.enqueue(row, now=now)
+        except Exception:
+            _LOGGER.exception(
+                "busy-defer: follow-up release enqueue raised id=%s", row.id,
+            )
 
     async def _find_open_busy_defer_for_conversation(
         self,
@@ -3480,6 +3734,7 @@ class ChatService:
         # so equivalent arg dicts collapse to the same key.
         seen_calls: set[tuple[str, str]] = set()
         image_tool_executed = False
+        force_final_reply = False
 
         # Give visual tools a window on the last few turns so they can
         # resolve scene references like "那樣的感覺" / "剛剛講的那家店"
@@ -3538,7 +3793,11 @@ class ChatService:
             # Previous tool outcomes stay visible via tool_outcomes so
             # the model can read what it already learned.
             is_last_hop = hop == _MAX_TOOL_HOPS - 1
-            tools_for_hop = tool_descriptors if not is_last_hop else []
+            tools_for_hop = (
+                tool_descriptors
+                if not is_last_hop and not force_final_reply
+                else []
+            )
             # Forced directive only applies while the forced tool hasn't
             # been executed yet. After a successful (or failed) forced
             # call, clear the flag so hop 1+ lets the model write a
@@ -3642,6 +3901,15 @@ class ChatService:
             traces.append(trace)
             last_text = text
             if not tools_for_hop:
+                if image_tool_executed and looks_like_tool_call_attempt(text):
+                    _LOGGER.warning(
+                        "chat tool-use: final reply after image was still a "
+                        "tool call; preserving attachment and using fallback",
+                    )
+                    last_text = localized_fallback_text(
+                        "chat.image_tool_final_reply_failed",
+                        operator_primary_language,
+                    )
                 break
             call = parse_tool_call(text)
             if call is None and forced_pending:
@@ -3730,6 +3998,7 @@ class ChatService:
                         ),
                     ),
                 )
+                force_final_reply = True
                 continue
             if call.name == _FORCED_IMAGE_TOOL_NAME:
                 quota_error = await self._reserve_runtime_chat_image_quota(
@@ -3745,6 +4014,7 @@ class ChatService:
                             error=quota_error,
                         ),
                     )
+                    force_final_reply = True
                     continue
             # Guard against a stuck model re-emitting the exact same
             # tool call in a loop. If we've already run this call this
@@ -3762,7 +4032,19 @@ class ChatService:
                     "breaking loop — tool=%s hop=%d",
                     call.name, hop,
                 )
-                break
+                tool_outcomes.append(
+                    ToolOutcomeMessage(
+                        tool_name=call.name,
+                        ok=False,
+                        output_text="",
+                        error=(
+                            "本回合已處理過相同工具呼叫；"
+                            "請勿重複執行，直接用角色台詞回覆。"
+                        ),
+                    ),
+                )
+                force_final_reply = True
+                continue
             seen_calls.add(call_key)
             try:
                 invocation, result = await self._tool_orchestrator.execute(
@@ -3794,6 +4076,13 @@ class ChatService:
             if result.ok:
                 for att in result.attachments:
                     collected.append(_tool_to_message_attachment(att))
+            # Image generation is a terminal side effect for this turn. Once it
+            # has run (successfully or not), the next model hop receives the
+            # outcome but no tool catalogue, so it can only write the natural
+            # language wrap-up. This prevents malformed/semantically duplicate
+            # image calls from consuming more paid hops or generating extras.
+            if call.name == _FORCED_IMAGE_TOOL_NAME:
+                force_final_reply = True
         novelty_retry_count = 0
         novelty_verdict = None
         if self._reply_quality_gate_required(
@@ -4925,9 +5214,36 @@ class ChatService:
         user_text: str,
         assistant_text: str,
         prior_messages: list[Message],
+        assistant_index: int,
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
     ) -> dict:
+        # Distributed (hosted) backend: offload the post-turn LLM extraction to a
+        # worker by enqueuing ONE immediate one-shot job carrying ids / flags only
+        # (§11 payload red line). The worker re-reads the conversation to rebuild the
+        # turn text. When there is no live leader (or the enqueue no-ops) we fall
+        # through to the in-process path below so the work is NEVER dropped.
+        if self._post_turn_enqueuer is not None:
+            outcome = await self._maybe_enqueue_post_turn(
+                character=character,
+                conversation_id=conversation_id,
+                turn_record_id=turn_record_id,
+                assistant_index=assistant_index,
+                persona_enabled=persona_enabled,
+                content_mode=content_mode,
+            )
+            # Fall back to in-process ONLY when no worker owns the turn (NO_LEADER).
+            # INSERTED / ALREADY_ACTIVE mean a worker has it; AMBIGUOUS deliberately
+            # drops this best-effort post-turn rather than risk a double run of its
+            # non-idempotent emotion / promise / schedule writes.
+            if not outcome.should_fallback:
+                return {
+                    "post_turn_enqueued": True,
+                    "post_turn_enqueue_outcome": outcome.value,
+                }
+        # Embedded / self-host (enqueuer unwired) AND the distributed no-leader
+        # fallback both run the SAME shared implementation in-process — byte-identical
+        # to the pre-Phase-5 behaviour on embedded.
         coro = self._do_post_turn(
             character=character,
             conversation_id=conversation_id,
@@ -4943,6 +5259,155 @@ class ChatService:
             return {"post_turn_background": True}
         else:
             return await coro
+
+    async def _maybe_enqueue_post_turn(
+        self,
+        *,
+        character: Character,
+        conversation_id: str,
+        turn_record_id: str,
+        assistant_index: int,
+        persona_enabled: bool,
+        content_mode: str,
+    ) -> PostTurnEnqueueOutcome:
+        """Enqueue the distributed post-turn job and return its classified outcome.
+
+        Never raises — a queue hiccup must not break the chat turn. An unwired
+        enqueuer or an unexpected raise degrades to ``NO_LEADER`` so ``_run_post_turn``
+        runs the post-turn in-process (no work dropped when nothing owns it)."""
+        enqueuer = self._post_turn_enqueuer
+        if enqueuer is None:
+            return PostTurnEnqueueOutcome.NO_LEADER
+        operator_id = getattr(character, "user_id", None) or None
+        try:
+            return await enqueuer.enqueue(
+                turn_record_id=turn_record_id,
+                conversation_id=conversation_id,
+                character_id=character.id,
+                assistant_index=assistant_index,
+                persona_enabled=persona_enabled,
+                content_mode=content_mode,
+                operator_id=operator_id,
+                now=self._resolve_now(),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "post-turn enqueue raised turn=%s character=%s",
+                turn_record_id, character.id,
+            )
+            return PostTurnEnqueueOutcome.NO_LEADER
+
+    async def run_post_turn_for_record(
+        self,
+        *,
+        turn_record_id: str,
+        conversation_id: str,
+        character_id: str,
+        assistant_index: int,
+        persona_enabled: bool = True,
+        content_mode: str = CONTENT_MODE_NORMAL,
+        now: datetime | None = None,
+    ) -> dict:
+        """Id-only post-turn entry (distributed worker) — rebuild inputs, then run.
+
+        The distributed worker calls this after claiming a ``post_turn`` job. It
+        re-reads the conversation (the reliable write-point SoT — persisted BEFORE the
+        job is enqueued) to rebuild ``user_text`` / ``assistant_text`` /
+        ``prior_messages``, re-verifies the character (§3.3: existence + frozen /
+        subscription gate), then delegates to the SAME ``_do_post_turn`` body the
+        embedded in-process path uses (抽共用而非複製 — zero behaviour fork).
+
+        **Anchor**: the assistant message's positional index in the conversation.
+        Conversations are append-only, so a concurrent later turn only appends at the
+        end and never shifts an earlier index — a stale slice-by-last-message would
+        instead pick up a NEWER turn's text. The prior-dialogue window is rebuilt from
+        the cross-source ``recent_messages_for_character`` cut at the turn's user
+        message instant, reproducing the pre-turn window the write point captured.
+
+        **Rerun safety**: ``_do_post_turn`` is fail-soft (it swallows each side
+        effect's error and returns), so a handled error never fails the job into a
+        retry. The only rerun is a hard worker crash mid-body → reclaim; memory writes
+        self-dedup by content, but additive emotion-event / promise / schedule writes
+        are not individually idempotent (documented residual — same exposure the rest
+        of the worker fleet carries for internal state writes)."""
+        character = await self._character_repository.get(character_id)
+        if character is None:
+            return {"post_turn_skipped": "character_missing"}
+        if getattr(character, "frozen", False) or getattr(
+            character, "subscription_locked", False,
+        ):
+            # §3.3 re-verify: a character stopped between enqueue and claim runs no
+            # post-turn work — consistent with the per-kind handler pre-flight guard.
+            return {"post_turn_skipped": "character_stopped"}
+        conversation = await self._conversation_repository.get(conversation_id)
+        if conversation is None:
+            return {"post_turn_skipped": "conversation_missing"}
+        rebuilt = self._rebuild_post_turn_texts(conversation, assistant_index)
+        if rebuilt is None:
+            return {"post_turn_skipped": "turn_not_found"}
+        user_text, assistant_text, user_created_at = rebuilt
+        prior_messages = await self._rebuild_prior_messages(
+            character_id=character_id, before=user_created_at,
+        )
+        return await self._do_post_turn(
+            character=character,
+            conversation_id=conversation_id,
+            turn_record_id=turn_record_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            prior_messages=prior_messages,
+            persona_enabled=persona_enabled,
+            content_mode=content_mode,
+        )
+
+    def _rebuild_post_turn_texts(
+        self, conversation: Conversation, assistant_index: int,
+    ) -> "tuple[str, str, datetime] | None":
+        """Locate the turn's (user_text, assistant_text, user_created_at) by index.
+
+        ``assistant_index`` is the assistant message's position recorded at the write
+        point. Append-only conversations keep it stable under concurrent later turns.
+        Returns ``None`` when the index is out of range or the anchored message is not
+        the expected assistant reply (a defensive skip rather than mis-attributing a
+        different turn's text)."""
+        messages = conversation.messages
+        if assistant_index < 1 or assistant_index >= len(messages):
+            return None
+        assistant_msg = messages[assistant_index]
+        if assistant_msg.role is not MessageRole.ASSISTANT:
+            return None
+        # The user message of this turn is the nearest preceding user-role message.
+        user_msg: Message | None = None
+        for idx in range(assistant_index - 1, -1, -1):
+            if messages[idx].role is MessageRole.USER:
+                user_msg = messages[idx]
+                break
+        if user_msg is None:
+            return None
+        return user_msg.content, assistant_msg.content, user_msg.created_at
+
+    async def _rebuild_prior_messages(
+        self, *, character_id: str, before: datetime,
+    ) -> list[Message]:
+        """Reproduce the pre-turn cross-source recent window (< the turn's user msg).
+
+        Mirrors the write-point ``recent_messages_for_character`` fetch (merged across
+        every channel, oldest-first) but cut at the turn's user-message instant so the
+        current turn's own user / assistant messages are excluded — fetching a couple
+        extra rows first so the window still holds ``_RECENT_MESSAGE_LIMIT`` prior
+        messages after the cut."""
+        try:
+            recent = await self._conversation_repository.recent_messages_for_character(
+                character_id, limit=_RECENT_MESSAGE_LIMIT + 2,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "post-turn: prior-message rebuild failed character=%s", character_id,
+            )
+            return []
+        anchor = ensure_utc(before)
+        prior = [m for m in recent if ensure_utc(m.created_at) < anchor]
+        return prior[-_RECENT_MESSAGE_LIMIT:]
 
     async def _do_post_turn(
         self,
@@ -5480,6 +5945,9 @@ class ChatService:
                     character_id, promise.intent[:60],
                     scheduled.isoformat(),
                 )
+                # Event-driven release (§5 priority 1): the promised instant is
+                # known now → enqueue its one-shot job (no-op on embedded).
+                await self._maybe_enqueue_follow_up_release(row, now=now)
             except Exception:
                 _LOGGER.exception(
                     "scheduled-promise persist failed character=%s",
@@ -5760,7 +6228,11 @@ class ChatService:
             )
 
     def _schedule_background(self, coro: Awaitable[None]) -> None:
-        task = asyncio.create_task(coro)
+        async def run_with_background_provenance() -> None:
+            with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+                await coro
+
+        task = asyncio.create_task(run_with_background_provenance())
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
@@ -6488,12 +6960,41 @@ class StreamFinalizer:
         # produced later by ``PendingFollowUpDispatcher``, where the
         # full post-turn pipeline runs against the resolved reply.
         self._prebuilt_response = prebuilt_response
+        # Per-conversation turn lease, handed over by ``send_message_stream``.
+        # The streaming turn is only finished once the assistant message is
+        # persisted here, so the finalizer — not the starter — owns the release.
+        self._turn_lease_session: StudioLeaseSession | None = None
 
     @property
     def conversation_id(self) -> str:
         return self._conversation.id
 
+    def attach_turn_lease(self, session: "StudioLeaseSession | None") -> None:
+        """Take ownership of the turn's conversation lease."""
+        self._turn_lease_session = session
+
+    async def release_turn_lease(self) -> None:
+        """Release the conversation lease. Idempotent — the route calls it in a
+        ``finally`` to cover streams that never reach :meth:`finish`."""
+        session, self._turn_lease_session = self._turn_lease_session, None
+        await release_turn_lease(session)
+
     async def finish(self, assistant_text: str) -> ChatReplyResponse:
+        try:
+            return await self._finish_turn(assistant_text)
+        finally:
+            # The lease covers the turn up to and including the assistant
+            # message's persistence, which ``_finish_turn`` awaits. The
+            # fire-and-forget tails it schedules (post-turn extraction, goal
+            # review, repetition check, TTS pregeneration) write memories /
+            # state / goals, never the conversation row, so they must not hold
+            # the conversation hostage. The one exception is the NSFW
+            # safe-summary writer, which re-reads the conversation by id and
+            # replaces two fixed positions — append-only tail growth from a
+            # later turn cannot move those positions, so it stays outside.
+            await self.release_turn_lease()
+
+    async def _finish_turn(self, assistant_text: str) -> ChatReplyResponse:
         if self._prebuilt_response is not None:
             return self._prebuilt_response
         if self._pre_resolved_text is not None:
@@ -6558,6 +7059,9 @@ class StreamFinalizer:
             user_text=self._user_message.content,
             assistant_text=assistant_text,
             prior_messages=self._prior_messages,
+            # The assistant reply is the last message on the just-saved conversation;
+            # its stable index anchors the distributed worker's id-only rebuild.
+            assistant_index=len(updated_conversation.messages) - 1,
             persona_enabled=self._persona_enabled,
             content_mode=self._content_mode.value,
         )

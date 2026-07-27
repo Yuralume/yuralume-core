@@ -7,6 +7,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     BigInteger,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -14,11 +15,13 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
     false,
     func,
+    text,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -137,6 +140,20 @@ class CharacterRow(Base):
         Boolean, nullable=False, default=False, server_default=false(),
     )
     """Retryable projection of the authoritative Cloud tenant lock."""
+    last_consolidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    """Cross-replica claim stamp for post-turn memory consolidation.
+
+    ``AutoConsolidationTrigger`` used to hold its cooldown and single-flight
+    state in per-process dicts, which under 2× api replicas let both processes
+    run the (LLM-heavy, memory-row-rewriting) ``consolidate()`` for the same
+    character at once and halved the effective cooldown. The trigger now takes
+    an atomic claim — a conditional UPDATE of this column fenced on the cooldown
+    cutoff — so cooldown *and* single-flight are decided by one statement the
+    DB serialises. Never written by the generic character ``save()``: like
+    ``subscription_locked`` it is a dedicated control field, so an unrelated
+    aggregate write can never resurrect a consumed cooldown."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -418,6 +435,13 @@ class ConversationRow(Base):
     source: Mapped[str] = mapped_column(
         String(32), nullable=False, default="web", index=True,
     )
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    """Optimistic-concurrency counter (B3). Every ``save()`` replace and every
+    CAS ``append_messages`` bumps it under a ``FOR UPDATE`` lock so a stale
+    whole-conversation ``save()`` can detect (and merge, never silently drop)
+    tail rows a concurrent append added."""
 
     messages: Mapped[list["MessageRow"]] = relationship(
         back_populates="conversation",
@@ -482,6 +506,28 @@ class MessageRow(Base):
     assembly must drop the restricted message instead of forwarding raw
     content.
     """
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(96), nullable=True,
+    )
+    """Turn-scoped idempotency key for a durable single-message append (B1).
+
+    ``NULL`` for every ordinary append (web chat, bulk sync); set to
+    ``{turn_id}:user`` / ``{turn_id}:assistant`` by the external-chat turn
+    adapter. The ``uq_messages_conversation_idempotency`` unique index treats
+    NULLs as distinct, so only keyed rows are de-duplicated: a takeover
+    re-appending the same turn adopts the original row instead of writing a
+    second copy."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id", "position",
+            name="uq_messages_conversation_position",
+        ),
+        UniqueConstraint(
+            "conversation_id", "idempotency_key",
+            name="uq_messages_conversation_idempotency",
+        ),
+    )
 
     conversation: Mapped["ConversationRow"] = relationship(back_populates="messages")
 
@@ -524,6 +570,17 @@ class DailyScheduleRow(Base):
     """A character's planned day (one row per civil date)."""
 
     __tablename__ = "daily_schedules"
+    __table_args__ = (
+        # P3-Dedup (§3.4): the app-level upsert on (character_id, date) was
+        # NOT DB-protected — two racing runners (a reclaimed job vs a still
+        # running original) could each read-none then insert, leaving two
+        # schedules for the same civil day. This constraint collapses that
+        # race to exactly one row; the SA repo's save() recovers idempotently
+        # from the violation instead of surfacing a 500.
+        UniqueConstraint(
+            "character_id", "date", name="uq_daily_schedules_character_date",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     character_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
@@ -866,6 +923,40 @@ class ChannelBindingRow(Base):
     )
 
 
+class InboundMessageReceiptRow(Base):
+    """At-most-once receipt for one inbound platform delivery.
+
+    The cross-instance half of the inbound dedup guard (see
+    ``contracts/inbound_receipts.py`` for the key-composition rationale): the
+    per-process ``InboundDebouncer`` cannot stop a webhook retry that a load
+    balancer lands on a second api replica, so each delivery claims a row here
+    before the (synchronous, LLM-heavy) chat turn runs.
+
+    Deliberately FK-free — the receipt is a short-lived idempotency token on
+    the hot inbound path, not a relational fact; it does not need to survive
+    or block account deletion and prunes out on the retention clock anyway.
+    """
+
+    __tablename__ = "inbound_message_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform", "account_id", "chat_ref", "platform_message_id",
+            name="uq_inbound_message_receipts_delivery",
+        ),
+        # Retention sweep scans by age only.
+        Index("ix_inbound_message_receipts_created", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    chat_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    platform_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
 class ToolInvocationRow(Base):
     """Audit log for tool invocations (ComfyUI image gen, etc.).
 
@@ -1038,10 +1129,21 @@ class StoryEventRow(Base):
 class StoryArcRow(Base):
     """Multi-week narrative spine for a character.
 
-    The current "active" arc (``status = 'active'``) is expected to be
-    unique per character — the service layer enforces this; the schema
-    does not (an ``active`` filter index helps but a partial unique
-    would force Postgres-specific migration).
+    At most ONE ``status = 'active'`` arc per character. This used to be a
+    service-layer-only invariant guarded by a process-local ``asyncio.Lock``
+    in ``StoryArcService.ensure_active_arc``; under the hosted topology
+    (2× api + 2× worker) that lock is not mutual exclusion, so two replicas
+    each planned a full arc (several LLM passes) and each inserted an active
+    row. ``get_active_for_character`` then picked whichever had the newest
+    ``updated_at``, so the narrative spine flip-flopped between two arcs.
+
+    ``uq_story_arcs_active_character`` is the DB-level backstop: a *partial*
+    unique index over ``character_id`` restricted to active rows (portable —
+    both PostgreSQL and SQLite support partial indexes). Completed / abandoned
+    history is unconstrained, so a character keeps as many past arcs as it
+    likes. The SA repository recovers idempotently from the violation the same
+    way ``daily_schedules`` does for its P3-Dedup constraint, instead of
+    surfacing a 500.
 
     ``tone`` is the one cross-arc field that survives template
     materialisation — it carries from ArcTemplate into the runtime arc
@@ -1050,6 +1152,15 @@ class StoryArcRow(Base):
     """
 
     __tablename__ = "story_arcs"
+    __table_args__ = (
+        Index(
+            "uq_story_arcs_active_character",
+            "character_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     character_id: Mapped[str] = mapped_column(
@@ -1246,6 +1357,44 @@ class CharacterAlbumItemRow(Base):
     byte_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True,
+    )
+
+
+class CharacterImageCandidateBatchRow(Base):
+    """The one pending album-gacha candidate batch of a character.
+
+    ``generate_candidates`` writes N throwaway objects under
+    ``characters/{id}/candidates/{batch_id}/`` and ``commit_candidates``
+    (a *separate* HTTP request) decides which survive. Object storage has
+    no list-by-prefix call, so the keys must be remembered in between —
+    and it cannot be process memory, because hosted load-balances several
+    api replicas and the two requests land wherever the LB sends them.
+
+    One row per character (``character_id`` is the primary key): a second
+    generate supersedes the first, matching the UI where only the latest
+    batch is on screen. The row is deleted once the batch is committed or
+    discarded, so this table stays tiny.
+    """
+
+    __tablename__ = "character_image_candidate_batches"
+
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    object_keys_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]",
+    )
+    """JSON-encoded ordered list[str] of candidate object keys.
+
+    JSON text rather than a PG array for the same reason as
+    ``CharacterRow.image_urls``: the list is at most
+    ``MAX_CANDIDATES_PER_BATCH`` entries, is always read and written whole,
+    and staying dialect-neutral keeps the SQLite migration tests runnable.
+    """
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
     )
 
 
@@ -2446,6 +2595,445 @@ class CharacterSeriesProgressRow(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Durable background-job queue foundation (P2-A / HOSTED_CORE_SCALING §3).
+#
+# These five tables are ADDITIVE and DORMANT: no running process reads or
+# writes them yet. They exist so the distributed Hosted topology
+# (coordinator / worker / realtime outbox) can land in P2-B/P4 without a
+# second schema migration + backfill. Self-host stays single-container and
+# never touches them.
+# ---------------------------------------------------------------------------
+
+
+class BackgroundJobRow(Base):
+    """One durable background job (queue row).
+
+    ``tenant_id`` / ``operator_id`` / ``character_id`` are intentionally
+    NOT foreign keys — a job must degrade to ``dead``/``failed`` if its
+    target vanished, never block a delete or orphan-cascade. ``payload_json``
+    holds IDs / dates / config versions ONLY (never prompts, tokens or chat
+    content); ``last_error`` holds an exception class + sanitised summary
+    (never a secret). See ``contracts/background_jobs.py``.
+    """
+
+    __tablename__ = "background_jobs"
+    __table_args__ = (
+        # Ready-queue scan: cheapest possible for the hot claim path.
+        Index(
+            "ix_background_jobs_ready",
+            "status",
+            "due_at",
+            "priority",
+            postgresql_where=text("status = 'queued'"),
+        ),
+        # Fairness / diagnostics per tenant.
+        Index(
+            "ix_background_jobs_tenant_status",
+            "tenant_id",
+            "status",
+        ),
+        # At most one ACTIVE (queued|claimed) row per logical key; the same
+        # key may recur once the previous occurrence reached a terminal
+        # status. This is the DB-enforced idempotency guarantee.
+        Index(
+            "uq_background_jobs_active_idem",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'claimed')"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    operator_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    character_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default="3",
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", server_default="queued",
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default="5",
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    fencing_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    payload_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}",
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+
+class BackgroundRuntimeLeaseRow(Base):
+    """TTL leader lease with a monotonic fencing epoch.
+
+    ``epoch`` is bumped ``+1`` on every ownership change and never reset,
+    so a partitioned ex-leader's stale epoch can be rejected on write.
+    """
+
+    __tablename__ = "background_runtime_leases"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
+    epoch: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0",
+    )
+    lease_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class BackgroundCoordinatorCursorRow(Base):
+    """Durable due-discovery bookmark for the coordinator (§4.2).
+
+    ``cursor_json`` holds IDs / timestamps only.
+    """
+
+    __tablename__ = "background_coordinator_cursors"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cursor_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class SchedulerTickJournalRow(Base):
+    """Append-only scheduler-tick journal for embedded/distributed parity.
+
+    Written by P2-B's shadow-gated embedded journal; schema only here.
+    ``kind`` is ``character_tick`` (with ``character_id``) or ``social_tick``
+    (``character_id`` NULL — the cross-character global bucket).
+    """
+
+    __tablename__ = "scheduler_tick_journal"
+    __table_args__ = (
+        Index(
+            "ix_scheduler_tick_journal_bucket_kind",
+            "tick_bucket",
+            "kind",
+        ),
+        Index(
+            "uq_scheduler_tick_journal_character",
+            "tick_bucket",
+            "kind",
+            "character_id",
+            unique=True,
+            postgresql_where=text("character_id IS NOT NULL"),
+            sqlite_where=text("character_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_scheduler_tick_journal_social",
+            "tick_bucket",
+            "kind",
+            unique=True,
+            postgresql_where=text("character_id IS NULL"),
+            sqlite_where=text("character_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True,
+    )
+    tick_bucket: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    character_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class RealtimeEventRow(Base):
+    """Transactional realtime-event outbox row.
+
+    DORMANT until Phase 4 (§7.1): laid down now per §13 Phase 2's
+    "jobs/leases/events/cursors additive migrations" so the outbox can
+    ship without a second migration. Nothing reads or writes this table
+    in P2-A/P2-B; the SSE relay (§7.0) is the interim bridge.
+    """
+
+    __tablename__ = "realtime_events"
+    __table_args__ = (
+        # Composite ``(created_at, id)`` supports both the Phase 4 outbox reads:
+        # the ``read_after`` overlap-window range scan on ``created_at`` (with
+        # ``id`` covered for the ascending order + de-dup) and the ``prune``
+        # ``created_at < cutoff`` range. Supersedes the original single-column
+        # ``ix_realtime_events_created`` (leftmost prefix keeps prune covered).
+        Index("ix_realtime_events_created_id", "created_at", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True,
+    )
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    operator_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class BackgroundVisibleSlotRow(Base):
+    """At-most-once claim ledger for visible per-character background output.
+
+    P3-Dedup (§3.4/§6.2): under real distributed execution a reclaimed job
+    can race a still-running original worker on the SAME character. The
+    per-source feed/story/reflection surfaces are already DB-protected by
+    their own UNIQUE constraints; the proactive-send and feed-comment-reply
+    passes were not. This table is the additive claim ledger those passes
+    take: the first executor to INSERT ``(character_id, kind, slot)`` owns the
+    slot for that tick bucket; a losing executor's INSERT trips the unique
+    index and it skips silently. ``slot`` is the tick-bucket id the caller
+    computes (string). Rows prune on the 7-day clock via ``created_at``.
+    """
+
+    __tablename__ = "background_visible_slots"
+    __table_args__ = (
+        UniqueConstraint(
+            "character_id", "kind", "slot",
+            name="uq_background_visible_slots_claim",
+        ),
+        Index("ix_background_visible_slots_created", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    character_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    slot: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class BackgroundExecutionModeRow(Base):
+    """Single-row execution-ownership flag (HOSTED_CORE_SCALING §2.2 / §13
+    Phase 3).
+
+    The database source of truth that makes embedded / distributed background
+    execution MUTUALLY EXCLUSIVE (§15). Exactly one logical row keyed
+    ``name='default'``; ``epoch`` is a monotonic CAS token bumped +1 on every
+    flip and never reset. An ABSENT row means ``('embedded', 0)`` — the
+    self-host red line, so no seed row ships. Deliberately NOT the TTL-CAS
+    ``background_runtime_leases`` table: a mode flag must not be stealable by
+    ordinary lease-acquire traffic once a TTL lapses.
+    """
+
+    __tablename__ = "background_execution_mode"
+
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class ExternalChatTurnReceiptRow(Base):
+    """Durable receipt for one recoverable external-chat turn (LH2, DR-LH0-004).
+
+    The spine of the ``source="line"`` turn state machine
+    (``PROCESSING → GENERATED → COMMITTED → COMPLETED`` /
+    ``FAILED_RETRYABLE`` / ``FAILED_TERMINAL``). ``UNIQUE(authenticated_caller,
+    request_id)`` enforces at-most-one receipt per cross-service idempotency id;
+    ``owner_id`` + ``lease_version`` fence every mutation so a stale (taken-over)
+    owner cannot write. ``tenant_id`` / ``account_id`` / ``character_id`` are
+    NOT foreign keys — a receipt must survive its target changing. Snapshot
+    columns hold opaque JSON owned by the turn service. See
+    ``contracts/external_chat_turn.py``.
+    """
+
+    __tablename__ = "external_chat_turn_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "authenticated_caller",
+            "request_id",
+            name="uq_external_chat_turn_receipts_caller_request",
+        ),
+        # Recovery scan: expired-lease takeover candidates by state.
+        Index(
+            "ix_external_chat_turn_receipts_state_lease",
+            "state",
+            "lease_until",
+        ),
+        Index(
+            "ix_external_chat_turn_receipts_conversation",
+            "conversation_id",
+        ),
+        CheckConstraint(
+            "channel = 'line'",
+            name="ck_external_chat_turn_receipts_channel",
+        ),
+    )
+
+    turn_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    authenticated_caller: Mapped[str] = mapped_column(
+        String(64), nullable=False,
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    contract_version: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True,
+    )
+    canonical_hash_version: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True,
+    )
+    canonical_request_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    character_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    owner_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    lease_version: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default="1",
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True,
+    )
+    user_message_row_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+    )
+    assistant_message_row_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+    )
+    assistant_position: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+    )
+    generated_snapshot_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+    )
+    response_snapshot_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+    )
+    terminal_error_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+    )
+    post_turn_state: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending",
+    )
+    post_turn_job_key: Mapped[str | None] = mapped_column(
+        String(160), nullable=True,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    generated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    committed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+
+class ExternalProactiveEventRow(Base):
+    """Durable pre-send ledger for one external proactive delivery event.
+
+    DR-LH0-005: Core records the immutable ``event_id + envelope + payload_hash``
+    BEFORE calling the channel, so a lost response re-sends the SAME event
+    without re-running the proactive judge / decider. ``tenant_id`` /
+    ``account_id`` / ``character_id`` are NOT foreign keys — the event must
+    survive its target changing. ``envelope_json`` / ``payload_hash`` are
+    write-once; only ``state`` / ``accept_attempts`` / ``last_error`` /
+    ``updated_at`` change. See ``contracts/external_proactive_ledger.py``.
+    """
+
+    __tablename__ = "external_proactive_events"
+    __table_args__ = (
+        # Pending-retry / expiry sweep scan by state then validity horizon.
+        Index(
+            "ix_external_proactive_events_state_expires",
+            "state",
+            "expires_at",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    character_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    envelope_json: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    accept_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conversation_recorded: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false(),
+    )
+    """Whether the delivered proactive turn has been appended to the
+    character's ``source="line"`` conversation history (M8). ``accepted`` marks
+    the transport handoff; this marks the durable history write. An accepted
+    row still ``False`` here is the retry worker's worklist for a lost /
+    crashed history append, so the channel-accepted send and the conversation
+    row share one lifecycle instead of the append being fire-and-forget."""
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
     )
 
 

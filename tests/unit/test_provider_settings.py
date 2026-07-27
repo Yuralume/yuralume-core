@@ -1649,3 +1649,193 @@ def test_saved_connection_test_populates_probes_and_status(monkeypatch) -> None:
     assert fail_body["last_validated_at"] is None
     assert fail_body["last_validation_error"].startswith("llm: ")
     assert any(probe["ok"] is False for probe in fail_body["probes"])
+
+
+# ---------------------------------------------------------------------------
+# Deleting a provider row must tear its runtime registration down
+#
+# The bug: the sync derived "what may I unregister?" from the rows that still
+# exist, so a *deleted* row's adapter was unreachable by the teardown pass and
+# survived in every process's registry until restart. Deleting the row an
+# operator just found leaking an API key is precisely the case where the key
+# must stop being usable immediately, so delete has to reach the same runtime
+# state as disable does.
+# ---------------------------------------------------------------------------
+
+
+def test_deleting_llm_provider_unregisters_its_adapter(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "custom_openai_compatible",
+            "label": "Leaky LLM",
+            "enabled": True,
+            "capabilities": ["llm"],
+            "config": {
+                "base_url": "https://llm.example.test/v1",
+                "default_model": "custom-chat",
+            },
+            "secret": {"api_key": "sk-leaked"},
+        },
+    )
+    assert created.status_code == 201
+    assert "custom_openai_compatible" in client.get("/api/v1/system/providers").json()
+
+    deleted = client.delete(f"/api/v1/admin/providers/{created.json()['id']}")
+    assert deleted.status_code == 204
+
+    # Same end state as disabling the row — the adapter is gone, not merely
+    # hidden from the admin list.
+    assert (
+        "custom_openai_compatible"
+        not in client.get("/api/v1/system/providers").json()
+    )
+
+
+def test_deleting_last_image_row_empties_the_profile_registry(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "xai",
+            "label": "Grok Image",
+            "enabled": True,
+            "capabilities": ["image"],
+            "config": {"default_model": "grok-2-image-1212"},
+            "secret": {"api_key": "xai-secret"},
+        },
+    )
+    assert created.status_code == 201
+    assert client.get("/api/v1/system/image-profiles").json() == [
+        {"id": "xai", "label": "Grok Image", "kind": "external_api"},
+    ]
+
+    deleted = client.delete(f"/api/v1/admin/providers/{created.json()['id']}")
+    assert deleted.status_code == 204
+    # Once the DB owns the profile snapshot, the empty snapshot must replace it
+    # too — "no rows left" is a desired state, not "nothing to do".
+    assert client.get("/api/v1/system/image-profiles").json() == []
+
+
+def test_deleting_last_video_row_empties_the_profile_registry(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "google_veo",
+            "label": "Veo",
+            "enabled": True,
+            "capabilities": ["video"],
+            "config": {"default_model": "veo-3.1-generate-preview"},
+            "secret": {"api_key": "veo-secret"},
+        },
+    )
+    assert created.status_code == 201
+    assert client.get("/api/v1/system/video-profiles").json() == [
+        {"id": "google_veo", "label": "Veo", "kind": "external_api"},
+    ]
+
+    deleted = client.delete(f"/api/v1/admin/providers/{created.json()['id']}")
+    assert deleted.status_code == 204
+    assert client.get("/api/v1/system/video-profiles").json() == []
+
+
+def test_deleting_last_search_row_unregisters_the_web_search_tool(
+    monkeypatch,
+) -> None:
+    _configure_env(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "duckduckgo",
+            "label": "DDG search",
+            "enabled": True,
+            "capabilities": ["search"],
+            "config": {},
+            "secret": {},
+        },
+    )
+    assert created.status_code == 201
+    assert _web_search_registered(app) is True
+
+    deleted = client.delete(f"/api/v1/admin/providers/{created.json()['id']}")
+    assert deleted.status_code == 204
+    assert _web_search_registered(app) is False
+
+
+def test_deleting_last_embedding_row_drops_the_backend(monkeypatch) -> None:
+    _configure_env(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+
+    created = client.post(
+        "/api/v1/admin/providers",
+        json={
+            "provider": "local_openai_compatible",
+            "label": "Local embedding",
+            "enabled": True,
+            "capabilities": ["embedding"],
+            "config": {
+                "base_url": "http://127.0.0.1:1234/v1",
+                "embedding_model": "text-embedding-bge-m3",
+                "embedding_dimension": 1024,
+            },
+            "secret": {},
+        },
+    )
+    assert created.status_code == 201
+    assert app.state.container.embedder.is_operational is True
+
+    deleted = client.delete(f"/api/v1/admin/providers/{created.json()['id']}")
+    assert deleted.status_code == 204
+    assert app.state.container.embedder.is_operational is False
+
+
+def test_sync_without_db_rows_leaves_env_wired_registrations_alone(
+    monkeypatch,
+) -> None:
+    """The teardown must only reach registrations the sync itself made.
+
+    A deployment whose image profiles come from env / YAML has never handed the
+    DB ownership of them, so a sync that finds no image rows must leave the
+    env-wired snapshot untouched rather than replacing it with an empty one.
+    """
+    from kokoro_link.contracts.image_profile import (
+        ExternalImageApiProfileConfig,
+        ImageProfile,
+    )
+    from kokoro_link.infrastructure.provider_settings.runtime_sync import (
+        sync_provider_connections,
+    )
+
+    _configure_env(monkeypatch)
+    app = create_app()
+    container = app.state.container
+    container.image_profile_registry.replace_profiles(
+        [
+            ImageProfile(
+                id="env-wired",
+                label="From env",
+                kind="external_api",
+                api=ExternalImageApiProfileConfig(
+                    base_url="https://img.example.test/v1",
+                    api_key="env-secret",
+                    model="env-model",
+                ),
+            ),
+        ],
+    )
+
+    asyncio.run(sync_provider_connections(container))
+
+    assert container.image_profile_registry.profile_ids == ["env-wired"]

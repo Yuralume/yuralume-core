@@ -89,6 +89,26 @@ class Conversation:
     addressable by id but the web UI's "latest conversation" lookup
     filters on source so TG / LINE activity doesn't hijack the panel.
     """
+    version: int = 0
+    """Optimistic-concurrency version this snapshot was loaded at (B3).
+
+    ``0`` for a freshly ``start()``-ed conversation that has never been
+    persisted. The repository stamps the stored value on read; ``save()``
+    compares it against the current DB row under a ``FOR UPDATE`` lock: an equal
+    version means no concurrent writer touched the row, so the whole-conversation
+    replace (including a legitimate truncation like undo) applies verbatim; a
+    differing version means a concurrent CAS append grew the tail after this
+    snapshot was read, so those tail rows are merged back instead of dropped."""
+    loaded_message_count: int = -1
+    """Number of messages present when this snapshot was READ (B3).
+
+    The stale-merge boundary: only DB rows at ``position >= loaded_message_count``
+    can be concurrent appends (a CAS append only ever grows the tail past the
+    snapshot). Rows below this boundary are the snapshot prefix — always
+    re-written by the whole-conversation replace, never inferred as concurrent
+    even if the writer edited one. ``-1`` marks a snapshot with no known boundary
+    (never read from a repository); the merge then falls back to the write
+    length (the pre-B3 behaviour)."""
 
     @classmethod
     def start(

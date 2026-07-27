@@ -68,10 +68,10 @@ def test_persona_fields_by_layer_routes_correctly():
     persona = OperatorPersona(
         character_id=_CHAR_ID,
         operator_id=_OP_ID,
-        layer1_identity={"name": _field("name", 1, "丹尼")},
+        layer1_identity={"name": _field("name", 1, "艾力")},
         layer2_life={"interests": _field("interests", 2, "電影")},
     )
-    assert persona.fields_by_layer(1)["name"].value == "丹尼"
+    assert persona.fields_by_layer(1)["name"].value == "艾力"
     assert persona.fields_by_layer(2)["interests"].value == "電影"
     assert persona.fields_by_layer(3) == {}
     with pytest.raises(ValueError):

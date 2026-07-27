@@ -205,6 +205,8 @@ def build_messaging_harness(
             Platform.WHATSAPP: whatsapp_adapter,
         },
         debouncer=InboundDebouncer(ttl_seconds=60.0),
+        # Exercise the busy-retry loop without spending its production pause.
+        busy_retry_delay_seconds=0.0,
         public_base_url=public_base_url,
         public_base_url_provider=public_base_url_provider,
         operator_language_resolver=operator_language_resolver,

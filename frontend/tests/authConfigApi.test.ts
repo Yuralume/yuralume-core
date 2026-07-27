@@ -47,6 +47,31 @@ describe('getAuthConfig', () => {
 
     expect(mockedAxios.get).toHaveBeenCalledWith('/api/v1/auth/config')
   })
+
+  it('carries the hosted portal url when the deployment advertises one', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: {
+        auth_enabled: true,
+        needs_setup: false,
+        mode: 'cloud',
+        portal_url: 'https://app.yuralume.com',
+      },
+    })
+
+    await expect(getAuthConfig()).resolves.toMatchObject({
+      portal_url: 'https://app.yuralume.com',
+    })
+  })
+
+  it('leaves portal_url absent for self-host', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: { auth_enabled: true, needs_setup: false, mode: 'self_host' },
+    })
+
+    const config = await getAuthConfig()
+
+    expect(config.portal_url ?? null).toBeNull()
+  })
 })
 
 describe('getDemoOAuthConfig', () => {

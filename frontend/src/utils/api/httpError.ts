@@ -31,19 +31,43 @@ function formatDetailEntry(entry: unknown): string {
 }
 
 /**
+ * Consume a non-ok `Response` body as JSON. Never throws — returns
+ * `null` when the body is missing or not JSON.
+ *
+ * Exposed separately from `readErrorResponse` because a `Response` body
+ * can only be read once: callers that need to *inspect* the structured
+ * detail (e.g. the shared `insufficient_credits` discriminator) must
+ * share this single read with the message formatter below.
+ */
+export async function readErrorBody(res: Response): Promise<unknown> {
+  try {
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Format an already-read error body into a human-readable message.
+ * Falls back to `"<status> <statusText>"` for unrecognized shapes.
+ */
+export function formatErrorBody(
+  body: unknown,
+  res: { status: number; statusText: string },
+): string {
+  const detail = (body as { detail?: unknown } | null)?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail.map(formatDetailEntry).join('\n')
+  }
+  return `${res.status} ${res.statusText}`
+}
+
+/**
  * Read a non-ok `fetch` `Response` body and return a human-readable
  * error message. Never throws — falls back to `"<status> <statusText>"`
  * when the body is missing, not JSON, or an unrecognized shape.
  */
 export async function readErrorResponse(res: Response): Promise<string> {
-  try {
-    const body = await res.json()
-    if (typeof body?.detail === 'string') return body.detail
-    if (Array.isArray(body?.detail)) {
-      return body.detail.map(formatDetailEntry).join('\n')
-    }
-  } catch {
-    /* ignore — fall through to status text below */
-  }
-  return `${res.status} ${res.statusText}`
+  return formatErrorBody(await readErrorBody(res), res)
 }

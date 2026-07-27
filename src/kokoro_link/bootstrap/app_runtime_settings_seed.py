@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from typing import Sequence
 
 from pydantic import BaseModel
 
@@ -136,10 +137,16 @@ async def seed_app_runtime_settings(
             )
 
 
-def _apply_overrides(
+def apply_site_settings_overrides(
     settings: AppSettings, groups: dict[str, BaseModel],
 ) -> AppSettings:
-    """Overlay DB-resolved group configs onto env-derived value objects."""
+    """Overlay DB-resolved group configs onto env-derived value objects.
+
+    Pure and re-entrant: the boot overlay and the runtime reloader both call it,
+    so a hot reload can never diverge from what a restart would have produced.
+    Groups absent from ``groups`` keep their env value objects untouched, which
+    is what lets the reloader pass only the four hot groups.
+    """
     changes: dict[str, object] = {}
     weather = groups.get("weather")
     if isinstance(weather, WeatherRuntimeConfig):
@@ -182,25 +189,60 @@ def _apply_overrides(
     return dataclasses.replace(settings, **changes)
 
 
-async def _read_all_groups(
-    service: AppRuntimeSettingsService, settings: AppSettings,
+# Historical name kept for the existing call sites / tests.
+_apply_overrides = apply_site_settings_overrides
+
+
+async def read_site_settings_groups(
+    service: AppRuntimeSettingsService,
+    settings: AppSettings,
+    *,
+    groups: Sequence[str] | None = None,
 ) -> dict[str, BaseModel]:
+    """Read ``groups`` (default: all) from the DB, env-defaulting each.
+
+    Shared by the boot overlay and the runtime reloader so the two can never
+    resolve a group differently. Deliberately *not* fail-soft per group: a read
+    error propagates, because the reloader's contract is "a failed reload keeps
+    the last good snapshot", and swallowing the error here would instead swap in
+    a snapshot silently rebuilt from env.
+    """
+    wanted = tuple(groups) if groups is not None else tuple(_GROUP_DEFAULT_BUILDERS)
     resolved: dict[str, BaseModel] = {}
-    for group, builder in _GROUP_DEFAULT_BUILDERS.items():
+    for group in wanted:
+        builder = _GROUP_DEFAULT_BUILDERS.get(group)
+        if builder is None:
+            continue
         resolved[group] = await service.get(group, default=builder(settings))
     return resolved
 
 
-def overlay_site_settings_from_db(settings: AppSettings) -> AppSettings:
-    """Return ``settings`` overlaid with DB-persisted site-settings groups.
+@dataclasses.dataclass(frozen=True, slots=True)
+class SiteSettingsOverlayResult:
+    """The overlaid settings plus *where they came from*.
+
+    The provenance is the point: the overlay is fail-soft, so before this the
+    difference between "the DB says Taipei" and "the DB read blew up and we
+    quietly kept the env default" was invisible to everything downstream.
+    """
+
+    settings: AppSettings
+    source: str  # "db" | "env_fallback" — see site_settings_holder.OverlaySource
+
+
+def resolve_site_settings_overlay(
+    settings: AppSettings,
+) -> SiteSettingsOverlayResult:
+    """Overlay the DB-persisted site-settings groups, reporting provenance.
 
     Runs a short-lived async read against the ``app_runtime_settings`` KV
     using its own engine (container build is synchronous and runs outside
     an event loop). Fail-soft: any error (no table yet on a fresh DB,
     transport failure) keeps the env-derived settings unchanged so the app
-    still boots."""
+    still boots — but says so via ``source="env_fallback"`` instead of
+    degrading silently."""
     if not settings.database_url:
-        return settings
+        return SiteSettingsOverlayResult(settings, "env_fallback")
     try:
         from kokoro_link.infrastructure.persistence.engine import (
             build_async_engine,
@@ -216,21 +258,37 @@ def overlay_site_settings_from_db(settings: AppSettings) -> AppSettings:
                 factory = build_session_factory(engine)
                 repo = SARuntimeSettingsRepository(factory)
                 service = AppRuntimeSettingsService(repo)
-                return await _read_all_groups(service, settings)
+                return await read_site_settings_groups(service, settings)
             finally:
                 await engine.dispose()
 
         groups = asyncio.run(_run())
     except Exception as exc:  # fail-soft — keep env settings, still boot
         _LOGGER.warning(
-            "site settings DB overlay skipped (using env defaults): %s", exc,
+            "site settings DB overlay FAILED; this process is running on env "
+            "defaults and will not see Admin site-settings changes until the "
+            "database read succeeds (health reports "
+            "site_settings_overlay=env_fallback): %s",
+            exc,
+            exc_info=True,
         )
-        return settings
-    return _apply_overrides(settings, groups)
+        return SiteSettingsOverlayResult(settings, "env_fallback")
+    return SiteSettingsOverlayResult(
+        apply_site_settings_overrides(settings, groups), "db",
+    )
+
+
+def overlay_site_settings_from_db(settings: AppSettings) -> AppSettings:
+    """Back-compat shim: the overlaid settings without the provenance."""
+    return resolve_site_settings_overlay(settings).settings
 
 
 __all__ = [
+    "SiteSettingsOverlayResult",
+    "apply_site_settings_overrides",
     "env_default_for_group",
     "overlay_site_settings_from_db",
+    "read_site_settings_groups",
+    "resolve_site_settings_overlay",
     "seed_app_runtime_settings",
 ]

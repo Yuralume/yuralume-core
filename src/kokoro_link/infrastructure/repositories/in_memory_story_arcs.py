@@ -2,6 +2,12 @@
 
 Mirrors the shape of ``InMemoryStoryEventRepository`` / ``InMemoryStorySeedRepository``
 so tests can drop in either backend without conditional wiring.
+
+It is also the unit twin of the SA adapter's single-active-arc invariant: writes
+that would leave a character with two ``active`` arcs raise ``ActiveArcConflict``
+exactly as ``uq_story_arcs_active_character`` makes them do on PostgreSQL /
+SQLite, so a caller that mishandles the race fails in unit tests rather than
+only in production.
 """
 
 from __future__ import annotations
@@ -9,7 +15,10 @@ from __future__ import annotations
 import threading
 from copy import copy
 
-from kokoro_link.contracts.story_arc import StoryArcRepositoryPort
+from kokoro_link.contracts.story_arc import (
+    ActiveArcConflict,
+    StoryArcRepositoryPort,
+)
 from kokoro_link.domain.entities.story_arc import ARC_ACTIVE, StoryArc
 
 
@@ -22,7 +31,20 @@ class InMemoryStoryArcRepository(StoryArcRepositoryPort):
         with self._lock:
             if arc.id in self._arcs:
                 raise ValueError(f"StoryArc id {arc.id!r} already exists")
+            self._reject_second_active(arc)
             self._arcs[arc.id] = arc
+
+    def _reject_second_active(self, arc: StoryArc) -> None:
+        """Twin of ``uq_story_arcs_active_character``. Caller holds the lock."""
+        if arc.status != ARC_ACTIVE:
+            return
+        for other in self._arcs.values():
+            if (
+                other.id != arc.id
+                and other.character_id == arc.character_id
+                and other.status == ARC_ACTIVE
+            ):
+                raise ActiveArcConflict(arc.character_id)
 
     async def get(self, arc_id: str) -> StoryArc | None:
         with self._lock:
@@ -38,9 +60,8 @@ class InMemoryStoryArcRepository(StoryArcRepositoryPort):
             ]
         if not actives:
             return None
-        # Multiple actives shouldn't happen in practice (service layer
-        # keeps one at a time) — if it does, prefer the most recently
-        # updated so the caller sees the latest planning output.
+        # ``_reject_second_active`` keeps this list at length 1; the sort is a
+        # belt-and-braces match for the SA adapter's ``updated_at DESC LIMIT 1``.
         actives.sort(key=lambda a: a.updated_at, reverse=True)
         return actives[0]
 
@@ -56,6 +77,7 @@ class InMemoryStoryArcRepository(StoryArcRepositoryPort):
 
     async def save(self, arc: StoryArc) -> None:
         with self._lock:
+            self._reject_second_active(arc)
             self._arcs[arc.id] = copy(arc)
 
     async def delete(self, arc_id: str) -> None:

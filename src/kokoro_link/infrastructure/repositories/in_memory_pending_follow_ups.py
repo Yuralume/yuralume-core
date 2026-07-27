@@ -6,7 +6,7 @@ threaded — no locking needed.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from kokoro_link.contracts.pending_follow_up import (
     PendingFollowUpRepositoryPort,
@@ -61,6 +61,22 @@ class InMemoryPendingFollowUpRepository(PendingFollowUpRepositoryPort):
             and row.scheduled_for <= now
         ]
         eligible.sort(key=lambda row: row.scheduled_for)
+        return eligible[: max(0, limit)]
+
+    async def list_stale_resolving(
+        self,
+        *,
+        now: datetime,
+        older_than_seconds: float,
+        limit: int = 50,
+    ) -> list[PendingFollowUp]:
+        cutoff = now - timedelta(seconds=max(0.0, older_than_seconds))
+        eligible = [
+            row for row in self._rows.values()
+            if row.status == PendingFollowUpStatus.RESOLVING
+            and row.updated_at < cutoff
+        ]
+        eligible.sort(key=lambda row: row.updated_at)
         return eligible[: max(0, limit)]
 
     async def list_open_for_character(

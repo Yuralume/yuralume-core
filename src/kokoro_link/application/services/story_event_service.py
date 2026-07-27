@@ -33,6 +33,10 @@ from kokoro_link.application.services.story_gacha import (
     GachaResult,
     StoryGachaService,
 )
+from kokoro_link.application.services.studio_execution_lease import (
+    StudioExecutionLease,
+    StudioLeaseSession,
+)
 from kokoro_link.contracts.embedder import EmbedderPort
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.story import (
@@ -67,6 +71,15 @@ from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_DAILY_COUNT = 1
+
+_ROLL_LEASE_PREFIX = "story_event:"
+"""Cross-replica claim namespace for the daily roll, one key per
+``(character, civil day)``. Layered on the existing per-target TTL lease
+(``background_runtime_leases`` via ``StudioExecutionLease``) — the in-process
+``asyncio.Lock`` below only serializes callers inside ONE process, but
+``ensure_today`` is driven from api replicas *and* the worker's proactive
+dispatcher, and ``story_events`` uniqueness is per-seed, so two processes
+rolling two different seeds both persist."""
 
 
 class _BeatAsSeed:
@@ -115,6 +128,8 @@ class StoryEventService:
         arc_service: "StoryArcService | None" = None,
         arc_completion_memory_writer: ArcCompletionMemoryWriterPort | None = None,
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
+        execution_lease: StudioExecutionLease | None = None,
+        lease_heartbeat_interval_seconds: float | None = None,
     ) -> None:
         self._gacha = gacha
         self._expander = expander
@@ -126,11 +141,23 @@ class StoryEventService:
         self._arc_service = arc_service
         self._arc_completion_memory_writer = arc_completion_memory_writer
         self._operator_profile_service = operator_profile_service
+        # Cross-replica claim on the day's roll. ``None`` → the historical
+        # single-process behaviour (self-host, lease-less test rigs).
+        self._execution_lease = execution_lease
+        self._lease_heartbeat_interval = lease_heartbeat_interval_seconds
         # Per-(character, day) lock — prevents chat + proactive
         # scheduler + schedule-panel poll from all triggering the
         # gacha roll in parallel when the day's first event hasn't
-        # been persisted yet.
+        # been persisted yet. Process-local: it saves a DB round-trip for
+        # same-process callers, the lease below covers the cross-process case.
         self._roll_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    def _roll_lease_session(self, character_id: str, day: str) -> StudioLeaseSession:
+        return StudioLeaseSession(
+            self._execution_lease,
+            f"{_ROLL_LEASE_PREFIX}{character_id}:{day}",
+            heartbeat_interval_seconds=self._lease_heartbeat_interval,
+        )
 
     async def ensure_today(
         self,
@@ -165,7 +192,31 @@ class StoryEventService:
             )
             if len(existing) >= self._daily_count:
                 return EnsureReport(events=tuple(existing), newly_rolled=0)
-            return await self._do_ensure_today(character, today, existing)
+            async with self._roll_lease_session(
+                character.id, today.isoformat(),
+            ) as lease:
+                if not lease.acquired:
+                    # Another replica is rolling this character's day right
+                    # now. Never block on it: ``ensure_today`` sits on the
+                    # chat turn / proactive tick, and every caller is polling
+                    # or opportunistic, so the next pass picks the event up.
+                    _LOGGER.info(
+                        "story event roll: day claimed by another replica "
+                        "character=%s day=%s", character.id, today.isoformat(),
+                    )
+                    current = await self._events.get_for_day(
+                        character.id, today.isoformat(),
+                    )
+                    return EnsureReport(events=tuple(current), newly_rolled=0)
+                # Third check, now under the claim: the replica that just
+                # released the lease may have filled the slot between our
+                # read above and our own claim.
+                existing = await self._events.get_for_day(
+                    character.id, today.isoformat(),
+                )
+                if len(existing) >= self._daily_count:
+                    return EnsureReport(events=tuple(existing), newly_rolled=0)
+                return await self._do_ensure_today(character, today, existing)
 
     async def _do_ensure_today(
         self,

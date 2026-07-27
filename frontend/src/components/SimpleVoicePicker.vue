@@ -11,6 +11,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 import type { Character, VoiceProfile } from '@/types/character'
 import { updateCharacter } from '@/utils/api/characters'
@@ -25,6 +26,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const catalog = ref<TTSAssetCatalog | null>(null)
 const catalogLoading = ref(false)
@@ -187,7 +189,7 @@ async function handleEnabledChange(event: Event) {
     </label>
 
     <p v-if="!catalogEnabled && !catalogLoading" class="field-hint field-hint--warn">
-      {{ t('simpleVoicePicker.hints.catalogDisabled') }}
+      {{ pt('simpleVoicePicker.hints.catalogDisabled') }}
     </p>
     <p v-else class="field-hint">
       {{ t('simpleVoicePicker.hints.advanced') }}

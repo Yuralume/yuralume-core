@@ -121,6 +121,12 @@ class FusionStoryResponse(BaseModel):
     head_version: int
     full_text: str
     error_message: str | None = None
+    error_code: str | None = None
+    """Machine-readable failure reason for a ``failed`` story (U4b).
+
+    The client polls this endpoint while the background pipeline runs;
+    ``insufficient_credits`` here means "show the top-up affordance"
+    rather than the generic failure copy. ``None`` for ordinary crashes."""
     progress: FusionStoryProgressResponse
     beats: list[FusionStoryBeatResponse]
     versions: list[FusionStoryVersionResponse]
@@ -140,6 +146,7 @@ class FusionStoryResponse(BaseModel):
             head_version=story.head_version,
             full_text=story.full_text,
             error_message=story.error_message,
+            error_code=story.error_code,
             progress=FusionStoryProgressResponse.from_domain(story),
             beats=[
                 FusionStoryBeatResponse.from_domain(b) for b in story.beats
@@ -167,6 +174,7 @@ class FusionStorySummaryResponse(BaseModel):
     status: str
     head_version: int
     error_message: str | None = None
+    error_code: str | None = None
     progress: FusionStoryProgressResponse
     total_chars: int = 0
     """Reading length for the bookshelf display — polished text length
@@ -192,6 +200,7 @@ class FusionStorySummaryResponse(BaseModel):
             status=story.status,
             head_version=story.head_version,
             error_message=story.error_message,
+            error_code=story.error_code,
             progress=FusionStoryProgressResponse.from_domain(story),
             total_chars=total_chars,
             created_at=story.created_at,

@@ -81,7 +81,7 @@ def test_correction_supersedes_existing_before_insert() -> None:
     persona = OperatorPersona(
         character_id="char-A",
         operator_id="alice",
-        layer1_identity={"name": _field("name", "丹尼", field_id="fld-old")},
+        layer1_identity={"name": _field("name", "艾力", field_id="fld-old")},
     )
     repo = _FakeRepo(persona)
     svc = _service(repo)
@@ -131,7 +131,7 @@ def test_observed_does_not_retire_user_explicit_row() -> None:
         character_id="char-A",
         operator_id="alice",
         layer1_identity={
-            "name": _field("name", "丹尼", field_id="fld-ux", source="user_explicit"),
+            "name": _field("name", "艾力", field_id="fld-ux", source="user_explicit"),
         },
     )
     repo = _FakeRepo(persona)
@@ -149,7 +149,7 @@ def test_observed_does_not_retire_user_explicit_row() -> None:
 
     assert repo.upserts == []  # nothing written
     assert repo.field_marks == []  # the deliberate row is not retired
-    assert result.value == "丹尼"  # existing user_explicit preserved
+    assert result.value == "艾力"  # existing user_explicit preserved
 
 
 def test_observed_supersedes_a_learned_row_at_lower_confidence() -> None:
@@ -157,7 +157,7 @@ def test_observed_supersedes_a_learned_row_at_lower_confidence() -> None:
         character_id="char-A",
         operator_id="alice",
         layer1_identity={
-            "name": _field("name", "丹尼", field_id="fld-ex", source="extraction"),
+            "name": _field("name", "艾力", field_id="fld-ex", source="extraction"),
         },
     )
     repo = _FakeRepo(persona)

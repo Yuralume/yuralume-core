@@ -427,3 +427,20 @@ def test_container_wires_operator_profile_service_into_persona_projection() -> N
         "OperatorPersonaProjectionService so persona-projection narrative "
         "follows the owning operator's primary_language"
     )
+
+
+def test_schedule_plan_claim_ttl_outlives_one_slow_planner_round() -> None:
+    """The plan claim must not expire while its own ``plan_day`` is still running.
+
+    ``RuntimeClaim`` defaults to 180s and the schedule claim carries no
+    heartbeat, but one planner round is a dialogue summary plus a ``plan_day``
+    call and the LLM read timeout alone is 300s per call. At the default TTL a
+    slow model let the claim lapse mid-plan, a second replica took the day over,
+    and the unique constraint quietly absorbed the duplicate — correct data, but
+    the spend was doubled and the player watched the plan flip on refresh.
+    """
+    container = build_container(AppSettings())
+
+    claim = container.schedule_service._plan_claim
+    assert claim is not None
+    assert claim.ttl_seconds >= 600

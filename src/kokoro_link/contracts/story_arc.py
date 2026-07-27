@@ -16,6 +16,27 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
 
 
+class ActiveArcConflict(Exception):
+    """Another writer already owns this character's single active-arc slot.
+
+    Raised by ``add`` / ``save`` when the write would leave a character with
+    two ``active`` arcs — i.e. when the DB's ``uq_story_arcs_active_character``
+    partial unique index rejects it. It is a *benign race*, not a defect: the
+    losing writer must adopt the winner (re-read ``get_active_for_character``)
+    rather than overwrite it, because the winner's arc is what every reader
+    surface is already showing.
+
+    Implementations that cannot detect the race (in-memory) never raise it, so
+    callers must treat it as an optional signal.
+    """
+
+    def __init__(self, character_id: str) -> None:
+        super().__init__(
+            f"character {character_id} already has an active story arc",
+        )
+        self.character_id = character_id
+
+
 class StoryArcRepositoryPort(ABC):
     """CRUD for ``StoryArc`` + its embedded beats.
 
@@ -25,10 +46,18 @@ class StoryArcRepositoryPort(ABC):
     beat) still route through ``save`` — cheaper than a per-beat API
     for the scales we care about (3–7 beats per arc, <20 arcs per
     character over the product's lifetime).
+
+    At most ONE arc per character may be ``active``. DB-backed
+    implementations enforce it with a partial unique index and surface a
+    violation as :class:`ActiveArcConflict`.
     """
 
     @abstractmethod
-    async def add(self, arc: StoryArc) -> None: ...
+    async def add(self, arc: StoryArc) -> None:
+        """Insert a new arc.
+
+        Raises :class:`ActiveArcConflict` when ``arc`` is active and the
+        character already has an active arc."""
 
     @abstractmethod
     async def get(self, arc_id: str) -> StoryArc | None: ...
@@ -45,7 +74,10 @@ class StoryArcRepositoryPort(ABC):
 
     @abstractmethod
     async def save(self, arc: StoryArc) -> None:
-        """Upsert — replaces the arc + all beats atomically."""
+        """Upsert — replaces the arc + all beats atomically.
+
+        Raises :class:`ActiveArcConflict` when the write would make this a
+        second active arc for the character."""
 
     @abstractmethod
     async def delete(self, arc_id: str) -> None: ...

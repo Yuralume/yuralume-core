@@ -9,16 +9,19 @@ const adminPlaceholderRoutes: RouteRecordRaw[] = [
     path: 'characters',
     name: 'admin-characters',
     component: () => import('@/pages/admin/CharactersAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'memories',
     name: 'admin-memories',
     component: () => import('@/pages/admin/MemoriesAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'channels',
     name: 'admin-channels',
     component: () => import('@/pages/admin/ChannelsAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'dispositions',
@@ -72,6 +75,7 @@ const adminPlaceholderRoutes: RouteRecordRaw[] = [
     path: 'schedule',
     name: 'admin-schedule',
     component: () => import('@/pages/admin/ScheduleAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'follow-ups',
@@ -83,6 +87,7 @@ const adminPlaceholderRoutes: RouteRecordRaw[] = [
     path: 'world',
     name: 'admin-world',
     component: () => import('@/pages/admin/WorldAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'site-settings',
@@ -94,21 +99,25 @@ const adminPlaceholderRoutes: RouteRecordRaw[] = [
     path: 'character-freeze',
     name: 'admin-character-freeze',
     component: () => import('@/pages/admin/CharacterFreezeAdminPage.vue'),
+    meta: { cloudOperatorOnly: true },
   },
   {
     path: 'dev-docs',
     name: 'admin-dev-docs',
     component: () => import('@/pages/admin/DevDocsAdminPage.vue'),
+    meta: { cloudLocked: true },
   },
   {
     path: 'dev-docs/:slug',
     name: 'admin-dev-docs-detail',
     component: () => import('@/pages/admin/DevDocsAdminPage.vue'),
+    meta: { cloudLocked: true },
   },
   {
     path: 'observability',
     name: 'admin-observability',
     component: () => import('@/pages/admin/ObservabilityAdminPage.vue'),
+    meta: { cloudLocked: true },
   },
   {
     path: 'users',
@@ -203,11 +212,12 @@ const router = createRouter({
     },
     {
       // Dev-only style guide。Phase 1 ~ 5 重構期間用來回歸 UI primitives。
-      // 完成全面遷移後可以移除此路由（或加 import.meta.env.DEV 守門）。
+      // `debugOnly` 掛既有 KOKORO_DEBUG_UI_ENABLED 閘：這頁本來就只是開發
+      // 回歸工具，玩家直打網址不該看到一頁英文元件展示（plan U1-E-1）。
       path: '/_styleguide',
       name: 'styleguide',
       component: () => import('@/pages/StyleGuidePage.vue'),
-      meta: { layout: 'player' },
+      meta: { layout: 'player', debugOnly: true },
     },
     {
       // Admin 區：AdminLayout 自帶左側 nav + 頂部 breadcrumb + 內部 <router-view />。
@@ -303,10 +313,25 @@ router.beforeEach(async (to) => {
   // reachable for curl-based exports regardless.
   const isDebugOnly = to.matched.some(record => record.meta?.debugOnly)
   if (isDebugOnly && !auth.debugUiEnabled.value) {
-    return { name: 'admin-home' }
+    // Non-admin debug routes (``/_styleguide``) have no admin shell to
+    // fall back into, so send those home instead of into /admin — which
+    // the requiresAdmin rule above would only bounce again.
+    return requiresAdmin ? { name: 'admin-home' } : { path: '/' }
   }
   const isCloudLocked = to.matched.some(record => record.meta?.cloudLocked)
   if (isCloudLocked && auth.cloudMode.value) {
+    return { name: 'admin-home' }
+  }
+  // Operator-only admin pages (plan U1-E-3 / §8-2). These are legitimate
+  // day-to-day tools for a self-host owner, so they must stay visible
+  // there — the zero-regression red line. In hosted they belong to the
+  // deployment operator alone, who turns on the same debug UI flag.
+  // Hence a cloud-scoped variant of `debugOnly` rather than `debugOnly`
+  // itself, which would have hidden six pages from every self-host owner.
+  const isCloudOperatorOnly = to.matched.some(
+    record => record.meta?.cloudOperatorOnly,
+  )
+  if (isCloudOperatorOnly && auth.cloudMode.value && !auth.debugUiEnabled.value) {
     return { name: 'admin-home' }
   }
   return true

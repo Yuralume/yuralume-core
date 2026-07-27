@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
 from kokoro_link.contracts.messaging import (
     InboundMessage,
@@ -203,7 +204,23 @@ class DiscordGatewayService:
             if parsed is None:
                 return
             inbound = await self._build_inbound(account, parsed)
-            await self._dispatcher.handle_inbound(inbound)
+            try:
+                await self._dispatcher.handle_inbound(inbound)
+            except ConversationBusyError:
+                # The Gateway is a live socket: an exception escaping this
+                # handler tears the connection down and reconnects, which does
+                # not re-deliver the message and disrupts every other chat on
+                # the account. Discord has no re-delivery at all, so the
+                # dispatcher's bounded retry was this message's only recovery
+                # — log it and keep the socket alive.
+                _LOGGER.warning(
+                    "discord message dropped — conversation stayed busy "
+                    "account=%s chat=%s id=%s",
+                    account.id,
+                    inbound.chat_ref,
+                    inbound.platform_message_id,
+                )
+                return
             await self._accounts.mark_gateway_success(
                 account.id,
                 owner_id=self._owner_id,

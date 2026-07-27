@@ -10,7 +10,9 @@ compatibility (several routes/tests import them from here).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from typing import Any
 
 from kokoro_link.bootstrap.container import ServiceContainer
@@ -49,6 +51,92 @@ from kokoro_link.infrastructure.security.provider_secret_cipher import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Process-wide serialisation of ``sync_provider_connections``. The sync
+# *unregisters* every configured LLM provider before re-registering the enabled
+# ones, so two overlapping syncs can interleave into a window where a provider
+# the other run just registered is torn down again — a live request in that
+# window fails with "unknown provider" for no reason. Previously this needed two
+# concurrent admin writes to hit; now the runtime-config refresher can sync
+# concurrently with an admin request on the same api replica, so the window is
+# reachable in normal operation and must be closed.
+#
+# Keyed by running loop (not a module-level ``asyncio.Lock``) because the test
+# suite builds many apps across many event loops, and an asyncio primitive
+# bound to a dead loop raises when awaited from a new one. The dictionary is
+# weak-keyed so a finished loop's lock is collected with it.
+_SYNC_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sync_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _SYNC_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SYNC_LOCKS[loop] = lock
+    return lock
+
+
+# --- what this process's sync currently owns --------------------------------
+#
+# The teardown pass used to derive "what may I unregister?" from the rows that
+# still exist, so a *deleted* row was unreachable by it: the adapter built from
+# the row an operator just deleted (typically because its key leaked) stayed
+# live in every process until restart. Fixing that needs a memory of what the
+# sync itself put into each registry, because the DB no longer remembers.
+#
+# The memory is per *target object* rather than per container: ``ServiceContainer``
+# is a ``slots=True`` dataclass (unhashable, no attribute to hang state on),
+# while every registry/backend the sync writes to is an ordinary object. Keying
+# by the target also states the invariant precisely — the entry describes what
+# lives in *that* registry — and weak keys let a finished test app's state be
+# collected with it (same rationale as ``_SYNC_LOCKS``).
+#
+# Only sync-made registrations are recorded, so an env/YAML-wired registration
+# is never torn down by a sync that has no DB rows to replace it with.
+_SYNCED_LLM_IDS: "weakref.WeakKeyDictionary[Any, set[str]]" = (
+    weakref.WeakKeyDictionary()
+)
+_DB_OWNED_TARGETS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def _recall_synced_llm_ids(registry: Any) -> set[str]:
+    """Provider ids the previous sync registered into ``registry``."""
+    try:
+        return set(_SYNCED_LLM_IDS.get(registry, ()))
+    except TypeError:
+        # Unhashable stub registry (test doubles): no memory, historical
+        # behaviour — the configured-rows teardown still applies.
+        return set()
+
+
+def _remember_synced_llm_ids(registry: Any, provider_ids: set[str]) -> None:
+    try:
+        _SYNCED_LLM_IDS[registry] = set(provider_ids)
+    except TypeError:
+        return
+
+
+def _claim_db_ownership(target: Any) -> None:
+    """Record that the DB snapshot now owns ``target``'s contents.
+
+    After the first DB-derived write, a later sync must apply the *desired
+    snapshot* — including the empty one — instead of treating "no rows" as
+    "nothing to do"; the env-wired baseline it used to protect is already gone.
+    """
+    try:
+        _DB_OWNED_TARGETS.add(target)
+    except TypeError:
+        return
+
+
+def _is_db_owned(target: Any) -> bool:
+    try:
+        return target in _DB_OWNED_TARGETS
+    except TypeError:
+        return False
+
 
 async def seed_legacy_provider_connections(
     container: ServiceContainer,
@@ -82,7 +170,15 @@ async def sync_provider_connections(container: ServiceContainer) -> None:
     concrete in-memory registry used by the app exposes ``register`` /
     ``unregister``. We feature-detect those methods so tests using
     stubs still work.
+
+    Serialised process-wide (see ``_SYNC_LOCKS``): the unregister/re-register
+    pass is not safe to interleave with itself.
     """
+    async with _sync_lock():
+        await _sync_provider_connections_locked(container)
+
+
+async def _sync_provider_connections_locked(container: ServiceContainer) -> None:
     service = getattr(container, "provider_connection_service", None)
     registry = getattr(container, "model_registry", None)
     register = getattr(registry, "register", None)
@@ -98,10 +194,17 @@ async def sync_provider_connections(container: ServiceContainer) -> None:
         if entry is not None and "llm" in row.capabilities and "llm" in entry.capabilities:
             configured_llm_provider_ids.add(row.provider)
     if unregister is not None:
-        for provider_id in configured_llm_provider_ids:
+        # Union with what the previous sync registered: a deleted row is absent
+        # from ``configured_llm_provider_ids`` (``list_connections`` excludes
+        # soft-deleted rows), so without the memory its adapter would survive
+        # every future sync.
+        for provider_id in configured_llm_provider_ids | _recall_synced_llm_ids(
+            registry,
+        ):
             unregister(provider_id)
 
     rows = await service.list_enabled_runtime(capability="llm")
+    synced_llm_ids: set[str] = set()
     for row in rows:
         try:
             model = await _build_llm_model(container, row)
@@ -116,7 +219,9 @@ async def sync_provider_connections(container: ServiceContainer) -> None:
             continue
         if model is not None:
             register(model)
+            synced_llm_ids.add(model.provider_id)
             await service.record_runtime_status(row.id, error=None)
+    _remember_synced_llm_ids(registry, synced_llm_ids)
     container.provider_ids = registry.list_ids()
 
     await _sync_image_profiles(container)
@@ -341,7 +446,13 @@ async def _sync_image_profiles(container: ServiceContainer) -> None:
     if service is None or replace_profiles is None:
         return
     all_rows = await service.list_connections()
-    if not any("image" in row.capabilities for row in all_rows):
+    if not any("image" in row.capabilities for row in all_rows) and not _is_db_owned(
+        registry,
+    ):
+        # Never any DB image rows → the profiles came from env/YAML and are not
+        # ours to replace. Once the DB *has* owned them, "no rows" is the
+        # desired (empty) snapshot and must be applied — deleting the last row
+        # is how an operator retires a compromised image provider.
         return
     rows = await service.list_enabled_runtime(capability="image")
     profiles: list[ImageProfile] = []
@@ -374,6 +485,7 @@ async def _sync_image_profiles(container: ServiceContainer) -> None:
             )
             await service.record_runtime_status(row.id, error=str(exc))
     replace_profiles(profiles)
+    _claim_db_ownership(registry)
 
 
 async def _sync_video_profiles(container: ServiceContainer) -> None:
@@ -383,7 +495,10 @@ async def _sync_video_profiles(container: ServiceContainer) -> None:
     if service is None or replace_profiles is None:
         return
     all_rows = await service.list_connections()
-    if not any("video" in row.capabilities for row in all_rows):
+    if not any("video" in row.capabilities for row in all_rows) and not _is_db_owned(
+        registry,
+    ):
+        # Same snapshot semantics as the image registry above.
         return
     rows = await service.list_enabled_runtime(capability="video")
     profiles: list[VideoProfile] = []
@@ -401,6 +516,7 @@ async def _sync_video_profiles(container: ServiceContainer) -> None:
             )
             await service.record_runtime_status(row.id, error=str(exc))
     replace_profiles(profiles)
+    _claim_db_ownership(registry)
 
 
 async def _sync_tts_backend(container: ServiceContainer) -> None:
@@ -409,10 +525,14 @@ async def _sync_tts_backend(container: ServiceContainer) -> None:
     if service is None or tts_service is None:
         return
     all_rows = await service.list_connections()
-    if not any("tts" in row.capabilities for row in all_rows):
+    if not any("tts" in row.capabilities for row in all_rows) and not _is_db_owned(
+        tts_service,
+    ):
         return
     rows = await service.list_enabled_runtime(capability="tts")
     if not rows:
+        # Deleting the last TTS row now lands in the same state as disabling it
+        # (previously deletion early-returned and left the catalog mounted).
         container.tts_voice_catalog = None
         return
     row = max(rows, key=_runtime_updated_at)
@@ -444,6 +564,7 @@ async def _sync_tts_backend(container: ServiceContainer) -> None:
             )
         tts_service.set_runtime_backend(port=built.port, settings=settings)
         container.tts_voice_catalog = built.port
+        _claim_db_ownership(tts_service)
         await service.record_runtime_status(row.id, error=None)
     except Exception as exc:
         _LOGGER.warning(
@@ -462,10 +583,14 @@ async def _sync_embedding_backend(container: ServiceContainer) -> None:
     if service is None or set_backend is None:
         return
     all_rows = await service.list_connections()
-    if not any("embedding" in row.capabilities for row in all_rows):
+    if not any("embedding" in row.capabilities for row in all_rows) and not _is_db_owned(
+        embedder,
+    ):
         return
     rows = await service.list_enabled_runtime(capability="embedding")
     if not rows:
+        # Deleting the last embedding row is as much a "stop using that key" as
+        # disabling it, so both converge on the null backend.
         set_backend(NullEmbedder(dimension=embedder.dimension))
         return
     row = max(rows, key=_runtime_updated_at)
@@ -477,6 +602,7 @@ async def _sync_embedding_backend(container: ServiceContainer) -> None:
         if backend is None:
             return
         set_backend(backend)
+        _claim_db_ownership(embedder)
         await service.record_runtime_status(row.id, error=None)
     except Exception as exc:
         _LOGGER.warning(
@@ -508,8 +634,12 @@ async def _sync_search_tool(container: ServiceContainer) -> None:
     if service is None or registry is None or replace is None or unregister is None:
         return
     all_rows = await service.list_connections()
-    if not any("search" in row.capabilities for row in all_rows):
-        # No search rows at all → leave any env-wired tool in place.
+    if not any("search" in row.capabilities for row in all_rows) and not _is_db_owned(
+        registry,
+    ):
+        # No search rows at all *and* the DB never mounted one → leave any
+        # env-wired tool in place. After a DB-mounted tool, deleting the row
+        # unmounts it exactly as disabling it does.
         return
     rows = await service.list_enabled_runtime(capability="search")
     if not rows:
@@ -532,6 +662,7 @@ async def _sync_search_tool(container: ServiceContainer) -> None:
             default_max_results=_config_int(row, "max_results", 5),
         )
         replace(tool)
+        _claim_db_ownership(registry)
         await service.record_runtime_status(row.id, error=None)
     except Exception as exc:
         _LOGGER.warning(

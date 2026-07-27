@@ -66,6 +66,15 @@ class FusionStoryRow(Base):
         Integer, nullable=False, default=1,
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    """Gateway refusal code behind a ``failed`` status (U4b).
+
+    ``NULL`` for every ordinary crash and for every pre-existing row —
+    the background pipelines are 202 + poll, so this column is the only
+    way a player-actionable refusal (``insufficient_credits``) reaches the
+    polling client."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )

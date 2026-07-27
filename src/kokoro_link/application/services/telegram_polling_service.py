@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
 from kokoro_link.contracts.messaging import (
     InboundMessage,
@@ -257,6 +258,24 @@ class TelegramPollingService:
                     )
                     await self._dispatcher.handle_inbound(inbound)
                     dispatched += 1
+            except ConversationBusyError:
+                # Stop the sweep *without* advancing the offset: Telegram hands
+                # the same update back on the next poll (~2s), which is exactly
+                # the re-delivery the dispatcher rolled its dedup stamps back
+                # for. Deliberately not recorded as an account error — nothing
+                # is wrong with the bot, one conversation is simply mid-turn.
+                _LOGGER.info(
+                    "telegram polling deferred busy conversation "
+                    "account=%s update_id=%s",
+                    account.id,
+                    update_id,
+                )
+                return TelegramPollingAccountResult(
+                    account_id=account.id,
+                    acquired=True,
+                    updates_seen=updates_seen,
+                    dispatched=dispatched,
+                )
             except Exception:
                 error = f"Telegram update {update_id} processing failed"
                 _LOGGER.exception(

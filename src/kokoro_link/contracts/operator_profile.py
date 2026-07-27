@@ -71,6 +71,25 @@ class OperatorProfileRepositoryPort(Protocol):
         Returns the number of operator rows written. Idempotent (a blank /
         unknown tenant updates nothing and returns 0)."""
 
+    async def set_identity_locale(
+        self,
+        operator_id: str,
+        *,
+        timezone_id: str | None = None,
+        primary_language: str | None = None,
+    ) -> OperatorProfile | None:
+        """Targeted update of the two pinned identity-locale columns (G2).
+
+        ``save`` deliberately refuses to move ``timezone_id`` /
+        ``primary_language`` on an existing row so no incidental profile
+        write (login projection, display-name edit, location refresh) can
+        reinterpret a player's history by accident. The hosted "change my
+        timezone / language" flow is the one sanctioned exception, so it
+        gets its own narrow method instead of loosening the general upsert.
+
+        Only the provided fields are written. Returns the post-update
+        entity, or ``None`` when the row does not exist. Idempotent."""
+
     async def list_all(self) -> list[OperatorProfile]:
         """Enumerate every operator profile — used by admin user CRUD."""
 

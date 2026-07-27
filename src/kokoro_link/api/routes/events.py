@@ -23,9 +23,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from kokoro_link.api.dependencies import (
@@ -38,12 +38,25 @@ from kokoro_link.application.services.feed_event_bus import (
 )
 from kokoro_link.application.services.proactive_event_bus import ProactiveEvent
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.contracts.realtime_events import DEFAULT_OVERLAP
 
 _LOGGER = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_SECONDS = 15.0
+# Cap on how many outbox rows a single ``Last-Event-ID`` reconnect replays, so a
+# browser that was offline for a long time can't force an unbounded replay. The
+# 7-day TTL prune already bounds the table; this bounds one connection's burst.
+_REPLAY_LIMIT = 512
 
 router = APIRouter(tags=["events"])
+
+
+def _id_prefix(event: object) -> str:
+    """``id: <n>\\n`` when the event carries a durable outbox id (postgres
+    backend), else empty — so the in-memory backend frame is byte-identical to
+    the historical single-process output (no ``id:`` line, no replay anchor)."""
+    event_id = getattr(event, "event_id", None)
+    return "" if event_id is None else f"id: {event_id}\n"
 
 
 def _encode_proactive_event(event: ProactiveEvent) -> str:
@@ -55,7 +68,10 @@ def _encode_proactive_event(event: ProactiveEvent) -> str:
         "unread_count": event.unread_count,
         "created_at": event.created_at.isoformat(),
     }
-    return f"event: proactive_message\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return (
+        f"{_id_prefix(event)}event: proactive_message\n"
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    )
 
 
 def _encode_feed_post_event(event: FeedPostEvent) -> str:
@@ -68,7 +84,10 @@ def _encode_feed_post_event(event: FeedPostEvent) -> str:
         "image_url": event.image_url,
         "created_at": event.created_at.isoformat(),
     }
-    return f"event: feed_post\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return (
+        f"{_id_prefix(event)}event: feed_post\n"
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    )
 
 
 def _encode_feed_reply_event(event: FeedCommentReplyEvent) -> str:
@@ -82,9 +101,71 @@ def _encode_feed_reply_event(event: FeedCommentReplyEvent) -> str:
         "created_at": event.created_at.isoformat(),
     }
     return (
-        f"event: feed_comment_reply\n"
+        f"{_id_prefix(event)}event: feed_comment_reply\n"
         f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     )
+
+
+def _encode_event(event: object) -> str | None:
+    if isinstance(event, FeedPostEvent):
+        return _encode_feed_post_event(event)
+    if isinstance(event, FeedCommentReplyEvent):
+        return _encode_feed_reply_event(event)
+    if isinstance(event, ProactiveEvent):
+        return _encode_proactive_event(event)
+    return None
+
+
+def _parse_last_event_id(raw: str | None) -> int | None:
+    """A browser resends the last ``id:`` it saw as ``Last-Event-ID``. Parse it
+    leniently — any non-integer means "no anchor", i.e. start live only."""
+    if not raw:
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+async def replay_frames(
+    outbox: object,
+    rehydrator: object,
+    resume_from: int,
+    is_owned: "Callable[[str | None], Awaitable[bool]]",
+    replayed_ids: set[int],
+) -> AsyncIterator[str]:
+    """Re-emit outbox events after ``resume_from`` as encoded SSE frames.
+
+    Shared rehydrate + encode path with the dispatcher. Populates
+    ``replayed_ids`` so the caller's live loop can de-dupe the replay/live
+    boundary. Reads the out-of-order overlap tail (``read_after``) and de-dupes
+    it by id within the replay itself. Fail-soft: any read/rehydrate error is
+    logged and skipped, never raised into the stream.
+    """
+    try:
+        rows = await outbox.read_after(
+            resume_from, overlap=DEFAULT_OVERLAP, limit=_REPLAY_LIMIT,
+        )
+    except Exception:
+        _LOGGER.exception("SSE replay read_after failed")
+        return
+    for stored in rows:
+        if stored.id in replayed_ids:
+            continue
+        replayed_ids.add(stored.id)
+        try:
+            event = await rehydrator.rehydrate(stored)
+        except Exception:
+            _LOGGER.exception("SSE replay rehydrate failed id=%s", stored.id)
+            continue
+        if event is None:
+            continue
+        if not await is_owned(getattr(event, "character_id", None)):
+            continue
+        frame = _encode_event(event)
+        if frame is not None:
+            yield frame
 
 
 @router.get("/events/stream")
@@ -92,6 +173,7 @@ async def events_stream(
     request: Request,
     container: ServiceContainer = Depends(get_container),
     current_user_id: str = Depends(get_current_user_id),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
     proactive_bus = container.proactive_event_bus
     if proactive_bus is None:
@@ -103,6 +185,15 @@ async def events_stream(
             detail="proactive event bus not configured",
         )
     feed_bus = container.feed_event_bus
+
+    # Phase 4 replay wiring — present only under the ``postgres`` realtime
+    # backend (the wiring task sets these container attributes). On the
+    # in-memory backend both are ``None``: no ``id:`` frames, no replay, wire
+    # output identical to the historical single-process stream (self-host red
+    # line). ``getattr`` keeps this route forward-compatible before wiring lands.
+    realtime_outbox = getattr(container, "realtime_outbox", None)
+    realtime_rehydrator = getattr(container, "realtime_rehydrator", None)
+    resume_from = _parse_last_event_id(last_event_id)
 
     async def _is_owned(character_id: str | None) -> bool:
         """Server-side gate: only forward events whose character is
@@ -136,6 +227,12 @@ async def events_stream(
 
     _OWNED: dict[str, bool] = {}
 
+    can_replay = (
+        realtime_outbox is not None
+        and realtime_rehydrator is not None
+        and resume_from is not None
+    )
+
     async def event_generator() -> AsyncIterator[str]:
         async with proactive_bus.subscription() as proactive_queue:
             async with _maybe_subscribe(feed_bus) as feed_queue:
@@ -143,6 +240,16 @@ async def events_stream(
                 # EventSource.readyState to OPEN and any open() handler
                 # finishes setup before real events arrive.
                 yield ": connected\n\n"
+                # Last-Event-ID replay (postgres backend only). Subscribed
+                # above already, so live events published during replay queue up
+                # and are de-duped by replayed_ids at the live boundary below.
+                replayed_ids: set[int] = set()
+                if can_replay:
+                    async for frame in replay_frames(
+                        realtime_outbox, realtime_rehydrator,
+                        resume_from, _is_owned, replayed_ids,
+                    ):
+                        yield frame
                 while True:
                     if await request.is_disconnected():
                         return
@@ -183,13 +290,15 @@ async def events_stream(
                             getattr(event, "character_id", None),
                         ):
                             continue
+                        # Replay/live boundary de-dup: an event already sent by
+                        # the replay prologue must not be re-delivered live.
+                        event_id = getattr(event, "event_id", None)
+                        if event_id is not None and event_id in replayed_ids:
+                            continue
                         try:
-                            if isinstance(event, FeedPostEvent):
-                                yield _encode_feed_post_event(event)
-                            elif isinstance(event, FeedCommentReplyEvent):
-                                yield _encode_feed_reply_event(event)
-                            elif isinstance(event, ProactiveEvent):
-                                yield _encode_proactive_event(event)
+                            frame = _encode_event(event)
+                            if frame is not None:
+                                yield frame
                         except Exception:
                             _LOGGER.exception(
                                 "failed to encode SSE event",

@@ -23,6 +23,9 @@ from kokoro_link.infrastructure.provider_settings.catalog import (
     ProviderFieldSpec,
     catalog_by_id,
 )
+from kokoro_link.infrastructure.persistence.runtime_config_signal import (
+    notify_runtime_config_changed,
+)
 from kokoro_link.infrastructure.provider_settings.model_discovery import (
     discover_models,
 )
@@ -32,6 +35,22 @@ from kokoro_link.infrastructure.provider_settings.runtime_sync import (
 )
 
 router = APIRouter(prefix="/admin/providers", tags=["admin-providers"])
+
+
+async def _apply_provider_change(container: ServiceContainer) -> None:
+    """Rebuild THIS process's registries, then tell every other process.
+
+    The local sync alone is what used to happen — and in a multi-process deploy
+    that meant the other six processes kept serving the old credentials
+    indefinitely (a disabled key stayed live on the replicas that did not
+    receive the request). The NOTIFY is the fleet-wide half; it is best-effort,
+    so a dropped hint only delays the others to their next fingerprint poll and
+    can never fail the admin write.
+    """
+    await sync_provider_connections(container)
+    await notify_runtime_config_changed(
+        getattr(container, "db_engine", None),
+    )
 
 
 def resolve_draft_base_url(config: dict[str, Any], provider_id: str) -> str:
@@ -222,7 +241,7 @@ async def create_connection(
         )
     except ProviderConnectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await sync_provider_connections(container)
+    await _apply_provider_change(container)
     return _connection(row)
 
 
@@ -324,7 +343,7 @@ async def update_connection(
     except ProviderConnectionError as exc:
         status_code = 404 if "not found" in str(exc) else 400
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    await sync_provider_connections(container)
+    await _apply_provider_change(container)
     return _connection(row)
 
 
@@ -337,7 +356,7 @@ async def delete_connection(
 ) -> None:
     del admin
     await _service(container).delete_connection(connection_id)
-    await sync_provider_connections(container)
+    await _apply_provider_change(container)
 
 
 @router.post("/{connection_id}/test", response_model=ProviderConnectionResponse)

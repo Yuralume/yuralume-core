@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { BulbOutlined, CloseOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import type { Character } from '@/types/character'
 import type { ChatMessage, StageAccessVerdict } from '@/types/chat'
@@ -14,6 +15,7 @@ import {
   uploadChatAttachments,
   undoLastTurn,
 } from '@/utils/api/chat'
+import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { suggestChatAssistMessages } from '@/utils/api/chatAssist'
 import { getCharacter, getStageAccess } from '@/utils/api/characters'
 import { updateOperatorProfile } from '@/utils/api/operatorProfile'
@@ -22,11 +24,12 @@ import { getCurrentActivity } from '@/utils/api/schedule'
 import ChatBubble from '@/components/ChatBubble.vue'
 import ChatAssistDiscoveryHint from '@/components/ChatAssistDiscoveryHint.vue'
 import ChatFirstTurnGuide from '@/components/ChatFirstTurnGuide.vue'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
 import { UiButton } from '@/components/ui'
 import { useChatAssistPreference } from '@/composables/useChatAssistPreference'
-import { useSceneAccessHintPreference } from '@/composables/useSceneAccessHintPreference'
 import { useAuth } from '@/composables/useAuth'
+import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
 import { useNsfwMode } from '@/composables/useNsfwMode'
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
@@ -34,6 +37,7 @@ import { formatTimeRange } from '@/i18n/formatters'
 import { characterDisplayRef } from '@/utils/characterDisplay'
 import { splitAssistantBubbles } from '@/utils/chatSegments'
 import { shouldSendChatInputOnKeydown } from '@/utils/chatInputKeys'
+import { resolveTTSAvailability } from '@/utils/ttsAvailability'
 import {
   resolveStageAccessNotice,
   shouldOpenStageAccessNotice,
@@ -50,11 +54,18 @@ const { t, locale } = useI18n()
 const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 const { chatAssistEnabled, loadChatAssistPreference } = useChatAssistPreference()
-const {
-  sceneAccessHintEnabled,
-  loadSceneAccessHintPreference,
-} = useSceneAccessHintPreference()
-const { cloudMode } = useAuth()
+const { cloudMode, portalUrl } = useAuth()
+const { pt } = usePlayerCopy()
+// A turn that was refused for lack of credits shows the shared notice card in
+// the message stream instead of a generic "chat failed" bubble.
+const creditsExhausted = ref(false)
+/**
+ * Hosted trial chat hit its message cap. On self-host this state is
+ * unreachable (there is no trial), so the existing error bubble is left
+ * untouched there and this card is hosted-only — it replaces copy that used
+ * to tell a paying player to "self-host or bring your own API key".
+ */
+const demoLimitReached = ref(false)
 const {
   active: nsfwModeActive,
   loadNsfwMode,
@@ -92,6 +103,7 @@ const textareaRef = ref<HTMLTextAreaElement>()
 const fileInputRef = ref<HTMLInputElement>()
 const localMessages = ref<ChatMessage[]>([])
 const streamingText = ref('')
+const ttsAvailable = ref(false)
 const revealingMessageIndex = ref<number | null>(null)
 const currentActivity = ref<ScheduleActivity | null>(null)
 const currentActivityLoading = ref(false)
@@ -131,7 +143,10 @@ function releaseSendingLock(lockId: number) {
 }
 
 type ChatInteractionMode = 'stage' | 'dm'
-const interactionMode = ref<ChatInteractionMode>('stage')
+// Stage Access invokes an LLM judge, so the passive/default mode is DM.
+// The player explicitly selecting Stage is the only automatic evaluation
+// trigger; opening the chat and activity polling stay provider-free.
+const interactionMode = ref<ChatInteractionMode>('dm')
 
 const panelClass = computed(() => [
   'chat-panel',
@@ -221,11 +236,10 @@ const stageTabSubtitle = computed(() => {
 })
 
 // Single source of truth for the notice's visible/collapsed/details
-// booleans. The scene-access-hint preference gates only the AMBIENT
-// trigger (see shouldOpenStageAccessNotice); explicit Stage attempts and
-// retries always open the notice, so the phone/meet/retry/add-context
-// affordances stay reachable in both preference states. The notice
-// always opens collapsed — expansion is the player's per-notice toggle.
+// booleans. Stage attempts and retries are explicit player actions, so
+// refusals always open the notice and keep phone/meet/retry/add-context
+// affordances reachable. The notice opens collapsed; expansion is the
+// player's per-notice toggle.
 const stageAccessNoticeState = computed(() => resolveStageAccessNotice({
   noticeOpen: stageAccessNoticeOpen.value,
   decision: stageAccessVerdict.value?.decision ?? null,
@@ -244,14 +258,14 @@ const shouldShowStageAccessContextForm = computed(() => (
 
 async function selectInteractionMode(mode: ChatInteractionMode) {
   if (mode === 'stage') {
-    await refreshStageAccess({ applyMode: false })
+    await refreshStageAccess()
   }
   if (mode === 'stage' && !canUseStageAccess(stageAccessVerdict.value)) {
     // Explicit player action — the notice always opens so the refusal is
     // explained and the phone/meet/retry affordances stay reachable.
     interactionMode.value = 'dm'
     stageAccessNoticeOpen.value = stageAccessVerdict.value !== null
-      && shouldOpenStageAccessNotice('explicit', sceneAccessHintEnabled.value)
+      && shouldOpenStageAccessNotice('explicit', true)
     stageAccessNoticeExpanded.value = false
     stageAccessContextFormOpen.value = false
     focusInput()
@@ -293,12 +307,12 @@ async function retryStageAccess() {
   stageAccessNoticeOpen.value = false
   stageAccessNoticeExpanded.value = false
   stageAccessContextFormOpen.value = false
-  await refreshStageAccess({ applyMode: false })
+  await refreshStageAccess()
   if (stageAccessVerdict.value && !canUseStageAccess(stageAccessVerdict.value)) {
     // Retry is an explicit player action — always explain the outcome.
     stageAccessNoticeOpen.value = shouldOpenStageAccessNotice(
       'explicit',
-      sceneAccessHintEnabled.value,
+      true,
     )
     stageAccessNoticeExpanded.value = false
   }
@@ -331,38 +345,6 @@ async function submitStageAccessStatus() {
       : t('chat.stageAccess.contextSaveFailed')
   } finally {
     stageAccessStatusSaving.value = false
-  }
-}
-
-function applyStageAccessMode(verdict: StageAccessVerdict | null) {
-  if (!verdict) {
-    interactionMode.value = 'dm'
-    stageAccessNoticeOpen.value = false
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
-    return
-  }
-  if (!canUseStageAccess(verdict)) {
-    // Ambient trigger — the verdict resolved in the background while the
-    // player was just opening the chat. Respect the scene-access-hint
-    // preference: hint off means no unsolicited banner.
-    interactionMode.value = 'dm'
-    stageAccessNoticeOpen.value = shouldOpenStageAccessNotice(
-      'ambient',
-      sceneAccessHintEnabled.value,
-    )
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
-    return
-  }
-  if (
-    localMessages.value.length === 0
-    && !props.conversationId
-    && verdict.decision !== 'allow'
-  ) {
-    interactionMode.value = 'dm'
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
   }
 }
 
@@ -614,50 +596,25 @@ async function handleUndoLastTurn() {
 // Refresh the current-activity badge every 60s so it stays in sync as
 // the character moves between scheduled blocks.
 let activityTimer: ReturnType<typeof setInterval> | null = null
-let lastStageAccessActivityKey: string | null = null
 
-function stageAccessActivityKey(activity: ScheduleActivity | null): string {
-  if (!activity) return 'none'
-  return JSON.stringify([
-    activity.id,
-    activity.start_at,
-    activity.end_at,
-    activity.description,
-    activity.location,
-    activity.scene_privacy,
-    activity.meeting_affordance,
-  ])
-}
-
-async function refreshCurrentActivity(options: { refreshStageAccess: 'always' | 'on-activity-change' | 'never' }) {
+async function refreshCurrentActivity() {
   if (!props.character) {
     currentActivity.value = null
     stageAccessVerdict.value = null
-    lastStageAccessActivityKey = null
     return
   }
-  let shouldRefreshStageAccess = options.refreshStageAccess === 'always'
   currentActivityLoading.value = true
   try {
     const snapshot = await getCurrentActivity(props.character.id)
-    const nextActivityKey = stageAccessActivityKey(snapshot.current)
-    const didActivityChange = lastStageAccessActivityKey !== null
-      && nextActivityKey !== lastStageAccessActivityKey
-    shouldRefreshStageAccess = shouldRefreshStageAccess
-      || (options.refreshStageAccess === 'on-activity-change' && didActivityChange)
     currentActivity.value = snapshot.current
-    lastStageAccessActivityKey = nextActivityKey
   } catch {
     currentActivity.value = null
   } finally {
     currentActivityLoading.value = false
   }
-  if (shouldRefreshStageAccess) {
-    await refreshStageAccess({ applyMode: true })
-  }
 }
 
-async function refreshStageAccess(options: { applyMode: boolean }) {
+async function refreshStageAccess() {
   if (!props.character) {
     stageAccessVerdict.value = null
     return
@@ -666,7 +623,6 @@ async function refreshStageAccess(options: { applyMode: boolean }) {
   try {
     const verdict = await getStageAccess(props.character.id)
     stageAccessVerdict.value = verdict
-    if (options.applyMode) applyStageAccessMode(verdict)
   } catch {
     stageAccessVerdict.value = null
   } finally {
@@ -701,14 +657,14 @@ watch(() => props.character?.id ?? null, (characterId) => {
     activityTimer = null
   }
   if (characterId) {
-    lastStageAccessActivityKey = null
+    interactionMode.value = 'dm'
     stageAccessVerdict.value = null
     stageAccessNoticeOpen.value = false
     stageAccessNoticeExpanded.value = false
     stageAccessContextFormOpen.value = false
-    refreshCurrentActivity({ refreshStageAccess: 'always' })
+    refreshCurrentActivity()
     activityTimer = setInterval(() => {
-      refreshCurrentActivity({ refreshStageAccess: 'on-activity-change' })
+      refreshCurrentActivity()
     }, 60_000)
   } else {
     currentActivity.value = null
@@ -716,25 +672,12 @@ watch(() => props.character?.id ?? null, (characterId) => {
     stageAccessNoticeOpen.value = false
     stageAccessNoticeExpanded.value = false
     stageAccessContextFormOpen.value = false
-    lastStageAccessActivityKey = null
   }
 }, { immediate: true })
 
 watch(chatAssistEnabled, (enabled) => {
   if (!enabled) {
     chatAssistOpen.value = false
-  }
-})
-
-// Turning the scene-access-hint preference OFF dismisses an ambient
-// notice that is already on screen so the change is felt immediately.
-// Turning it ON does not retroactively open anything — the next ambient
-// verdict will.
-watch(sceneAccessHintEnabled, (enabled) => {
-  if (!enabled && stageAccessNoticeOpen.value) {
-    stageAccessNoticeOpen.value = false
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
   }
 })
 
@@ -787,6 +730,8 @@ async function handleSend() {
   const toUpload = stagedAttachments.value.slice()
   inputText.value = ''
   uploadError.value = null
+  creditsExhausted.value = false
+  demoLimitReached.value = false
   const sendingLockId = beginSendingLock()
 
   // Upload first so the assistant turn has real URLs to reference.
@@ -876,9 +821,12 @@ async function handleSend() {
     }
     emit('conversationUpdate', reply.conversation_id, [...localMessages.value], updatedChar)
     // The post-turn processor may have nudged the character forward in
-    // their schedule; refresh so the badge doesn't lag a minute behind,
-    // and only re-check Stage Access if that schedule context changed.
-    refreshCurrentActivity({ refreshStageAccess: 'on-activity-change' })
+    // their schedule; refresh the cheap activity badge without invoking the
+    // Stage Access LLM judge.
+    refreshCurrentActivity()
+    // The turn just spent credits — settle the badge on the post-charge
+    // number rather than leaving the player to guess.
+    refreshCloudCreditsAfterAction()
     if (!cloudMode.value) {
       loadNsfwMode()
     }
@@ -890,10 +838,19 @@ async function handleSend() {
       pendingRevealResolve = null
     }
     pendingFirstRevealRelease = null
-    localMessages.value.push({
-      role: 'assistant',
-      content: chatErrorContent(err),
-    })
+    if (isInsufficientCreditsError(err)) {
+      // Not a failure to explain away: nothing ran and nothing was charged.
+      // The notice card carries that promise plus the top-up CTA, so a
+      // generic error bubble here would only muddy it.
+      creditsExhausted.value = true
+    } else if (cloudMode.value && isDemoMessageCapError(err)) {
+      demoLimitReached.value = true
+    } else {
+      localMessages.value.push({
+        role: 'assistant',
+        content: chatErrorContent(err),
+      })
+    }
     // Surface whatever conversation id we did learn so the parent
     // rehydrates against the backend copy (which has the user message
     // persisted from send_message_stream pre-LLM save).
@@ -905,6 +862,12 @@ async function handleSend() {
     await scrollToBottom()
     focusInput()
   }
+}
+
+/** The hosted trial's own message ceiling, not a runtime/billing failure. */
+function isDemoMessageCapError(err: unknown): boolean {
+  return err instanceof ChatRuntimeLimitError
+    && err.code === 'max_messages_per_session'
 }
 
 function chatErrorContent(err: unknown): string {
@@ -1006,8 +969,10 @@ function updateAppHeight() {
 }
 
 onMounted(() => {
+  void resolveTTSAvailability().then((available) => {
+    ttsAvailable.value = available
+  })
   loadChatAssistPreference()
-  loadSceneAccessHintPreference()
   if (!cloudMode.value) {
     startNsfwModeClock()
     loadNsfwMode()
@@ -1212,16 +1177,20 @@ onUnmounted(() => {
           :key="i"
           :message="msg"
           :character-id="character?.id ?? null"
+          :tts-available="ttsAvailable"
           :animate-reveal="revealingMessageIndex === i"
           :text-message-mode="interactionMode === 'dm'"
           @reveal-complete="handleBubbleRevealComplete(i)"
           @reveal-progress="handleBubbleRevealProgress(i)"
+          @insufficient-credits="creditsExhausted = true"
         />
         <!-- 串流中的 bubble -->
         <ChatBubble
           v-if="streamingText"
           :message="{ role: 'assistant', content: streamingText }"
           :character-id="character?.id ?? null"
+          :tts-available="ttsAvailable"
+          @insufficient-credits="creditsExhausted = true"
         />
         <!-- 首 token 到達前的 typing indicator -->
         <div v-else-if="sending && !revealInProgress" class="typing-indicator">
@@ -1230,6 +1199,24 @@ onUnmounted(() => {
             v-if="character && character.allowed_tools && character.allowed_tools.length > 0"
             class="tool-wait-hint"
           >{{ t('chat.history.streamingHint') }}</span>
+        </div>
+
+        <!-- 螢火不足：取代泛用錯誤氣泡，直接給承諾文案與加值入口。
+             獨立 v-if（不接上面的 v-else-if 鏈）以免動到 typing
+             indicator 既有的顯示條件。 -->
+        <InsufficientCreditsNotice
+          v-if="creditsExhausted"
+          class="chat-credits-notice"
+        />
+
+        <!-- 試玩上限：雲端專用卡片，把玩家帶回帳號中心註冊正式方案。 -->
+        <div v-if="demoLimitReached" class="chat-demo-limit" role="status">
+          <p class="chat-demo-limit__body">{{ pt('chat.errors.demoMaxMessages') }}</p>
+          <a
+            v-if="portalUrl"
+            class="chat-demo-limit__cta"
+            :href="portalUrl"
+          >{{ t('chat.errors.demoMaxMessagesCta') }}</a>
         </div>
       </div>
 
@@ -1873,6 +1860,44 @@ onUnmounted(() => {
      which on iOS can otherwise lift the input area above the keyboard
      unexpectedly mid-scroll. */
   overscroll-behavior: contain;
+}
+
+.chat-credits-notice {
+  align-self: flex-start;
+  max-width: 90%;
+}
+
+.chat-demo-limit {
+  align-self: flex-start;
+  max-width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.chat-demo-limit__body {
+  margin: 0;
+  font-size: var(--font-xs);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+.chat-demo-limit__cta {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid var(--color-primary);
+  border-radius: 6px;
+  color: var(--color-primary-light);
+  font-size: var(--font-xs);
+  text-decoration: none;
+}
+
+.chat-demo-limit__cta:hover {
+  background: rgba(183, 93, 63, 0.18);
 }
 
 .typing-indicator {

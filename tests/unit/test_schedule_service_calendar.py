@@ -237,3 +237,29 @@ async def test_operator_location_drives_calendar_region_and_weather_location() -
     assert location is not None
     assert location.label == "San Francisco"
     assert location.latitude == 37.7749
+
+
+@pytest.mark.asyncio
+async def test_operator_for_character_exposes_the_owning_profile() -> None:
+    # Public façade used by background surfaces (encounter life context)
+    # that already depend on ScheduleService and must not wire the
+    # operator profile service a second time.
+    profile = OperatorProfile(id="user-1", display_name="User", country_code="JP")
+    service = ScheduleService(
+        repository=InMemoryScheduleRepository(),
+        planner=_RecordingPlanner(),
+        local_tz=UTC,
+        operator_profile_service=_ProfileService(profile),
+    )
+    resolved = await service.operator_for_character(_character(user_id="user-1"))
+    assert resolved is profile
+
+
+@pytest.mark.asyncio
+async def test_operator_for_character_is_none_without_profile_service() -> None:
+    service = ScheduleService(
+        repository=InMemoryScheduleRepository(),
+        planner=_RecordingPlanner(),
+        local_tz=UTC,
+    )
+    assert await service.operator_for_character(_character()) is None

@@ -12,6 +12,7 @@
  */
 import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type { AlbumItem } from '@/types/album'
 import { UiButton } from '@/components/ui'
@@ -34,6 +35,7 @@ const emit = defineEmits<{
 }>()
 
 const { t, locale } = useI18n()
+const { pt } = usePlayerCopy()
 const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 
@@ -137,7 +139,7 @@ defineExpose({ reload })
     <div class="album-header">
       <h3 class="section-title">{{ t('albumPanel.title') }}</h3>
       <p class="album-hint">
-        {{ t('albumPanel.hint') }}
+        {{ pt('albumPanel.hint') }}
       </p>
     </div>
 

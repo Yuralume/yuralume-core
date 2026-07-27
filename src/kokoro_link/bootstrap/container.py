@@ -2,9 +2,41 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
+from typing import TYPE_CHECKING, Awaitable, Callable
 from urllib.parse import unquote, urlparse
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+
+    from kokoro_link.application.services.realtime_event_dispatcher import (
+        RealtimeEventDispatcher,
+        RealtimeEventRehydrator,
+    )
+    from kokoro_link.contracts.realtime_events import RealtimeOutboxPort
+    from kokoro_link.application.services.background_shadow_coordinator import (
+        ShadowCoordinator,
+    )
+    from kokoro_link.application.services.background_shadow_worker import (
+        ShadowDryRunWorker,
+    )
+    from kokoro_link.contracts.background_jobs import (
+        BackgroundCoordinatorLeasePort,
+        BackgroundJobQueuePort,
+    )
+    from kokoro_link.contracts.execution_mode import RuntimeOwnershipPort
+    from kokoro_link.application.services.external_chat_roster_service import (
+        ExternalChatRosterService,
+    )
+    from kokoro_link.application.services.external_chat_attachment_service import (
+        ExternalChatAttachmentService,
+    )
+    from kokoro_link.application.services.external_chat_turn_service import (
+        ExternalChatTurnService,
+    )
+
 _LOGGER = logging.getLogger(__name__)
+from kokoro_link.contracts.due_jobs import DEFAULT_CAPABILITY_CAPS
 from kokoro_link.application.services.album_service import AlbumService
 from kokoro_link.application.services.account_runtime_profile import (
     AccountRuntimeProfileResolver,
@@ -131,6 +163,7 @@ from kokoro_link.infrastructure.character_card.sillytavern_normalizer import (
 from kokoro_link.infrastructure.memoir.llm_localizer import LLMMemoirLocalizer
 from kokoro_link.application.services.chat_assist_service import ChatAssistService
 from kokoro_link.application.services.chat_service import ChatService
+from kokoro_link.application.services.chat_turn_lease import ChatTurnLease
 from kokoro_link.application.services.turn_undo_service import TurnUndoService
 from kokoro_link.infrastructure.prompt.llm_material_digester import (
     LLMPromptMaterialDigester,
@@ -225,6 +258,21 @@ from kokoro_link.application.services.cloud_tier_profile_cache import (
 from kokoro_link.contracts.cloud_tier_runtime_profile import (
     TierRuntimeProfilePort,
 )
+from kokoro_link.infrastructure.cloud.credit_balance_client import (
+    CreditBalanceClient,
+)
+from kokoro_link.application.services.cloud_credit_service import (
+    CloudCreditService,
+)
+from kokoro_link.application.services.player_locale_service import (
+    LOCALE_CLAIM_PREFIX,
+    LOCALE_CLAIM_TTL_SECONDS,
+    PlayerLocaleService,
+)
+from kokoro_link.contracts.geocoding import GeocodingPort
+from kokoro_link.infrastructure.geo.open_meteo_geocoding_client import (
+    OpenMeteoGeocodingClient,
+)
 from kokoro_link.infrastructure.llm.cloud_gateway_model import (
     CloudGatewayChatModel,
 )
@@ -271,6 +319,15 @@ from kokoro_link.application.services.feed_reaction_service import (
 from kokoro_link.application.services.proactive_dispatcher import ProactiveDispatcher
 from kokoro_link.application.services.proactive_event_bus import ProactiveEventBus
 from kokoro_link.application.services.proactive_scheduler import ProactiveScheduler
+from kokoro_link.application.services.character_tick_executor import (
+    CharacterTickExecutor,
+)
+from kokoro_link.application.services.social_tick_executor import (
+    SocialTickExecutor,
+)
+from kokoro_link.infrastructure.observability.scheduler_metrics import (
+    SchedulerMetrics,
+)
 from kokoro_link.application.services.event_curator_service import (
     EventCuratorService,
 )
@@ -549,6 +606,7 @@ from kokoro_link.infrastructure.dialogue.llm_safe_summary import LLMNsfwSafeSumm
 from kokoro_link.infrastructure.dialogue.llm_summarizer import LLMDialogueSummarizer
 from kokoro_link.infrastructure.dialogue.null_safe_summary import NullNsfwSafeSummarizer
 from kokoro_link.infrastructure.dialogue.null_summarizer import NullDialogueSummarizer
+from kokoro_link.infrastructure.embedder.cloud_gateway import CloudGatewayEmbedder
 from kokoro_link.infrastructure.embedder.lm_studio import LMStudioEmbedder
 from kokoro_link.infrastructure.embedder.null import NullEmbedder
 from kokoro_link.infrastructure.embedder.runtime import RuntimeConfigurableEmbedder
@@ -768,6 +826,18 @@ from kokoro_link.infrastructure.tools.websearch import (
     TavilyClient,
     WebSearchTool,
 )
+from kokoro_link.bootstrap.site_settings_holder import (
+    SiteSettingsHolder,
+    SiteSettingsSnapshot,
+)
+from kokoro_link.bootstrap.site_settings_providers import (
+    ReloadableCalendarProvider,
+    ReloadableGeoLocationProvider,
+    ReloadableWeatherProvider,
+    build_calendar_provider,
+    build_geo_location_provider,
+    build_weather_provider,
+)
 from kokoro_link.contracts.calendar_context import CalendarContextPort
 from kokoro_link.contracts.geo_location import GeoLocationPort
 from kokoro_link.contracts.character_encounter import (
@@ -782,19 +852,7 @@ from kokoro_link.contracts.character_relationship import (
 from kokoro_link.contracts.character_peer_profile import (
     CharacterPeerProfileRepositoryPort,
 )
-from kokoro_link.infrastructure.calendar.holidays_provider import (
-    HolidaysCalendarProvider,
-    NullCalendarProvider,
-)
-from kokoro_link.infrastructure.geo.ip_api_provider import IpApiGeoLocationProvider
-from kokoro_link.infrastructure.geo.null_provider import NullGeoLocationProvider
-from kokoro_link.infrastructure.weather.open_meteo_provider import (
-    NullWeatherProvider,
-    OpenMeteoWeatherProvider,
-)
-from kokoro_link.infrastructure.localization.fallback_texts import (
-    localized_fallback_text,
-)
+from kokoro_link.contracts.weather_context import WeatherContextPort
 from kokoro_link.infrastructure.schedule.llm_planner import LLMSchedulePlanner
 from kokoro_link.infrastructure.schedule.null_planner import NullSchedulePlanner
 from kokoro_link.infrastructure.schedule.stub_planner import StubSchedulePlanner
@@ -860,6 +918,18 @@ class ServiceContainer:
     ) = None
     operator_profile_service: OperatorProfileService | None = None
     geo_location_provider: GeoLocationPort | None = None
+    site_settings_holder: SiteSettingsHolder | None = None
+    """Live weather/calendar/geoip/world_events settings (G0 hot reload).
+
+    ``None`` only on hand-built test containers. The admin write path and the
+    site-settings refresher both converge THIS holder; every consumer reads
+    through it instead of a boot-time copy."""
+    site_settings_reloader: "Callable[[], Awaitable[None]] | None" = None
+    """Re-reads the hot groups into :attr:`site_settings_holder`.
+
+    One callback shared by the local admin write path and the cross-process
+    refresher, so "what a save applies here" and "what a NOTIFY applies there"
+    can never drift apart."""
     auth_service: "AuthService | None" = None
     auth_strategy: "AuthStrategy | None" = None
     password_hasher: "PasswordHasherPort | None" = None
@@ -908,6 +978,30 @@ class ServiceContainer:
     proactive_attempt_repository: ProactiveAttemptRepositoryPort | None = None
     proactive_dispatcher: ProactiveDispatcher | None = None
     proactive_scheduler: ProactiveScheduler | None = None
+    # P3-A tick executors (HOSTED_CORE_SCALING §13). The scheduler owns these and
+    # delegates the per-character / global-social tick bodies to them; stored here
+    # too so the distributed worker (P3-C) reuses the byte-identical executors.
+    character_tick_executor: CharacterTickExecutor | None = None
+    social_tick_executor: SocialTickExecutor | None = None
+    # Phase 0 metrics registry (HOSTED_CORE_SCALING §12): fed by the scheduler
+    # each tick, read by the internal metrics route. ``None`` on bare
+    # ``ServiceContainer()`` test harnesses.
+    scheduler_metrics: SchedulerMetrics | None = None
+    # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). All ``None`` unless
+    # YURALUME_BACKGROUND_SHADOW=postgres on a scheduler-owning role with a DB —
+    # the self-host red line is that leaving the env unset changes nothing. The
+    # queue + lease ports are exposed so the internal metrics route and the
+    # admin diagnostics route can read live queue stats / lease info.
+    background_shadow_coordinator: "ShadowCoordinator | None" = None
+    background_shadow_worker: "ShadowDryRunWorker | None" = None
+    background_job_queue: "BackgroundJobQueuePort | None" = None
+    background_coordinator_lease: "BackgroundCoordinatorLeasePort | None" = None
+    # Execution-ownership port (P3-B, §2.2 / §15). Wired ONLY on the hosted
+    # opt-in (background_backend=='postgres' AND a DB). Self-host default leaves
+    # it None so the embedded scheduler never reads ownership. The internal
+    # metrics + execution-mode admin routes read through this.
+    runtime_ownership: "RuntimeOwnershipPort | None" = None
+    execution_mode_transition: "ExecutionModeTransitionService | None" = None
     demo_account_reaper: DemoAccountReaper | None = None
     character_freeze_reaper: "CharacterFreezeReaper | None" = None
     # Cloud→Core subscription-lapse batch freeze/thaw, invoked by the
@@ -918,6 +1012,26 @@ class ServiceContainer:
     cloud_tenant_tier_sync_service: "CloudTenantTierSyncService | None" = None
     subscription_access_guard: "SubscriptionAccessGuard | None" = None
     cloud_subscription_repository: "CloudSubscriptionRepositoryPort | None" = None
+    # Display-only hosted credit balance proxy (U3). Wired in cloud mode only;
+    # ``None`` leaves ``GET /api/v1/cloud/credits`` degraded, never blocking play.
+    cloud_credit_service: "CloudCreditService | None" = None
+    # Hosted player locale / location lifecycle (G2). Cloud mode only — ``None``
+    # in self-host, where the locale routes 404 by construction.
+    player_locale_service: "PlayerLocaleService | None" = None
+    # City-name search behind ``GET /api/v1/geo/search`` (G2). Cloud mode only;
+    # ``None`` degrades the picker to an empty result list, never an error.
+    geocoding_client: "GeocodingPort | None" = None
+    # Read-only external-chat roster projection (LH2), served by the internal
+    # service-credential route for the hosted LINE official-channel Cloud side.
+    external_chat_roster_service: "ExternalChatRosterService | None" = None
+    # Service-credential attachment ingest (LH2): Core-side MIME sniff, size,
+    # and pixel-bomb gate before an inbound LINE image lands in Object Storage.
+    external_chat_attachment_service: (
+        "ExternalChatAttachmentService | None"
+    ) = None
+    # Recoverable external-chat turn orchestrator (LH2, DR-LH0-004): the durable
+    # state machine behind the internal ``POST .../external-chat/turns`` route.
+    external_chat_turn_service: "ExternalChatTurnService | None" = None
     # Exposed for the admin character-freeze surface (site-wide overview
     # + immediate freeze/unfreeze) which needs list / get / set_frozen.
     character_repository: "CharacterRepositoryPort | None" = None
@@ -931,6 +1045,17 @@ class ServiceContainer:
     feed_comment_reply_service: FeedCommentReplyService | None = None
     feed_reaction_memorializer: FeedReactionMemorializer | None = None
     feed_event_bus: FeedEventBus | None = None
+    # Phase 4 realtime outbox (§7.1). All three are set ONLY under
+    # YURALUME_REALTIME_BACKEND=postgres with a database, and only on the api
+    # reader role: ``realtime_outbox`` + ``realtime_rehydrator`` back the SSE
+    # ``Last-Event-ID`` replay path (read via ``getattr`` in api/routes/events),
+    # and ``realtime_dispatcher`` tails the outbox onto the local buses (started
+    # / stopped by the app lifespan). ``None`` on the self-host default (memory
+    # backend) and on the background writer role — the red line is that an unset
+    # backend changes nothing.
+    realtime_outbox: "RealtimeOutboxPort | None" = None
+    realtime_rehydrator: "RealtimeEventRehydrator | None" = None
+    realtime_dispatcher: "RealtimeEventDispatcher | None" = None
     tts_service: TTSService | None = None
     tts_pregeneration_service: TTSPregenerationService | None = None
     tts_voice_catalog: TTSVoiceCatalogPort | None = None
@@ -999,6 +1124,11 @@ class ServiceContainer:
     # HUMANIZATION_ROADMAP §4.4 / §4.1 — read-only flag display in UI.
     app_settings: "AppSettings | None" = None
     clock: ClockPort | None = None
+    # HOSTED_CORE_SCALING §9.1 — the single shared async engine built once
+    # in ``build_container``'s DB branch. ``None`` for in-memory builds and
+    # bare ``ServiceContainer()`` test harnesses. Disposed once in the app
+    # lifespan shutdown.
+    db_engine: "AsyncEngine | None" = None
 
 
 _RepoBundle = tuple[
@@ -1021,6 +1151,22 @@ _RepoBundle = tuple[
     FeedReactionRepositoryPort,
     FeedCommentRepositoryPort,
 ]
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a non-negative int env override, falling back to ``default``.
+
+    Used for the Phase 5 ``YURALUME_``-prefixed knobs (capability caps, reconcile
+    interval, reseed jitter). A missing / malformed value keeps the default so
+    the self-host path never needs to set these."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw.strip())
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _build_in_memory_repositories() -> _RepoBundle:
@@ -1046,11 +1192,9 @@ def _build_in_memory_repositories() -> _RepoBundle:
     )
 
 
-def _build_db_repositories(database_url: str) -> _RepoBundle:
-    from kokoro_link.infrastructure.persistence.engine import (
-        build_async_engine,
-        build_session_factory,
-    )
+def _build_db_repositories(
+    session_factory: "sessionmaker[AsyncSession]",
+) -> _RepoBundle:
     from kokoro_link.infrastructure.persistence.sa_channel_binding_repository import (
         SAChannelBindingRepository,
     )
@@ -1092,8 +1236,6 @@ def _build_db_repositories(database_url: str) -> _RepoBundle:
         SAFeedReactionRepository,
     )
 
-    engine = build_async_engine(database_url)
-    session_factory = build_session_factory(engine)
     return (
         SACharacterRepository(session_factory),
         SAConversationRepository(session_factory),
@@ -1326,9 +1468,32 @@ def _build_proactive_intention_judge(
     )
 
 
-def _build_embedder(*, settings: AppSettings) -> EmbedderPort:
-    """Install a stable embedder reference with a runtime-switchable backend."""
+def _build_embedder(
+    *,
+    settings: AppSettings,
+    identity_resolver: CloudOperatorIdentityResolver | None = None,
+    routing_profile_port: CloudRoutingProfilePort | None = None,
+    provider_credentials_enabled: bool = True,
+) -> EmbedderPort:
+    """Install the mode-specific embedder behind a stable runtime reference."""
     if settings.use_embedder:
+        if settings.cloud.active:
+            if not provider_credentials_enabled:
+                return RuntimeConfigurableEmbedder(
+                    NullEmbedder(dimension=settings.embedding.dimension),
+                )
+            return RuntimeConfigurableEmbedder(
+                CloudGatewayEmbedder(
+                    base_url=settings.cloud.gateway_url,
+                    deployment_token=settings.cloud.deployment_token,
+                    deployment_id=settings.cloud.deployment_id,
+                    audience=settings.cloud.deployment_audience,
+                    default_model=(settings.cloud.embedding_preset or settings.embedding.model),
+                    dimension=settings.embedding.dimension,
+                    identity_resolver=identity_resolver,
+                    routing_profile_port=routing_profile_port,
+                ),
+            )
         return RuntimeConfigurableEmbedder(
             LMStudioEmbedder(
                 base_url=settings.embedding.base_url,
@@ -1407,59 +1572,27 @@ def _build_schedule_planner(
     )
 
 
+# The three "real world" adapters are built from a single site-settings value
+# object each, so their builders live in ``site_settings_providers`` where the
+# hot-reload wrappers can share them verbatim. These thin ``AppSettings``-shaped
+# wrappers stay for the existing call sites.
+
+
 def _build_calendar_provider(
     *, settings: AppSettings, local_tz: tzinfo,
 ) -> CalendarContextPort:
-    """Build the calendar-facts provider.
-
-    Returns the null implementation when calendar context is disabled
-    via ``KOKORO_CALENDAR_ENABLED=false`` so prompt blocks stay empty;
-    otherwise instantiates the ``holidays``-backed adapter for the
-    operator-configured region (default ``TW``).
-    """
-    if not settings.calendar.enabled:
-        return NullCalendarProvider()
-    return HolidaysCalendarProvider(
-        region=settings.calendar.region, local_tz=local_tz,
-    )
+    return build_calendar_provider(settings.calendar, local_tz=local_tz)
 
 
-def _build_weather_provider(*, settings: AppSettings):
-    """Build the weather-facts provider.
-
-    Falls through to :class:`NullWeatherProvider` when weather is
-    disabled or lat/lon is missing — prompt blocks stay empty without
-    any conditional logic at the call sites (mirrors the calendar
-    provider's "always installable" contract)."""
-    weather = settings.weather
-    if not weather.enabled:
-        return NullWeatherProvider()
-    # When the deployment leaves the label empty, resolve it to the deploy-time
-    # content language instead of the provider's hardcoded Chinese last resort,
-    # so an en/ja deployment's fallback weather label follows its own language.
-    location_label = weather.location_label.strip() or localized_fallback_text(
-        "weather.current_location_label", settings.default_primary_language,
-    )
-    return OpenMeteoWeatherProvider(
-        latitude=weather.latitude,
-        longitude=weather.longitude,
-        location_label=location_label,
-        timezone_id=weather.timezone_id,
-        cache_ttl_seconds=weather.cache_ttl_seconds,
+def _build_weather_provider(*, settings: AppSettings) -> WeatherContextPort:
+    return build_weather_provider(
+        settings.weather,
+        default_primary_language=settings.default_primary_language,
     )
 
 
 def _build_geo_location_provider(*, settings: AppSettings) -> GeoLocationPort:
-    geoip = settings.geoip
-    if not geoip.enabled:
-        return NullGeoLocationProvider()
-    if geoip.provider != "ip-api":
-        return NullGeoLocationProvider()
-    return IpApiGeoLocationProvider(
-        endpoint=geoip.endpoint,
-        timeout_seconds=geoip.timeout_seconds,
-        cache_ttl_seconds=geoip.cache_ttl_seconds,
-    )
+    return build_geo_location_provider(settings.geoip)
 
 
 def _resolve_local_tz(settings: UserTimezoneSettings) -> tzinfo:
@@ -1551,6 +1684,80 @@ def _build_object_storage(settings: AppSettings) -> ObjectStoragePort:
     if provider == "memory":
         return InMemoryObjectStorage()
     raise ValueError("KOKORO_STORAGE_PROVIDER must be http")
+
+
+def _build_runtime_lease_backend(
+    app_settings: AppSettings,
+    db_session_factory: "sessionmaker[AsyncSession] | None",
+) -> "BackgroundCoordinatorLeasePort":
+    """The process's :class:`BackgroundCoordinatorLeasePort` for per-key claims.
+
+    Distributed topology → the SA lease on the shared ``background_runtime_leases``
+    table, so scaled replicas can coordinate. The signal reuses the existing
+    distributed opt-ins: ``postgres`` realtime backend (the api-side Phase 4 split
+    signal, present on every reader replica) OR ``postgres`` background backend
+    (the P3-C execution opt-in) with a database present. Self-host (both at their
+    ``memory``/``embedded`` defaults, or no DB) → an in-process lease, which is
+    byte-identical to a process-local lock: a single process always finds the key
+    free, so ``acquire`` always succeeds. No new self-host env is introduced.
+    """
+    process = app_settings.process
+    distributed = db_session_factory is not None and (
+        process.realtime_backend == "postgres"
+        or process.background_backend == "postgres"
+    )
+    if distributed:
+        from kokoro_link.infrastructure.persistence.sa_background_runtime import (
+            SABackgroundCoordinatorLease,
+        )
+
+        return SABackgroundCoordinatorLease(db_session_factory)
+    from kokoro_link.infrastructure.repositories.in_memory_background_jobs import (
+        InMemoryBackgroundCoordinatorLease,
+    )
+
+    return InMemoryBackgroundCoordinatorLease()
+
+
+def _runtime_lease_owner_id(prefix: str) -> str:
+    """A stable-per-process, unique-across-processes lease owner id.
+
+    ``background_runtime_leases.owner_id`` is ``String(64)``, and a container /
+    pod hostname can be long, so the host part is truncated — the ``uuid4``
+    suffix is what actually guarantees uniqueness across incarnations.
+    """
+    import os
+    import socket
+    from uuid import uuid4
+
+    return f"{prefix}-{socket.gethostname()[:24]}-{os.getpid()}-{uuid4().hex[:8]}"
+
+
+def _build_studio_execution_lease(
+    app_settings: AppSettings,
+    db_session_factory: "sessionmaker[AsyncSession] | None",
+) -> "StudioExecutionLease":
+    """Per-target Creator Studio execution lease (HOSTED_CORE_SCALING §13 Phase 4
+    前置 1).
+
+    Distributed topology → SA lease on the shared ``background_runtime_leases``
+    table so scaled ``api`` replicas can't double-drive one Studio target. The
+    signal reuses the existing distributed opt-ins: ``postgres`` realtime backend
+    (the api-side Phase 4 split signal, present on every reader replica) OR
+    ``postgres`` background backend (the P3-C execution opt-in) with a database
+    present. Self-host (both at their ``memory``/``embedded`` defaults, or no DB)
+    → an in-process lease, byte-identical to the historical process-local lock:
+    a single process always finds the target free once the lock lets the runner
+    in, so ``acquire`` always succeeds. No new self-host env is introduced.
+    """
+    from kokoro_link.application.services.studio_execution_lease import (
+        StudioExecutionLease,
+    )
+
+    return StudioExecutionLease(
+        _build_runtime_lease_backend(app_settings, db_session_factory),
+        owner_id=_runtime_lease_owner_id("studio"),
+    )
 
 
 def _build_scene_generator(
@@ -1668,25 +1875,190 @@ def _build_companion_draft_generator(
     )
 
 
+def _build_shadow_runtime(
+    *,
+    app_settings: AppSettings,
+    db_session_factory: "sessionmaker[AsyncSession] | None",
+    character_repository: CharacterRepositoryPort,
+    operator_profile_repository: OperatorProfileRepositoryPort | None,
+    subscription_access_guard: "SubscriptionAccessGuard | None",
+    clock: ClockPort,
+):
+    """Build the P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2).
+
+    Gate is split (M6): whenever ``YURALUME_BACKGROUND_SHADOW=postgres`` AND a
+    DB session factory exists, the durable **queue + lease read ports** are
+    built in EVERY role so the admin diagnostics + internal metrics surfaces
+    (which live on the api / all role) can read live queue stats and the
+    coordinator lease — an api process that only serves routes still needs to
+    SEE the queue. The coordinator/worker TASKS are built per the §2.1 matrix:
+    the coordinator where ``run_background_coordinator`` (all / background /
+    dedicated ``coordinator`` role), the worker where ``run_background_worker``
+    (all / background / dedicated ``worker`` role). The embedded tick journal is
+    built alongside the coordinator (only the embedded+shadow mirror path reads
+    it). A role that runs neither loop (api / connector) gets just the read ports.
+
+    Returns ``(queue, lease, coordinator, worker, tick_journal, bucket_seconds)``.
+    ``coordinator`` / ``journal`` are ``None`` on a worker-only role; ``worker``
+    is ``None`` on a coordinator-only role; all four trailing values are ``None``
+    on api / connector.
+    """
+    none_row = (None, None, None, None, None, None)
+    # P3-C: the durable runtime is built when EITHER the shadow OR the execution
+    # backend is on postgres — a hosted execution deployment needs the same
+    # queue/lease/coordinator/worker even if it never ran a shadow phase.
+    if (
+        app_settings.process.background_shadow != "postgres"
+        and app_settings.process.background_backend != "postgres"
+    ):
+        return none_row
+    if db_session_factory is None:
+        # The only remaining reason to skip when shadow is requested: no DB.
+        # (settings.py already fail-fasts shadow=postgres without DATABASE_URL,
+        # so this is a defensive belt-and-braces path.)
+        _LOGGER.warning(
+            "YURALUME_BACKGROUND_SHADOW=postgres set but no database session "
+            "factory is available; shadow runtime not built",
+        )
+        return none_row
+
+    import os
+    import socket
+    from uuid import uuid4
+
+    from kokoro_link.application.services.background_shadow_coordinator import (
+        _DEFAULT_BUCKET_SECONDS,
+        ShadowCoordinator,
+    )
+    from kokoro_link.application.services.background_shadow_worker import (
+        ShadowDryRunWorker,
+    )
+    from kokoro_link.bootstrap.process_roles import matrix_for_role
+    from kokoro_link.infrastructure.persistence.sa_background_jobs import (
+        SABackgroundJobQueue,
+    )
+    from kokoro_link.infrastructure.persistence.sa_background_runtime import (
+        SABackgroundCoordinatorCursor,
+        SABackgroundCoordinatorLease,
+        SATickJournal,
+    )
+
+    # Queue + lease read ports: built in EVERY role so admin/metrics can read.
+    queue = SABackgroundJobQueue(db_session_factory)
+    lease = SABackgroundCoordinatorLease(db_session_factory)
+
+    matrix = matrix_for_role(app_settings.process.role)
+    # §2.1 dedicated roles decouple the coordinator/worker TASKS from the embedded
+    # scheduler: build the coordinator only where the matrix runs the coordinator
+    # loop (``all`` / ``background`` transitional, or the dedicated ``coordinator``
+    # role), and the worker only where it runs the worker loop (``all`` /
+    # ``background`` transitional, or the dedicated ``worker`` role). A role that
+    # runs neither (``api`` / ``connector``) still gets the queue+lease READ ports
+    # above so admin diagnostics + internal metrics can see the queue.
+    if not (matrix.run_background_coordinator or matrix.run_background_worker):
+        # api / connector role: serves the diagnostics read ports but runs no
+        # coordinator/worker and writes no embedded tick journal. Expected — no
+        # warning.
+        return (queue, lease, None, None, None, None)
+
+    host = socket.gethostname()
+    pid = os.getpid()
+    coordinator = None
+    journal = None
+    if matrix.run_background_coordinator:
+        cursor = SABackgroundCoordinatorCursor(db_session_factory)
+        # The tick journal only feeds the embedded+shadow mirror path; a
+        # dedicated coordinator on the postgres backend never mirrors, but the SA
+        # port is a cheap wrapper and ``ShadowCoordinator`` requires the arg.
+        journal = SATickJournal(db_session_factory)
+        coordinator = ShadowCoordinator(
+            queue=queue,
+            lease=lease,
+            cursor=cursor,
+            journal=journal,
+            character_repository=character_repository,
+            operator_profile_repository=operator_profile_repository,
+            owner_id=f"shadow-coord-{host}-{pid}",
+            bucket_seconds=_DEFAULT_BUCKET_SECONDS,
+            clock=clock,
+            mirror_from_journal=(
+                app_settings.process.background_shadow == "postgres"
+                and app_settings.process.background_backend == "embedded"
+            ),
+        )
+    worker = None
+    if matrix.run_background_worker:
+        worker = ShadowDryRunWorker(
+            queue=queue,
+            character_repository=character_repository,
+            subscription_access_guard=subscription_access_guard,
+            operator_profile_repository=operator_profile_repository,
+            worker_id=f"shadow-worker-{host}-{pid}-{uuid4().hex[:8]}",
+            clock=clock,
+            # §13 per-replica execution concurrency (execution mode only; dry-run
+            # stays sequential). Deploy scales replicas × this for global width.
+            execution_concurrency=_env_int("YURALUME_BG_EXEC_CONCURRENCY", 2),
+        )
+    return (queue, lease, coordinator, worker, journal, _DEFAULT_BUCKET_SECONDS)
+
+
 def build_container(settings: AppSettings | None = None) -> ServiceContainer:
+    from kokoro_link.bootstrap.process_roles import matrix_for_role
     app_settings = settings or AppSettings.from_env()
+    # Kept for the whole build: the *env-derived* settings are the per-group
+    # fallback the reloader re-applies on every refresh. Re-deriving them from
+    # the overlaid object would make a cleared DB row resolve to the last DB
+    # value instead of the env default.
+    env_app_settings = app_settings
     # Site-level runtime settings (Weather/Calendar/GeoIP/NSFW/world-event
     # policy) are DB-authoritative once seeded (CORE_ENV_TO_ADMIN_CONFIG
     # track 2). Read them here, before any provider is wired, and overlay
     # onto app_settings so the whole downstream wiring receives the
     # DB-effective values; env stays the fallback + first-boot seed.
-    # Fail-soft: any read error keeps the env-derived settings.
+    # Fail-soft: any read error keeps the env-derived settings — and now says
+    # so, so /health can tell "no Admin change was made" apart from "this
+    # process never managed to read the Admin changes".
+    site_settings_source = "env_fallback"
     if app_settings.use_database:
         from kokoro_link.bootstrap.app_runtime_settings_seed import (
-            overlay_site_settings_from_db,
+            resolve_site_settings_overlay,
         )
 
-        app_settings = overlay_site_settings_from_db(app_settings)
+        overlay = resolve_site_settings_overlay(app_settings)
+        app_settings = overlay.settings
+        site_settings_source = overlay.source
+    # The four "real world" groups (weather / calendar / geoip / world_events)
+    # additionally live behind a hot-swappable holder so a multi-process Hosted
+    # fleet converges on an Admin change without a rolling restart
+    # (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §2 G0). The boot overlay above is its
+    # initial value; every later value comes from the site-settings refresher.
+    site_settings_holder = SiteSettingsHolder(
+        SiteSettingsSnapshot.from_app_settings(
+            app_settings, source=site_settings_source,
+        ),
+    )
+    process_matrix = matrix_for_role(app_settings.process.role)
     clock = SystemClock()
     object_storage = _build_object_storage(app_settings)
 
     preferences_repository: PreferencesRepositoryPort
+    # HOSTED_CORE_SCALING §9.1 / §13 Phase 1 — ONE async engine + ONE session
+    # factory per process. Built once here and threaded to every SA repository
+    # below (the old per-site ``build_async_engine`` calls each leaked an
+    # undisposed engine + pool). ``None`` on the in-memory fallback path.
+    db_engine: "AsyncEngine | None" = None
+    db_session_factory: "sessionmaker[AsyncSession] | None" = None
     if app_settings.use_database:
+        from kokoro_link.infrastructure.persistence.engine import (
+            build_async_engine,
+            build_session_factory,
+        )
+        db_engine = build_async_engine(
+            app_settings.database_url,
+            pool_size=app_settings.db_pool_size,
+            max_overflow=app_settings.db_max_overflow,
+        )
+        db_session_factory = build_session_factory(db_engine)
         (
             character_repository,
             conversation_repository,
@@ -1706,11 +2078,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             feed_post_repository,
             feed_reaction_repository,
             feed_comment_repository,
-        ) = _build_db_repositories(app_settings.database_url)
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine,
-            build_session_factory,
-        )
+        ) = _build_db_repositories(db_session_factory)
         from kokoro_link.infrastructure.persistence.sa_preferences_repository import (
             SAPreferencesRepository,
         )
@@ -1720,33 +2088,28 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.persistence.sa_initial_relationship_repository import (
             SACharacterOperatorRelationshipSeedRepository,
         )
-        # Reuse a dedicated session factory for the prefs repo. Building
-        # its own engine is cheap and keeps the main ``_build_db_repositories``
-        # tuple unchanged — no ripple through every test harness.
-        _prefs_engine = build_async_engine(app_settings.database_url)
-        _prefs_session_factory = build_session_factory(_prefs_engine)
-        preferences_repository = SAPreferencesRepository(_prefs_session_factory)
+        preferences_repository = SAPreferencesRepository(db_session_factory)
         operator_profile_repository: OperatorProfileRepositoryPort = (
-            SAOperatorProfileRepository(_prefs_session_factory)
+            SAOperatorProfileRepository(db_session_factory)
         )
         from kokoro_link.infrastructure.persistence.sa_cloud_subscription_repository import (
             SACloudSubscriptionRepository,
         )
         cloud_subscription_repository = SACloudSubscriptionRepository(
-            _prefs_session_factory,
+            db_session_factory,
         )
         relationship_seed_repository = (
-            SACharacterOperatorRelationshipSeedRepository(_prefs_session_factory)
+            SACharacterOperatorRelationshipSeedRepository(db_session_factory)
         )
         from kokoro_link.infrastructure.persistence.sa_notifications import (
             SaNotificationPreferencesRepository,
             SaWebPushSubscriptionRepository,
         )
         web_push_subscription_repository = SaWebPushSubscriptionRepository(
-            _prefs_session_factory,
+            db_session_factory,
         )
         notification_preferences_repository = (
-            SaNotificationPreferencesRepository(_prefs_session_factory)
+            SaNotificationPreferencesRepository(db_session_factory)
         )
     else:
         (
@@ -1793,6 +2156,31 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_profile_repository=operator_profile_repository,
     )
 
+    # Read-only roster projection for the internal external-chat route (LH2).
+    # Wired in every mode: the route's own service-credential gate 503s on
+    # self-host (no credentials configured), so exposing the service is safe.
+    from kokoro_link.application.services.external_chat_roster_service import (
+        ExternalChatRosterService,
+    )
+    external_chat_roster_service = ExternalChatRosterService(
+        character_repository=character_repository,
+        operator_profile_repository=operator_profile_repository,
+        subscription_access_guard=subscription_access_guard,
+        object_storage=object_storage,
+    )
+    # Attachment ingest reuses the roster projection as its single
+    # authorization source (roster membership == chattable), and the operator
+    # repository only to recover the owner id for the object key. Wired in
+    # every mode; the route's own credential gate 503s where unconfigured.
+    from kokoro_link.application.services.external_chat_attachment_service import (
+        ExternalChatAttachmentService,
+    )
+    external_chat_attachment_service = ExternalChatAttachmentService(
+        roster_service=external_chat_roster_service,
+        operator_profile_repository=operator_profile_repository,
+        object_storage=object_storage,
+    )
+
     nsfw_mode_service = NsfwModeService(
         preferences=preferences_repository,
         ttl_seconds=app_settings.nsfw_mode.ttl_seconds,
@@ -1804,32 +2192,20 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # the bundle by destructuring. SA + in-memory share the same
     # ``FusionStoryRepositoryPort`` shape.
     fusion_story_repository: FusionStoryRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _fs_build_engine,
-            build_session_factory as _fs_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_fusion_story_repository import (
             SAFusionStoryRepository,
         )
-        _fs_engine = _fs_build_engine(app_settings.database_url)
-        _fs_session_factory = _fs_build_session_factory(_fs_engine)
-        fusion_story_repository = SAFusionStoryRepository(_fs_session_factory)
+        fusion_story_repository = SAFusionStoryRepository(db_session_factory)
     else:
         fusion_story_repository = InMemoryFusionStoryRepository()
 
     branching_drama_repository: BranchingDramaRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _bd_build_engine,
-            build_session_factory as _bd_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_branching_drama_repository import (
             SABranchingDramaRepository,
         )
-        _bd_engine = _bd_build_engine(app_settings.database_url)
-        _bd_session_factory = _bd_build_session_factory(_bd_engine)
-        branching_drama_repository = SABranchingDramaRepository(_bd_session_factory)
+        branching_drama_repository = SABranchingDramaRepository(db_session_factory)
     else:
         from kokoro_link.infrastructure.repositories.in_memory_branching_drama import (
             InMemoryBranchingDramaRepository,
@@ -1839,17 +2215,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # Creator Studio durable job ledger (C0) — same isolated-engine
     # pattern as fusion_story / branching_drama above.
     studio_job_repository: StudioJobRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _sj_build_engine,
-            build_session_factory as _sj_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_studio_job_repository import (
             SAStudioJobRepository,
         )
-        _sj_engine = _sj_build_engine(app_settings.database_url)
-        _sj_session_factory = _sj_build_session_factory(_sj_engine)
-        studio_job_repository = SAStudioJobRepository(_sj_session_factory)
+        studio_job_repository = SAStudioJobRepository(db_session_factory)
     else:
         from kokoro_link.infrastructure.repositories.in_memory_studio_jobs import (
             InMemoryStudioJobRepository,
@@ -1860,18 +2230,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # fusion_story / branching_drama — additions never ripple through
     # the main ``_RepoBundle``.
     pending_follow_up_repository: "PendingFollowUpRepositoryPort"
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _pf_build_engine,
-            build_session_factory as _pf_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_pending_follow_up_repository import (
             SaPendingFollowUpRepository,
         )
-        _pf_engine = _pf_build_engine(app_settings.database_url)
-        _pf_session_factory = _pf_build_session_factory(_pf_engine)
         pending_follow_up_repository = SaPendingFollowUpRepository(
-            _pf_session_factory,
+            db_session_factory,
         )
     else:
         from kokoro_link.infrastructure.repositories.in_memory_pending_follow_ups import (
@@ -1885,11 +2249,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     world_event_repository: WorldEventRepositoryPort
     rss_source_repository: RssSourceRepositoryPort
     character_event_inbox_repository: CharacterEventInboxRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _we_build_engine,
-            build_session_factory as _we_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_world_event_repository import (
             SaWorldEventRepository,
         )
@@ -1899,12 +2259,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.persistence.sa_character_event_inbox_repository import (
             SaCharacterEventInboxRepository,
         )
-        _we_engine = _we_build_engine(app_settings.database_url)
-        _we_session_factory = _we_build_session_factory(_we_engine)
-        world_event_repository = SaWorldEventRepository(_we_session_factory)
-        rss_source_repository = SaRssSourceRepository(_we_session_factory)
+        world_event_repository = SaWorldEventRepository(db_session_factory)
+        rss_source_repository = SaRssSourceRepository(db_session_factory)
         character_event_inbox_repository = SaCharacterEventInboxRepository(
-            _we_session_factory,
+            db_session_factory,
         )
     else:
         from kokoro_link.infrastructure.repositories.in_memory_world_events import (
@@ -1924,11 +2282,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     character_peer_profile_repository: CharacterPeerProfileRepositoryPort
     character_encounter_repository: CharacterEncounterRepositoryPort
     character_encounter_intent_repository: CharacterEncounterIntentRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _cr_build_engine,
-            build_session_factory as _cr_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_character_encounter_repository import (
             SACharacterEncounterRepository,
         )
@@ -1942,19 +2296,17 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             SACharacterPeerProfileRepository,
         )
 
-        _cr_engine = _cr_build_engine(app_settings.database_url)
-        _cr_session_factory = _cr_build_session_factory(_cr_engine)
         character_relationship_repository = SACharacterRelationshipRepository(
-            _cr_session_factory,
+            db_session_factory,
         )
         character_peer_profile_repository = SACharacterPeerProfileRepository(
-            _cr_session_factory,
+            db_session_factory,
         )
         character_encounter_repository = SACharacterEncounterRepository(
-            _cr_session_factory,
+            db_session_factory,
         )
         character_encounter_intent_repository = SACharacterEncounterIntentRepository(
-            _cr_session_factory,
+            db_session_factory,
         )
     else:
         character_relationship_repository = InMemoryCharacterRelationshipRepository()
@@ -1969,19 +2321,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # session_factory mirrors the persona / relationship / memoir
     # wiring so the main ``_build_db_repositories`` tuple stays stable.
     arc_template_pack_loader = YAMLArcTemplatePackLoader()
-    if app_settings.database_url:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _at_build_engine,
-            build_session_factory as _at_build_session_factory,
-        )
-
-        _at_engine = _at_build_engine(app_settings.database_url)
-        _at_session_factory = _at_build_session_factory(_at_engine)
+    if db_session_factory is not None:
         arc_template_repository: ArcTemplateRepositoryPort = (
-            SAArcTemplateRepository(_at_session_factory)
+            SAArcTemplateRepository(db_session_factory)
         )
         arc_series_repository: ArcSeriesRepositoryPort = (
-            SAArcSeriesRepository(_at_session_factory)
+            SAArcSeriesRepository(db_session_factory)
         )
     else:
         arc_template_repository = InMemoryArcTemplateRepository()
@@ -1999,6 +2344,46 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     operator_profile_service = OperatorProfileService(
         repository=operator_profile_repository,
     )
+    # Cross-instance claims (hosted 2×api + 2×worker). ONE lease backend and ONE
+    # owner id per process, shared by every per-key claim below, so they all
+    # speak the same ownership identity as the rest of the runtime-lease family.
+    # Self-host → an in-process lease, i.e. the historical single-process
+    # behaviour with no new env to set.
+    from kokoro_link.application.services.runtime_claim import RuntimeClaim
+
+    runtime_claim_backend = _build_runtime_lease_backend(
+        app_settings, db_session_factory,
+    )
+    runtime_claim_owner_id = _runtime_lease_owner_id("claim")
+
+    # G2 — hosted player locale / location lifecycle. Cloud mode only; the
+    # routes 404 elsewhere, so self-host keeps the repair-CLI-only story and
+    # its unchanged route inventory. State lives in ``app_preferences`` under
+    # user-scoped keys — no schema change.
+    player_locale_service: PlayerLocaleService | None = None
+    geocoding_client: GeocodingPort | None = None
+    if app_settings.cloud.active:
+        player_locale_service = PlayerLocaleService(
+            profiles=operator_profile_repository,
+            preferences=preferences_repository,
+            clock=clock.now,
+            # Tells "brand-new player" apart from "account older than the
+            # confirmation gate"; the latter is back-filled as confirmed
+            # instead of being stranded behind an onboarding dialog.
+            characters=character_repository,
+            # The rolling guardrail is a read-modify-write over a preference
+            # row. Two replicas doing that at once each saw a free slot, so a
+            # determined player got 2×N changes and the losing write clobbered
+            # the winner's log. The TTL is seconds — the guarded section is
+            # three small writes, not an LLM call.
+            change_claim=RuntimeClaim(
+                runtime_claim_backend,
+                prefix=LOCALE_CLAIM_PREFIX,
+                owner_id=runtime_claim_owner_id,
+                ttl_seconds=LOCALE_CLAIM_TTL_SECONDS,
+            ),
+        )
+        geocoding_client = OpenMeteoGeocodingClient()
     # Per-paid-tier AccountRuntimeProfile comes from the control-plane (plan
     # H2 §5-10) — no hardcoded tier->knob table in Core. Wired only in cloud
     # mode with runtime-config enabled; otherwise paid tiers resolve to the
@@ -2012,6 +2397,19 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 timeout_seconds=app_settings.cloud.introspect_timeout,
                 internal_token=app_settings.cloud.runtime_config_internal_token,
                 internal_credential=app_settings.cloud.internal_service_credential,
+            ),
+        )
+    # U3 — hosted credit ("螢火") balance proxy. Cloud mode + a configured User
+    # service only; self-host leaves it None so the route 404s by construction.
+    cloud_credit_service: CloudCreditService | None = None
+    if app_settings.cloud.active and app_settings.cloud.user_service_url:
+        cloud_credit_service = CloudCreditService(
+            client=CreditBalanceClient(
+                base_url=app_settings.cloud.user_service_url,
+                timeout_seconds=app_settings.cloud.introspect_timeout,
+                internal_credential=(
+                    app_settings.cloud.internal_service_credential
+                ),
             ),
         )
     account_runtime_profile_resolver = AccountRuntimeProfileResolver(
@@ -2073,7 +2471,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ttl_seconds=app_settings.auth.jwt_ttl_seconds,
         clock=clock.now,
     )
-    geo_location_provider = _build_geo_location_provider(settings=app_settings)
+    # Reads the live holder on each lookup (G0): an Admin GeoIP endpoint /
+    # timeout change reaches every process without a restart, and the
+    # superseded adapter's HTTP client is released on swap.
+    geo_location_provider = ReloadableGeoLocationProvider(
+        holder=site_settings_holder,
+    )
 
     auth_service = AuthService(
         repository=operator_profile_repository,
@@ -2174,6 +2577,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # dream tick). The LLM-backed extractor / consolidator only wire up
     # when there's a real provider — fake provider would just pollute
     # staging.
+    # ``runtime_claim_backend`` / ``runtime_claim_owner_id`` are built once
+    # further up (the locale guard needs them earlier) and shared by every
+    # per-key claim in this function.
     operator_persona_service: OperatorPersonaService | None = None
     operator_persona_projection_service: OperatorPersonaProjectionService | None = None
     persona_extraction_service: PersonaExtractionService | None = None
@@ -2216,12 +2622,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # operator_profiles on the same engine. Curiosity attempts share
         # this storage because they are per-character/operator persona
         # metadata, not chat transcripts.
-        persona_repository = SAOperatorPersonaRepository(_prefs_session_factory)
+        persona_repository = SAOperatorPersonaRepository(db_session_factory)
         persona_curiosity_repository = SAPersonaCuriosityRepository(
-            _prefs_session_factory,
+            db_session_factory,
         )
         strength_calculator = InteractionStrengthCalculator(
-            session_factory=_prefs_session_factory,
+            session_factory=db_session_factory,
             settings=app_settings.persona,
         )
         operator_persona_service = _OperatorPersonaService(
@@ -2270,6 +2676,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             operator_profile_service=operator_profile_service,
             relationship_milestone_service=relationship_milestone_service,
             clock=clock,
+            # Fleet-wide dream cooldown: the service sets the TTL to
+            # ``dream_min_interval_hours`` and never releases, so the TTL is the
+            # cooldown. Without it the per-process ``_last_run_at`` map lets each
+            # worker replica dream the same pair once per window.
+            cooldown_claim=RuntimeClaim(
+                runtime_claim_backend,
+                prefix="dream",
+                owner_id=runtime_claim_owner_id,
+            ),
         )
 
     post_turn_processor = _build_post_turn_processor(
@@ -2330,6 +2745,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         provider=active_llm_provider,
         feature_key=FEATURE_ARC_TEMPLATE_TRANSLATE,
     )
+    # Per-target TTL execution lease (HOSTED_CORE_SCALING §13 Phase 4 前置):
+    # shared by fusion + branching execution, startup recovery, the daily
+    # story-event roll and lazy story-arc planning so scaled api/worker
+    # replicas never double-drive one target. SA lease under the distributed
+    # topology, in-process lease (lock-parity) for self-host. Built here —
+    # ahead of its first consumer — so the whole process shares ONE owner_id.
+    studio_execution_lease = _build_studio_execution_lease(
+        app_settings, db_session_factory,
+    )
     story_arc_service = StoryArcService(
         repository=story_arc_repository,
         planner=story_arc_planner,
@@ -2343,11 +2767,20 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         beat_rechecker=story_beat_rechecker,
         operator_profile_service=operator_profile_service,
         template_translator=arc_template_translator,
+        execution_lease=studio_execution_lease,
     )
-    calendar_provider = _build_calendar_provider(
-        settings=app_settings, local_tz=local_tz,
+    # Both follow the live site-settings holder rather than the boot snapshot
+    # (G0). Steady state is one frozen-dataclass equality check per call; a
+    # changed region / coordinate rebuilds the adapter once, which also drops
+    # exactly the cache (holiday calendar / Open-Meteo payloads) that the
+    # change invalidated.
+    calendar_provider = ReloadableCalendarProvider(
+        holder=site_settings_holder, local_tz=local_tz,
     )
-    weather_provider = _build_weather_provider(settings=app_settings)
+    weather_provider = ReloadableWeatherProvider(
+        holder=site_settings_holder,
+        default_primary_language=app_settings.default_primary_language,
+    )
     schedule_service = ScheduleService(
         repository=schedule_repository,
         planner=schedule_planner,
@@ -2360,8 +2793,42 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         relationship_seed_repository=relationship_seed_repository,
         operator_persona_service=operator_persona_service,
         operator_profile_service=operator_profile_service,
+        # §4.1 schedule staggering — ON only on the hosted execution backend so
+        # a fleet's day+3 generation trickles through the prior day instead of
+        # herding at midnight. Self-host (embedded) stays byte-identical: OFF.
+        staggering_enabled=(
+            app_settings.process.background_backend == "postgres"
+        ),
+        # Cross-instance single-flight for the full-day plan. The TTL covers one
+        # ``plan_day`` (dialogue summary + planner LLM + weather/calendar); the
+        # losing replica waits a few seconds for the winner's row rather than
+        # blocking a chat request or duplicating the spend.
+        #
+        # 600s, not the 180s default: this claim has no heartbeat, so the TTL is
+        # the entire budget one planner round gets. A round is up to two LLM
+        # calls in series (dialogue summary, then ``plan_day``) and the client's
+        # read timeout is 300s EACH, so 2×300 is the worst case a call can take
+        # without the transport itself giving up. A shorter TTL lapses under a
+        # slow model while the winner is still planning, and the replica that
+        # picks the day up then pays for a second full round —
+        # ``uq_daily_schedules_character_date`` keeps the data right, but the
+        # spend doubles and the player can watch the plan flip on refresh.
+        # ``ScheduleService`` releases the slot as soon as it finishes, so the
+        # generous TTL costs nothing on the happy path.
+        plan_claim=RuntimeClaim(
+            runtime_claim_backend,
+            prefix="sched",
+            owner_id=runtime_claim_owner_id,
+            ttl_seconds=600,
+            wait_seconds=8.0,
+        ),
     )
-    embedder = _build_embedder(settings=app_settings)
+    embedder = _build_embedder(
+        settings=app_settings,
+        identity_resolver=cloud_identity_resolver,
+        routing_profile_port=cloud_routing_profile_resolver,
+        provider_credentials_enabled=process_matrix.requires_cloud_provider_credentials,
+    )
 
     memory_consolidator = _build_memory_consolidator(
         registry=model_registry,
@@ -2384,6 +2851,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         auto_consolidation_trigger = AutoConsolidationTrigger(
             memory_repository=memory_repository,
             consolidation_service=memory_consolidation_service,
+            # Cooldown + single-flight are claimed on the character row so
+            # scaled api replicas can't both consolidate one character.
+            character_repository=character_repository,
             threshold=app_settings.auto_consolidation.threshold,
             cooldown=timedelta(
                 hours=app_settings.auto_consolidation.cooldown_hours,
@@ -2575,6 +3045,29 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     visual_generation_style_service = VisualGenerationStyleService(
         preferences=preferences_repository,
     )
+    # The album gacha's pending batch must be visible to every api replica:
+    # generate and commit are separate requests and hosted load-balances
+    # several processes, so a process-local batch drops the player's picks.
+    from kokoro_link.contracts.character_image_candidate_batch import (
+        CharacterImageCandidateBatchRepositoryPort,
+    )
+    character_image_candidate_batch_repository: (
+        CharacterImageCandidateBatchRepositoryPort
+    )
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_character_image_candidate_batch_repository import (  # noqa: E501
+            SACharacterImageCandidateBatchRepository,
+        )
+        character_image_candidate_batch_repository = (
+            SACharacterImageCandidateBatchRepository(db_session_factory)
+        )
+    else:
+        from kokoro_link.infrastructure.repositories.in_memory_character_image_candidate_batches import (  # noqa: E501
+            InMemoryCharacterImageCandidateBatchRepository,
+        )
+        character_image_candidate_batch_repository = (
+            InMemoryCharacterImageCandidateBatchRepository()
+        )
     character_image_service = CharacterImageService(
         character_repository=character_repository,
         uploads_dir=app_settings.uploads_dir,
@@ -2583,6 +3076,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         visual_style_service=visual_generation_style_service,
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         subscription_access_guard=subscription_access_guard,
+        candidate_batch_repository=character_image_candidate_batch_repository,
     )
     character_lora_service = CharacterLoraService(
         character_repository=character_repository,
@@ -2640,6 +3134,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         arc_service=story_arc_service,
         arc_completion_memory_writer=arc_completion_memory_writer,
         operator_profile_service=operator_profile_service,
+        execution_lease=studio_execution_lease,
     )
     story_beat_scene_service = StoryBeatSceneService(
         story_arc_service=story_arc_service,
@@ -2705,11 +3200,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     usage_event_repository: UsageEventRepositoryPort
     account_runtime_usage_repository: AccountRuntimeUsageRepositoryPort
     emotion_event_repository: EmotionEventRepositoryPort
-    if app_settings.use_database:
-        from kokoro_link.infrastructure.persistence.engine import (
-            build_async_engine as _tr_build_engine,
-            build_session_factory as _tr_build_session_factory,
-        )
+    if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_turn_record_repository import (
             SATurnRecordRepository,
         )
@@ -2722,14 +3213,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.persistence.sa_emotion_event_repository import (
             SAEmotionEventRepository,
         )
-        _tr_engine = _tr_build_engine(app_settings.database_url)
-        _tr_session_factory = _tr_build_session_factory(_tr_engine)
-        turn_record_repository = SATurnRecordRepository(_tr_session_factory)
-        usage_event_repository = SAGenerationUsageRepository(_tr_session_factory)
+        turn_record_repository = SATurnRecordRepository(db_session_factory)
+        usage_event_repository = SAGenerationUsageRepository(db_session_factory)
         account_runtime_usage_repository = SAAccountRuntimeUsageRepository(
-            _tr_session_factory,
+            db_session_factory,
         )
-        emotion_event_repository = SAEmotionEventRepository(_tr_session_factory)
+        emotion_event_repository = SAEmotionEventRepository(db_session_factory)
         from kokoro_link.infrastructure.persistence.sa_deferred_intent_repository import (
             SADeferredIntentRepository,
         )
@@ -2745,18 +3234,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.persistence.sa_memoir_pin_repository import (
             SAMemoirPinRepository,
         )
-        deferred_intent_repository = SADeferredIntentRepository(_tr_session_factory)
+        deferred_intent_repository = SADeferredIntentRepository(db_session_factory)
         behavioral_pattern_repository = SABehavioralPatternRepository(
-            _tr_session_factory,
+            db_session_factory,
         )
         self_reflection_repository = SASelfReflectionRepository(
-            _tr_session_factory,
+            db_session_factory,
         )
         disposition_drift_history_repository = SADispositionDriftHistoryRepository(
-            _tr_session_factory,
+            db_session_factory,
         )
         memoir_pin_repository: MemoirPinRepositoryPort = SAMemoirPinRepository(
-            _tr_session_factory,
+            db_session_factory,
         )
     else:
         from kokoro_link.infrastructure.repositories.in_memory_turn_records import (
@@ -2952,7 +3441,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         InMemoryRuntimeSettingsRepository,
     )
     runtime_settings_repository = None
-    _tr_factory_for_settings = locals().get("_tr_session_factory")
+    # Single shared factory (or None on the in-memory path) drives every
+    # remaining SA repo below — turn-record, provider-settings, address,
+    # experiment. Direct ref replaces the old ``locals().get(...)`` probes.
+    _tr_factory_for_settings = db_session_factory
     if _tr_factory_for_settings is not None:
         from kokoro_link.infrastructure.persistence.sa_runtime_settings_repository import (
             SARuntimeSettingsRepository,
@@ -2962,6 +3454,17 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         )
     else:
         runtime_settings_repository = InMemoryRuntimeSettingsRepository()
+    # G0: built here because this is the first point where the KV repository and
+    # the holder are both in scope. Shared verbatim by the admin write path
+    # (local convergence) and the cross-process refresher (remote convergence).
+    from kokoro_link.bootstrap.site_settings_refresh import (
+        build_site_settings_reloader,
+    )
+    site_settings_reloader = build_site_settings_reloader(
+        holder=site_settings_holder,
+        repository=runtime_settings_repository,
+        env_settings=env_app_settings,
+    )
     quiet_hours_service = QuietHoursService(
         preferences=preferences_repository,
         env_start=app_settings.persona.dream_quiet_hours_start,
@@ -2975,7 +3478,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # connections managed from Admin UI. The repository is separate
     # from generic runtime settings because it carries secrets.
     provider_connection_repository: ProviderConnectionRepositoryPort
-    _provider_settings_factory = locals().get("_prefs_session_factory")
+    _provider_settings_factory = db_session_factory
     if _provider_settings_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_provider_connection_repository import (
             SAProviderConnectionRepository,
@@ -3260,6 +3763,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         turn_recorder=turn_recorder,
         usage_recorder=usage_recorder,
         subscription_access_guard=subscription_access_guard,
+        # Per-conversation player-turn mutex. Reuses the lease backend already
+        # chosen for the studio lease (SA table under the distributed topology,
+        # in-process otherwise) but mints a per-turn owner, so two turns exclude
+        # each other whether they land on two api replicas or one.
+        turn_lease=ChatTurnLease.from_studio_lease(studio_execution_lease),
         emotion_event_repository=emotion_event_repository,
         self_reflection_repository=self_reflection_repository,
         address_preference_repository=(
@@ -3275,6 +3783,37 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_usage_repository=account_runtime_usage_repository,
         event_seed_dispenser=event_seed_dispenser,
         clock=clock,
+    )
+
+    # LH2 external-chat turn state machine (DR-LH0-004): the durable receipt
+    # store + the recoverable orchestrator that drives ChatService through the
+    # fenced execution seam. Wired in every mode — the route's own service-
+    # credential gate 503s where unconfigured (self-host), so exposing the
+    # service is safe. Needs ``chat_service`` so it is built here, after it.
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_external_chat_turn_repository import (
+            SAExternalChatTurnReceiptRepository,
+        )
+        external_chat_turn_receipt_repository = SAExternalChatTurnReceiptRepository(
+            db_session_factory,
+        )
+    else:
+        from kokoro_link.infrastructure.repositories.in_memory_external_chat_turn import (
+            InMemoryExternalChatTurnReceiptRepository,
+        )
+        external_chat_turn_receipt_repository = (
+            InMemoryExternalChatTurnReceiptRepository()
+        )
+    from kokoro_link.application.services.external_chat_turn_service import (
+        ExternalChatTurnService,
+    )
+    external_chat_turn_service = ExternalChatTurnService(
+        receipt_repository=external_chat_turn_receipt_repository,
+        chat_service=chat_service,
+        conversation_repository=conversation_repository,
+        roster_service=external_chat_roster_service,
+        operator_profile_repository=operator_profile_repository,
+        object_storage=object_storage,
     )
 
     messaging_account_service = MessagingAccountService(
@@ -3309,6 +3848,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         language = getattr(operator, "primary_language", "") or ""
         return language.strip() or "zh-TW"
 
+    # Cross-instance inbound dedup. DB-backed only (the claim is a DB
+    # unique-index race); ``None`` on the in-memory / no-DB path, where a
+    # single process is already fully covered by ``InboundDebouncer`` and
+    # behaviour is unchanged.
+    from kokoro_link.infrastructure.persistence.sa_inbound_receipts import (
+        SAInboundReceiptRepository,
+    )
+
+    inbound_receipt_port = (
+        SAInboundReceiptRepository(db_session_factory)
+        if db_session_factory is not None else None
+    )
     # Dispatcher is always wired now — it just does nothing useful until
     # the operator creates at least one MessagingAccount via the UI.
     messaging_dispatcher = MessagingDispatcher(
@@ -3318,6 +3869,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         chat_service=chat_service,
         adapters=messaging_adapters,
         debouncer=InboundDebouncer(),
+        receipt_repository=inbound_receipt_port,
         public_base_url=app_settings.public_base_url,
         public_base_url_provider=messaging_public_url_resolver.resolve,
         operator_language_resolver=_messaging_operator_language,
@@ -3399,6 +3951,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         embedder=embedder,
         operator_persona_service=operator_persona_service,
         relationship_seed_repository=relationship_seed_repository,
+        # Resolves the owning player's region so the shared event pool is
+        # narrowed per player (G3). Absent → no filter, i.e. today's
+        # behaviour, which is what self-host keeps.
+        operator_profile_service=operator_profile_service,
     )
     world_event_scheduler = WorldEventScheduler(
         ingestion_service=rss_ingestion_service,
@@ -3411,11 +3967,142 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         seed_path=_Path(__file__).resolve().parents[1] / "data" / "rss_sources.yaml",
         # Bind region-scoped emergency feeds to the deployment region so
         # an overseas self-host doesn't auto-enable Taiwan-only civil
-        # alerts (SHIPPED_CONTENT_LOCALIZATION_PLAN #5 / D6-P3).
-        deployment_region=app_settings.calendar.region,
+        # alerts (SHIPPED_CONTENT_LOCALIZATION_PLAN #5 / D6-P3). Passed as the
+        # holder's accessor rather than the boot value: a process that came up
+        # before the region was corrected would otherwise seed the wrong
+        # defaults on any later sync (G0).
+        deployment_region=site_settings_holder.calendar_region,
     )
 
-    proactive_event_bus = ProactiveEventBus()
+    # Phase 4 realtime outbox wiring (§7.1). Under YURALUME_REALTIME_BACKEND=
+    # postgres with a database, the background writer role wraps the two buses
+    # with the durable-outbox decorators and the api reader role gets a
+    # dispatcher that tails the outbox onto its raw buses (see
+    # ``bootstrap/realtime_wiring``). The wrappers are duck-type identical, so
+    # every other role / the memory default keeps the raw bus and the container
+    # shape is unchanged. Built before the publishers below so the
+    # dispatcher/composer publish through the wrapper, not around it.
+    from kokoro_link.bootstrap.process_roles import matrix_for_role
+    from kokoro_link.bootstrap.realtime_wiring import build_realtime_wiring
+
+    _realtime = build_realtime_wiring(
+        matrix=matrix_for_role(app_settings.process.role),
+        realtime_backend=app_settings.process.realtime_backend,
+        database_url=app_settings.database_url,
+        db_session_factory=db_session_factory,
+        proactive_bus=ProactiveEventBus(),
+        feed_bus=FeedEventBus(),
+        conversations=conversation_repository,
+        feed_posts=feed_post_repository,
+        feed_comments=feed_comment_repository,
+        poll_interval=app_settings.process.realtime_poll_interval,
+    )
+    proactive_event_bus = _realtime.proactive_bus
+    feed_event_bus = _realtime.feed_bus
+    # P3-Dedup §3.4 — the visible-output slot ledger. DB-backed only (the
+    # claim is a DB unique-index race); ``None`` on the in-memory / no-DB path,
+    # where the proactive + feed-reply passes fall back to their in-code caps
+    # exactly as before. Shared by the dispatcher and the feed-reply service so
+    # their per-tick slots dedup against a distributed reclaimed job.
+    from kokoro_link.infrastructure.persistence.sa_visible_slots import (
+        SAVisibleSlotRepository,
+    )
+
+    visible_slot_port = (
+        SAVisibleSlotRepository(db_session_factory)
+        if db_session_factory is not None else None
+    )
+    # LH4 §8.3 — the external proactive sink behind ``ExternalProactiveDeliveryPort``.
+    # Self-host (and cloud mode without a configured Channel) wires the self-host
+    # messaging adapter (wraps the existing account/binding repos + platform
+    # adapters) with NO pre-send ledger. Hosted mode — cloud active AND a Channel
+    # base URL AND a database — wires the Hosted Official LINE Channel adapter,
+    # the durable pre-send ledger (DR-LH0-005), and the retry worker that re-sends
+    # still-pending events; ``_record_pre_send`` / ``_settle_pre_send`` then engage
+    # on the dispatcher's hosted path (Core-A left the param).
+    from kokoro_link.application.services.proactive_delivery.local_adapter import (
+        LocalMessagingProactiveDeliveryAdapter,
+    )
+    proactive_hosted_delivery = (
+        app_settings.cloud.active
+        and bool(app_settings.cloud.channel_base_url)
+        and db_session_factory is not None
+    )
+    proactive_event_ledger = None
+    proactive_delivery_retry_worker = None
+    proactive_hosted_identity_resolver = None
+    proactive_local_delivery = None
+    if proactive_hosted_delivery:
+        from kokoro_link.application.services.proactive_delivery.hosted_adapter import (  # noqa: E501
+            HostedChannelProactiveDeliveryAdapter,
+        )
+        from kokoro_link.application.services.proactive_delivery.hosted_identity import (  # noqa: E501
+            build_hosted_delivery_identity_resolver,
+        )
+        from kokoro_link.application.services.proactive_delivery.retry_worker import (  # noqa: E501
+            ProactiveDeliveryRetryWorker,
+        )
+        from kokoro_link.infrastructure.cloud.hosted_channel_proactive_client import (  # noqa: E501
+            HostedChannelProactiveClient,
+        )
+        from kokoro_link.infrastructure.persistence.sa_external_proactive_events import (  # noqa: E501
+            SAExternalProactiveEventRepository,
+        )
+
+        # LH4 Core-C — the real reverse identity map: a hosted character is
+        # routed to its owner's cloud ``(tenant_id, account_id)`` projection.
+        # A character whose owner is not a cloud operator (or whose projection
+        # is missing either half) resolves to ``None`` and the dispatcher skips
+        # the hosted path with NO_BINDING-gate semantics. Shared by the adapter
+        # (cost preflight) and the dispatcher (gate + envelope identity).
+        proactive_hosted_identity_resolver = (
+            build_hosted_delivery_identity_resolver(
+                character_repository=character_repository,
+                operator_repository=operator_profile_repository,
+            )
+        )
+
+        proactive_event_ledger = SAExternalProactiveEventRepository(
+            db_session_factory,
+        )
+        proactive_external_delivery = HostedChannelProactiveDeliveryAdapter(
+            client=HostedChannelProactiveClient(
+                base_url=app_settings.cloud.channel_base_url,
+                service_credential=app_settings.cloud.channel_service_credential,
+            ),
+            object_storage=object_storage,
+            identity_resolver=proactive_hosted_identity_resolver,
+            event_ledger=proactive_event_ledger,
+        )
+        # H4: hosted mode still needs the self-host binding path for any
+        # operator who bound their own bot. The local binding path routes to
+        # THIS local adapter; the hosted-target path routes to the hosted
+        # adapter above. Both are injected so neither ever feeds the other's
+        # identity.
+        proactive_local_delivery = LocalMessagingProactiveDeliveryAdapter(
+            account_repository=messaging_account_repository,
+            binding_repository=channel_binding_repository,
+            conversation_repository=conversation_repository,
+            adapters=messaging_adapters,
+        )
+        from kokoro_link.application.services.proactive_delivery.line_conversation_recorder import (  # noqa: E501
+            HostedLineConversationRecorder,
+        )
+        proactive_delivery_retry_worker = ProactiveDeliveryRetryWorker(
+            ledger=proactive_event_ledger,
+            external_delivery=proactive_external_delivery,
+            conversation_recorder=HostedLineConversationRecorder(
+                conversation_repository=conversation_repository,
+            ),
+            clock=clock,
+        )
+    else:
+        proactive_external_delivery = LocalMessagingProactiveDeliveryAdapter(
+            account_repository=messaging_account_repository,
+            binding_repository=channel_binding_repository,
+            conversation_repository=conversation_repository,
+            adapters=messaging_adapters,
+        )
     proactive_dispatcher = ProactiveDispatcher(
         character_repository=character_repository,
         conversation_repository=conversation_repository,
@@ -3425,6 +4112,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         gate=HeuristicProactiveGate(local_tz=local_tz),
         decider=proactive_decider,
         adapters=messaging_adapters,
+        external_delivery=proactive_external_delivery,
+        local_delivery=proactive_local_delivery,
+        proactive_event_ledger=proactive_event_ledger,
+        hosted_identity_resolver=proactive_hosted_identity_resolver,
         intention_judge=proactive_intention_judge,
         schedule_resolver=_proactive_schedule_resolver,
         memory_repository=memory_repository,
@@ -3473,6 +4164,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             app_settings.prompt_quality.novelty_gate_max_retries
         ),
         subscription_access_guard=subscription_access_guard,
+        visible_slot_port=visible_slot_port,
     )
     # Phase 3 of SCENE_BEAT_PLAN — runs on every tick so an offline
     # user still sees beats land in memory by the time they come back.
@@ -3483,7 +4175,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         local_tz=local_tz,
         operator_profile_service=operator_profile_service,
     )
-    feed_event_bus = FeedEventBus()
+    # ``feed_event_bus`` was built (and possibly outbox-wrapped) up front with
+    # the proactive bus in the Phase 4 realtime wiring above.
     feed_candidate_collector = FeedCandidateCollector(
         feed_posts=feed_post_repository,
         schedules=schedule_repository,
@@ -3555,6 +4248,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         event_bus=feed_event_bus,
         operator_profile_service=operator_profile_service,
         notification_service=notification_service,
+        visible_slot_port=visible_slot_port,
     )
     pending_follow_up_dispatcher = PendingFollowUpDispatcher(
         repository=pending_follow_up_repository,
@@ -3567,8 +4261,71 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         scheduled_promise_composer=scheduled_promise_composer,
         operator_persona_service=operator_persona_service,
         operator_profile_service=operator_profile_service,
+        # At-most-once visible send for the distributed release path (shared with
+        # proactive/feed). ``None`` on the no-DB path → fail-open, embedded tick
+        # byte-identical.
+        visible_slot_port=visible_slot_port,
         local_tz=local_tz,
     )
+    # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). Built ONLY for a
+    # scheduler-owning role (all / background) when YURALUME_BACKGROUND_SHADOW=
+    # postgres and a DB session factory exists. Off by default → every field
+    # stays None, the scheduler gets no journal, and behaviour is byte-identical
+    # (self-host red line). The SA journal is threaded into the scheduler below
+    # so the embedded tick can be compared bucket-for-bucket with the queue.
+    (
+        background_job_queue,
+        background_coordinator_lease,
+        background_shadow_coordinator,
+        background_shadow_worker,
+        shadow_tick_journal,
+        shadow_bucket_seconds,
+    ) = _build_shadow_runtime(
+        app_settings=app_settings,
+        db_session_factory=db_session_factory,
+        character_repository=character_repository,
+        operator_profile_repository=operator_profile_repository,
+        subscription_access_guard=subscription_access_guard,
+        clock=clock,
+    )
+
+    # Execution-ownership gate (P3-B, §2.2 / §15). Built ONLY on the hosted
+    # opt-in: background_backend=='postgres' AND a DB session factory exists.
+    # On the self-host default (embedded backend) the port stays None and
+    # ``ownership_enforced`` is False, so the embedded scheduler NEVER reads
+    # ownership — zero DB calls, byte-identical. (from_env still rejects the
+    # postgres backend until P3-C; this path is reached via direct AppSettings
+    # construction in tests / the future unlock.)
+    runtime_ownership: "RuntimeOwnershipPort | None" = None
+    execution_mode_transition: "ExecutionModeTransitionService | None" = None
+    ownership_enforced = (
+        app_settings.process.background_backend == "postgres"
+        and db_session_factory is not None
+    )
+    if ownership_enforced:
+        from kokoro_link.infrastructure.persistence.sa_background_runtime import (
+            SABackgroundExecutionMode,
+        )
+
+        assert db_session_factory is not None
+        runtime_ownership = SABackgroundExecutionMode(db_session_factory)
+        from kokoro_link.infrastructure.persistence.sa_background_runtime import (
+            SABackgroundCoordinatorCursor,
+        )
+        from kokoro_link.application.services.execution_mode_transition import (
+            ExecutionModeTransitionService,
+        )
+
+        execution_mode_transition = ExecutionModeTransitionService(
+            ownership=runtime_ownership,
+            queue=background_job_queue,
+            cursor=SABackgroundCoordinatorCursor(db_session_factory),
+            clock=clock,
+        )
+        if background_shadow_coordinator is not None:
+            background_shadow_coordinator.set_runtime_ownership(runtime_ownership)
+
+    scheduler_metrics = SchedulerMetrics()
     proactive_scheduler = ProactiveScheduler(
         dispatcher=proactive_dispatcher,
         character_repository=character_repository,
@@ -3578,6 +4335,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feed_composer=feed_composer_service,
         feed_comment_reply=feed_comment_reply_service,
         pending_follow_up_dispatcher=pending_follow_up_dispatcher,
+        proactive_delivery_retry_worker=proactive_delivery_retry_worker,
         character_encounter_service=character_encounter_service,
         character_social_knowledge_service=character_social_knowledge_service,
         schedule_memorializer=schedule_memorializer,
@@ -3586,11 +4344,246 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         clock=clock,
         subscription_access_guard=subscription_access_guard,
+        metrics=scheduler_metrics,
+        tick_journal=shadow_tick_journal,
+        bucket_seconds=shadow_bucket_seconds,
+        runtime_ownership=runtime_ownership,
+        ownership_enforced=ownership_enforced,
     )
+
+    # Phase 5: per-kind due-job wiring (§4.2 / §4.3 / §5). Built on the same
+    # hosted opt-in as execution. The reconciler is injected into the coordinator
+    # (reseeds missing chains, ~15 min); the per-kind handler is injected into the
+    # worker's execution runner (step + self-chain). Both share ONE
+    # NextDueCalculator and the coordinator's leader epoch. Self-host / embedded
+    # never reaches here (ownership_enforced is False), so behaviour is unchanged.
+    if (
+        ownership_enforced
+        and background_job_queue is not None
+        and background_shadow_coordinator is not None
+    ):
+        from kokoro_link.application.services.due_job_scheduler import (
+            NextDueCalculator,
+        )
+        from kokoro_link.application.services.due_job_reconciler import (
+            DueJobReconciler,
+        )
+        from kokoro_link.application.services.social_due_job_reconciler import (
+            SocialDueJobReconciler,
+        )
+        from kokoro_link.application.services.pending_follow_up_release import (
+            PendingFollowUpReleaseEnqueuer,
+            PendingFollowUpReleaseReconciler,
+        )
+        from kokoro_link.application.services.post_turn_runner import (
+            PostTurnEnqueuer,
+        )
+
+        # Event-driven follow-up release (§5 priority 1). ONE enqueuer is shared by
+        # the chat write points (via a ChatService setter) and the reconcile sweep,
+        # so both mint the same idempotent release job. The enqueuer reads the
+        # current coordinator epoch from the lease (the API process holds no lease).
+        assert background_coordinator_lease is not None
+        _release_enqueuer = PendingFollowUpReleaseEnqueuer(
+            queue=background_job_queue,
+            coordinator_lease=background_coordinator_lease,
+            clock=clock,
+        )
+        chat_service.set_pending_follow_up_release_enqueuer(_release_enqueuer)
+
+        # Event-driven post-turn processing (§5 priority 3). The chat write point
+        # enqueues ONE immediate one-shot job so the post-turn LLM extraction runs on
+        # a worker instead of inside the API request; a no-leader enqueue no-ops and
+        # the write point falls back to in-process execution (no dropped work).
+        chat_service.set_post_turn_enqueuer(PostTurnEnqueuer(
+            queue=background_job_queue,
+            coordinator_lease=background_coordinator_lease,
+            clock=clock,
+        ))
+        _follow_up_reconciler = PendingFollowUpReleaseReconciler(
+            repository=pending_follow_up_repository,
+            enqueuer=_release_enqueuer,
+            clock=clock,
+        )
+
+        # §13 social split: relink missing social chains (per character dream/peer
+        # + per pair encounter) on the same leader + cadence as the character
+        # reconcile. Shares the ONE NextDueCalculator and the coordinator's epoch.
+        _reconcile_next_due = NextDueCalculator(
+            resolver=account_runtime_profile_resolver, clock=clock,
+        )
+        _reseed_jitter = _env_int("YURALUME_DUE_RESEED_JITTER", 300)
+        _social_reconciler = SocialDueJobReconciler(
+            queue=background_job_queue,
+            character_repository=character_repository,
+            relationship_repository=character_relationship_repository,
+            next_due_calculator=_reconcile_next_due,
+            epoch_provider=lambda: background_shadow_coordinator.epoch,
+            runtime_ownership=runtime_ownership,
+            operator_profile_repository=operator_profile_repository,
+            clock=clock,
+            reseed_jitter_seconds=_reseed_jitter,
+        )
+        # Reconciler → coordinator (only where a coordinator runs in this
+        # process). Shares the coordinator's leader epoch via ``epoch_provider``.
+        _reconciler = DueJobReconciler(
+            queue=background_job_queue,
+            character_repository=character_repository,
+            next_due_calculator=_reconcile_next_due,
+            epoch_provider=lambda: background_shadow_coordinator.epoch,
+            runtime_ownership=runtime_ownership,
+            operator_profile_repository=operator_profile_repository,
+            clock=clock,
+            reseed_jitter_seconds=_reseed_jitter,
+            follow_up_reconciler=_follow_up_reconciler,
+            social_reconciler=_social_reconciler,
+        )
+        background_shadow_coordinator.set_due_job_reconciler(
+            _reconciler,
+            interval_seconds=float(
+                _env_int("YURALUME_DUE_RECONCILE_INTERVAL", 900),
+            ),
+        )
+
+    # P3-C: upgrade the shadow worker from dry-run to mode-aware execution on the
+    # hosted opt-in (background_backend=='postgres' AND DB AND this role runs the
+    # scheduler). The runner reuses the SCHEDULER's executors so the distributed
+    # tick body is byte-identical to embedded; it flips to real execution only
+    # when the ownership row confirms ``distributed`` (fail-closed to dry-run).
+    if (
+        ownership_enforced
+        and background_shadow_worker is not None
+        and runtime_ownership is not None
+    ):
+        from kokoro_link.application.services.execution_mode_runner import (
+            ExecutionModeRunner,
+        )
+        from kokoro_link.application.services.runtime_activity_gate import (
+            RuntimeActivityGateService,
+        )
+        from kokoro_link.application.services.due_job_scheduler import (
+            NextDueCalculator,
+        )
+        from kokoro_link.application.services.due_job_handlers import (
+            CharacterKindHandler,
+        )
+        from kokoro_link.application.services.social_due_job_handlers import (
+            SocialKindHandler,
+        )
+        from kokoro_link.application.services.due_job_deferral import (
+            DueJobDeferral,
+        )
+        from kokoro_link.infrastructure.persistence.sa_background_runtime import (
+            SABackgroundCoordinatorCursor,
+        )
+        from kokoro_link.infrastructure.persistence.sa_pair_lease import (
+            SAPairLease,
+        )
+        import socket as _socket
+
+        assert db_session_factory is not None
+        assert background_job_queue is not None
+        _worker_next_due = NextDueCalculator(
+            resolver=account_runtime_profile_resolver, clock=clock,
+        )
+        _worker_deferral = DueJobDeferral(
+            feed_post_repository=feed_post_repository,
+            operator_profile_service=operator_profile_service,
+        )
+        # The worker's handler enqueues its next chain link under the CLAIMED
+        # job's fencing epoch (cross-process — it does not hold the coordinator
+        # lease); ``epoch_provider`` is a passive fallback (no local coordinator
+        # in a dedicated worker role → None → reconciler owns reseeding).
+        _worker_epoch_provider = (
+            (lambda: background_shadow_coordinator.epoch)
+            if background_shadow_coordinator is not None
+            else (lambda: None)
+        )
+        _character_kind_handler = CharacterKindHandler(
+            executor=proactive_scheduler.character_tick_executor,
+            queue=background_job_queue,
+            next_due_calculator=_worker_next_due,
+            epoch_provider=_worker_epoch_provider,
+            operator_profile_repository=operator_profile_repository,
+            deferral_check=_worker_deferral.check,
+            beat_next_due_provider=beat_due_checker.next_due_at,
+            clock=clock,
+        )
+        # §13 social split handler: the pair lease (atomic two-character guard)
+        # backs ``encounter_tick``; ``persona_dream`` / ``peer_knowledge`` are
+        # per-character. Owner id is stable per worker process so a same-process
+        # re-acquire renews the same epoch.
+        _social_kind_handler = SocialKindHandler(
+            social_executor=proactive_scheduler.social_tick_executor,
+            encounter_service=character_encounter_service,
+            queue=background_job_queue,
+            next_due_calculator=_worker_next_due,
+            epoch_provider=_worker_epoch_provider,
+            pair_lease=SAPairLease(db_session_factory),
+            pair_lease_owner=f"social-worker-{_socket.gethostname()}-{os.getpid()}",
+            operator_profile_repository=operator_profile_repository,
+            clock=clock,
+        )
+        # §5 priority 1: the worker-side follow-up release handler delegates the
+        # busy re-gate + compose + fan-out to the SAME dispatcher the embedded tick
+        # uses (抽共用而非複製).
+        from kokoro_link.application.services.pending_follow_up_release import (
+            PendingFollowUpReleaseHandler,
+        )
+        from kokoro_link.application.services.post_turn_runner import (
+            PostTurnHandler,
+        )
+
+        _release_handler = PendingFollowUpReleaseHandler(
+            repository=pending_follow_up_repository,
+            dispatcher=pending_follow_up_dispatcher,
+            clock=clock,
+        )
+        # §5 priority 3: the worker-side post-turn handler delegates to the SAME
+        # ``_do_post_turn`` the embedded tick runs, via the id-only rebuild entry
+        # (抽共用而非複製). It re-reads the conversation to rebuild the turn text so the
+        # job payload never carries chat content.
+        _post_turn_handler = PostTurnHandler(
+            runner=chat_service.run_post_turn_for_record,
+            clock=clock,
+        )
+        execution_runner = ExecutionModeRunner(
+            queue=background_job_queue,
+            character_repository=character_repository,
+            character_tick_executor=proactive_scheduler.character_tick_executor,
+            social_tick_executor=proactive_scheduler.social_tick_executor,
+            gate_service=RuntimeActivityGateService(
+                resolver=account_runtime_profile_resolver,
+                character_repository=character_repository,
+            ),
+            cursor=SABackgroundCoordinatorCursor(db_session_factory),
+            bucket_seconds=shadow_bucket_seconds or 300,
+            clock=clock,
+            runtime_ownership=runtime_ownership,
+            character_kind_handler=_character_kind_handler,
+            social_kind_handler=_social_kind_handler,
+            character_relationship_repository=character_relationship_repository,
+            pending_follow_up_release_handler=_release_handler,
+            post_turn_handler=_post_turn_handler,
+        )
+        background_shadow_worker.enable_execution(
+            runtime_ownership=runtime_ownership,
+            execution_runner=execution_runner,
+        )
+        # §5 caps bind at claim time (execution mode only).
+        background_shadow_worker.set_capability_caps({
+            "llm": _env_int("YURALUME_BG_CAP_LLM", DEFAULT_CAPABILITY_CAPS["llm"]),
+            "image": _env_int(
+                "YURALUME_BG_CAP_IMAGE", DEFAULT_CAPABILITY_CAPS["image"],
+            ),
+        })
 
     tts_voice_catalog: TTSVoiceCatalogPort | None = None
     tts_settings = app_settings.tts
-    if app_settings.cloud.active:
+    if (
+        app_settings.cloud.active
+        and process_matrix.requires_cloud_provider_credentials
+    ):
         assert cloud_identity_resolver is not None
         tts_settings = TTSSettings(
             provider="api",
@@ -3611,6 +4604,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             timeout_seconds=app_settings.tts.timeout_seconds,
         )
         tts_voice_catalog = tts_port
+    elif app_settings.cloud.active:
+        tts_port = NullTTSAdapter()
     elif not app_settings.tts.enabled:
         tts_port = NullTTSAdapter()
     elif app_settings.tts.provider == "openai":
@@ -3686,6 +4681,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_usage_repository=account_runtime_usage_repository,
         clock=clock,
         subscription_access_guard=subscription_access_guard,
+        # P3-C durable warmup: enqueue a character_warmup job on create so a new
+        # character is ready before its first bucket. Wired ONLY on the hosted
+        # execution backend (queue + coordinator lease present); self-heals via
+        # the next character_tick if the enqueue is fenced out / fails.
+        background_job_queue=background_job_queue,
+        background_coordinator_lease=background_coordinator_lease,
+        warmup_enqueue_enabled=(
+            app_settings.process.background_backend == "postgres"
+        ),
     )
     demo_account_reaper = DemoAccountReaper(
         character_repository=character_repository,
@@ -3790,6 +4794,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ),
         jobs=studio_job_repository,
         notifications=notification_service,
+        execution_lease=studio_execution_lease,
     )
     # Fusion material-richness stats (Creator Studio C1-P1). Shares
     # ``select_brief_memories`` with the brief builder above so the picker
@@ -3900,14 +4905,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         event_seed_dispenser=event_seed_dispenser,
         visual_style_service=visual_generation_style_service,
         jobs=studio_job_repository,
+        execution_lease=studio_execution_lease,
     )
 
     # Startup recovery for interrupted Creator Studio pipelines —
-    # invoked once from the FastAPI lifespan (fail-soft there).
+    # invoked once from the FastAPI lifespan (fail-soft there). Shares the
+    # execution lease so a scaled api replica skips targets another replica is
+    # already recovering, and hands a re-driven target's lease to the runner.
     studio_job_recovery_service = StudioJobRecoveryService(
         jobs=studio_job_repository,
         fusion_story_service=fusion_story_service,
         branching_drama_service=branching_drama_service,
+        execution_lease=studio_execution_lease,
     )
 
     return ServiceContainer(
@@ -3947,6 +4956,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_profile_repository=operator_profile_repository,
         operator_profile_service=operator_profile_service,
         geo_location_provider=geo_location_provider,
+        site_settings_holder=site_settings_holder,
+        site_settings_reloader=site_settings_reloader,
         auth_service=auth_service,
         auth_strategy=auth_strategy,
         password_hasher=password_hasher,
@@ -3964,12 +4975,27 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         proactive_attempt_repository=proactive_attempt_repository,
         proactive_dispatcher=proactive_dispatcher,
         proactive_scheduler=proactive_scheduler,
+        character_tick_executor=proactive_scheduler.character_tick_executor,
+        social_tick_executor=proactive_scheduler.social_tick_executor,
+        scheduler_metrics=scheduler_metrics,
+        background_shadow_coordinator=background_shadow_coordinator,
+        background_shadow_worker=background_shadow_worker,
+        background_job_queue=background_job_queue,
+        background_coordinator_lease=background_coordinator_lease,
+        runtime_ownership=runtime_ownership,
+        execution_mode_transition=execution_mode_transition,
         demo_account_reaper=demo_account_reaper,
         character_freeze_reaper=character_freeze_reaper,
         subscription_freeze_service=subscription_freeze_service,
         cloud_tenant_tier_sync_service=cloud_tenant_tier_sync_service,
         subscription_access_guard=subscription_access_guard,
         cloud_subscription_repository=cloud_subscription_repository,
+        cloud_credit_service=cloud_credit_service,
+        player_locale_service=player_locale_service,
+        geocoding_client=geocoding_client,
+        external_chat_roster_service=external_chat_roster_service,
+        external_chat_attachment_service=external_chat_attachment_service,
+        external_chat_turn_service=external_chat_turn_service,
         character_repository=character_repository,
         proactive_event_bus=proactive_event_bus,
         story_seed_repository=story_seed_repository,
@@ -4003,6 +5029,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feed_comment_reply_service=feed_comment_reply_service,
         feed_reaction_memorializer=feed_reaction_memorializer,
         feed_event_bus=feed_event_bus,
+        realtime_outbox=_realtime.outbox,
+        realtime_rehydrator=_realtime.rehydrator,
+        realtime_dispatcher=_realtime.dispatcher,
         tts_service=tts_service,
         tts_pregeneration_service=tts_pregeneration_service,
         tts_voice_catalog=tts_voice_catalog,
@@ -4061,4 +5090,5 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         llm_priority_gate=llm_priority_gate,
         app_settings=app_settings,
         clock=clock,
+        db_engine=db_engine,
     )

@@ -16,6 +16,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import type { ArcTemplate } from '@/types/arcTemplate'
 import { listArcTemplates } from '@/utils/api/arcTemplates'
 import { useArcTemplateTranslation } from '@/composables/useArcTemplateTranslation'
@@ -45,6 +46,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt, cloudMode } = usePlayerCopy()
 
 const templates = ref<ArcTemplate[]>([])
 const loading = ref(false)
@@ -144,13 +146,13 @@ const sortedTemplates = computed<ArcTemplate[]>(() => {
       <div class="picker" role="dialog" :aria-label="t('story.arcTemplatePicker.ariaLabel')">
         <div class="picker-header">
           <div>
-            <div class="picker-title display-title">{{ t('story.arcTemplatePicker.title') }}</div>
+            <div class="picker-title display-title">{{ pt('story.arcTemplatePicker.title') }}</div>
             <div class="picker-hint">
-              {{ t('story.arcTemplatePicker.hint') }}
+              {{ pt('story.arcTemplatePicker.hint') }}
             </div>
           </div>
           <div class="header-actions">
-            <label class="translate-toggle" :title="t('story.arcTemplatePicker.translate.hint')">
+            <label class="translate-toggle" :title="pt('story.arcTemplatePicker.translate.hint')">
               <input
                 type="checkbox"
                 :checked="translateEnabled"
@@ -180,9 +182,16 @@ const sortedTemplates = computed<ArcTemplate[]>(() => {
           <div v-if="loading" class="empty-msg">{{ t('common.state.loading') }}</div>
           <div v-else-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
           <div v-else-if="sortedTemplates.length === 0" class="empty-msg">
-            {{ t('story.arcTemplatePicker.emptyPrefix') }}
-            <code>data/arc_templates/</code>
-            {{ t('story.arcTemplatePicker.emptySuffix') }}
+            <!-- Hosted players cannot inspect a server directory, so the
+                 operator diagnostic collapses to a plain statement. -->
+            <template v-if="cloudMode">
+              {{ t('story.arcTemplatePicker.emptyCloud') }}
+            </template>
+            <template v-else>
+              {{ t('story.arcTemplatePicker.emptyPrefix') }}
+              <code>data/arc_templates/</code>
+              {{ t('story.arcTemplatePicker.emptySuffix') }}
+            </template>
           </div>
           <ul v-else class="tpl-list">
             <li
@@ -263,7 +272,7 @@ const sortedTemplates = computed<ArcTemplate[]>(() => {
             class="chip-btn"
             :disabled="!currentTemplateId"
             @click="clearBinding"
-          >{{ t('story.arcTemplatePicker.clearBinding') }}</button>
+          >{{ pt('story.arcTemplatePicker.clearBinding') }}</button>
           <button class="chip-btn" @click="close">{{ t('common.actions.close') }}</button>
         </div>
       </div>

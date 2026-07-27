@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 
 import ArcTemplateIntakeWizard from '@/components/ArcTemplateIntakeWizard.vue'
@@ -29,6 +30,7 @@ import type { ArcTemplate } from '@/types/arcTemplate'
 import type { Character } from '@/types/character'
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 const router = useRouter()
 const confirmDialog = useConfirmDialog()
 
@@ -414,7 +416,7 @@ onMounted(() => {
         <div class="studio-section__head">
           <div>
             <h2 id="studio-templates-title">{{ t('studio.templates.title') }}</h2>
-            <p>{{ t('studio.templates.subtitle') }}</p>
+            <p>{{ pt('studio.templates.subtitle') }}</p>
           </div>
           <div class="studio-templates__actions">
             <label
@@ -471,7 +473,7 @@ onMounted(() => {
               <div class="template-item__title-row">
                 <h3 class="display-title">{{ displayTemplate(template).title }}</h3>
                 <span class="template-item__meta">
-                  {{ t('studio.templates.beatCount', { count: template.beat_count }) }}
+                  {{ pt('studio.templates.beatCount', { count: template.beat_count }) }}
                 </span>
               </div>
               <p>{{ displayTemplate(template).premise }}</p>

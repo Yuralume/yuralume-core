@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import {
   createStorySeed,
   deleteStorySeed,
@@ -34,6 +35,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt, cloudMode } = usePlayerCopy()
 const confirmDialog = useConfirmDialog()
 
 const frameChoices = ['modern', 'fantasy', 'school', 'custom']
@@ -195,7 +197,7 @@ watch(() => props.characterId, async () => {
     <div class="section-divider" aria-hidden="true"></div>
 
     <p class="field-hint">
-      {{ t('story.panel.hint') }}
+      {{ pt('story.panel.hint') }}
     </p>
 
     <div class="frame-block">
@@ -232,7 +234,7 @@ watch(() => props.characterId, async () => {
       </ul>
     </div>
 
-    <div class="seeds-block">
+    <div v-if="!cloudMode" class="seeds-block">
       <div class="block-header">
         <h4 class="block-title">{{ t('story.panel.seedsTitle') }}</h4>
         <UiButton size="sm" :loading="seedsLoading" @click="reloadSeeds">

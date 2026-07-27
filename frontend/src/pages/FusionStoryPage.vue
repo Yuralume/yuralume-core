@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 import { listCharacters } from '@/utils/api/characters'
 import {
@@ -11,6 +12,7 @@ import {
   serializeCastQuery,
 } from '@/utils/fusionSeed'
 import { stashStudioSeed, takeStudioSeed } from '@/utils/studioSeedTransfer'
+import { isInsufficientCreditsFailure } from '@/utils/studioFailure'
 import {
   adaptFusionStoryToArc,
   createFusionStory,
@@ -41,6 +43,7 @@ import { useTimezone } from '@/composables/useTimezone'
 import { formatDate } from '@/i18n/formatters'
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 const confirmDialog = useConfirmDialog()
 const route = useRoute()
 const router = useRouter()
@@ -170,9 +173,14 @@ function notifyIfFinished(prevStatus: FusionStoryStatus, next: FusionStory) {
       duration: 4,
     })
   } else if (next.status === 'failed') {
+    // A credit-exhausted run gets the player-facing promise ("nothing ran,
+    // daily life is unaffected") rather than the raw backend message; the
+    // viewer below simultaneously swaps in the top-up card.
     notification.error({
       message: t('fusionStory.notifications.failedTitle'),
-      description: next.error_message || undefined,
+      description: isInsufficientCreditsFailure(next)
+        ? t('credits.insufficient.body')
+        : next.error_message || undefined,
       duration: 6,
     })
   }
@@ -197,6 +205,7 @@ async function refreshSelected(silent = false) {
         status: next.status,
         head_version: next.head_version,
         error_message: next.error_message,
+        error_code: next.error_code ?? null,
         progress: next.progress,
         total_chars: next.full_text
           ? next.full_text.length
@@ -574,7 +583,7 @@ onBeforeUnmount(stopPolling)
           class="fusion-page__creator"
           :eyebrow="t('studio.creatorPanel.eyebrow')"
           :title="t('fusionStory.page.createTitle')"
-          :notice="t('fusionStory.page.notice')"
+          :notice="pt('fusionStory.page.notice')"
         >
           <div class="fusion-page__field">
             <label class="field-label">{{ t('fusionStory.page.castLabel') }}</label>

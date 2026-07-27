@@ -191,6 +191,13 @@ class FusionStory:
     """1-based monotonic version counter — see class docstring."""
     versions: tuple[FusionStoryVersion, ...] = field(default_factory=tuple)
     error_message: str | None = None
+    error_code: str | None = None
+    """Machine-readable reason for a ``failed`` status, when there is one.
+
+    Set only for deliberate cloud-gateway refusals (``insufficient_credits``
+    and friends) so the polling client can offer a top-up affordance instead
+    of the generic failure copy. ``None`` for ordinary crashes — free-text
+    ``error_message`` remains the only thing an unexpected fault carries."""
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
 
@@ -306,7 +313,13 @@ class FusionStory:
         status: str,
         *,
         error_message: str | None = None,
+        error_code: str | None = None,
     ) -> "FusionStory":
+        """Transition status, replacing both failure fields wholesale.
+
+        Omitting them clears them — a story that recovers into any other
+        status must not keep advertising the reason it failed last time.
+        """
         if status not in _VALID_STATUSES:
             raise ValueError(
                 f"with_status: {status!r} not in {sorted(_VALID_STATUSES)}",
@@ -315,6 +328,7 @@ class FusionStory:
             self,
             status=status,
             error_message=error_message,
+            error_code=error_code,
             updated_at=_utcnow(),
         )
 

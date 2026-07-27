@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kokoro_link.application.services.feature_keys import FEATURE_PROACTIVE_MESSAGE
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.persona_curiosity import PersonaCuriosityPlan
 from kokoro_link.contracts.proactive import ProactiveContext
@@ -41,6 +42,22 @@ class _StubModel(ChatModelPort):
 
     async def generate_stream(self, prompt: str) -> AsyncIterator[str]:  # pragma: no cover
         yield self._response
+
+
+class _CapturingProvider:
+    def __init__(self, model: ChatModelPort) -> None:
+        self.model = model
+        self.feature_keys: list[str | None] = []
+
+    async def resolve(self, feature_key=None, **kwargs):
+        self.feature_keys.append(feature_key)
+        return self.model
+
+    async def resolve_model_id(self, feature_key=None, **kwargs):
+        return None
+
+    async def is_fake(self, feature_key=None, **kwargs):
+        return False
 
 
 def _context(
@@ -114,6 +131,19 @@ async def test_should_send_true_returns_trimmed_message() -> None:
     assert decision.should_send is True
     assert decision.message == "剛練完那首歌，想傳一段給你聽 🎸"
     assert "分享" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_proactive_message_uses_dedicated_feature_key() -> None:
+    provider = _CapturingProvider(
+        _StubModel(
+            '{"should_send": false, "reason": "先不打擾", "message": null}',
+        ),
+    )
+
+    await LLMProactiveDecider(provider=provider).decide(_context())
+
+    assert provider.feature_keys == [FEATURE_PROACTIVE_MESSAGE]
 
 
 @pytest.mark.asyncio

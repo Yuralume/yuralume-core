@@ -12,6 +12,12 @@ Design principles (from CLAUDE.md):
   embedding cosine handles the fine grain.
 - Generalisation: novel interests / new sources / new event topics
   flow through the same path. No special-casing.
+- Region is a *pre-filter*, not a score term: the event pool is global
+  but a hosted deployment serves players worldwide, and no amount of
+  embedding similarity makes a Taiwanese local-news item useful to a
+  player living in Japan. Events whose source is region-bound to
+  somewhere else are removed before ranking; global (untagged) sources
+  stay visible to everyone.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from kokoro_link.domain.entities.character_event_inbox import (
 )
 from kokoro_link.domain.entities.world_event import WorldEvent
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
+from kokoro_link.domain.value_objects.region_code import normalise_region
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,16 @@ class OperatorWorldEventRelevancePort(Protocol):
     async def get_current(self, character_id: str, operator_id: str): ...
 
     def render_world_event_relevance(self, persona) -> list[str]: ...
+
+
+class OperatorRegionLookupPort(Protocol):
+    """Structural view of ``OperatorProfileService`` used for region lookup.
+
+    The curator only needs the owning player's profile; declaring the
+    single method keeps the application service free of the concrete
+    class and lets tests pass a two-line stub."""
+
+    async def get_for_user(self, user_id: str): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +91,7 @@ class EventCuratorService:
         relationship_seed_repository: (
             CharacterOperatorRelationshipSeedRepositoryPort | None
         ) = None,
+        operator_profile_service: OperatorRegionLookupPort | None = None,
         operator_id: str = DEFAULT_OPERATOR_ID,
     ) -> None:
         self._events = world_event_repository
@@ -87,6 +105,7 @@ class EventCuratorService:
         self._max_new_per_pass = max_new_per_pass
         self._operator_persona_service = operator_persona_service
         self._relationship_seed_repository = relationship_seed_repository
+        self._operator_profile_service = operator_profile_service
         self._operator_id = operator_id
 
     async def curate(self, character: Character) -> int:
@@ -114,6 +133,11 @@ class EventCuratorService:
                 if character.subscribed_categories else None
             ),
             limit=self._candidate_pool_size,
+            # Region narrowing precedes the embedding ranking on purpose:
+            # relevance is scored *within* the material this player could
+            # plausibly care about, instead of scoring a pool dominated by
+            # another region and hoping the cosine sorts it out.
+            operator_region=await self._resolve_operator_region(character),
         )
         if not candidates:
             return 0
@@ -147,6 +171,32 @@ class EventCuratorService:
                 character.id, keep=self._inbox_cap,
             )
         return added
+
+    async def _resolve_operator_region(
+        self, character: Character,
+    ) -> str | None:
+        """Region of the player who owns this character, or ``None``.
+
+        ``None`` means *no region filter at all* — the pool stays exactly
+        what it is today. That is the self-host path (a single operator
+        who never filled in a country) and the fail-soft path (service
+        unwired, lookup blew up): a world-events feature must never go
+        quiet because a profile read failed.
+        """
+        service = self._operator_profile_service
+        if service is None:
+            return None
+        user_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        try:
+            operator = await service.get_for_user(user_id)
+        except Exception:
+            logger.warning(
+                "operator region lookup failed; curating unfiltered",
+                extra={"character_id": character.id},
+                exc_info=True,
+            )
+            return None
+        return normalise_region(getattr(operator, "country_code", None))
 
     async def _build_relevance_profile(
         self, character: Character,

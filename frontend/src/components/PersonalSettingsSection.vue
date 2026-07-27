@@ -11,13 +11,13 @@ import {
   getOperatorProfile,
   updateOperatorProfile,
 } from '@/utils/api/operatorProfile'
-import { normalizeCoordinateInput } from '@/utils/coordinateInput'
 import { UiButton } from '@/components/ui'
 import ChatAssistSetting from './ChatAssistSetting.vue'
-import SceneAccessHintSetting from './SceneAccessHintSetting.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
 import NsfwModeSetting from './NsfwModeSetting.vue'
 import PlayerPasswordPanel from './PlayerPasswordPanel.vue'
+import PlayerPlaceLocaleSettings from './PlayerPlaceLocaleSettings.vue'
+import PortalAccountLink from './PortalAccountLink.vue'
 import SimpleImageProfilePicker from './SimpleImageProfilePicker.vue'
 import TtsPregenSetting from './TtsPregenSetting.vue'
 import VisualGenerationStyleSetting from './VisualGenerationStyleSetting.vue'
@@ -25,7 +25,7 @@ import WebNotificationSetting from './WebNotificationSetting.vue'
 
 const { t } = useI18n()
 const router = useRouter()
-const { locale, supported } = useLocale()
+const { locale } = useLocale()
 const {
   authEnabled,
   currentUser,
@@ -34,6 +34,10 @@ const {
   logout,
 } = useAuth()
 
+// The place / timezone / language block owns its own drafts (its cloud and
+// self-host branches diverge too far to share them); this section only
+// hands it the loaded profile so both stay in sync with one GET.
+const operatorProfile = ref<OperatorProfile | null>(null)
 const displayNameDraft = ref('')
 const displayNameLocked = ref(false)
 const displayNameAliases = ref<string[]>([])
@@ -44,21 +48,6 @@ const currentStatusSetAt = ref<string | null>(null)
 const currentStatusSaving = ref(false)
 const currentStatusLoading = ref(false)
 const currentStatusFeedback = ref<string | null>(null)
-const countryCodeDraft = ref('')
-// Vue auto-casts v-model on <input type="number"> to a JS number even
-// without the .number modifier, so these can hold a number after manual
-// entry despite being seeded with ''. See normalizeCoordinateInput.
-const latitudeDraft = ref<string | number>('')
-const longitudeDraft = ref<string | number>('')
-const locationLabelDraft = ref('')
-const locationSaving = ref(false)
-const locationFeedback = ref<string | null>(null)
-
-const currentUserLanguageLabel = computed(() => {
-  const language = currentUser.value?.primary_language
-  if (!language) return null
-  return supported.value.find((item) => item.code === language)?.label ?? language
-})
 
 const currentStatusSetAtLabel = computed(() => {
   if (!currentStatusSetAt.value || !currentUser.value?.timezone_id) return null
@@ -70,6 +59,7 @@ const currentStatusSetAtLabel = computed(() => {
 })
 
 function applyOperatorProfile(profile: OperatorProfile) {
+  operatorProfile.value = profile
   if (!displayNameSaving.value) {
     displayNameDraft.value = profile.has_real_name ? profile.display_name : ''
   }
@@ -77,10 +67,6 @@ function applyOperatorProfile(profile: OperatorProfile) {
   displayNameAliases.value = profile.aliases ?? []
   currentStatusDraft.value = profile.current_status ?? ''
   currentStatusSetAt.value = profile.current_status_set_at ?? null
-  countryCodeDraft.value = profile.country_code ?? ''
-  latitudeDraft.value = profile.latitude == null ? '' : String(profile.latitude)
-  longitudeDraft.value = profile.longitude == null ? '' : String(profile.longitude)
-  locationLabelDraft.value = profile.location_label ?? ''
 }
 
 async function loadOperatorProfile() {
@@ -150,53 +136,17 @@ async function clearCurrentStatus() {
   await saveCurrentStatus()
 }
 
-function locationPayload() {
-  const country = countryCodeDraft.value.trim()
-  const label = locationLabelDraft.value.trim()
-  return {
-    country_code: country || null,
-    latitude: normalizeCoordinateInput(latitudeDraft.value),
-    longitude: normalizeCoordinateInput(longitudeDraft.value),
-    location_label: label || null,
-  }
-}
-
-async function saveLocation() {
-  if (!currentUser.value) return
-  locationSaving.value = true
-  locationFeedback.value = null
-  try {
-    const profile = await updateOperatorProfile(locationPayload())
-    applyOperatorProfile(profile)
-    window.dispatchEvent(new CustomEvent('kokoro:operator-profile-updated', {
-      detail: profile,
-    }))
-    locationFeedback.value = profile.location_label || profile.country_code
-      ? t('playerSidebar.location.saved')
-      : t('playerSidebar.location.cleared')
-  } catch (err) {
-    locationFeedback.value = err instanceof Error
-      ? t('common.errorWithDetail', { message: t('playerSidebar.location.saveFailed'), detail: err.message })
-      : t('playerSidebar.location.saveFailed')
-  } finally {
-    locationSaving.value = false
-  }
-}
-
-async function clearLocation() {
-  countryCodeDraft.value = ''
-  latitudeDraft.value = ''
-  longitudeDraft.value = ''
-  locationLabelDraft.value = ''
-  await saveLocation()
-}
-
 function handleOperatorProfileUpdated(event: Event) {
   const profile = (event as CustomEvent<OperatorProfile>).detail
   if (profile) applyOperatorProfile(profile)
 }
 
 function handleLogout() {
+  // Per-identity caches (the credit balance, and anything that subscribes
+  // later) drop themselves off the back of the token change — see
+  // `@/utils/identityLifecycle`. Doing it here only ever covered logout, and
+  // left login / account switch on a shared browser leaking the previous
+  // player's numbers.
   logout()
   router.replace({ name: 'login' })
 }
@@ -297,79 +247,12 @@ defineExpose({ flashWebNotification, flashAdminEntry })
         {{ displayNameFeedback }}
       </p>
     </div>
-    <div class="identity-section__row">
-      <span>{{ t('locale.primaryLanguage.label') }}</span>
-      <strong>{{ currentUserLanguageLabel }}</strong>
-    </div>
-    <div class="identity-section__row">
-      <span>{{ t('locale.timezone.label') }}</span>
-      <strong>{{ currentUser.timezone_id }}</strong>
-    </div>
-    <p class="identity-section__hint">
-      {{ t('locale.timezone.readonlyExplain') }}
-    </p>
-    <div class="location-field">
-      <label class="field-label" for="operator-location-label">
-        {{ t('playerSidebar.location.label') }}
-      </label>
-      <input
-        id="operator-location-label"
-        v-model="locationLabelDraft"
-        type="text"
-        class="field-input"
-        :placeholder="t('locale.location.labelPlaceholder')"
-        :disabled="locationSaving || currentStatusLoading"
-      />
-      <div class="location-grid">
-        <input
-          v-model="countryCodeDraft"
-          type="text"
-          class="field-input"
-          maxlength="2"
-          :placeholder="t('locale.location.countryPlaceholder')"
-          :disabled="locationSaving || currentStatusLoading"
-        />
-        <input
-          v-model="latitudeDraft"
-          type="number"
-          step="0.000001"
-          class="field-input"
-          :placeholder="t('locale.location.latitudePlaceholder')"
-          :disabled="locationSaving || currentStatusLoading"
-        />
-        <input
-          v-model="longitudeDraft"
-          type="number"
-          step="0.000001"
-          class="field-input"
-          :placeholder="t('locale.location.longitudePlaceholder')"
-          :disabled="locationSaving || currentStatusLoading"
-        />
-      </div>
-      <div class="location-actions">
-        <UiButton
-          variant="primary"
-          size="sm"
-          :loading="locationSaving"
-          :disabled="currentStatusLoading"
-          @click="saveLocation"
-        >
-          {{ locationSaving ? t('playerSidebar.location.saving') : t('playerSidebar.location.save') }}
-        </UiButton>
-        <UiButton
-          variant="ghost"
-          size="sm"
-          :disabled="locationSaving || currentStatusLoading"
-          @click="clearLocation"
-        >
-          {{ t('playerSidebar.location.clear') }}
-        </UiButton>
-      </div>
-      <p class="location-hint">{{ t('playerSidebar.location.hint') }}</p>
-      <p v-if="locationFeedback" class="location-feedback">
-        {{ locationFeedback }}
-      </p>
-    </div>
+    <!-- 我的所在地／時區／語言。cloud 走玩家版（城市搜尋＋受控修改），
+         self-host 分支與 G2 之前逐字相同（唯讀時區＋手填座標）。 -->
+    <PlayerPlaceLocaleSettings
+      :profile="operatorProfile"
+      :disabled="currentStatusLoading"
+    />
     <div class="current-status-field">
       <label class="field-label" for="operator-current-status">
         {{ t('playerSidebar.currentStatus.label') }}
@@ -416,8 +299,13 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     </div>
   </section>
 
+  <!--
+    Hosted identities live in the portal, and `require_self_host_mode`
+    already 403s the change-password endpoint in cloud. Rendering the
+    form there only walks the player into that 403 (plan U1-E-2).
+  -->
   <CollapsibleSection
-    v-if="authEnabled"
+    v-if="authEnabled && !cloudMode"
     :title="t('playerSidebar.password.title')"
     :default-open="false"
   >
@@ -428,9 +316,6 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <h3 class="settings-group__title">{{ t('playerSidebar.settings.personalPreferencesTitle') }}</h3>
     <section class="voice-pregen-section">
       <ChatAssistSetting />
-    </section>
-    <section class="voice-pregen-section">
-      <SceneAccessHintSetting />
     </section>
     <section class="voice-pregen-section">
       <TtsPregenSetting />
@@ -461,6 +346,11 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <span class="admin-settings-entry__hint">{{ t('playerSidebar.admin.hint') }}</span>
   </RouterLink>
 
+  <!-- Hosted 玩家的回程動線：放在登出旁邊，因為兩者是同一個「離開這個
+       遊戲畫面」的意圖。self-host 下這個元件不輸出任何節點（連容器都沒有），
+       個人設定面在自架站的渲染結果與改動前逐字元相同。 -->
+  <PortalAccountLink class="portal-account-entry" />
+
   <section v-if="authEnabled" class="logout-section">
     <UiButton
       variant="danger"
@@ -483,23 +373,8 @@ defineExpose({ flashWebNotification, flashAdminEntry })
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.04);
 }
-.identity-section__row {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-.identity-section__row strong {
-  color: var(--color-text);
-  font-weight: 600;
-}
-.identity-section__hint {
-  margin: 2px 0 0;
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  line-height: 1.5;
-}
+/* .identity-section__row / __hint live in PlayerPlaceLocaleSettings.vue
+   alongside the markup that uses them. */
 
 .display-name-field {
   display: flex;
@@ -552,8 +427,7 @@ defineExpose({ flashWebNotification, flashAdminEntry })
   color: var(--color-text-secondary);
 }
 
-.current-status-field,
-.location-field {
+.current-status-field {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -561,13 +435,6 @@ defineExpose({ flashWebNotification, flashAdminEntry })
   border-top: 1px dashed var(--color-border);
 }
 
-.location-grid {
-  display: grid;
-  grid-template-columns: 0.8fr 1fr 1fr;
-  gap: 8px;
-}
-
-.location-actions,
 .current-status-actions {
   display: flex;
   gap: 8px;
@@ -579,17 +446,14 @@ defineExpose({ flashWebNotification, flashAdminEntry })
 }
 
 .current-status-hint,
-.current-status-feedback,
-.location-hint,
-.location-feedback {
+.current-status-feedback {
   margin: 0;
   color: var(--color-text-secondary);
   font-size: 11px;
   line-height: 1.45;
 }
 
-.current-status-feedback,
-.location-feedback {
+.current-status-feedback {
   color: #7dc49a;
 }
 
@@ -659,6 +523,10 @@ defineExpose({ flashWebNotification, flashAdminEntry })
 
 .admin-settings-entry__hint {
   line-height: 1.45;
+}
+
+.portal-account-entry {
+  margin-top: var(--space-2);
 }
 
 .logout-section {

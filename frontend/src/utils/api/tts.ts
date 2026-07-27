@@ -8,6 +8,8 @@
 
 import axios from 'axios'
 
+import { insufficientCreditsFromAxios } from '@/utils/api/insufficientCredits'
+
 export interface TTSSynthResponse {
   audio_url: string
   cached: boolean
@@ -31,6 +33,10 @@ export async function synthesizeCharacterTTS(
     )
     return res.data
   } catch (err) {
+    // Out of credits is a player-actionable refusal (402), not a
+    // "TTS is not configured" deployment fault — keep the two apart.
+    const creditsError = insufficientCreditsFromAxios(err)
+    if (creditsError) throw creditsError
     if (
       axios.isAxiosError(err)
       && (err.response?.status === 403 || err.response?.status === 503)

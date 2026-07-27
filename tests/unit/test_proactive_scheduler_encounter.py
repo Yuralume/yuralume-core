@@ -81,13 +81,13 @@ class _RecordingEncounterService:
         self.plan_nows: list[datetime | None] = []
         self._crash = crash
 
-    async def run_pending(self, *, now: datetime | None = None):
+    async def run_pending(self, *, now: datetime | None = None, gate=None):
         self.run_nows.append(now)
         if self._crash:
             raise RuntimeError("encounter run exploded")
         return None
 
-    async def plan_pending(self, *, now: datetime | None = None):
+    async def plan_pending(self, *, now: datetime | None = None, gate=None):
         self.plan_nows.append(now)
         if self._crash:
             raise RuntimeError("encounter plan exploded")
@@ -99,7 +99,7 @@ class _RecordingPeerKnowledgeService:
         self.calls = 0
         self._crash = crash
 
-    async def consolidate_due(self):
+    async def consolidate_due(self, *, gate=None):
         self.calls += 1
         if self._crash:
             raise RuntimeError("peer knowledge exploded")

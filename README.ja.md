@@ -152,7 +152,7 @@ docker compose -f docker-compose.container.yml --profile storage-local up -d
 
 自分のローカル ComfyUI で画像を生成したい場合：Core は ComfyUI と直接は話しません — あなた自身が実装・運用する **Custom Media Gateway** に対して、小さく正規化された HTTP コントラクトを話します。完全な仕様と最小の FastAPI スターターは [`docs/CUSTOM_MEDIA_GATEWAY_SPEC.md`](docs/CUSTOM_MEDIA_GATEWAY_SPEC.md)（英語）、またはアプリ内 **Admin → Developer docs** から。
 
-自分の音声エンジン（GPT-SoVITS、XTTS…）を繋ぎたい場合：TTS も同様に小さな HTTP コントラクト（`GET /voices` + `POST /tts/synthesize`）を話す **Custom TTS Server** 方式です。仕様と GPT-SoVITS をラップする最小スターターは [`docs/CUSTOM_TTS_SERVER_SPEC.md`](docs/CUSTOM_TTS_SERVER_SPEC.md)（英語）、またはアプリ内 **Admin → Developer docs** から。自前で立てたくない場合は内蔵の OpenAI TTS プロバイダを BYOK で使えます。
+自分の音声エンジン（GPT-SoVITS、XTTS…）を繋ぎたい場合：TTS も同様に小さな HTTP コントラクト（`GET /voices` + `POST /tts/synthesize`）を話す **Custom TTS Server** 方式です。仕様と GPT-SoVITS をラップする最小スターターは [`docs/CUSTOM_TTS_SERVER_SPEC.md`](docs/CUSTOM_TTS_SERVER_SPEC.md)（英語）、またはアプリ内 **Admin → Developer docs** から。自分でラッパーを書きたくない方向けに、オープンソースの Kokoro-82M モデルを包んだ公式のすぐ使える参考実装 [`custom-tts-kokoro`](https://github.com/Yuralume/custom-tts-kokoro) もあります——`docker run` 一行で起動できます。自前で立てたくない場合は内蔵の OpenAI TTS プロバイダを BYOK で使えます。
 
 プロンプトのオーバーレイは `./prompts/tuned` 配下に `src/kokoro_link/data/prompts/` と同じ相対パスでファイルを置き、`.env.container` に `YURALUME_PROMPT_PACK_DIR=/app/prompts/tuned` を設定して `app` サービスを再起動します。起動時のログに `Prompt pack overlay loaded` とテンプレート数が出ます。
 
@@ -176,9 +176,7 @@ uv run python scripts/self_host_smoke.py --openai-key sk-...   # BYOK のラウ�
 | `AUTH_ENABLED` | `false` でシングルユーザーモード（デフォルト）。マルチユーザーは `true` + `JWT_SECRET`。 |
 | `USER_PRIMARY_LANGUAGE` | ローカル単一ユーザーの初期 UI + コンテンツ言語（デフォルト `zh-TW`、`en-US`・`ja-JP` 可）。シングルユーザーモードでは初回起動時にデフォルト operator に seed され、UI とキャラクターの返答言語が最初から正しくなります。セルフホストのインストーラーはインストール時の選択で設定します。マルチユーザーモードでは各ユーザーが `/auth/setup` で選びます。 |
 | `USER_TIMEZONE` / `KOKORO_USER_TIMEZONE` | ローカル単一ユーザーの UI タイムゾーン（IANA、例 `Asia/Tokyo`）。民間日付・スケジュール・「今日」の境界を決めます。DB とサーバーの instant は UTC のまま。デフォルト `UTC`。 |
-| `YURALUME_CLOUD_ENABLED` / `YURALUME_CLOUD_*` | Hosted cloud モード。有効化するとローカルの setup / user / provider 管理はロックされ、認証は Yuralume Cloud User service へ、LLM / 画像 / 動画 / TTS は Cloud Gateway 経由になります。 |
-| `VITE_YURALUME_DEMO_DISCORD_CLIENT_ID` / `VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID` | Hosted demo OAuth の SPA client id。Vite の build 時値なので、shell env・`docker compose --env-file .env.container`・GitHub repository variables のいずれかで build 前に渡す必要があります。 |
-| `VITE_YURALUME_DEMO_*_URL` | 任意。hosted demo フロントエンドの導線リンク（Tier0 / waitlist / Discord / self-host CTA）。 |
+| `YURALUME_CLOUD_ENABLED` / `YURALUME_CLOUD_*` | 公式ホステッドクラウド（マネージド運用）専用。セルフホストでは未設定のままにしてください。 |
 | `WEB_PUSH_VAPID_PUBLIC_KEY` / `WEB_PUSH_VAPID_PRIVATE_KEY` / `WEB_PUSH_VAPID_SUBJECT` | 任意。Browser Web Push の資格情報。設定するとプレイヤー設定からこのブラウザの OS 通知を購読できます。未設定でも push API は `configured=false` を返し、実行時配信は fail-soft。 |
 | `STORAGE_URL` / `STORAGE_KEY` | Object Storage エンドポイント。セルフホストは同梱の `storage-local` を使えます。 |
 | `APP_BASE_URL` / `STORAGE_PUBLIC_URL` | ブラウザ向け origin の fallback。メディア参照はデフォルトで app 相対の `/v1/public/...`。URL でプッシュするプラットフォームは Admin **Channel settings → Public Base URL** を優先し、空のとき `APP_BASE_URL` を使います。 |

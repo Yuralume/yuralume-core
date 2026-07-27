@@ -7,6 +7,12 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
+# The effective-multiplier clamp is evaluated on every gate check of every
+# scheduler tick; an over-cap tier would otherwise repeat the same warning
+# hundreds of times per hour. Warn once per distinct (profile, activity,
+# effective) combination — a config change produces a fresh warning.
+_WARNED_CLAMPS: set[tuple[str, str, int]] = set()
+
 
 @dataclass(frozen=True, slots=True)
 class AccountRuntimeProfile:
@@ -22,6 +28,9 @@ class AccountRuntimeProfile:
 
     name: str
     proactive_tick_multiplier: int = 1
+    background_activity_multiplier: int = 1
+    idle_downshift_days: int | None = None
+    idle_multiplier: int = 1
     character_ttl: timedelta | None = None
     max_characters: int | None = None
     daily_character_create_limit: int | None = None
@@ -33,6 +42,34 @@ class AccountRuntimeProfile:
     album_generation_enabled: bool = True
     video_generation_enabled: bool = True
     tts_enabled: bool = True
+
+    def effective_proactive_multiplier(self, *, idle: bool) -> int:
+        return self._effective_multiplier(
+            self.proactive_tick_multiplier, idle=idle, activity="proactive",
+        )
+
+    def effective_background_multiplier(self, *, idle: bool) -> int:
+        return self._effective_multiplier(
+            self.background_activity_multiplier,
+            idle=idle,
+            activity="background",
+        )
+
+    def _effective_multiplier(
+        self, base: int, *, idle: bool, activity: str,
+    ) -> int:
+        effective = base * (self.idle_multiplier if idle else 1)
+        clamped = min(288, max(1, effective))
+        if clamped != effective:
+            key = (self.name, activity, effective)
+            if key not in _WARNED_CLAMPS:
+                _WARNED_CLAMPS.add(key)
+                _LOGGER.warning(
+                    "account runtime profile %r: clamped effective %s "
+                    "multiplier from %d to %d",
+                    self.name, activity, effective, clamped,
+                )
+        return clamped
 
     @property
     def is_demo(self) -> bool:
@@ -59,8 +96,23 @@ class AccountRuntimeProfile:
             name=name,
             proactive_tick_multiplier=_int_knob(
                 data, "proactive_tick_multiplier", minimum=1,
+                maximum=288,
                 default=default.proactive_tick_multiplier,
                 nullable=False, name=name,
+            ),
+            background_activity_multiplier=_int_knob(
+                data, "background_activity_multiplier", minimum=1,
+                maximum=288,
+                default=default.background_activity_multiplier,
+                nullable=False, name=name,
+            ),
+            idle_downshift_days=_int_knob(
+                data, "idle_downshift_days", minimum=1, maximum=3650,
+                default=default.idle_downshift_days, nullable=True, name=name,
+            ),
+            idle_multiplier=_int_knob(
+                data, "idle_multiplier", minimum=1, maximum=288,
+                default=default.idle_multiplier, nullable=False, name=name,
             ),
             character_ttl=(
                 timedelta(days=ttl_days) if ttl_days is not None else None
@@ -116,6 +168,7 @@ DEFAULT_ACCOUNT_RUNTIME_PROFILE = AccountRuntimeProfile(name="default")
 DEMO_ACCOUNT_RUNTIME_PROFILE = AccountRuntimeProfile(
     name="demo",
     proactive_tick_multiplier=6,
+    background_activity_multiplier=6,
     character_ttl=timedelta(days=3),
     max_characters=1,
     daily_character_create_limit=1,
@@ -134,13 +187,12 @@ def _int_knob(
     key: str,
     *,
     minimum: int,
+    maximum: int | None = None,
     default: int | None,
     nullable: bool,
     name: str,
 ) -> int | None:
-    """Resolve an integer knob. Missing -> ``default``; explicit ``null`` ->
-    ``None`` when ``nullable`` else invalid; a real ``int`` (bools rejected)
-    >= ``minimum`` -> that int; anything else -> ``default`` + warning."""
+    """Resolve a bounded integer knob with per-knob fail-open fallback."""
     if key not in payload:
         return default
     value = payload[key]
@@ -151,7 +203,12 @@ def _int_knob(
         return default
     # ``bool`` is a subclass of ``int`` — reject it so a stray ``true`` isn't
     # silently read as 1.
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
         _warn_invalid(name, key, value)
         return default
     return value

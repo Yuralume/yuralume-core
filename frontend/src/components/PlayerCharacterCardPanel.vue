@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 import CharacterCardGalleryModal from '@/components/CharacterCardGalleryModal.vue'
 import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
@@ -26,6 +27,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const packs = ref<CharacterCardPackSummary[]>([])
 const loadingPacks = ref(false)
@@ -354,7 +356,7 @@ defineExpose({
 <template>
   <section class="character-cards">
     <p class="character-cards__hint">{{ t('playerSidebar.characterCards.hint') }}</p>
-    <p class="character-cards__hint">{{ t('playerSidebar.characterCards.importHint') }}</p>
+    <p class="character-cards__hint">{{ pt('playerSidebar.characterCards.importHint') }}</p>
 
     <div class="character-cards__actions">
       <UiButton

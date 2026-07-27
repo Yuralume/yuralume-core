@@ -99,13 +99,13 @@ def test_layer1_renders_compact_clause():
         character_id=_CHAR_ID,
         operator_id=_OP_ID,
         layer1_identity={
-            "name": _field("name", 1, "丹尼"),
+            "name": _field("name", 1, "艾力"),
             "occupation": _field("occupation", 1, "後端工程師"),
         },
     )
     lines = svc.render_for_prompt(persona)
     body = "\n".join(lines)
-    assert "丹尼" in body
+    assert "艾力" in body
     assert "後端工程師" in body
     assert "關於對方" in body
     assert "不要每一輪都提起" in body

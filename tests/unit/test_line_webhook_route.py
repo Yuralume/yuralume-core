@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.infrastructure.messaging.line.signature import compute_signature
 from tests.unit._messaging_harness import (
     build_messaging_app_client,
@@ -189,3 +190,35 @@ async def test_non_text_events_acked_with_zero_dispatched() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "dispatched": 0}
+
+
+@pytest.mark.asyncio
+async def test_busy_conversation_asks_line_to_re_deliver() -> None:
+    """Non-2xx is the only way a handed-back LINE event survives.
+
+    The dispatcher rolled the event's dedup stamps back, so a 200 here would
+    ack a message that was never processed and never will be.
+    """
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_line_account(
+        harness, character_id=character.id, channel_secret="SEC",
+    )
+
+    async def _busy(*_args, **_kwargs):
+        raise ConversationBusyError("conv-1")
+
+    harness.chat_service.send_message = _busy
+    client = build_messaging_app_client(harness)
+
+    body = _webhook_body()
+    sig = compute_signature(channel_secret="SEC", body=body)
+    response = client.post(
+        f"/api/v1/messaging/line/webhook/{account.webhook_slug}",
+        content=body,
+        headers={"Content-Type": "application/json", "X-Line-Signature": sig},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert harness.line_adapter.sent == []

@@ -17,6 +17,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { RouterLink } from 'vue-router'
 import type {
   Character,
@@ -43,6 +44,7 @@ import CharacterRelationshipsPanel from './CharacterRelationshipsPanel.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 const confirmDialog = useConfirmDialog()
 
 const PERSONALITY_TYPE_CODES: CharacterPersonalityTypeCode[] = [
@@ -407,7 +409,7 @@ function handleClearAll() {
     <div class="reset-panel">
       <div class="reset-panel-title">{{ t('characterEdit.reset.title') }}</div>
       <div class="reset-panel-hint">
-        {{ t('characterEdit.reset.hint') }}
+        {{ pt('characterEdit.reset.hint') }}
       </div>
       <div class="reset-panel-actions">
         <button
@@ -606,7 +608,7 @@ function handleClearAll() {
       >{{ t('characterEdit.companions.addManualAction') }}</button>
 
       <div v-if="!companions.length" class="companions-empty">
-        {{ t('characterEdit.companions.empty') }}
+        {{ pt('characterEdit.companions.empty') }}
       </div>
 
       <p v-if="shouldShowTechnicalHints" class="field-hint">

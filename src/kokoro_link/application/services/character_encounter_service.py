@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone, tzinfo
-from typing import Any
+from typing import Any, Callable
+
+#: Cooperative abort hook for a pair encounter run. The handler passes the pair
+#: lease's ``raise_if_lost`` here; the encounter stages call it at their boundaries
+#: so a lease stolen mid-run raises ``EncounterPairLeaseLost`` and stops the losing
+#: worker before it claims further encounters. ``None`` (embedded / sweep path)
+#: disables the check — byte-identical to the pre-lease single-process behaviour.
+AbortCheck = Callable[[], None]
 
 from kokoro_link.application.services.character_life_context import (
     CharacterLifeContext,
@@ -38,6 +45,10 @@ from kokoro_link.contracts.register_profile import (
 from kokoro_link.contracts.reply_quality import ReplyDiversityEvidence
 from kokoro_link.application.services.schedule_service import ScheduleService
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
+from kokoro_link.contracts.background_activity_gate import (
+    BackgroundActivityClass,
+    BackgroundActivityGatePort,
+)
 from kokoro_link.contracts.character_encounter import CharacterEncounterRepositoryPort
 from kokoro_link.contracts.character_encounter_intent import (
     CharacterEncounterIntentRepositoryPort,
@@ -99,6 +110,12 @@ async def _resolve_owner_language(
 _LOGGER = logging.getLogger(__name__)
 
 _MIN_PAIR_GAP = timedelta(hours=6)
+_GATE_DEFER_SECONDS = 300.0
+"""How far a background-gate-denied due encounter is pushed forward. One
+default scheduler tick: enough to move the row behind everything currently
+due (the runnable window is shared oldest-first across all operators), while
+keeping "deferred, not skipped" — it becomes due again almost immediately and
+runs on its operator's next on-phase tick."""
 _MIN_SLOT = timedelta(minutes=15)
 _MAX_SLOT = timedelta(minutes=45)
 _INTENT_PLANNING_HORIZON = timedelta(days=2)
@@ -196,12 +213,19 @@ class CharacterEncounterPlanner:
         self._intents = intent_repository
         self._operator_profile_service = operator_profile_service
 
-    async def plan_due(self, *, now: datetime | None = None) -> list[CharacterEncounter]:
+    async def plan_due(
+        self,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+    ) -> list[CharacterEncounter]:
         moment = _as_utc(now or datetime.now(timezone.utc))
         planned: list[CharacterEncounter] = []
         for relationship in await self._relationships.list_enabled():
             try:
-                encounter = await self._maybe_plan_pair(relationship, now=moment)
+                encounter = await self._maybe_plan_pair(
+                    relationship, now=moment, gate=gate,
+                )
             except Exception:
                 _LOGGER.exception(
                     "encounter planner failed relationship=%s", relationship.id,
@@ -211,11 +235,34 @@ class CharacterEncounterPlanner:
                 planned.append(encounter)
         return planned
 
+    async def plan_pair(
+        self,
+        relationship: CharacterRelationship,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+    ) -> CharacterEncounter | None:
+        """Plan (at most) one encounter for a SINGLE relationship (§13 split).
+
+        The per-pair ``encounter_tick`` due chain drives this instead of the
+        whole-table ``plan_due`` sweep. Delegates to the SAME
+        :meth:`_maybe_plan_pair` the sweep uses (抽共用而非複製); fail-soft so one
+        pair's planner error never escapes into the handler's chain advance."""
+        moment = _as_utc(now or datetime.now(timezone.utc))
+        try:
+            return await self._maybe_plan_pair(relationship, now=moment, gate=gate)
+        except Exception:
+            _LOGGER.exception(
+                "encounter planner failed relationship=%s", relationship.id,
+            )
+            return None
+
     async def _maybe_plan_pair(
         self,
         relationship: CharacterRelationship,
         *,
         now: datetime,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> CharacterEncounter | None:
         if await self._encounters.has_pending_for_relationship(relationship.id):
             return None
@@ -226,6 +273,21 @@ class CharacterEncounterPlanner:
         char_a = await self._characters.get(relationship.character_a_id)
         char_b = await self._characters.get(relationship.character_b_id)
         if char_a is None or char_b is None:
+            return None
+        if char_a.user_id != char_b.user_id:
+            _LOGGER.warning(
+                "encounter planner skipped cross-operator relationship=%s",
+                relationship.id,
+            )
+            return None
+        # A pair activity is gated on BOTH sides (same rule as the frozen
+        # check below): which character landed in the a/b slot is decided by
+        # lexicographic canonical_pair ordering, so a single-sided check would
+        # make idle downshift a coin flip per relationship.
+        if gate is not None and not (
+            await gate.allows(char_a, BackgroundActivityClass.ENCOUNTER_PLAN)
+            and await gate.allows(char_b, BackgroundActivityClass.ENCOUNTER_PLAN)
+        ):
             return None
         # A frozen character halts all background activity (CHARACTER_FREEZE_PLAN):
         # never plan a new encounter that would involve one.
@@ -542,12 +604,18 @@ class CharacterEncounterRunner:
         self._novelty_gate = novelty_gate
 
     async def run_due(
-        self, *, now: datetime | None = None,
+        self,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> tuple[list[str], list[str]]:
         moment = _as_utc(now or datetime.now(timezone.utc))
         completed: list[str] = []
         failed: list[str] = []
-        for encounter in await self._encounters.list_runnable(moment):
+        for encounter in await self._encounters.list_runnable(moment, limit=20):
+            if not await self._background_gate_allows(encounter, gate=gate):
+                await self._defer_gated(encounter, moment=moment)
+                continue
             result = await self.run(encounter.id, now=moment)
             if result.status == "completed":
                 completed.append(result.id)
@@ -555,11 +623,117 @@ class CharacterEncounterRunner:
                 failed.append(result.id)
         return completed, failed
 
+    async def run_pair(
+        self,
+        relationship: CharacterRelationship,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+        abort: AbortCheck | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Run this SINGLE relationship's due encounters (§13 split).
+
+        The per-pair ``encounter_tick`` due chain drives this instead of the
+        whole-table ``run_due`` sweep. Same per-encounter CAS claim + gate-defer
+        semantics as the sweep, scoped to one pair — the handler already holds the
+        pair lease, so a passed ``gate`` here is normally ``None`` (the handler ran
+        the AND gate before the lease).
+
+        ``abort`` (the pair lease's ``raise_if_lost``) is checked BEFORE claiming
+        each encounter, so a lease stolen after one encounter has run stops the
+        losing worker from claiming and racing the remaining ones. The single
+        already-claimed in-flight encounter is protected by the per-encounter
+        ``claim_for_run`` CAS (a reclaiming worker cannot re-run it), the documented
+        residual for the write window inside one ``run``."""
+        moment = _as_utc(now or datetime.now(timezone.utc))
+        completed: list[str] = []
+        failed: list[str] = []
+        encounters = await self._encounters.list_for_relationship(
+            relationship.id, limit=20,
+        )
+        runnable = sorted(
+            (
+                item for item in encounters
+                if item.status == "planned"
+                and _as_utc(item.scheduled_for) <= moment
+            ),
+            key=lambda item: item.scheduled_for,
+        )
+        for encounter in runnable:
+            if abort is not None:
+                # Stage boundary: a lost pair lease raises here so we neither claim
+                # nor run this (still-``planned``) encounter — the reclaiming worker
+                # owns it.
+                abort()
+            if not await self._background_gate_allows(encounter, gate=gate):
+                await self._defer_gated(encounter, moment=moment)
+                continue
+            result = await self.run(encounter.id, now=moment, abort=abort)
+            if result.status == "completed":
+                completed.append(result.id)
+            elif result.status == "failed":
+                failed.append(result.id)
+        return completed, failed
+
+    async def _defer_gated(
+        self,
+        encounter: CharacterEncounter,
+        *,
+        moment: datetime,
+    ) -> None:
+        """Push a gate-denied encounter behind currently-due work.
+
+        ``list_runnable`` is a shared, un-tenanted oldest-first window; a
+        denied row that keeps its stale ``scheduled_for`` would occupy the
+        head of that window every tick and starve other operators' due
+        encounters once enough gated rows accumulate. Re-anchoring to
+        ``moment + defer`` keeps the semantics "deferred, not skipped" while
+        letting the queue rotate. Best-effort: a failed defer only means the
+        row is retried at its old position next tick."""
+        try:
+            await self._encounters.save(replace(
+                encounter,
+                scheduled_for=moment + timedelta(
+                    seconds=_GATE_DEFER_SECONDS,
+                ),
+            ))
+        except Exception:
+            _LOGGER.exception(
+                "encounter runner failed to defer gated encounter=%s",
+                encounter.id,
+            )
+
+    async def _background_gate_allows(
+        self,
+        encounter: CharacterEncounter,
+        *,
+        gate: BackgroundActivityGatePort | None,
+    ) -> bool:
+        if gate is None:
+            return True
+        char_a = await self._characters.get(encounter.character_a_id)
+        char_b = await self._characters.get(encounter.character_b_id)
+        if char_a is None or char_b is None:
+            return True
+        if char_a.user_id != char_b.user_id:
+            _LOGGER.warning(
+                "encounter runner skipped cross-operator encounter=%s",
+                encounter.id,
+            )
+            return False
+        # Both sides must be on-phase — a/b slot assignment is lexicographic,
+        # so a single-sided check would tie idle downshift to id ordering.
+        return (
+            await gate.allows(char_a, BackgroundActivityClass.ENCOUNTER_RUN)
+            and await gate.allows(char_b, BackgroundActivityClass.ENCOUNTER_RUN)
+        )
+
     async def run(
         self,
         encounter_id: str,
         *,
         now: datetime | None = None,
+        abort: AbortCheck | None = None,
     ) -> CharacterEncounter:
         moment = _as_utc(now or datetime.now(timezone.utc))
         encounter = await self._encounters.get(encounter_id)
@@ -567,6 +741,28 @@ class CharacterEncounterRunner:
             raise ValueError("Encounter not found")
         if encounter.status not in {"planned", "running"}:
             return encounter
+        if abort is not None:
+            # Pair-lease abort BEFORE the CAS claim: raising here leaves the
+            # encounter ``planned`` so the reclaiming worker (which holds the pair
+            # lease) runs it, rather than the losing worker claiming it and racing
+            # the terminal transcript / memory / relationship writes. Placed outside
+            # the run try-block so ``EncounterPairLeaseLost`` propagates to the
+            # handler's abandon path instead of being marked ``failed``.
+            abort()
+        # P3-Dedup §3.4 — atomic run-claim. A ``planned`` encounter is claimed
+        # by a CAS that only one runner can win, so a reclaimed distributed job
+        # cannot race the original into a duplicate transcript/reflection. A
+        # ``running`` encounter is a single-runner resume (list_runnable never
+        # surfaces it) and proceeds without re-claiming, exactly as before.
+        if encounter.status == "planned":
+            claimed = await self._encounters.claim_for_run(
+                encounter.id, now=moment,
+            )
+            if not claimed:
+                # Another runner won the claim; return the current row without
+                # producing any visible output.
+                latest = await self._encounters.get(encounter.id)
+                return latest if latest is not None else encounter
         running = encounter.mark_running(at=moment)
         await self._encounters.save(running)
         char_a = await self._characters.get(running.character_a_id)
@@ -1217,7 +1413,21 @@ class CharacterEncounterRunner:
         """
         life_contexts: dict[str, CharacterLifeContext | None] = {}
         for speaker in (char_a, char_b):
-            life_contexts[speaker.id] = await self._life_context(speaker, now=now)
+            # ``ambient_reference=char_a``: weather/holidays are a property
+            # of the meeting *place*, not of each speaker, so both sides
+            # must read the same sky (owner decision 2026-07-26,
+            # HOSTED_PLAYER_GEO_ADAPTATION_PLAN §7-4: a cross-player
+            # encounter happens in the initiating side's world).
+            # Side A carries that role here: the encounter row persists no
+            # initiator column — the a/b slots come from ``canonical_pair``
+            # ordering and the intent that requested the meeting is
+            # consumed at plan time — and side A is already the reference
+            # for every other encounter-wide fact (owner language, the
+            # ``local_tz`` used for the whole transcript). Should an
+            # explicit initiator column ever land, only this argument moves.
+            life_contexts[speaker.id] = await self._life_context(
+                speaker, now=now, ambient_reference=char_a,
+            )
         if history is None:
             history = await self._completed_pair_history(encounter)
         contexts: dict[str, list[str]] = {}
@@ -1260,12 +1470,15 @@ class CharacterEncounterRunner:
         character: Character,
         *,
         now: datetime | None = None,
+        ambient_reference: Character | None = None,
     ) -> CharacterLifeContext | None:
         if self._life_context_builder is None:
             return None
         moment = _as_utc(now or datetime.now(timezone.utc))
         try:
-            return await self._life_context_builder.build(character, now=moment)
+            return await self._life_context_builder.build(
+                character, now=moment, ambient_reference=ambient_reference,
+            )
         except Exception:
             _LOGGER.exception(
                 "encounter life context failed character=%s", character.id,
@@ -1459,18 +1672,90 @@ class CharacterEncounterService:
         )
 
     async def plan_pending(
-        self, *, now: datetime | None = None,
+        self,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> EncounterTickResult:
-        planned = await self._planner.plan_due(now=now)
+        planned = await self._planner.plan_due(now=now, gate=gate)
         return EncounterTickResult(
             planned=len(planned),
             planned_ids=tuple(item.id for item in planned),
         )
 
     async def run_pending(
-        self, *, now: datetime | None = None,
+        self,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
     ) -> EncounterTickResult:
-        completed, failed = await self._runner.run_due(now=now)
+        completed, failed = await self._runner.run_due(now=now, gate=gate)
+        return EncounterTickResult(
+            completed=len(completed),
+            failed=len(failed),
+            completed_ids=tuple(completed),
+            failed_ids=tuple(failed),
+        )
+
+    async def step_pair(
+        self,
+        relationship: CharacterRelationship,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+        abort: AbortCheck | None = None,
+    ) -> EncounterTickResult:
+        """One ``encounter_tick`` step for a single canonical pair: plan then run.
+
+        Mirrors :meth:`tick` (plan + run) but scoped to ONE relationship — the
+        per-pair due chain's unit of work. The handler holds the pair lease around
+        this call, so a crossing pair can never drive either character concurrently.
+
+        ``abort`` (the pair lease's ``raise_if_lost``) is checked between the plan
+        and run stages and threaded into ``run_pair`` so a lease stolen mid-run
+        aborts before the run stage / before claiming further encounters.
+        """
+        plan_result = await self.plan_pair(relationship, now=now, gate=gate)
+        if abort is not None:
+            # Lease stolen during planning → stop before spending the run stage's
+            # LLM turns and before claiming any encounter for this lost lease.
+            abort()
+        run_result = await self.run_pair(
+            relationship, now=now, gate=gate, abort=abort,
+        )
+        return EncounterTickResult(
+            planned=plan_result.planned,
+            completed=run_result.completed,
+            failed=run_result.failed,
+            planned_ids=plan_result.planned_ids,
+            completed_ids=run_result.completed_ids,
+            failed_ids=run_result.failed_ids,
+        )
+
+    async def plan_pair(
+        self,
+        relationship: CharacterRelationship,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+    ) -> EncounterTickResult:
+        planned = await self._planner.plan_pair(relationship, now=now, gate=gate)
+        return EncounterTickResult(
+            planned=1 if planned is not None else 0,
+            planned_ids=(planned.id,) if planned is not None else (),
+        )
+
+    async def run_pair(
+        self,
+        relationship: CharacterRelationship,
+        *,
+        now: datetime | None = None,
+        gate: BackgroundActivityGatePort | None = None,
+        abort: AbortCheck | None = None,
+    ) -> EncounterTickResult:
+        completed, failed = await self._runner.run_pair(
+            relationship, now=now, gate=gate, abort=abort,
+        )
         return EncounterTickResult(
             completed=len(completed),
             failed=len(failed),

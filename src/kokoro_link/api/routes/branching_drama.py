@@ -18,6 +18,7 @@ from kokoro_link.api.dependencies import (
     get_container,
     get_current_user_id,
 )
+from kokoro_link.api.routes._cloud_errors import insufficient_credits_guard
 from kokoro_link.application.dto.branching_drama import (
     AdvanceSessionResponse,
     BranchingDramaResponse,
@@ -30,6 +31,7 @@ from kokoro_link.application.dto.branching_drama import (
 )
 from kokoro_link.application.services.branching_drama_service import (
     BranchingDramaService,
+    BranchingGenerationInProgress,
 )
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.branching_drama import (
@@ -268,12 +270,13 @@ async def start_session(
     await _ensure_drama_owned(container, drama_id, current_user_id)
     service = _require_service(container)
     try:
-        session, _, _ = await service.start_session(
-            drama_id,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container, current_user_id,
-            ),
-        )
+        with insufficient_credits_guard():
+            session, _, _ = await service.start_session(
+                drama_id,
+                operator_primary_language=await _resolve_operator_primary_language(
+                    container, current_user_id,
+                ),
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -332,13 +335,14 @@ async def interact_session(
     await _ensure_drama_owned(container, drama_id, current_user_id)
     service = _require_service(container)
     try:
-        session, response, advance_hint = await service.interact_session(
-            session_id,
-            player_input=payload.player_input,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container, current_user_id,
-            ),
-        )
+        with insufficient_credits_guard():
+            session, response, advance_hint = await service.interact_session(
+                session_id,
+                player_input=payload.player_input,
+                operator_primary_language=await _resolve_operator_primary_language(
+                    container, current_user_id,
+                ),
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -364,12 +368,21 @@ async def advance_session(
     await _ensure_drama_owned(container, drama_id, current_user_id)
     service = _require_service(container)
     try:
-        session, node, narration, is_ending = await service.advance_session(
-            session_id,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container, current_user_id,
-            ),
-        )
+        with insufficient_credits_guard():
+            session, node, narration, is_ending = await service.advance_session(
+                session_id,
+                operator_primary_language=await _resolve_operator_primary_language(
+                    container, current_user_id,
+                ),
+            )
+    except BranchingGenerationInProgress as exc:
+        # Transient, retryable: another replica is generating the next layer.
+        # Must NOT be a 400 — the session is intact and the client should
+        # simply advance again in a moment.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

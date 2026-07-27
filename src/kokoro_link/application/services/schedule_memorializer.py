@@ -194,19 +194,30 @@ class ScheduleMemorializer:
             try:
                 embedded = await attach_embeddings(unique, self._embedder)
             except EmbedderError:
-                # Fail-loud: do NOT write memorialised memories without
-                # embeddings, and do NOT mark the activities as done —
-                # the next turn will retry once the embedder is back.
                 _LOGGER.exception(
                     "Embedder unavailable; deferring memorialisation of %d activit(y|ies)",
                     len(generic_completed),
                 )
                 await self._mark_memorialized(encounter_completed)
                 return 0
+            claimed_activity_ids = await self._schedule_repository.claim_memorialize(
+                [activity.id for _, activity in memory_completed],
+            )
+            if not claimed_activity_ids:
+                await self._mark_memorialized(encounter_completed)
+                return 0
+            embedded = [
+                item for item in embedded
+                if activity_ids_by_memory_id[item.id] in claimed_activity_ids
+            ]
+            has_memory_activity_ids.intersection_update(claimed_activity_ids)
             try:
                 await self._memory_repository.add_many(embedded)
             except Exception:
                 _LOGGER.exception("Failed to persist memorialised activities")
+                await self._schedule_repository.release_memorialize(
+                    list(claimed_activity_ids),
+                )
                 await self._mark_memorialized(encounter_completed)
                 return 0
             has_memory_activity_ids.update(

@@ -12,20 +12,27 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentityResolverPort,
     CloudResourceContext,
 )
+from kokoro_link.contracts.generation_trigger import (
+    TRIGGER_HEADER_NAME,
+    generation_trigger_header_value,
+)
 from kokoro_link.contracts.image_provider import (
     ImageGenerationError,
     ImageNoOutputError,
-    ImageTokenUsage,
     ImageTimeoutError,
+    ImageTokenUsage,
 )
-from kokoro_link.infrastructure.http_error_logging import log_http_error_response
+from kokoro_link.infrastructure.http_error_logging import (
+    log_expected_refusal,
+    log_http_error_response,
+)
+from kokoro_link.infrastructure.llm.cloud_refusal import refusal_from_response
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_visual_identity_lines,
 )
 from kokoro_link.infrastructure.prompt.visual_subject import (
     render_character_visual_subject_lines,
 )
-
 
 ASPECT_TO_SIZE: dict[str, str] = {
     "portrait": "1024x1536",
@@ -161,6 +168,7 @@ class CloudGatewayImageProvider:
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
+            TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
 
 
@@ -247,13 +255,31 @@ async def _download_bytes(
 
 def _json_or_raise(response: httpx.Response, label: str) -> Mapping:
     if response.status_code >= 400:
+        operation = f"cloud {label} gateway"
+        body_text = response.text
+        # A deliberate control-plane refusal (no credits, entitlement revoked)
+        # is not a fault: log it quietly and keep the machine-readable code on
+        # the cause chain so the HTTP boundary can answer the player properly.
+        refusal = refusal_from_response(response, body_text)
+        if refusal is not None:
+            log_expected_refusal(
+                _LOGGER,
+                response,
+                operation=operation,
+                code=refusal.code,
+                message=refusal.reason,
+            )
+            raise ImageGenerationError(
+                f"{label} gateway refused ({refusal.code})",
+            ) from refusal
         log_http_error_response(
             _LOGGER,
             response,
-            operation=f"cloud {label} gateway",
+            operation=operation,
+            body_text=body_text,
         )
         raise ImageGenerationError(
-            f"{label} gateway error {response.status_code}: {response.text}",
+            f"{label} gateway error {response.status_code}: {body_text}",
         )
     payload = response.json()
     if not isinstance(payload, Mapping):

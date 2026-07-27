@@ -1,10 +1,21 @@
-from kokoro_link.contracts.repositories import ConversationRepositoryPort
+from dataclasses import replace
+
+from kokoro_link.contracts.repositories import (
+    AppendResult,
+    ConversationRepositoryPort,
+)
 from kokoro_link.domain.entities.conversation import (
     Conversation,
     Message,
     MessageKind,
     MessageRole,
 )
+
+
+def _same_message(a: Message, b: Message) -> bool:
+    """Whether two messages are the same turn (role + content) — used to tell a
+    writer's own re-saved tail from a concurrent append (B3)."""
+    return a.role == b.role and a.content == b.content
 
 
 class InMemoryConversationRepository(ConversationRepositoryPort):
@@ -14,14 +25,69 @@ class InMemoryConversationRepository(ConversationRepositoryPort):
         # ``latest_for_character`` can return the most recent one
         # without needing timestamps.
         self._order: list[str] = []
+        # Monotonic surrogate for the SA autoincrement message row id so the
+        # ``append_messages`` twin can hand back stable ``row_ids``.
+        self._row_seq = 0
+        # B1 twin: per-conversation idempotency map key -> (row_id, position),
+        # mirroring the SA ``uq_messages_conversation_idempotency`` behaviour.
+        self._idempotency: dict[str, dict[str, tuple[int, int]]] = {}
 
     async def get(self, conversation_id: str) -> Conversation | None:
-        return self._conversations.get(conversation_id)
+        conversation = self._conversations.get(conversation_id)
+        if conversation is None:
+            return None
+        return self._stamp_read(conversation)
 
-    async def save(self, conversation: Conversation) -> None:
+    def _stamp_read(self, conversation: Conversation) -> Conversation:
+        """Stamp the read-time B3 snapshot boundary onto a returned snapshot,
+        mirroring the SA repo's ``_row_to_domain``."""
+        return replace(
+            conversation,
+            loaded_message_count=len(conversation.messages),
+        )
+
+    async def save(
+        self, conversation: Conversation, *, truncation: bool = False,
+    ) -> None:
+        existing = self._conversations.get(conversation.id)
+        if existing is None:
+            merged = replace(conversation, version=1)
+        else:
+            messages = list(conversation.messages)
+            # B3 parity: a stale save (a write bumped the stored row after this
+            # snapshot loaded) preserves genuine concurrent appends but NOT this
+            # writer's own re-saved tail. An authoritative truncation (undo)
+            # skips the merge entirely.
+            if conversation.version != existing.version and not truncation:
+                boundary = conversation.loaded_message_count
+                if boundary < 0:
+                    boundary = len(conversation.messages)
+                keyed_positions = {
+                    pos
+                    for _key, (_rid, pos) in self._idempotency.get(
+                        conversation.id, {},
+                    ).items()
+                }
+                for idx, stored in enumerate(existing.messages):
+                    if idx < boundary:
+                        continue
+                    # This writer's own earlier save (skip) only when the tail
+                    # row is un-keyed AND identical to the writer's message at
+                    # that position; a keyed row or a divergent one is a genuine
+                    # concurrent append that must survive.
+                    if (
+                        idx not in keyed_positions
+                        and idx < len(conversation.messages)
+                        and _same_message(stored, conversation.messages[idx])
+                    ):
+                        continue
+                    messages.append(stored)
+            merged = replace(
+                conversation, messages=messages, version=existing.version + 1,
+            )
         if conversation.id in self._conversations:
             self._order.remove(conversation.id)
-        self._conversations[conversation.id] = conversation
+        self._conversations[conversation.id] = merged
         self._order.append(conversation.id)
 
     async def latest_for_character(
@@ -33,7 +99,7 @@ class InMemoryConversationRepository(ConversationRepositoryPort):
                 continue
             if source is not None and conversation.source != source:
                 continue
-            return conversation
+            return self._stamp_read(conversation)
         return None
 
     async def recent_messages_for_character(
@@ -62,6 +128,59 @@ class InMemoryConversationRepository(ConversationRepositoryPort):
             for conversation in self._conversations.values()
             if conversation.character_id == character_id
             for msg in conversation.messages
+        )
+
+    async def append_messages(
+        self,
+        conversation_id: str,
+        *,
+        expected_next_position: int,
+        messages: list[Message],
+        idempotency_key: str | None = None,
+    ) -> AppendResult:
+        """Same CAS semantics as the SA twin: position-checked tail append,
+        never a whole-conversation replace. ``idempotency_key`` mirrors the SA
+        unique-index behaviour: a repeat keyed append adopts the existing row
+        (B1)."""
+        if not messages:
+            return AppendResult(ok=True, conflict=False)
+        conversation = self._conversations.get(conversation_id)
+        if conversation is None:
+            return AppendResult(ok=False, conflict=True)
+        if idempotency_key is not None:
+            existing = self._idempotency.get(conversation_id, {}).get(
+                idempotency_key,
+            )
+            if existing is not None:
+                row_id, position = existing
+                return AppendResult(
+                    ok=True, conflict=False,
+                    row_ids=(row_id,), positions=(position,),
+                )
+        next_position = len(conversation.messages)
+        if next_position != expected_next_position:
+            return AppendResult(ok=False, conflict=True)
+        updated = conversation
+        row_ids: list[int] = []
+        positions: list[int] = []
+        for offset, msg in enumerate(messages):
+            updated = updated.append(msg)
+            self._row_seq += 1
+            row_ids.append(self._row_seq)
+            positions.append(next_position + offset)
+        # B3: bump the stored version so a concurrent whole-conversation
+        # ``save()`` loaded before this append detects the mismatch and merges.
+        updated = replace(updated, version=conversation.version + 1)
+        self._conversations[conversation_id] = updated
+        if idempotency_key is not None:
+            self._idempotency.setdefault(conversation_id, {})[idempotency_key] = (
+                row_ids[0], positions[0],
+            )
+        return AppendResult(
+            ok=True,
+            conflict=False,
+            row_ids=tuple(row_ids),
+            positions=tuple(positions),
         )
 
     async def delete_for_character(self, character_id: str) -> int:

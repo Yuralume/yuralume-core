@@ -25,6 +25,12 @@ from kokoro_link.api.routes.admin_app_settings import (
 from kokoro_link.api.routes.admin_characters import (
     router as admin_characters_router,
 )
+from kokoro_link.api.routes.background_jobs_admin import (
+    router as background_jobs_admin_router,
+)
+from kokoro_link.api.routes.execution_mode_admin import (
+    router as execution_mode_admin_router,
+)
 from kokoro_link.api.routes.character_relationships import (
     router as character_relationships_router,
 )
@@ -32,6 +38,9 @@ from kokoro_link.api.routes.characters import router as character_router
 from kokoro_link.api.routes.character_cards import router as character_cards_router
 from kokoro_link.api.routes.chat_assist import router as chat_assist_router
 from kokoro_link.api.routes.chat import router as chat_router
+from kokoro_link.api.routes.auth_locale import router as auth_locale_router
+from kokoro_link.api.routes.cloud_credits import router as cloud_credits_router
+from kokoro_link.api.routes.geo import router as geo_router
 from kokoro_link.api.routes.events import router as events_router
 from kokoro_link.api.routes.feed import router as feed_router
 from kokoro_link.api.routes.fusion_story import router as fusion_story_router
@@ -41,8 +50,15 @@ from kokoro_link.api.routes.studio_material import (
 )
 from kokoro_link.api.routes.goals import router as goal_router
 from kokoro_link.api.routes.health import router as health_router
+from kokoro_link.api.routes.external_chat import (
+    register_external_chat_exception_handlers,
+    router as external_chat_router,
+)
 from kokoro_link.api.routes.internal_cloud import (
     router as internal_cloud_router,
+)
+from kokoro_link.api.routes.internal_metrics import (
+    router as internal_metrics_router,
 )
 from kokoro_link.api.routes.memoir import router as memoir_router
 from kokoro_link.api.routes.memory import router as memory_admin_router
@@ -74,22 +90,21 @@ from kokoro_link.api.routes.ui import router as ui_router
 from kokoro_link.api.routes.usage import router as usage_router
 from kokoro_link.api.routes.version import router as version_router
 from kokoro_link.api.routes.world_events import router as world_events_router
-from kokoro_link.application.services.bootstrap_admin_seed import (
-    seed_bootstrap_admin,
-)
-from kokoro_link.application.services.default_locale_seed import (
-    seed_default_locale,
-)
-from kokoro_link.application.services.preference_validator import (
-    ModelPreferenceValidator,
-)
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessLocked,
 )
 from kokoro_link.bootstrap.container import build_container
+from kokoro_link.bootstrap.process_roles import matrix_for_role
+from kokoro_link.bootstrap.runtime_config_wiring import (
+    build_runtime_config_refresher,
+)
+from kokoro_link.bootstrap.site_settings_refresh import (
+    build_site_settings_refresher,
+)
 from kokoro_link.bootstrap.settings import AppSettings
+from kokoro_link.bootstrap.startup_seed_lock import startup_seed_lock
+from kokoro_link.bootstrap.startup_seeds import run_startup_seeds
 from kokoro_link.infrastructure.provider_settings.runtime_sync import (
-    seed_legacy_provider_connections,
     sync_provider_connections,
 )
 from kokoro_link.infrastructure.build_info import get_build_info
@@ -157,12 +172,17 @@ def _log_prompt_pack_overlay_status() -> None:
     )
 
 
-def create_app() -> FastAPI:
+def create_app(settings: AppSettings | None = None) -> FastAPI:
     _configure_logging()
-    settings = AppSettings.from_env()
+    settings = settings or AppSettings.from_env()
     build_info = get_build_info()
     _log_prompt_pack_overlay_status()
     container = build_container(settings)
+    # Process-role component matrix (HOSTED_CORE_SCALING §2.1). Drives which
+    # routers are registered below and which schedulers/connectors the
+    # lifespan starts. Default role = all → historical single-container
+    # behaviour.
+    matrix = matrix_for_role(settings.process.role)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -174,122 +194,61 @@ def create_app() -> FastAPI:
         telegram_polling = container.telegram_polling_service
         discord_gateway = container.discord_gateway_service
         whatsapp_gateway = container.whatsapp_gateway_service
-        rss_source_sync = container.rss_source_sync_service
+        # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). Both are None
+        # unless YURALUME_BACKGROUND_SHADOW=postgres on a scheduler-owning role.
+        shadow_coordinator = container.background_shadow_coordinator
+        shadow_worker = container.background_shadow_worker
+        # Phase 4 realtime outbox dispatcher (§7.1). Set only on the api reader
+        # role under YURALUME_REALTIME_BACKEND=postgres; ``None`` everywhere else
+        # (memory default / background writer / bare container), so the start /
+        # stop below is a natural no-op off the postgres backend.
+        realtime_dispatcher = getattr(container, "realtime_dispatcher", None)
 
-        # Reset any model preferences that point at providers / model
-        # ids no longer registered (operator changed env, removed an
-        # adapter, unloaded a model in LM Studio…). Without this the
-        # DB pref keeps shadowing env and the only way back is editing
-        # the picker by hand or running SQL.
-        await seed_legacy_provider_connections(container, settings)
-        await sync_provider_connections(container)
-
-        # Site-level runtime settings (Weather/Calendar/GeoIP/NSFW/world-event
-        # policy): first-boot seed env → app_runtime_settings when a group's
-        # DB row is absent, then DB is authoritative. The Weather/Calendar
-        # providers were already wired from the DB-overlaid settings at
-        # container build; here we also seed so the Admin「站點設定」page has
-        # rows to edit (CORE_ENV_TO_ADMIN_CONFIG track 2).
-        if container.runtime_settings_repository is not None:
-            from kokoro_link.application.services.app_runtime_settings_service import (
-                AppRuntimeSettingsService,
-            )
-            from kokoro_link.bootstrap.app_runtime_settings_seed import (
-                seed_app_runtime_settings,
-            )
-            await seed_app_runtime_settings(
-                AppRuntimeSettingsService(container.runtime_settings_repository),
-                settings,
-            )
-
-        # First-run admin bootstrap from BOOTSTRAP_ADMIN_* env vars.
-        # No-op once the default user has credentials, so safe to leave
-        # in long-running deployments. Independent of auth.enabled — a
-        # deployment can pre-seed credentials before flipping the auth
-        # switch on.
-        if container.auth_service is not None:
-            try:
-                await seed_bootstrap_admin(
-                    container.auth_service,
-                    email=settings.auth.bootstrap_admin_email,
-                    password=settings.auth.bootstrap_admin_password,
+        # Boot-time seed/sync batch, serialised across processes by a
+        # PostgreSQL advisory lock. Seven Hosted processes come up at once and
+        # every one of them runs these unlocked read-then-write upserts against
+        # the same database; the lock turns that into a queue. Timing out means
+        # we seed anyway (exactly the pre-lock behaviour), never that a
+        # deployment silently skipped its seeds. Non-PostgreSQL takes no lock.
+        async with startup_seed_lock(container.db_engine) as seed_lock_held:
+            if not seed_lock_held:
+                _LOGGER.debug(
+                    "startup seeds running without the advisory lock "
+                    "(single-process dialect or lock wait timed out)",
                 )
-            except Exception as exc:  # belt-and-braces; seed is itself fail-soft
-                print(f"[lifespan] bootstrap_admin_seed failed: {exc!r}")
+            await run_startup_seeds(container, settings)
 
-        # Deploy-time default UI/content language + timezone for the
-        # single-user default operator (USER_PRIMARY_LANGUAGE / USER_TIMEZONE,
-        # written by the self-host installer). Applies only while the default
-        # row is unconfigured (no password); a real /auth/setup locks both.
-        # Skipped in cloud mode, where identity + prefs are federated, not
-        # seeded onto a local default row.
-        operator_repo = getattr(container, "operator_profile_repository", None)
-        if operator_repo is not None and not getattr(
-            settings.cloud, "active", False,
-        ):
-            try:
-                await seed_default_locale(
-                    operator_repo,
-                    language=settings.default_primary_language,
-                    timezone_id=settings.user_timezone.default_timezone_id,
-                )
-            except Exception as exc:  # belt-and-braces; seed is itself fail-soft
-                print(f"[lifespan] default_locale_seed failed: {exc!r}")
-
-        pref_validator = ModelPreferenceValidator(
-            registry=container.model_registry,
-            preferences=container.preferences_repository,
-            default_provider_id=settings.default_provider_id,
+        # Cross-process runtime-config refresher (provider hot-reload). Built on
+        # PostgreSQL only, in EVERY role: a coordinator/worker/connector serves
+        # no admin route, so before this it could never learn that an operator
+        # disabled a leaked key and kept using it until restarted. ``None`` on
+        # SQLite / no database, where one process already syncs itself inline.
+        runtime_config_refresher = build_runtime_config_refresher(
+            engine=container.db_engine,
+            database_url=settings.database_url,
+            refresh=lambda: sync_provider_connections(container),
+            poll_interval=settings.process.runtime_config_poll_interval,
         )
-        try:
-            await pref_validator.repair()
-        except Exception as exc:  # fail-soft: never block startup on this
-            print(f"[lifespan] model preference repair failed: {exc!r}")
+        if runtime_config_refresher is not None:
+            await runtime_config_refresher.start()
 
-        if rss_source_sync is not None:
-            try:
-                touched = await rss_source_sync.sync()
-                if touched:
-                    print(f"[lifespan] rss_source_sync touched {touched} rows")
-            except Exception as exc:  # fail-soft: missing yaml etc.
-                print(f"[lifespan] rss_source_sync failed: {exc!r}")
-            # First-boot bridge: deprecated KOKORO_WORLD_EVENT_FEED_* env →
-            # rss_sources table (CORE_ENV_TO_ADMIN_CONFIG track 3). Only
-            # inserts ids not already present, so admin deletions stick.
-            try:
-                from kokoro_link.application.services.rss_source_sync_service import (
-                    EnvFeedSeed,
-                )
-                env_feeds = tuple(
-                    EnvFeedSeed(
-                        source_id=f.source_id,
-                        url=f.url,
-                        topic_tags=f.topic_tags,
-                    )
-                    for f in settings.world_events.feeds
-                )
-                seeded = await rss_source_sync.seed_env_feeds(env_feeds)
-                if seeded:
-                    print(f"[lifespan] world-event env feeds seeded {seeded} rows")
-            except Exception as exc:  # fail-soft
-                print(f"[lifespan] world-event env feed seed failed: {exc!r}")
+        # Same discipline for the second hot config surface: the "real world"
+        # site settings (weather coordinates / calendar region / GeoIP /
+        # world-event policy). Before this, ``build_container`` read them once
+        # and every process kept its own boot snapshot, so an Admin change took
+        # effect on whichever replica served the request and needed a rolling
+        # restart to reach the rest (G0 / plan §0.2 G-2). Built in EVERY role
+        # for the same reason: a coordinator/worker composes prompts with these
+        # facts and serves no admin route.
+        site_settings_refresher = build_site_settings_refresher(
+            engine=container.db_engine,
+            database_url=settings.database_url,
+            reload=getattr(container, "site_settings_reloader", None),
+            poll_interval=settings.process.runtime_config_poll_interval,
+        )
+        if site_settings_refresher is not None:
+            await site_settings_refresher.start()
 
-        # Arc template pack sync — YAML files under
-        # src/kokoro_link/data/arc_templates/ upserted as user_id=NULL
-        # rows in the arc_templates table. Same fail-soft policy: a
-        # crashed sync leaves whatever's in the DB intact rather than
-        # blocking startup.
-        arc_template_pack_sync = container.arc_template_pack_sync_service
-        if arc_template_pack_sync is not None:
-            try:
-                touched = await arc_template_pack_sync.sync()
-                if touched:
-                    print(
-                        f"[lifespan] arc_template_pack_sync upserted "
-                        f"{touched} rows"
-                    )
-            except Exception as exc:  # fail-soft
-                print(f"[lifespan] arc_template_pack_sync failed: {exc!r}")
         # Creator Studio durable jobs (C0): re-drive fusion/branching
         # pipelines the previous shutdown interrupted, so no story or
         # drama stays stuck on a non-terminal status with nothing
@@ -297,7 +256,10 @@ def create_app() -> FastAPI:
         studio_job_recovery = getattr(
             container, "studio_job_recovery_service", None,
         )
-        if studio_job_recovery is not None:
+        # Studio executes as asyncio tasks in *this* API process (process-local
+        # locks), so recovery must run only where the executor lives — the api
+        # / all roles, never background (matrix.run_studio_recovery).
+        if matrix.run_studio_recovery and studio_job_recovery is not None:
             try:
                 report = await studio_job_recovery.recover()
                 if any(report.values()):
@@ -307,38 +269,106 @@ def create_app() -> FastAPI:
                         f"finalized={report.get('finalized', 0)} "
                         f"failed={report.get('failed', 0)} "
                         f"superseded={report.get('superseded', 0)} "
-                        f"pruned={report.get('pruned', 0)}"
+                        f"pruned={report.get('pruned', 0)} "
+                        f"lease_skipped={report.get('lease_skipped', 0)}"
                     )
             except Exception as exc:  # fail-soft
                 print(f"[lifespan] studio job recovery failed: {exc!r}")
 
-        if proactive is not None:
-            await proactive.start()
-        if world_event_scheduler is not None:
-            await world_event_scheduler.start()
-        if telegram_polling is not None:
-            await telegram_polling.start()
-        if discord_gateway is not None:
-            await discord_gateway.start()
-        if whatsapp_gateway is not None:
-            await whatsapp_gateway.start()
+        # Role-gated startup: character/world-event schedulers and messaging
+        # connectors run only where the matrix allows (HOSTED_CORE_SCALING
+        # §2.1). The api role starts neither (background owns them); the all
+        # role starts both. Shutdown mirrors exactly — only stop what started.
+        if matrix.start_schedulers:
+            if proactive is not None:
+                await proactive.start()
+            if world_event_scheduler is not None:
+                await world_event_scheduler.start()
+        # §2.1 dedicated roles: the durable coordinator/worker loops are gated
+        # independently of the embedded scheduler. ``all`` / ``background`` set
+        # both flags (they ride together, as before); the dedicated
+        # ``coordinator`` / ``worker`` roles start exactly one loop in a process
+        # that starts no embedded scheduler at all.
+        if matrix.run_background_coordinator and shadow_coordinator is not None:
+            await shadow_coordinator.start()
+        if matrix.run_background_worker and shadow_worker is not None:
+            await shadow_worker.start()
+        if matrix.start_connectors:
+            if telegram_polling is not None:
+                await telegram_polling.start()
+            if discord_gateway is not None:
+                await discord_gateway.start()
+            if whatsapp_gateway is not None:
+                await whatsapp_gateway.start()
+        # Realtime outbox dispatcher: independent of the scheduler/connector
+        # gates (it runs on the api role, which starts neither) — the None guard
+        # is the only gate needed. Priming its cursor at the current tail means a
+        # fresh replica forwards only events appended after it came up.
+        if realtime_dispatcher is not None:
+            await realtime_dispatcher.start()
         try:
             yield
         finally:
-            if whatsapp_gateway is not None:
-                await whatsapp_gateway.stop()
-            if discord_gateway is not None:
-                await discord_gateway.stop()
-            if telegram_polling is not None:
-                await telegram_polling.stop()
-            if world_event_scheduler is not None:
-                await world_event_scheduler.stop()
-            if proactive is not None:
-                await proactive.stop()
+            # Stop the LISTEN/poll-driven components first so their loops unwind
+            # before the shared engine's pool is disposed below.
+            if runtime_config_refresher is not None:
+                try:
+                    await runtime_config_refresher.stop()
+                except Exception as exc:  # fail-soft: never mask a clean shutdown
+                    print(
+                        "[lifespan] runtime config refresher stop failed: "
+                        f"{exc!r}"
+                    )
+            if site_settings_refresher is not None:
+                try:
+                    await site_settings_refresher.stop()
+                except Exception as exc:  # fail-soft: never mask a clean shutdown
+                    print(
+                        "[lifespan] site settings refresher stop failed: "
+                        f"{exc!r}"
+                    )
+            if realtime_dispatcher is not None:
+                try:
+                    await realtime_dispatcher.stop()
+                except Exception as exc:  # fail-soft: never mask a clean shutdown
+                    print(f"[lifespan] realtime dispatcher stop failed: {exc!r}")
+            if matrix.start_connectors:
+                if whatsapp_gateway is not None:
+                    await whatsapp_gateway.stop()
+                if discord_gateway is not None:
+                    await discord_gateway.stop()
+                if telegram_polling is not None:
+                    await telegram_polling.stop()
+            # Mirror startup order in reverse: durable worker/coordinator loops
+            # first (each gated on the same flag it started under), then the
+            # embedded schedulers.
+            if matrix.run_background_worker and shadow_worker is not None:
+                await shadow_worker.stop()
+            if matrix.run_background_coordinator and shadow_coordinator is not None:
+                await shadow_coordinator.stop()
+            if matrix.start_schedulers:
+                if world_event_scheduler is not None:
+                    await world_event_scheduler.stop()
+                if proactive is not None:
+                    await proactive.stop()
+            # HOSTED_CORE_SCALING §9.1 — dispose the single shared async
+            # engine (releases its connection pool) once, in every process
+            # role. Fail-soft so a dispose error never masks a clean
+            # shutdown; ``None`` on in-memory builds is a no-op.
+            if container.db_engine is not None:
+                try:
+                    await container.db_engine.dispose()
+                except Exception as exc:  # fail-soft
+                    print(f"[lifespan] db_engine dispose failed: {exc!r}")
 
     app = FastAPI(title="Yuralume", version=build_info.version, lifespan=lifespan)
     app.state.container = container
     app.state.settings = settings
+    # Stash the process-role component matrix so the /health probe can be
+    # scheduler-liveness-aware: a role that starts schedulers (all/background)
+    # must 503 when its scheduler task has died, while api / bare-container /
+    # never-started shapes stay 200 (see api/routes/health.py).
+    app.state.matrix = matrix
 
     # CharacterNotOwned → 404 (deliberately same as "not found" to
     # prevent cross-user enumeration). Service layer raises this from
@@ -366,6 +396,27 @@ def create_app() -> FastAPI:
             },
         )
 
+    # M11: external-chat internal routes answer credential-gate (401/503) and
+    # request-validation (422) failures with the same ErrorEnvelope as their
+    # other errors. The validation handler is a no-op for every non-external-chat
+    # path (forwarded to FastAPI's default), so global behaviour is unchanged.
+    register_external_chat_exception_handlers(app)
+
+    # Health probe is served in every process role (background exposes only a
+    # loopback health/metrics surface — no public API, SPA, SSE, or uploads).
+    app.include_router(health_router)
+    # Internal Prometheus scrape endpoint (§12 / Phase 0). Registered in every
+    # role whose matrix sets ``serve_metrics_route`` — including background, so
+    # the singleton scheduler's tick timings are observable — BEFORE the
+    # background early return. Own per-channel bearer token (not the operator
+    # JWT), kept off the /api/v1 operator surface.
+    if matrix.serve_metrics_route:
+        app.include_router(internal_metrics_router, prefix="/api/internal/v1")
+    if not matrix.serve_api_routes:
+        # background role: schedulers/connectors run headless; nothing else is
+        # mounted, so a representative /api/v1 route 404s by construction.
+        return app
+
     # Serve Vue build assets if available, otherwise legacy static
     assets_dir = DIST_DIR / "assets" if DIST_DIR.exists() else LEGACY_STATIC_DIR
     app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
@@ -388,7 +439,6 @@ def create_app() -> FastAPI:
     # a token, /health is a probe, static files are CDN-style).
     _auth_dep = [Depends(get_current_user)]
 
-    app.include_router(health_router)
     app.include_router(public_objects_router)
     app.include_router(version_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
@@ -397,6 +447,17 @@ def create_app() -> FastAPI:
     app.include_router(character_relationships_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(chat_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(chat_assist_router, prefix="/api/v1", dependencies=_auth_dep)
+    # Cloud-only player surfaces (U3 credit badge). Mounted unconditionally —
+    # the handlers 404 outside cloud mode, matching /auth/cloud/session — so the
+    # self-host route inventory is unchanged.
+    app.include_router(cloud_credits_router, prefix="/api/v1", dependencies=_auth_dep)
+    # G2 hosted locale lifecycle + city search. Same unconditional mount /
+    # in-handler 404: self-host's route inventory is unchanged, and both
+    # already carry their own per-handler bearer dependency (the locale
+    # router lives under the /auth prefix, which is exempt from the blanket
+    # dependency for the public login endpoints' sake).
+    app.include_router(auth_locale_router, prefix="/api/v1")
+    app.include_router(geo_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(events_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(goal_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(schedule_router, prefix="/api/v1", dependencies=_auth_dep)
@@ -415,6 +476,22 @@ def create_app() -> FastAPI:
     app.include_router(admin_providers_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_app_settings_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_characters_router, prefix="/api/v1", dependencies=_auth_dep)
+    # Background-jobs admin diagnostics (P2-B). Registered ONLY when the shadow
+    # queue is on (``YURALUME_BACKGROUND_SHADOW=postgres``) so shadow-off
+    # deployments keep the exact pre-Phase-2 surface (these paths 404, not a new
+    # 200/503 degrade shape). With shadow on, M6 builds the queue port in every
+    # api-serving role, so the routes return real data on api and all alike.
+    if settings.process.background_shadow == "postgres":
+        app.include_router(background_jobs_admin_router, prefix="/api/v1", dependencies=_auth_dep)
+    # Execution-mode admin (P3-B, §11/§15). Registered when the ownership port
+    # COULD be wired — either the shadow queue is on OR the process opted into
+    # the postgres background backend — so a distributed rollout can flip the
+    # mutual-exclusion mode. Off both → the paths 404/405 exactly like before.
+    if (
+        settings.process.background_shadow == "postgres"
+        or settings.process.background_backend == "postgres"
+    ):
+        app.include_router(execution_mode_admin_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(tools_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(story_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(story_arc_router, prefix="/api/v1", dependencies=_auth_dep)
@@ -442,6 +519,12 @@ def create_app() -> FastAPI:
     # bearer token checked inside the router (``KOKORO_CLOUD_INTERNAL_TOKENS``,
     # fail-closed). Mounted under /api/internal/v1 to keep it off the
     # operator-facing /api/v1 surface.
-    app.include_router(internal_cloud_router, prefix="/api/internal/v1")
+    # Phase 4 (§7.1) retired the §7.0 internal realtime relay consumer: the
+    # background→api bridge is now the durable PostgreSQL outbox tailed by the
+    # api-side RealtimeEventDispatcher (started in the lifespan), so there is no
+    # HTTP relay route to mount.
+    if matrix.serve_cloud_internal_routes:
+        app.include_router(internal_cloud_router, prefix="/api/internal/v1")
+        app.include_router(external_chat_router, prefix="/api/internal/v1")
     app.include_router(ui_router)
     return app

@@ -13,6 +13,12 @@ Rules we nail down here:
 - second call after cooldown → fires again
 - concurrent calls for the same character → only one runs
 - consolidation exceptions don't bubble up
+
+Cooldown and single-flight are decided by ``claim_consolidation_slot`` on the
+character repository (an atomic conditional UPDATE in production), so these
+tests drive the real ``InMemoryCharacterRepository`` with an injected clock
+rather than a trigger-local timestamp dict. Cross-replica behaviour lives in
+``test_auto_consolidation_cross_replica``.
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ import pytest
 
 from kokoro_link.application.services.auto_consolidation_trigger import (
     AutoConsolidationTrigger,
+)
+from kokoro_link.infrastructure.repositories.in_memory_characters import (
+    InMemoryCharacterRepository,
 )
 
 
@@ -97,9 +106,9 @@ def _make_trigger(
     trigger = AutoConsolidationTrigger(
         memory_repository=repo,  # type: ignore[arg-type]
         consolidation_service=service,  # type: ignore[arg-type]
+        character_repository=InMemoryCharacterRepository(clock=clock),
         threshold=threshold,
         cooldown=timedelta(hours=cooldown_hours),
-        clock=clock,
     )
     return trigger, service, clock
 

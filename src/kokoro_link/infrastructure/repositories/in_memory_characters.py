@@ -1,15 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.domain.entities.character import Character
 
 
 class InMemoryCharacterRepository(CharacterRepositoryPort):
-    def __init__(self) -> None:
+    def __init__(
+        self, *, clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._characters: dict[str, Character] = {}
+        # Consolidation claim ledger — the in-process twin of the
+        # ``characters.last_consolidated_at`` column. Kept beside the entities
+        # rather than on them because it is a dedicated control field the
+        # aggregate ``save()`` must never write (same rule as the SA adapter).
+        self._consolidation_claims: dict[str, datetime] = {}
+        # Injectable so cooldown tests can travel in time; the SA adapter's
+        # equivalent authority is the DB clock.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    async def claim_consolidation_slot(
+        self, character_id: str, *, cooldown: timedelta,
+    ) -> bool:
+        """Single-process twin of the conditional UPDATE.
+
+        Deliberately independent of whether the character was ever ``save``d:
+        this adapter backs no-DB runs and lease-less test rigs, where the
+        historical gate was a bare per-process dict with no row behind it, so
+        requiring one would change behaviour rather than preserve it."""
+        now = self._clock()
+        last = self._consolidation_claims.get(character_id)
+        if last is not None and now - last < cooldown:
+            return False
+        self._consolidation_claims[character_id] = now
+        return True
 
     async def list(self) -> list[Character]:
         return list(self._characters.values())

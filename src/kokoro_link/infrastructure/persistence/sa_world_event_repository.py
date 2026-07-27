@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import ColumnElement, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kokoro_link.domain.entities.world_event import WorldEvent
+from kokoro_link.domain.value_objects.region_code import normalise_region
 from kokoro_link.infrastructure.persistence.rss_models import WorldEventRow
 
 
@@ -26,6 +28,7 @@ def _row_to_domain(row: WorldEventRow) -> WorldEvent:
         fetched_at=_ensure_utc(row.fetched_at),
         category=row.category or "news",
         locale=row.locale or None,
+        source_region=row.source_region or None,
         topic_tags=tuple(json.loads(tags_raw)),
         embedding=embedding,
     )
@@ -79,6 +82,7 @@ class SaWorldEventRepository:
             "fetched_at": event.fetched_at,
             "category": event.category or "news",
             "locale": event.locale or None,
+            "source_region": event.source_region or None,
             "topic_tags": json.dumps(list(event.topic_tags), ensure_ascii=False),
             "embedding": event.embedding,
         }
@@ -91,6 +95,7 @@ class SaWorldEventRepository:
                     "summary": stmt.excluded.summary,
                     "category": stmt.excluded.category,
                     "locale": stmt.excluded.locale,
+                    "source_region": stmt.excluded.source_region,
                     "topic_tags": stmt.excluded.topic_tags,
                     "embedding": stmt.excluded.embedding,
                     "fetched_at": stmt.excluded.fetched_at,
@@ -123,12 +128,47 @@ class SaWorldEventRepository:
             )).scalar_one_or_none()
             return row is not None
 
+    async def sync_source_region(
+        self, *, urls: Sequence[str], source_region: str | None,
+    ) -> int:
+        targets = list(dict.fromkeys(urls))
+        if not targets:
+            return 0
+        return await self._set_source_region(
+            WorldEventRow.url.in_(targets), source_region,
+        )
+
+    async def retag_source_region(
+        self, *, source_name: str, source_region: str | None,
+    ) -> int:
+        return await self._set_source_region(
+            WorldEventRow.source == source_name, source_region,
+        )
+
+    async def _set_source_region(
+        self, predicate: ColumnElement[bool], source_region: str | None,
+    ) -> int:
+        region = normalise_region(source_region)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(WorldEventRow)
+                .where(predicate)
+                # ``IS DISTINCT FROM`` keeps the common case (nothing to fix,
+                # every pass over a live feed) a no-op write instead of
+                # rewriting the whole batch's rows on every ingest tick.
+                .where(WorldEventRow.source_region.is_distinct_from(region))
+                .values(source_region=region)
+            )
+            await session.commit()
+            return result.rowcount or 0
+
     async def list_with_embeddings_in_window(
         self,
         *,
         since: datetime,
         categories: list[str] | None = None,
         limit: int = 500,
+        operator_region: str | None = None,
     ) -> list[WorldEvent]:
         async with self._session_factory() as session:
             stmt = (
@@ -142,6 +182,17 @@ class SaWorldEventRepository:
                 normalised = [c.strip().lower() for c in categories if c.strip()]
                 if normalised:
                     stmt = stmt.where(WorldEventRow.category.in_(normalised))
+            region = normalise_region(operator_region)
+            if region is not None:
+                # Region narrowing runs in SQL, before ``limit``: filtering
+                # the fetched page in Python would let a busy neighbouring
+                # region push every eligible event past the window.
+                stmt = stmt.where(
+                    or_(
+                        WorldEventRow.source_region.is_(None),
+                        WorldEventRow.source_region == region,
+                    )
+                )
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_domain(r) for r in rows]
 

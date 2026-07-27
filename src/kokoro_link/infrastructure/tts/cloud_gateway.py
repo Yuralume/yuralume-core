@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from uuid import uuid4
 
@@ -11,6 +12,10 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudResourceContext,
 )
 from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfilePort
+from kokoro_link.contracts.generation_trigger import (
+    TRIGGER_HEADER_NAME,
+    generation_trigger_header_value,
+)
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.contracts.tts import (
     TTSError,
@@ -19,6 +24,10 @@ from kokoro_link.contracts.tts import (
     TTSUnavailable,
 )
 from kokoro_link.contracts.tts_catalog import TTSVoice
+from kokoro_link.infrastructure.http_error_logging import log_expected_refusal
+from kokoro_link.infrastructure.llm.cloud_refusal import refusal_from_response
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # Forwarded feature string the upstream/usage ledger sees. Kept as ``tts`` for
@@ -134,6 +143,21 @@ class CloudGatewayTTSAdapter:
         if response.status_code == 404:
             raise TTSUnavailable("cloud TTS voice not found")
         if response.status_code >= 400:
+            # Deliberate control-plane refusal (no credits, entitlement
+            # revoked): keep the typed code on the cause chain so the route
+            # can answer the player rather than a generic 502.
+            refusal = refusal_from_response(response, response.text)
+            if refusal is not None:
+                log_expected_refusal(
+                    _LOGGER,
+                    response,
+                    operation="cloud TTS gateway",
+                    code=refusal.code,
+                    message=refusal.reason,
+                )
+                raise TTSError(
+                    f"cloud TTS gateway refused ({refusal.code})",
+                ) from refusal
             raise TTSError(
                 f"cloud TTS gateway error {response.status_code}: {response.text}",
             )
@@ -169,6 +193,7 @@ class CloudGatewayTTSAdapter:
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": _TTS_FEATURE_KEY,
             "X-Yuralume-Character": identity.character_ref,
+            TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         })
         return headers
 

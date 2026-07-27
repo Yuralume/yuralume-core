@@ -18,6 +18,9 @@ import json
 import logging
 from datetime import datetime, tzinfo
 
+from kokoro_link.application.services.feature_keys import (
+    FEATURE_PROACTIVE_MESSAGE,
+)
 from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
@@ -65,7 +68,11 @@ class LLMProactiveDecider(ProactiveDeciderPort):
         provider: ActiveLLMProviderPort | None = None,
         max_message_chars: int = _MAX_MESSAGE_CHARS,
     ) -> None:
-        self._resolver = ModelResolver(provider=provider, model=model)
+        self._resolver = ModelResolver(
+            provider=provider,
+            model=model,
+            feature_key=FEATURE_PROACTIVE_MESSAGE,
+        )
         self._max_message_chars = max_message_chars
 
     async def decide(self, context: ProactiveContext) -> ProactiveDecision:

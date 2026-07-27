@@ -25,6 +25,10 @@ from kokoro_link.application.dto.chat import SendChatMessageRequest
 from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
+from kokoro_link.contracts.generation_trigger import (
+    GenerationTrigger,
+    current_generation_trigger,
+)
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEMO_ACCOUNT_RUNTIME_PROFILE,
@@ -219,6 +223,22 @@ async def test_plain_text_reply_skips_tool_cycle() -> None:
     assert response.assistant_message.attachments == []
     assert len(model.calls) == 1
     assert await invocations.list_for_character(character_id) == []
+
+
+@pytest.mark.asyncio
+async def test_chat_fire_and_forget_task_binds_background_provenance() -> None:
+    chat, _chars, _model, _invocations = _build_chat_service(
+        replies=["unused"],
+    )
+    observed: list[GenerationTrigger] = []
+
+    async def capture() -> None:
+        observed.append(current_generation_trigger())
+
+    chat._schedule_background(capture())
+    await chat.wait_for_pending()
+
+    assert observed == [GenerationTrigger.BACKGROUND]
 
 
 @pytest.mark.asyncio
@@ -708,10 +728,6 @@ async def test_chat_turn_blocks_repeated_generate_image_tool_calls() -> None:
         replies=[
             '```json\n{"tool": "generate_image", "args": '
             '{"positive": "first portrait"}}\n```',
-            '```json\n{"tool": "generate_image", "args": '
-            '{"positive": "second portrait"}}\n```',
-            '```json\n{"tool": "generate_image", "args": '
-            '{"positive": "third portrait"}}\n```',
             "我只傳這一張給你。",
         ],
     )
@@ -729,7 +745,36 @@ async def test_chat_turn_blocks_repeated_generate_image_tool_calls() -> None:
     assert image_tool.last_positive == "first portrait"
     assert len(response.assistant_message.attachments) == 1
     assert response.assistant_message.content == "我只傳這一張給你。"
-    assert len(model.calls) == 4
+    assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_image_final_hop_tool_json_uses_success_fallback_without_third_hop() -> None:
+    chat, chars, model, image_tool = _build_forced_trigger_service(
+        replies=[
+            'json {"tool": "generate_image", "args": '
+            '{"positive": "first portrait"}}',
+            'json {"tool": "generate_image", "args": '
+            '{"positive": "duplicate portrait"}}',
+            "第三輪不應被呼叫",
+        ],
+    )
+    character_id = await _seed_trigger_character(
+        chars,
+        allowed_tools=["generate_image"],
+    )
+
+    response = await chat.send_message(SendChatMessageRequest(
+        character_id=character_id,
+        message="傳一張你現在的照片給我",
+    ))
+
+    assert image_tool.invoke_count == 1
+    assert len(model.calls) == 2
+    assert len(response.assistant_message.attachments) == 1
+    assert response.assistant_message.attachments[0].url == "/uploads/stub/forced.png"
+    assert "圖片已經傳好了" in response.assistant_message.content
+    assert "generate_image" not in response.assistant_message.content
 
 
 @pytest.mark.asyncio

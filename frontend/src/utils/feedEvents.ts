@@ -19,6 +19,7 @@
  */
 
 import { getStoredToken } from '@/composables/useAuth'
+import { createEventStreamDedup } from '@/utils/eventStreamDedup'
 
 export interface FeedPostEvent {
   type: 'feed_post'
@@ -61,8 +62,14 @@ export function connectFeedEvents(
     ? `/api/v1/events/stream?access_token=${encodeURIComponent(token)}`
     : '/api/v1/events/stream'
   const source = new EventSource(url)
+  // One dedup across both event names on this connection — ids come from a
+  // single outbox sequence, so they never collide. Held in the closure so it
+  // survives auto-reconnects, where the Last-Event-ID replay re-emits confirmed
+  // ids (a ``feed_post`` re-count would otherwise double the unread badge).
+  const shouldProcess = createEventStreamDedup()
 
   source.addEventListener('feed_post', (ev: MessageEvent) => {
+    if (!shouldProcess(ev.lastEventId)) return
     try {
       const payload = JSON.parse(ev.data) as FeedPostEvent
       onEvent(payload)
@@ -74,6 +81,7 @@ export function connectFeedEvents(
   if (options.onCommentReply) {
     const handler = options.onCommentReply
     source.addEventListener('feed_comment_reply', (ev: MessageEvent) => {
+      if (!shouldProcess(ev.lastEventId)) return
       try {
         const payload = JSON.parse(ev.data) as FeedCommentReplyEvent
         handler(payload)

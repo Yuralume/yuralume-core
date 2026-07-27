@@ -12,6 +12,8 @@ export interface WorldEventFeed {
   feed_url: string
   category: string
   locale: string
+  /** Content region (TW / JP …). null = global source, curated for every player. */
+  region: string | null
   enabled: boolean
   health_status: string
   last_success_at: string | null
@@ -33,8 +35,17 @@ export interface FeedCreatePayload {
   feed_url: string
   category?: string
   locale?: string
+  region?: string
   enabled?: boolean
 }
+
+/**
+ * Partial feed update. Omitting a field keeps its current value; passing an
+ * empty string for `region` is the explicit "back to global" clear.
+ */
+export type FeedUpdatePayload = Partial<
+  Pick<WorldEventFeed, 'name' | 'feed_url' | 'category' | 'locale' | 'enabled'>
+> & { region?: string }
 
 export async function listWorldEventFeeds(): Promise<WorldEventFeedList> {
   const { data } = await axios.get<WorldEventFeedList>(
@@ -55,7 +66,7 @@ export async function createWorldEventFeed(
 
 export async function updateWorldEventFeed(
   id: string,
-  patch: Partial<Pick<WorldEventFeed, 'name' | 'feed_url' | 'category' | 'locale' | 'enabled'>>,
+  patch: FeedUpdatePayload,
 ): Promise<WorldEventFeed> {
   const { data } = await axios.patch<WorldEventFeed>(
     `/api/v1/admin/world-events/sources/${encodeURIComponent(id)}`,

@@ -21,12 +21,25 @@ from kokoro_link.application.services.feature_key_manifest import (
     build_feature_key_manifest,
 )
 from kokoro_link.application.services.feature_keys import (
+    FEATURE_GROUP_DESCRIPTIONS,
+    FEATURE_GROUP_LABELS,
+    FEATURE_GROUP_MEMBERS,
     GLOBAL_FEATURE_KEYS,
     IMAGE_FEATURE_KEYS,
+    LLM_FEATURE_GROUP_KEYS,
     VIDEO_FEATURE_KEYS,
 )
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_SIBLING_CLOUD_ROOT = _WORKSPACE_ROOT / "yuralume-cloud"
+_REPO_ROOT = (
+    _SIBLING_CLOUD_ROOT
+    if (
+        (_SIBLING_CLOUD_ROOT / "services" / "user").is_dir()
+        and (_SIBLING_CLOUD_ROOT / "admin-console").is_dir()
+    )
+    else _WORKSPACE_ROOT
+)
 _CANONICAL = _REPO_ROOT / "contracts" / "feature-key-manifest.json"
 _USER_COPY = (
     _REPO_ROOT
@@ -82,7 +95,12 @@ def test_on_disk_copies_agree() -> None:
 
 def test_artifact_is_valid_json_with_expected_shape() -> None:
     data = json.loads(_CANONICAL.read_text(encoding="utf-8"))
-    assert set(data) == {"manifest_version", "content_hash", "capabilities"}
+    assert set(data) == {
+        "manifest_version",
+        "content_hash",
+        "capabilities",
+        "groups",
+    }
     assert data["manifest_version"] == 1
     assert set(data["capabilities"]) == {
         CAPABILITY_LLM,
@@ -90,3 +108,45 @@ def test_artifact_is_valid_json_with_expected_shape() -> None:
         CAPABILITY_VIDEO,
         CAPABILITY_TTS,
     }
+    # Only the llm capability carries routing groups today.
+    assert set(data["groups"]) == {CAPABILITY_LLM}
+
+
+def test_groups_cover_declared_llm_group_keys_in_order() -> None:
+    manifest = build_feature_key_manifest()
+    assert manifest.group_keys_for(CAPABILITY_LLM) == LLM_FEATURE_GROUP_KEYS
+    # Capabilities without groups do not appear in the groups map.
+    assert manifest.group_keys_for(CAPABILITY_IMAGE) == ()
+    assert manifest.group_keys_for(CAPABILITY_VIDEO) == ()
+    assert manifest.group_keys_for(CAPABILITY_TTS) == ()
+
+
+def test_each_group_is_labelled_described_and_scoped_to_llm_keys() -> None:
+    manifest = build_feature_key_manifest()
+    llm_keys = set(manifest.feature_keys_for(CAPABILITY_LLM))
+    for group in manifest.groups[CAPABILITY_LLM]:
+        assert group.label == FEATURE_GROUP_LABELS[group.key]
+        assert group.label.strip()
+        assert group.description == FEATURE_GROUP_DESCRIPTIONS[group.key]
+        assert group.description.strip()
+        assert group.members, f"group {group.key} has no members"
+        assert set(group.members) <= llm_keys
+        # Members preserve the curated declaration order (dedup, no sort).
+        assert group.members == tuple(
+            dict.fromkeys(FEATURE_GROUP_MEMBERS[group.key])
+        )
+        assert manifest.group_members(CAPABILITY_LLM, group.key) == group.members
+
+
+def test_group_keys_are_disjoint_from_feature_keys() -> None:
+    manifest = build_feature_key_manifest()
+    group_keys = set(manifest.group_keys_for(CAPABILITY_LLM))
+    feature_keys = set(manifest.feature_keys_for(CAPABILITY_LLM))
+    # match_kind disambiguation at the routing layer relies on this.
+    assert group_keys.isdisjoint(feature_keys)
+
+
+def test_content_hash_covers_groups() -> None:
+    data = json.loads(_CANONICAL.read_text(encoding="utf-8"))
+    assert "groups" in data
+    assert data["content_hash"] == build_feature_key_manifest().content_hash

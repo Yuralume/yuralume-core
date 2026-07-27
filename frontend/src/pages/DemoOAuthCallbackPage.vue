@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { useAuth } from '@/composables/useAuth'
 import {
   demoSessionErrorCopy,
@@ -8,6 +9,7 @@ import {
 } from '@/utils/demoSessionErrors'
 import { demoUnavailableActions } from '@/utils/demoConversionLinks'
 
+const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const auth = useAuth()
@@ -16,9 +18,10 @@ const loading = ref(true)
 const error = ref<DemoSessionErrorCopy | null>(null)
 
 const provider = computed(() => String(route.params.provider || '').trim())
-const title = computed(() => (
-  loading.value ? 'Starting demo' : error.value ? error.value.title : 'Demo ready'
-))
+const title = computed(() => {
+  if (loading.value) return t('demo.callback.connectingTitle')
+  return error.value ? t(error.value.titleKey) : t('demo.callback.readyTitle')
+})
 
 function callbackRedirectUri(): string {
   return `${window.location.origin}/demo/oauth/${provider.value}/callback`
@@ -37,8 +40,8 @@ onMounted(async () => {
   const code = String(route.query.code || '').trim()
   if (!provider.value || !code) {
     error.value = {
-      title: 'Demo unavailable',
-      message: 'Missing OAuth callback data.',
+      titleKey: 'demo.errors.unavailableTitle',
+      messageKey: 'demo.callback.missingCallbackData',
       actions: demoUnavailableActions(),
     }
     loading.value = false
@@ -67,22 +70,24 @@ onMounted(async () => {
   <main class="demo-oauth-callback">
     <section class="panel">
       <h1>{{ title }}</h1>
-      <p v-if="loading">Connecting your verified account.</p>
-      <p v-else-if="error">{{ error.message }}</p>
-      <p v-else>Redirecting.</p>
+      <p v-if="loading">{{ t('demo.callback.connectingBody') }}</p>
+      <p v-else-if="error">{{ t(error.messageKey) }}</p>
+      <p v-else>{{ t('demo.callback.redirecting') }}</p>
       <div v-if="error" class="actions">
         <a
           v-for="action in error.actions"
-          :key="action.label"
+          :key="action.labelKey"
           class="button"
           :class="`button-${action.variant}`"
           :href="action.href"
           :target="action.external ? '_blank' : undefined"
           :rel="action.external ? 'noopener noreferrer' : undefined"
         >
-          {{ action.label }}
+          {{ t(action.labelKey) }}
         </a>
-        <RouterLink class="button button-ghost" to="/login">Back to login</RouterLink>
+        <RouterLink class="button button-ghost" to="/login">
+          {{ t('demo.actions.backToLogin') }}
+        </RouterLink>
       </div>
     </section>
   </main>

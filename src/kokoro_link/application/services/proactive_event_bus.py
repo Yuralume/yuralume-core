@@ -42,6 +42,13 @@ class ProactiveEvent:
     message: str
     created_at: datetime
     unread_count: int
+    event_id: int | None = None
+    """Durable outbox row id when this event was rehydrated from the Phase 4
+    PostgreSQL outbox (``postgres`` realtime backend). ``None`` on the in-memory
+    backend (self-host red line) — the SSE encoder then emits no ``id:`` line, so
+    the wire output is byte-identical to the historical single-process path. The
+    api-side dispatcher / SSE replay stamp it so a browser's ``Last-Event-ID``
+    can resume from the exact row."""
 
 
 class ProactiveEventBus:

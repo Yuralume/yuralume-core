@@ -266,6 +266,12 @@ class OperatorProfile:
         from new content). ``timezone_id`` is the same class of pinned
         identity setting: changing it later would reinterpret memories,
         schedules, birthdays, daily caps, and date-only history.
+
+        That conservatism still holds for every *incidental* profile
+        save — a login projection or a display-name edit must never
+        move the locale. The one sanctioned exception is the explicit
+        hosted channel :meth:`update_identity_locale`, which a player
+        reaches only through a deliberate, rate-limited cloud route.
         """
         next_aliases: tuple[str, ...]
         if aliases is None:
@@ -322,6 +328,51 @@ class OperatorProfile:
             ),
             auth_provider=(
                 self.auth_provider if auth_provider is None else auth_provider
+            ),
+        )
+
+    def update_identity_locale(
+        self,
+        *,
+        timezone_id: str | None = None,
+        primary_language: str | None = None,
+    ) -> "OperatorProfile":
+        """Explicit, opt-in change of the two pinned identity-locale fields.
+
+        Deliberately a **separate** method rather than two more keywords on
+        :meth:`update`: every incidental save (login projection, display-name
+        edit, location refresh, freeze/tier push) goes through ``update`` and
+        must never be able to move the locale by accident. Callers reach this
+        method only when a player deliberately asked for the change.
+
+        The conservative reasoning behind the original immutability still
+        stands and is *not* revoked: changing either field reinterprets — it
+        does not migrate — existing content. Instants are stored in UTC, so
+        nothing is structurally corrupted (the same premise the one-shot
+        ``cli/repair_user_timezone`` repair tool has always relied on); what
+        moves is rendering and day-boundary interpretation from now on. Old
+        memory prose keeps its original wording and language; the current
+        day's schedule is re-planned once by the schedule service's own
+        staleness self-heal; quiet hours / birthdays / date-only views use
+        the new zone from the next tick.
+
+        Because of that, the hosted channel that calls this wraps it in an
+        explicit confirmation plus a change-rate guardrail
+        (``PlayerLocaleService``). Self-host keeps the old story: no route
+        reaches here, and the repair CLI stays the escape hatch.
+
+        ``None`` means "leave alone" for both parameters, so a caller can
+        change one field without restating the other.
+        """
+        return replace(
+            self,
+            timezone_id=(
+                self.timezone_id if timezone_id is None else timezone_id
+            ),
+            primary_language=(
+                self.primary_language
+                if primary_language is None
+                else primary_language
             ),
         )
 

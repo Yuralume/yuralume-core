@@ -32,11 +32,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
 
+from kokoro_link.application.services.beat_retry_policy import (
+    AUTONOMOUS_SCENE_RETRY_POLICY,
+)
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
 if TYPE_CHECKING:
     from kokoro_link.application.services.story_arc_service import StoryArcService
+    from kokoro_link.domain.entities.story_arc import StoryArcBeat
     from kokoro_link.application.services.story_beat_scene_service import (
         StoryBeatSceneService,
     )
@@ -109,8 +113,18 @@ class BeatDueChecker:
         # the chat path's job — keeping the tick loop arc-only avoids
         # accidentally rolling daily gacha for users who just haven't
         # opened chat yet today.
+        attempted_at = now or datetime.now(timezone.utc)
         try:
-            due = await self._arcs.next_beat_due(character.id, today=today)
+            due = await self._arcs.next_beat_due(
+                character.id,
+                today=today,
+                retry_policy=(
+                    AUTONOMOUS_SCENE_RETRY_POLICY
+                    if self._scene_service is not None
+                    else None
+                ),
+                retry_at=attempted_at,
+            )
         except Exception:
             _LOGGER.exception(
                 "beat-due check: next_beat_due crashed character=%s",
@@ -140,11 +154,37 @@ class BeatDueChecker:
                     should_notify=False,
                     realized_event_id=event.id,
                 )
+            if not await self._scene_attempt_was_recorded(
+                character.id, beat,
+            ):
+                try:
+                    await self._arcs.mark_beat_play_attempted(
+                        beat_id=beat.id,
+                        attempted_at=attempted_at,
+                        source="scene_simulation",
+                        result="failed",
+                        push_intensity="autonomous_scene",
+                    )
+                except Exception:
+                    _LOGGER.exception(
+                        "beat-due check: scene failure record crashed "
+                        "character=%s beat=%s",
+                        character.id,
+                        beat.id,
+                    )
+                    return BeatScanResult.empty()
+            return BeatScanResult(
+                attempted_beat_id=beat.id,
+                should_notify=(
+                    bool(beat.required) and bool(character.proactive_enabled)
+                ),
+                realized_event_id=None,
+            )
 
         try:
             await self._arcs.mark_beat_play_attempted(
                 beat_id=beat.id,
-                attempted_at=now or datetime.now(timezone.utc),
+                attempted_at=attempted_at,
                 source="proactive_tick",
                 result="notification_candidate",
                 push_intensity="proactive_candidate",
@@ -161,6 +201,62 @@ class BeatDueChecker:
             attempted_beat_id=beat.id,
             should_notify=should_notify,
             realized_event_id=None,
+        )
+
+    async def next_due_at(
+        self,
+        character: Character,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        """Precise UTC instant of the character's next FUTURE story beat.
+
+        The distributed ``beat_due`` chain (§ beat_due precision) passes this as
+        ``explicit_next_due`` so a beat scheduled days out does not incur 288
+        pointless 300s rechecks. Returns the operator-local day START of the next
+        pending beat whose ``scheduled_date`` is strictly after today; ``None``
+        when nothing is scheduled ahead (beat due today / no arc) so the chain
+        keeps its base 300s recheck. Fail-soft: any error → ``None`` (fallback).
+        """
+        try:
+            local_tz = await self._resolve_operator_timezone(character)
+            today = await self._today_for_character(character, now)
+            future_date = await self._arcs.next_future_beat_date(
+                character.id, after=today,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "beat-due check: next_due_at crashed character=%s", character.id,
+            )
+            return None
+        if future_date is None:
+            return None
+        local_midnight = datetime(
+            future_date.year, future_date.month, future_date.day,
+            tzinfo=local_tz,
+        )
+        return local_midnight.astimezone(timezone.utc)
+
+    async def _scene_attempt_was_recorded(
+        self,
+        character_id: str,
+        previous: "StoryArcBeat",
+    ) -> bool:
+        try:
+            refreshed = await self._arcs.next_beat_due(
+                character_id,
+                today=previous.scheduled_date,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "beat-due check: failed to verify scene attempt beat=%s",
+                previous.id,
+            )
+            return False
+        if refreshed is None:
+            return True
+        _arc, beat = refreshed
+        return beat.id == previous.id and (
+            beat.play_attempt_count > previous.play_attempt_count
         )
 
     async def _today_for_character(self, character: Character, now: datetime | None):

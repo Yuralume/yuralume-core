@@ -13,6 +13,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type { DailySchedule, ScheduleActivity } from '@/types/schedule'
 import { useTimezone } from '@/composables/useTimezone'
@@ -38,6 +39,7 @@ const props = defineProps<{
 }>()
 
 const { t, locale } = useI18n()
+const { pt } = usePlayerCopy()
 const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 
@@ -140,7 +142,7 @@ watch(timeZone, () => {
 async function handleRegenerate() {
   if (!props.characterId) return
   if (!await confirmDialog({
-    content: t('schedulePanel.confirm.regenerate'),
+    content: pt('schedulePanel.confirm.regenerate'),
   })) return
   regenerating.value = true
   errorMsg.value = null

@@ -80,3 +80,12 @@ class InMemoryCharacterEncounterRepository(CharacterEncounterRepositoryPort):
         for item_id in target:
             del self._items[item_id]
         return len(target)
+
+    async def claim_for_run(
+        self, encounter_id: str, *, now: datetime,
+    ) -> bool:
+        item = self._items.get(encounter_id)
+        if item is None or item.status != "planned":
+            return False
+        self._items[encounter_id] = item.mark_running(at=_as_utc(now))
+        return True

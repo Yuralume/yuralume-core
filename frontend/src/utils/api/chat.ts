@@ -5,6 +5,18 @@ import type {
 } from '@/types/chat'
 import type { Character } from '@/types/character'
 import { authedFetch } from '@/utils/authedFetch'
+import {
+  InsufficientCreditsError,
+  insufficientCreditsFromBody,
+  insufficientCreditsFromStreamFrame,
+} from '@/utils/api/insufficientCredits'
+
+/**
+ * Re-exported so chat call sites can catch every typed chat outcome from one
+ * module. The definition lives in ``insufficientCredits`` because image / TTS
+ * / studio entry points raise the same error.
+ */
+export { InsufficientCreditsError }
 
 export class ChatRuntimeLimitError extends Error {
   code: string
@@ -172,6 +184,12 @@ export async function sendChatMessageStream(
   const decoder = new TextDecoder()
   let buffer = ''
   let finalResponse: ChatReplyResponse | null = null
+  // Terminal ``error`` frames land here rather than throwing from inside
+  // ``processLine``: the reader loop must still drain (and the trailing
+  // ``[DONE]`` still be consumed) before we surface the failure. An array
+  // rather than a nullable local so only the *first* error wins and TypeScript
+  // sees the closure write.
+  const streamErrors: Error[] = []
 
   const processLine = (line: string): void => {
     if (!line.startsWith('data: ')) return
@@ -179,6 +197,22 @@ export async function sendChatMessageStream(
     if (!payload || payload === '[DONE]') return
     try {
       const parsed = JSON.parse(payload)
+      // A refusal after the SSE headers are already on the wire cannot be an
+      // HTTP status, so the backend closes the stream with
+      // ``{"error": {"code": ..., "message": ...}}`` + ``[DONE]``. Handled
+      // before the token/done branches: an error frame never carries either.
+      if (parsed && typeof parsed === 'object' && parsed.error) {
+        if (streamErrors.length === 0) {
+          streamErrors.push(
+            insufficientCreditsFromStreamFrame(parsed)
+            ?? new ChatStreamProtocolError(
+              'stream_error_frame',
+              streamErrorFrameMessage(parsed.error),
+            ),
+          )
+        }
+        return
+      }
       // Backend emits ``{"conversation_id": ...}`` as the first SSE event —
       // surface it to the caller right away so a later network failure
       // still leaves the frontend knowing which conversation to reload.
@@ -213,6 +247,12 @@ export async function sendChatMessageStream(
     for (const line of buffer.split('\n')) processLine(line)
   }
 
+  // A deliberate refusal outranks the generic "no final event" diagnosis —
+  // the stream did end without a response, but we know exactly why.
+  if (streamErrors.length > 0) {
+    throw streamErrors[0]
+  }
+
   if (!finalResponse) {
     throw new ChatStreamProtocolError(
       'stream_ended_without_final_response',
@@ -222,11 +262,24 @@ export async function sendChatMessageStream(
   return finalResponse
 }
 
+function streamErrorFrameMessage(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string' && message) return message
+  }
+  if (typeof error === 'string' && error) return error
+  return 'Stream ended with an error'
+}
+
 async function chatErrorFromResponse(
   response: Response,
   prefix: string,
 ): Promise<Error> {
   const detail = await detailFromResponse(response)
+  // Out of credits (402) — the player can act on this, so it gets the same
+  // typed treatment as the other entitlement outcomes below.
+  const creditsError = insufficientCreditsFromBody({ detail }, response.status)
+  if (creditsError) return creditsError
   if (response.status === 429 && isSessionMessageLimit(detail)) {
     return new ChatRuntimeLimitError({
       code: 'max_messages_per_session',

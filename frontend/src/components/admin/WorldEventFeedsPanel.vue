@@ -26,6 +26,7 @@ const draft = reactive<FeedCreatePayload>({
   feed_url: '',
   category: 'news',
   locale: 'zh-TW',
+  region: '',
   enabled: true,
 })
 
@@ -62,6 +63,7 @@ async function addFeed(): Promise<void> {
     draft.id = ''
     draft.name = ''
     draft.feed_url = ''
+    draft.region = ''
     await load()
   } catch (err) {
     notification.error({
@@ -71,6 +73,28 @@ async function addFeed(): Promise<void> {
     })
   } finally {
     busy.__new = false
+  }
+}
+
+/**
+ * Persist an edited region. An emptied field is sent as `''`, the API's
+ * explicit "back to global" clear — omitting it would mean "keep as is".
+ */
+async function saveRegion(feed: WorldEventFeed, value: string): Promise<void> {
+  const next = value.trim().toUpperCase()
+  if (next === (feed.region ?? '')) return
+  busy[feed.id] = true
+  try {
+    await updateWorldEventFeed(feed.id, { region: next })
+    await load()
+  } catch (err) {
+    notification.error({
+      message: t('admin.worldFeeds.updateFailed'),
+      description: String(apiError(err)),
+    })
+    await load()
+  } finally {
+    busy[feed.id] = false
   }
 }
 
@@ -115,6 +139,7 @@ onMounted(load)
 <template>
   <UiSection :title="t('admin.worldFeeds.title')" bordered>
     <p class="field-hint">{{ t('admin.worldFeeds.hint') }}</p>
+    <p class="field-hint">{{ t('admin.worldFeeds.regionHint') }}</p>
 
     <!-- Add feed -->
     <div class="world-feeds__add">
@@ -129,6 +154,10 @@ onMounted(load)
       <label class="field-label">
         {{ t('admin.worldFeeds.category') }}
         <input v-model="draft.category" class="field-input" type="text" placeholder="news" />
+      </label>
+      <label class="field-label">
+        {{ t('admin.worldFeeds.region') }}
+        <input v-model="draft.region" class="field-input" type="text" placeholder="TW" />
       </label>
       <UiButton variant="primary" :loading="busy.__new" @click="addFeed">
         {{ t('admin.worldFeeds.add') }}
@@ -145,6 +174,7 @@ onMounted(load)
           <th>{{ t('admin.worldFeeds.colId') }}</th>
           <th>{{ t('admin.worldFeeds.colUrl') }}</th>
           <th>{{ t('admin.worldFeeds.colCategory') }}</th>
+          <th>{{ t('admin.worldFeeds.colRegion') }}</th>
           <th>{{ t('admin.worldFeeds.colStatus') }}</th>
           <th></th>
         </tr>
@@ -154,6 +184,16 @@ onMounted(load)
           <td>{{ feed.id }}</td>
           <td class="world-feeds__url">{{ feed.feed_url }}</td>
           <td>{{ feed.category }}</td>
+          <td>
+            <input
+              class="field-input world-feeds__region"
+              type="text"
+              :value="feed.region ?? ''"
+              :placeholder="t('admin.worldFeeds.regionGlobal')"
+              :disabled="busy[feed.id]"
+              @change="saveRegion(feed, ($event.target as HTMLInputElement).value)"
+            />
+          </td>
           <td>{{ feed.health_status }}</td>
           <td class="world-feeds__actions">
             <UiButton size="sm" variant="ghost" :loading="busy[feed.id]" @click="toggle(feed)">
@@ -193,6 +233,10 @@ onMounted(load)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.world-feeds__region {
+  width: 6rem;
+  text-transform: uppercase;
 }
 .world-feeds__actions {
   display: flex;

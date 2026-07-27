@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 const props = withDefaults(defineProps<{
   modelEnabled: boolean
@@ -20,6 +21,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const CANONICAL_CATEGORIES = [
   'news',
@@ -99,7 +101,7 @@ function onExcludedKeydown(ev: KeyboardEvent) {
 <template>
   <div class="interest-sub-panel">
     <p class="field-hint">
-      {{ t(`${copyNamespace}.hint`) }}
+      {{ pt(`${copyNamespace}.hint`) }}
     </p>
 
     <label class="field-label toggle-row">

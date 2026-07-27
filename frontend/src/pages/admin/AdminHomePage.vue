@@ -20,6 +20,13 @@ interface AdminPanelEntry {
    */
   debugOnly?: boolean
   cloudLocked?: boolean
+  /**
+   * Day-to-day operator tooling: kept for every self-host owner, but in
+   * hosted only the deployment operator (who turns the debug UI flag on)
+   * should see it — a cloud tenant admin should not. Mirrors
+   * `meta.cloudOperatorOnly` in the router.
+   */
+  cloudOperatorOnly?: boolean
 }
 
 const { t } = useI18n()
@@ -31,6 +38,11 @@ const routingConfigured = ref(true)
 
 function isVisible(entry: AdminPanelEntry): boolean {
   if (entry.cloudLocked === true && cloudMode.value === true) return false
+  if (
+    entry.cloudOperatorOnly === true
+    && cloudMode.value === true
+    && debugUiEnabled.value !== true
+  ) return false
   return entry.debugOnly !== true || debugUiEnabled.value === true
 }
 
@@ -40,18 +52,21 @@ const entries: AdminPanelEntry[] = [
     titleKey: 'admin.home.entries.characters.title',
     descriptionKey: 'admin.home.entries.characters.description',
     group: 'character',
+    cloudOperatorOnly: true,
   },
   {
     to: '/admin/memories',
     titleKey: 'admin.home.entries.memories.title',
     descriptionKey: 'admin.home.entries.memories.description',
     group: 'character',
+    cloudOperatorOnly: true,
   },
   {
     to: '/admin/channels',
     titleKey: 'admin.home.entries.channels.title',
     descriptionKey: 'admin.home.entries.channels.description',
     group: 'ops',
+    cloudOperatorOnly: true,
   },
   {
     to: '/admin/dispositions',
@@ -114,6 +129,7 @@ const entries: AdminPanelEntry[] = [
     titleKey: 'admin.home.entries.schedule.title',
     descriptionKey: 'admin.home.entries.schedule.description',
     group: 'behavior',
+    cloudOperatorOnly: true,
   },
   {
     to: '/admin/follow-ups',
@@ -127,12 +143,14 @@ const entries: AdminPanelEntry[] = [
     titleKey: 'admin.home.entries.world.title',
     descriptionKey: 'admin.home.entries.world.description',
     group: 'behavior',
+    cloudOperatorOnly: true,
   },
   {
     to: '/admin/observability',
     titleKey: 'admin.home.entries.observability.title',
     descriptionKey: 'admin.home.entries.observability.description',
     group: 'ops',
+    cloudLocked: true,
   },
   {
     to: '/admin/users',

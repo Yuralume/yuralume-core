@@ -18,6 +18,7 @@ from kokoro_link.api.dependencies import (
     get_container,
     get_current_user_id,
 )
+from kokoro_link.api.routes._cloud_errors import insufficient_credits_guard
 from kokoro_link.application.services.fusion_story_export import (
     EXPORT_FORMATS,
     export_fusion_story,
@@ -286,15 +287,16 @@ async def adapt_fusion_story_to_arc(
     await _ensure_story_owned(container, story_id, current_user_id)
     service = _require_adapt_service(container)
     try:
-        draft = await service.adapt(
-            story_id,
-            user_id=current_user_id,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container,
-                current_user_id,
-            ),
-            instruction=(payload.instruction if payload else None) or "",
-        )
+        with insufficient_credits_guard():
+            draft = await service.adapt(
+                story_id,
+                user_id=current_user_id,
+                operator_primary_language=await _resolve_operator_primary_language(
+                    container,
+                    current_user_id,
+                ),
+                instruction=(payload.instruction if payload else None) or "",
+            )
     except ValueError as exc:
         message = str(exc)
         if "not found" in message.lower():

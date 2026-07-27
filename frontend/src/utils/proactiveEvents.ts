@@ -19,6 +19,7 @@
  */
 
 import { getStoredToken } from '@/composables/useAuth'
+import { createEventStreamDedup } from '@/utils/eventStreamDedup'
 
 export interface ProactiveMessageEvent {
   type: 'proactive_message'
@@ -44,8 +45,14 @@ export function connectProactiveEvents(
     ? `/api/v1/events/stream?access_token=${encodeURIComponent(token)}`
     : '/api/v1/events/stream'
   const source = new EventSource(url)
+  // Held in this closure so it survives EventSource auto-reconnects — a
+  // Last-Event-ID replay re-emits already-seen ids, and de-dup is our job.
+  const shouldProcess = createEventStreamDedup()
 
   source.addEventListener('proactive_message', (ev: MessageEvent) => {
+    // Skip an event id already delivered (replay of a confirmed event on
+    // reconnect) so a reconnect doesn't re-fire the toast / re-count the badge.
+    if (!shouldProcess(ev.lastEventId)) return
     try {
       const payload = JSON.parse(ev.data) as ProactiveMessageEvent
       onEvent(payload)

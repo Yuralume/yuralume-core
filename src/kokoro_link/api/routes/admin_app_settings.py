@@ -22,8 +22,15 @@ from kokoro_link.application.services.app_runtime_settings_service import (
 )
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.bootstrap.app_runtime_settings_seed import env_default_for_group
+from kokoro_link.bootstrap.site_settings_holder import SITE_SETTINGS_HOT_GROUPS
+from kokoro_link.contracts.runtime_config_events import (
+    RUNTIME_CONFIG_TOPIC_SITE_SETTINGS,
+)
 from kokoro_link.infrastructure.app_runtime_settings.schemas import (
     APP_SETTINGS_GROUPS,
+)
+from kokoro_link.infrastructure.persistence.runtime_config_signal import (
+    notify_runtime_config_changed,
 )
 
 router = APIRouter(
@@ -34,7 +41,35 @@ router = APIRouter(
 
 
 def _service(container: ServiceContainer) -> AppRuntimeSettingsService:
-    return AppRuntimeSettingsService(container.runtime_settings_repository)
+    """Build the service with the "converge everyone" hook attached.
+
+    Before this, a PUT here only wrote the row: the replica that served the
+    request re-read nothing (its own site settings were a boot-time snapshot
+    too) and the other Hosted processes never learned at all, so changing the
+    site weather coordinates needed a rolling restart of the whole fleet.
+
+    The hook mirrors ``admin_providers._apply_provider_change``: reload THIS
+    process first, then tell the others. Self-host gets the local half and no
+    transport (the NOTIFY is an inert no-op off PostgreSQL) — which is exactly
+    right, because a single process *is* everyone.
+    """
+    engine = getattr(container, "db_engine", None)
+    reload_local = getattr(container, "site_settings_reloader", None)
+
+    async def _converge(group: str) -> None:
+        # Only the hot groups are held in memory anywhere; the rest are read
+        # on demand, so waking the fleet for them would be pure noise.
+        if group not in SITE_SETTINGS_HOT_GROUPS:
+            return
+        if reload_local is not None:
+            await reload_local()
+        await notify_runtime_config_changed(
+            engine, topic=RUNTIME_CONFIG_TOPIC_SITE_SETTINGS,
+        )
+
+    return AppRuntimeSettingsService(
+        container.runtime_settings_repository, on_changed=_converge,
+    )
 
 
 @router.get("")

@@ -30,6 +30,7 @@ from datetime import datetime, tzinfo, timezone
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.character_goal import GoalStatus
+from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_FRONTIER,
@@ -110,7 +111,15 @@ class CharacterLifeContextBuilder:
         *,
         now: datetime,
         local_tz: tzinfo | None = None,
+        ambient_reference: Character | None = None,
     ) -> CharacterLifeContext:
+        """Assemble the life buckets for ``character`` at ``now``.
+
+        ``ambient_reference`` names the character whose owning player
+        defines the *shared physical environment* (weather, holidays) of
+        this moment — see :meth:`_ambient_lines`. ``None`` (the
+        single-player / self-host case) means the character itself.
+        """
         moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
         tz = local_tz or await self._resolve_tz(character)
         return CharacterLifeContext(
@@ -118,7 +127,12 @@ class CharacterLifeContextBuilder:
             goal_lines=await self._goal_lines(character),
             arc_lines=await self._arc_lines(character, moment, tz),
             world_event_lines=await self._world_event_lines(character),
-            ambient_lines=await self._ambient_lines(character, moment, tz),
+            ambient_lines=await self._ambient_lines(
+                character,
+                moment,
+                tz,
+                ambient_reference=ambient_reference or character,
+            ),
             operator_dialogue_summary=await self._operator_dialogue_summary(
                 character,
             ),
@@ -263,13 +277,43 @@ class CharacterLifeContextBuilder:
         character: Character,
         moment: datetime,
         tz: tzinfo,
+        *,
+        ambient_reference: Character,
     ) -> tuple[str, ...]:
+        """Weather / calendar lines for the world the character stands in.
+
+        Both facts are **per-player** in hosted mode: the weather comes
+        from the operator's coordinates and the holiday calendar from
+        their country (``location_context`` helpers). Omitting the
+        ``operator=`` argument here used to pin every player's characters
+        to the site-level fallback — i.e. the site owner's city — so a
+        Japanese player's encounter read out Taipei weather and TW
+        holidays (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §G-1).
+
+        Cross-player encounters (Route B, the two characters belonging to
+        different players) resolve **one** ambient reference for the whole
+        encounter rather than one per speaker: a meeting happens at a
+        single place, so a single sky and a single holiday calendar is the
+        only coherent reading. Owner decision (2026-07-26, plan §7-4): the
+        initiating side's operator wins — the encounter takes place in the
+        initiator's world. The caller passes that side in via
+        ``ambient_reference``; same-player pairs are unambiguous and
+        self-host has a single operator, so both collapse to today's
+        behaviour.
+
+        Operators with no coordinates / no country code resolve to
+        ``None`` inside the ``location_context`` helpers, which keeps the
+        site-level fallback — self-host parity is unchanged.
+        """
         lines: list[str] = []
         target = moment.astimezone(tz).date()
+        operator = await self._resolve_ambient_operator(ambient_reference)
         describe_weather = getattr(self._schedule_service, "describe_weather", None)
         if describe_weather is not None:
             try:
-                weather = (await describe_weather(target) or "").strip()
+                weather = (
+                    await describe_weather(target, operator=operator) or ""
+                ).strip()
             except Exception:
                 _LOGGER.exception(
                     "life context: weather describe failed character=%s",
@@ -281,7 +325,9 @@ class CharacterLifeContextBuilder:
         describe_calendar = getattr(self._schedule_service, "describe_calendar", None)
         if describe_calendar is not None:
             try:
-                calendar = (describe_calendar(target) or "").strip()
+                calendar = (
+                    describe_calendar(target, operator=operator) or ""
+                ).strip()
             except Exception:
                 _LOGGER.exception(
                     "life context: calendar describe failed character=%s",
@@ -291,6 +337,28 @@ class CharacterLifeContextBuilder:
             if calendar:
                 lines.append(f"- 節慶/行事曆：{_clip(calendar, 160)}")
         return tuple(lines)
+
+    async def _resolve_ambient_operator(
+        self, character: Character,
+    ) -> OperatorProfile | None:
+        """Operator profile behind ``character``, or ``None``.
+
+        Read through the schedule service façade (which already owns the
+        ``OperatorProfileService`` handle) so this builder keeps its
+        single infrastructure dependency. Fail-soft like every other
+        source here: ``None`` simply means the weather/calendar ports
+        fall back to the site-level configuration.
+        """
+        resolver = getattr(self._schedule_service, "operator_for_character", None)
+        if resolver is None:
+            return None
+        try:
+            return await resolver(character)
+        except Exception:
+            _LOGGER.exception(
+                "life context: operator lookup failed character=%s", character.id,
+            )
+            return None
 
     async def _operator_dialogue_summary(self, character: Character) -> str:
         if self._conversations is None or self._dialogue_summarizer is None:

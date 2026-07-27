@@ -19,11 +19,16 @@ from kokoro_link.application.services.fusion_character_brief import (
 )
 from kokoro_link.application.services.fusion_story_service import (
     FusionStoryService,
+    _PipelineContext,
+)
+from kokoro_link.application.services.studio_execution_lease import (
+    StudioLeaseLost,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.fusion_story import (
     STATUS_FAILED,
     STATUS_READY,
+    FusionStory,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.fusion_critique import (
@@ -296,6 +301,85 @@ class TestFullPipeline:
         assert final.character_ids == ("c-a",)
         assert final.full_text
         assert all(b.content.startswith("PROSE-") for b in final.beats)
+
+
+class _RaiseOnNthLease:
+    """Fake StudioLeaseSession that raises ``StudioLeaseLost`` on its Nth
+    ``raise_if_lost`` call — used to pin the abort to the AFTER-writer, BEFORE-save
+    window (finding #9)."""
+
+    def __init__(self, *, raise_on_call: int) -> None:
+        self.calls = 0
+        self._raise_on = raise_on_call
+
+    def raise_if_lost(self) -> None:
+        self.calls += 1
+        if self.calls >= self._raise_on:
+            raise StudioLeaseLost("s1")
+
+
+def _four_beat_outline() -> FusionOutline:
+    beats = [
+        FusionBeatPlan.create(
+            sequence=i, act=act, title=f"幕{i}", hook=f"hook{i}",
+            dramatic_question="", target_chars=500, focus_character_ids=(),
+        )
+        for i, act in enumerate(
+            (ACT_OPENING, ACT_RISING, ACT_TURN, ACT_RESOLUTION),
+        )
+    ]
+    return FusionOutline.create(
+        title="標題", premise="前提", theme="custom", beats=beats,
+    )
+
+
+class TestLeaseAbortWindow:
+    @pytest.mark.asyncio
+    async def test_write_all_aborts_after_writer_before_save(self) -> None:
+        # A lease stolen DURING the beat-0 writer round-trip must abort before the
+        # save, so this losing replica never overwrites the reclaiming owner's beat.
+        writer = _ScriptedWriter()
+        repo, service = _service(writer=writer)
+        story = FusionStory.create_pending(
+            character_ids=["c-a"], prompt="提示", id="s1",
+        ).with_outline(_four_beat_outline())
+        await repo.save(story)
+        ctx = _PipelineContext(
+            story_id="s1", prompt="提示", characters=[], briefs=[],
+        )
+        # Call 1 = loop-top check (no raise), call 2 = the NEW after-writer check.
+        lease = _RaiseOnNthLease(raise_on_call=2)
+
+        with pytest.raises(StudioLeaseLost):
+            await service._stage_write_all(ctx, lease=lease)
+
+        # The writer ran for beat 0, but the abort landed BEFORE its save → the
+        # persisted beat stays empty (no clobber). Without the recheck the save
+        # would have committed and this assertion would fail.
+        assert writer.calls == [0]
+        persisted = await repo.get("s1")
+        assert persisted is not None
+        assert persisted.beats[0].content == ""
+
+    @pytest.mark.asyncio
+    async def test_write_all_persists_when_lease_held(self) -> None:
+        # Sanity: a never-lost lease persists every beat (the recheck is a no-op).
+        writer = _ScriptedWriter()
+        repo, service = _service(writer=writer)
+        story = FusionStory.create_pending(
+            character_ids=["c-a"], prompt="提示", id="s1",
+        ).with_outline(_four_beat_outline())
+        await repo.save(story)
+        ctx = _PipelineContext(
+            story_id="s1", prompt="提示", characters=[], briefs=[],
+        )
+        lease = _RaiseOnNthLease(raise_on_call=999)  # never trips
+
+        await service._stage_write_all(ctx, lease=lease)
+
+        persisted = await repo.get("s1")
+        assert persisted is not None
+        assert all(b.content.startswith("PROSE-") for b in persisted.beats)
 
 
 class TestIterateBeat:

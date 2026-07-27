@@ -17,6 +17,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import {
   blankBeatDraft,
@@ -57,6 +58,7 @@ const props = defineProps<{
 }>()
 
 const { t, te } = useI18n()
+const { pt, cloudMode } = usePlayerCopy()
 const confirmDiscard = useConfirmDialog()
 
 /**
@@ -301,7 +303,7 @@ async function condense() {
 
 function commitPremise() {
   if (!draft.value.premise.trim()) {
-    errorMsg.value = t('story.arcTemplateIntake.validation.premiseRequired')
+    errorMsg.value = pt('story.arcTemplateIntake.validation.premiseRequired')
     return
   }
   errorMsg.value = null
@@ -704,7 +706,7 @@ function sceneTypeLabel(s: string): string {
             </label>
 
             <label class="field">
-              <span class="field-label">{{ t('story.arcTemplateIntake.fields.theme') }}</span>
+              <span class="field-label">{{ pt('story.arcTemplateIntake.fields.theme') }}</span>
               <div class="chip-row">
                 <button
                   v-for="theme in scaffolds?.themes ?? []"
@@ -726,7 +728,7 @@ function sceneTypeLabel(s: string): string {
             </label>
 
             <label class="field">
-              <span class="field-label">{{ t('story.arcTemplateIntake.fields.tone') }}</span>
+              <span class="field-label">{{ pt('story.arcTemplateIntake.fields.tone') }}</span>
               <div class="chip-row">
                 <button
                   v-for="tone in scaffolds?.tones ?? []"
@@ -739,12 +741,12 @@ function sceneTypeLabel(s: string): string {
                 >{{ scaffoldText('tones', tone.id, 'label', tone.label) }}</button>
               </div>
               <div class="hint-small">
-                {{ t('story.arcTemplateIntake.meta.toneHint') }}
+                {{ pt('story.arcTemplateIntake.meta.toneHint') }}
               </div>
             </label>
 
             <label class="field">
-              <span class="field-label">{{ t('story.arcTemplateIntake.fields.worldFrames') }}</span>
+              <span class="field-label">{{ pt('story.arcTemplateIntake.fields.worldFrames') }}</span>
               <div class="chip-row">
                 <button
                   v-for="f in scaffolds?.world_frames ?? []"
@@ -757,7 +759,7 @@ function sceneTypeLabel(s: string): string {
               </div>
             </label>
 
-            <label class="field">
+            <label v-if="!cloudMode" class="field">
               <span class="field-label">{{ t('story.arcTemplateIntake.fields.id') }}</span>
               <input
                 v-model="draft.id"
@@ -775,7 +777,7 @@ function sceneTypeLabel(s: string): string {
           <!-- ===== Step 3: Premise ===== -->
           <section v-else-if="step === 3" class="step">
             <p class="hint">
-              {{ t('story.arcTemplateIntake.premise.hint') }}
+              {{ pt('story.arcTemplateIntake.premise.hint') }}
             </p>
             <label class="field">
               <span class="field-label">{{ t('story.arcTemplateIntake.fields.startState') }}</span>
@@ -800,10 +802,10 @@ function sceneTypeLabel(s: string): string {
                 class="chip-btn alt"
                 :disabled="busy"
                 @click="condense"
-              >{{ busy ? t('story.arcTemplateIntake.premise.condensing') : t('story.arcTemplateIntake.premise.condense') }}</button>
+              >{{ busy ? t('story.arcTemplateIntake.premise.condensing') : pt('story.arcTemplateIntake.premise.condense') }}</button>
             </div>
             <label class="field">
-              <span class="field-label">{{ t('story.arcTemplateIntake.fields.premise') }}</span>
+              <span class="field-label">{{ pt('story.arcTemplateIntake.fields.premise') }}</span>
               <textarea
                 v-model="draft.premise"
                 class="field-textarea"
@@ -947,7 +949,7 @@ function sceneTypeLabel(s: string): string {
                   </div>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.beatTitle') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.beatTitle') }}</span>
                     <input v-model="beat.title" class="field-input" />
                     <div v-if="beatOptions?.titles.length" class="chip-row">
                       <button
@@ -961,7 +963,7 @@ function sceneTypeLabel(s: string): string {
                   </label>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.sceneType') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.sceneType') }}</span>
                     <div class="chip-row">
                       <button
                         v-for="s in scaffolds?.scene_types ?? []"
@@ -975,7 +977,7 @@ function sceneTypeLabel(s: string): string {
                   </label>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.location') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.location') }}</span>
                     <input
                       v-model="beat.location"
                       class="field-input"
@@ -993,7 +995,7 @@ function sceneTypeLabel(s: string): string {
                   </label>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.sceneCharacters') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.sceneCharacters') }}</span>
                     <div class="char-row">
                       <span
                         v-for="c in beat.scene_characters"
@@ -1021,7 +1023,7 @@ function sceneTypeLabel(s: string): string {
                   </label>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.dramaticQuestion') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.dramaticQuestion') }}</span>
                     <input
                       v-model="beat.dramatic_question"
                       class="field-input"
@@ -1039,12 +1041,12 @@ function sceneTypeLabel(s: string): string {
                   </label>
 
                   <label class="field">
-                    <span class="field-label">{{ t('story.arcTemplateIntake.fields.summary') }}</span>
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.summary') }}</span>
                     <textarea
                       v-model="beat.summary"
                       class="field-textarea"
                       rows="4"
-                      :placeholder="t('story.arcTemplateIntake.beats.summaryPlaceholder')"
+                      :placeholder="pt('story.arcTemplateIntake.beats.summaryPlaceholder')"
                     />
                     <div class="field-actions">
                       <button
@@ -1068,9 +1070,16 @@ function sceneTypeLabel(s: string): string {
           <!-- ===== Step 6: Review ===== -->
           <section v-else-if="step === 6" class="step">
             <p class="hint">
-              {{ t('story.arcTemplateIntake.review.hintPrefix') }}
-              <code>data/arc_templates/{{ idPreview }}.yaml</code>
-              {{ t('story.arcTemplateIntake.review.hintSuffix') }}
+              <!-- Hosted players never see the on-disk destination; the
+                   file path is an operator detail. -->
+              <template v-if="cloudMode">
+                {{ t('story.arcTemplateIntake.review.hintCloud') }}
+              </template>
+              <template v-else>
+                {{ t('story.arcTemplateIntake.review.hintPrefix') }}
+                <code>data/arc_templates/{{ idPreview }}.yaml</code>
+                {{ t('story.arcTemplateIntake.review.hintSuffix') }}
+              </template>
             </p>
 
             <div class="review-card">
@@ -1092,7 +1101,7 @@ function sceneTypeLabel(s: string): string {
                   @click="setGenericScope"
                 >{{ t('story.arcTemplateIntake.review.scopeGeneric') }}</button>
               </div>
-              <div class="review-row">
+              <div v-if="!cloudMode" class="review-row">
                 <span class="review-label">{{ t('story.arcTemplateIntake.review.idLabel') }}</span>
                 <span class="review-value mono">{{ idPreview }}</span>
               </div>

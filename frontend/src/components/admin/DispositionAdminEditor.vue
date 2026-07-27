@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import type {
   Character,
   CharacterDisposition,
@@ -32,6 +33,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 interface DispositionForm {
   self_centeredness: DispositionBand
@@ -79,7 +81,7 @@ const copyRoot = computed(() => (
 ))
 
 function copy(path: string, params?: Record<string, unknown>): string {
-  return t(`${copyRoot.value}.${path}`, params ?? {})
+  return pt(`${copyRoot.value}.${path}`, params ?? {})
 }
 
 function fieldCopy(field: DispositionField, path: string): string {

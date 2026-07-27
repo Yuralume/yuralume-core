@@ -30,6 +30,10 @@ _ALLOWED_CLOUD_ADAPTERS = frozenset({
     "CloudGatewayImageProvider",
     "CloudGatewayVideoProvider",
     "CloudGatewayTTSAdapter",
+    "CloudGatewayEmbedder",
+    # Null object for the token-free coordinator role — carries no provider
+    # credentials and performs no paid calls, so direct construction is safe.
+    "NullTTSAdapter",
 })
 
 # Class-name suffixes that mark a paid capability adapter constructor.

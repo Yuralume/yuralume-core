@@ -8,7 +8,7 @@ import type {
   InteractSessionResponse,
 } from '@/types/branchingDrama'
 import { authedFetch } from '@/utils/authedFetch'
-import { readErrorResponse } from '@/utils/api/httpError'
+import { apiErrorFromResponse } from '@/utils/api/insufficientCredits'
 
 const BASE = '/api/v1'
 
@@ -19,7 +19,9 @@ async function _req<T>(path: string, init: RequestInit = {}): Promise<T> {
       : init.headers,
     ...init,
   })
-  if (!res.ok) throw new Error(await readErrorResponse(res))
+  // Start / interact / advance can each hit the hosted credit ceiling, so the
+  // shared reader hands back the typed error instead of an opaque message.
+  if (!res.ok) throw await apiErrorFromResponse(res)
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
 }

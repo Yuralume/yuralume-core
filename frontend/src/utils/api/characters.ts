@@ -16,6 +16,7 @@ import type {
   UpdateCharacterRequest,
 } from '@/types/character'
 import type { ChatSurface, StageAccessVerdict } from '@/types/chat'
+import { insufficientCreditsFromAxios } from '@/utils/api/insufficientCredits'
 
 const BASE = '/api/v1/characters'
 
@@ -167,16 +168,34 @@ export async function reorderCharacterImages(
 
 export type PortraitAspect = 'portrait' | 'landscape' | 'square'
 
+/**
+ * Run an image-generation POST, re-raising a hosted credit refusal as the
+ * shared typed error so the panel can show the "top up" notice instead of a
+ * generic "generation failed".
+ */
+async function postImageGeneration<T>(
+  path: string,
+  body: unknown,
+): Promise<T> {
+  try {
+    const { data } = await axios.post<T>(path, body)
+    return data
+  } catch (err) {
+    const creditsError = insufficientCreditsFromAxios(err)
+    if (creditsError) throw creditsError
+    throw err
+  }
+}
+
 export async function generateCharacterPortrait(
   characterId: string,
   positive: string,
   aspect: PortraitAspect = 'portrait',
 ): Promise<Character> {
-  const { data } = await axios.post<Character>(
+  return postImageGeneration<Character>(
     `${BASE}/${characterId}/images/generate`,
     { positive, aspect },
   )
-  return data
 }
 
 export interface GenerateCandidatesResponse {
@@ -190,11 +209,10 @@ export async function generatePortraitCandidates(
   aspect: PortraitAspect = 'portrait',
   count: number = 4,
 ): Promise<GenerateCandidatesResponse> {
-  const { data } = await axios.post<GenerateCandidatesResponse>(
+  return postImageGeneration<GenerateCandidatesResponse>(
     `${BASE}/${characterId}/images/candidates`,
     { positive, aspect, count },
   )
-  return data
 }
 
 export async function commitPortraitCandidates(

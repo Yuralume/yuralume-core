@@ -8,6 +8,8 @@ never returns 404 — an unsaved profile renders as the placeholder.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from kokoro_link.api.dependencies import (
@@ -22,6 +24,8 @@ from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.operator_profile import UNSET
 
 router = APIRouter(tags=["operator"])
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @router.get(
@@ -100,4 +104,30 @@ async def update_operator_profile(
             else UNSET
         ),
     )
+    if payload.model_fields_set & _LOCATION_FIELDS:
+        await _clear_location_hint(container, current_user_id)
     return OperatorProfileResponse.from_domain(updated)
+
+
+_LOCATION_FIELDS = frozenset(
+    {"country_code", "latitude", "longitude", "location_label"},
+)
+
+
+async def _clear_location_hint(
+    container: ServiceContainer, user_id: str,
+) -> None:
+    """Retire the "you seem to have moved" hint once the player acts on it.
+
+    Accepting the suggestion and setting a location by hand are the same
+    thing from the hint's point of view: the player has answered, so the
+    prompt should not come back. Fail-soft — a preference-store hiccup must
+    never fail a profile save the player already sees as done.
+    """
+    service = getattr(container, "player_locale_service", None)
+    if service is None:
+        return
+    try:
+        await service.clear_location_hint(user_id)
+    except Exception as exc:  # noqa: BLE001 - hint upkeep is never critical
+        _LOGGER.info("Failed to clear location hint for %s: %s", user_id, exc)

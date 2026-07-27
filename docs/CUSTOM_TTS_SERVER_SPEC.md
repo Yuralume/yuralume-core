@@ -112,6 +112,8 @@ There is no structured error body Core parses — the status code alone drives t
 
 ## Minimal reference server (starter, not tuned)
 
+Don't want to write your own wrapper? Alongside the starter below, we also publish a ready-made reference implementation, [`custom-tts-kokoro`](https://github.com/Yuralume/custom-tts-kokoro) (image: `ghcr.io/yuralume/custom-tts-kokoro`), which wraps the open-source [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model behind this same contract with dual checkpoints for en/ja/zh. It's a lightweight CPU model provided as-is — we evaluated it and chose not to bundle it as the default in-product voice.
+
 > **This is a starter, not a tuned server.** It exposes a fixed voice catalog and wraps **one hardcoded GPT-SoVITS backend** (`api_v2.py`, `GET /tts`), returning raw WAV bytes Core can play. **Per-voice tuning is up to you** — which reference clip, which transcript, which GPT/SoVITS weights, and any weight-switching between voices are engine-specific and intentionally not part of this skeleton. Grow the `VOICES` map (and add weight switching) yourself, or use built-in OpenAI TTS / the hosted voice line.
 >
 > Assumes a local GPT-SoVITS `api_v2.py` at `http://127.0.0.1:9880`. No auth, no `/v1` — so register it in Admin with `base_url = http://<host>:8100`.

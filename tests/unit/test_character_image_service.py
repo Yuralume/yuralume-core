@@ -37,6 +37,9 @@ from kokoro_link.contracts.object_storage import (
     ObjectStorageUnavailableError,
     StoredObject,
 )
+from kokoro_link.infrastructure.repositories.in_memory_character_image_candidate_batches import (  # noqa: E501
+    InMemoryCharacterImageCandidateBatchRepository,
+)
 from kokoro_link.infrastructure.repositories.in_memory_characters import (
     InMemoryCharacterRepository,
 )
@@ -567,11 +570,13 @@ async def test_commit_candidates_storage_outage_preserves_batch_for_retry(
     char_repo = InMemoryCharacterRepository()
     character_service = CharacterService(char_repo)
     provider = _GeneratingProvider([_PNG_BYTES, _PNG_BYTES])
+    candidate_batches = InMemoryCharacterImageCandidateBatchRepository()
     service = CharacterImageService(
         character_repository=char_repo,
         uploads_dir=tmp_path,
         object_storage=_CopyUnreachableObjectStorage(public_base_url="/uploads"),
         image_provider=StaticActiveImageProvider(provider),
+        candidate_batch_repository=candidate_batches,
     )
     character_id = await _seed_character(character_service)
     _, urls = await service.generate_candidates(
@@ -585,7 +590,7 @@ async def test_commit_candidates_storage_outage_preserves_batch_for_retry(
     with pytest.raises(StorageUnavailableError):
         await service.commit_candidates(character_id, keep_urls=[urls[0]])
 
-    remaining = service._candidate_batches.get(character_id)
+    remaining = await candidate_batches.get(character_id)
     assert remaining, "candidate batch must survive a storage outage"
     assert len(remaining) == 2
 

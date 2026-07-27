@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import type { DeliveryMode, MessagingAccount } from '@/types/messaging'
 
 const props = withDefaults(defineProps<{
@@ -14,31 +15,32 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const complete = computed(() => props.bindingCount > 0)
 const hasPublicBaseUrl = computed(() => props.effectivePublicBaseUrl.trim().length > 0)
 
 const message = computed(() => {
   if (complete.value) {
-    return t('channelAccountNextStep.complete.message')
+    return pt('channelAccountNextStep.complete.message')
   }
   if (props.account.platform === 'telegram') {
     if (props.telegramDeliveryMode === 'polling') {
-      return t('channelAccountNextStep.pending.telegramPolling')
+      return pt('channelAccountNextStep.pending.telegramPolling')
     }
     return hasPublicBaseUrl.value
-      ? t('channelAccountNextStep.pending.telegramWebhookReady')
-      : t('channelAccountNextStep.pending.telegramWebhookMissing')
+      ? pt('channelAccountNextStep.pending.telegramWebhookReady')
+      : pt('channelAccountNextStep.pending.telegramWebhookMissing')
   }
   if (props.account.platform === 'discord') {
-    return t('channelAccountNextStep.pending.discordGateway')
+    return pt('channelAccountNextStep.pending.discordGateway')
   }
   if (props.account.platform === 'whatsapp') {
-    return t('channelAccountNextStep.pending.whatsappGateway')
+    return pt('channelAccountNextStep.pending.whatsappGateway')
   }
   return hasPublicBaseUrl.value
-    ? t('channelAccountNextStep.pending.lineWebhookReady')
-    : t('channelAccountNextStep.pending.lineWebhookMissing')
+    ? pt('channelAccountNextStep.pending.lineWebhookReady')
+    : pt('channelAccountNextStep.pending.lineWebhookMissing')
 })
 </script>
 

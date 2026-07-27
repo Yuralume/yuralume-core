@@ -155,9 +155,17 @@ class TurnUndoService:
             character_id=conv.character_id,
             messages=list(conv.messages[:turn_index]),
             source=conv.source,
+            # Carry the loaded optimistic-concurrency version + read boundary
+            # (B3) so the repo can tell a genuine concurrent append from the
+            # tail this undo is deliberately dropping.
+            version=conv.version,
+            loaded_message_count=conv.loaded_message_count,
         )
         try:
-            await self._conversations.save(truncated)
+            # B3: an undo is an authoritative truncation — it must not merge the
+            # tail it is removing back, even if a concurrent append bumped the
+            # version in between. ``truncation=True`` applies the replace verbatim.
+            await self._conversations.save(truncated, truncation=True)
         except Exception:
             _LOGGER.exception("Undo: conversation save failed")
             return 0

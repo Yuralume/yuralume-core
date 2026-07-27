@@ -53,6 +53,10 @@ class WorldEventRow(Base):
     locale: Mapped[str | None] = mapped_column(
         String(16), nullable=True, index=True,
     )
+    source_region: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, index=True,
+    )
+    """Denormalised ``rss_sources.region`` (``v7t4u9w0023``). NULL = global."""
     topic_tags: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]",
     )
@@ -74,6 +78,13 @@ class RssSourceRow(Base):
     locale: Mapped[str] = mapped_column(
         String(16), nullable=False, default="zh-TW", server_default="zh-TW",
     )
+    region: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    """Content region binding (``v7t4u9w0023``). NULL = global source."""
+    region_locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    """Operator has pinned ``region`` (``x9m6g3k10025``) — including pinning
+    it to *global*. The YAML seed stops backfilling once this is set."""
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true",
     )

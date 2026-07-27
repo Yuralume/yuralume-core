@@ -33,6 +33,7 @@ from kokoro_link.application.dto.messaging import (
     UpdateChannelBindingRequest,
     UpdateMessagingAccountRequest,
 )
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.channel_binding_service import (
     ChannelBindingConflictError,
 )
@@ -1047,6 +1048,23 @@ async def _account_owner_id(
     return str(getattr(character, "user_id", "default") or "default")
 
 
+#: A conversation-busy delivery was handed back by the dispatcher (nothing was
+#: written, both dedup stamps rolled back), so the only way it is not lost is
+#: for the platform to re-deliver it — and both Telegram and LINE re-deliver on
+#: any non-2xx. 503 + ``Retry-After`` is the honest shape: "not now, later",
+#: distinct from the 4xx we return for a payload the platform must never
+#: repeat.
+_BUSY_RETRY_AFTER_SECONDS = "5"
+
+
+def _conversation_busy_response() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Conversation is busy with another turn; re-deliver shortly",
+        headers={"Retry-After": _BUSY_RETRY_AFTER_SECONDS},
+    )
+
+
 def _require_dispatcher(container: ServiceContainer):
     dispatcher = container.messaging_dispatcher
     if dispatcher is None:  # pragma: no cover — always wired in production
@@ -1120,6 +1138,12 @@ async def telegram_webhook(
     dispatcher = _require_dispatcher(container)
     try:
         await dispatcher.handle_inbound(inbound)
+    except ConversationBusyError:
+        _LOGGER.info(
+            "Telegram update deferred — conversation busy account=%s",
+            account.id,
+        )
+        raise _conversation_busy_response()
     except Exception:
         _LOGGER.exception("dispatcher crashed for Telegram update")
     return {"ok": True, "dispatched": True}
@@ -1157,6 +1181,7 @@ async def line_webhook(
     parsed_events = parse_line_webhook(payload)
     dispatcher = _require_dispatcher(container)
     dispatched = 0
+    deferred = 0
     for parsed in parsed_events:
         attachment_urls: tuple[str, ...] = ()
         if parsed.photo_refs:
@@ -1185,6 +1210,18 @@ async def line_webhook(
         try:
             await dispatcher.handle_inbound(inbound)
             dispatched += 1
+        except ConversationBusyError:
+            # Keep working through the batch rather than aborting it: the
+            # deferred event's dedup stamps were rolled back, every event
+            # already processed is protected by its own receipt, so LINE's
+            # re-delivery of the batch replays exactly the deferred one.
+            deferred += 1
+            _LOGGER.info(
+                "LINE event deferred — conversation busy account=%s",
+                account.id,
+            )
         except Exception:
             _LOGGER.exception("dispatcher crashed for LINE event")
+    if deferred:
+        raise _conversation_busy_response()
     return {"ok": True, "dispatched": dispatched}

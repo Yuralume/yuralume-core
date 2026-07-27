@@ -291,7 +291,7 @@ def _render_operator_context(
 
     Phase 1 of the world-system roadmap: when the operator has saved a
     real name, the extractor is told to write memory ``content`` using
-    that name (e.g. "丹尼說他住在東京") instead of the generic
+    that name (e.g. "艾力說他住在東京") instead of the generic
     "使用者". When no real name is set, returns an empty list so the
     legacy "使用者" wording in the example output still reads
     correctly. This is the minimal change that lets memories carry

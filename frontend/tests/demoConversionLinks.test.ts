@@ -11,6 +11,14 @@ afterEach(() => {
 })
 
 describe('demoConversionLinks', () => {
+  it('labels actions with i18n keys rather than display strings', () => {
+    // The module must own no copy: the demo pages localise these through
+    // t(), so a raw English label here would be an un-translatable leak.
+    for (const action of [...demoRetryActions(), ...demoUnavailableActions()]) {
+      expect(action.labelKey).toMatch(/^demo\.actions\./)
+    }
+  })
+
   it('uses landing anchors and Discord defaults', () => {
     expect(demoConversionLinks()).toEqual({
       tier0Url: '/#demo-showcase',
@@ -38,11 +46,15 @@ describe('demoConversionLinks', () => {
     const retryActions = demoRetryActions()
     const unavailableActions = demoUnavailableActions()
 
-    expect(retryActions.find((action) => action.label === 'Join Discord')).toMatchObject({
+    expect(
+      retryActions.find((action) => action.labelKey === 'demo.actions.discord'),
+    ).toMatchObject({
       external: true,
       variant: 'secondary',
     })
-    expect(unavailableActions.find((action) => action.label === 'Self-host path')).toMatchObject({
+    expect(
+      unavailableActions.find((action) => action.labelKey === 'demo.actions.selfHost'),
+    ).toMatchObject({
       external: false,
       variant: 'secondary',
     })

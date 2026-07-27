@@ -19,6 +19,9 @@ Plain-language release notes for everyday users — what each update actually fe
 
 | 版本 / Version | 繁中 | EN | 日本語 |
 |---|---|---|---|
+| 2026.07.26 — 天氣節慶各看各的所在地、新聞來源可標地區、同時觸發不再重複跑 / weather & holidays per owner's location, region-tagged news sources, no more double runs / 天気と祝日は持ち主の所在地基準・ニュースソースの地域指定・二重実行の解消 | [zh-TW](zh-TW/2026-07-26.md) | [en-US](en-US/2026-07-26.md) | [ja-JP](ja-JP/2026-07-26.md) |
+| 2026.07.22 — 閒置自動放慢更省成本、修掉默默燒 API 的重試、語音鈕該藏就藏 / gentler auto-slowdown when idle, silent API-burning retry fixed, voice button hidden when unset / アイドル時の自動スローダウン・APIを浪費する再試行を修正・音声ボタンの表示改善 | [zh-TW](zh-TW/2026-07-22.md) | [en-US](en-US/2026-07-22.md) | [ja-JP](ja-JP/2026-07-22.md) |
+| 2026.07.16 — 共演短篇更穩更好上手、供應商測試來真的、模型相容性自癒 / sturdier co-writing, provider tests that really test, model-compatibility self-healing / 共作短編の安定化・プロバイダの本当のテスト・モデル互換の自己修復 | [zh-TW](zh-TW/2026-07-16.md) | [en-US](en-US/2026-07-16.md) | [ja-JP](ja-JP/2026-07-16.md) |
 | 2026.07.13 — 角色互聊更有生活感、傳圖更穩、閒置角色可凍結省成本 / livelier character-to-character talk, stable photo sharing, freeze idle characters / キャラ同士の会話が生き生きと・画像送信の安定化・アイドルキャラの凍結 | [zh-TW](zh-TW/2026-07-13.md) | [en-US](en-US/2026-07-13.md) | [ja-JP](ja-JP/2026-07-13.md) |
 | 2026.07.06 — 帶入既有角色卡、角色可上網查、模型更可控、語言一致性大修 / import existing cards, web search, more model control, localization overhaul / 既存カード取り込み・ウェブ検索・モデル制御強化・翻訳総点検 | [zh-TW](zh-TW/2026-07-06.md) | [en-US](en-US/2026-07-06.md) | [ja-JP](ja-JP/2026-07-06.md) |
 | 2026.06.30 — 自架一行安裝、通知更不易漏接 / one-line self-host install, fewer missed notifications / 一行セルフホスト導入・通知を逃しにくく | [zh-TW](zh-TW/2026-06-30.md) | [en-US](en-US/2026-06-30.md) | [ja-JP](ja-JP/2026-06-30.md) |

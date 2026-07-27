@@ -1,10 +1,28 @@
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import Conversation, Message
+
+
+@dataclass(frozen=True, slots=True)
+class AppendResult:
+    """Outcome of a CAS append to a conversation (LH2 / DR-LH0-004).
+
+    ``ok`` — the expected next position matched and the rows were inserted.
+    ``conflict`` — another writer advanced the tail (a lost-update race); no
+    rows were written. ``row_ids`` / ``positions`` carry the durable
+    coordinates of the just-appended messages (empty on conflict), in the same
+    order they were supplied.
+    """
+
+    ok: bool
+    conflict: bool
+    row_ids: tuple[int, ...] = ()
+    positions: tuple[int, ...] = ()
 
 
 class CharacterRepositoryPort(Protocol):
@@ -59,11 +77,36 @@ class CharacterRepositoryPort(Protocol):
         passes ``DEFAULT_OPERATOR_ID`` so this is effectively the same
         as ``list()`` on a fresh install."""
 
+    async def claim_consolidation_slot(
+        self, character_id: str, *, cooldown: timedelta,
+    ) -> bool:
+        """Atomically claim this character's next memory-consolidation run.
+
+        One conditional UPDATE of ``last_consolidated_at`` fenced on the
+        cooldown cutoff — it decides *cooldown* and *single-flight* together,
+        across processes, in a statement the DB serialises. ``True`` means the
+        caller owns this run; ``False`` means someone already claimed it
+        (another replica right now, or anyone within the cooldown window).
+
+        The claim is consumed on **attempt**, not on success: a failed
+        consolidation does not roll it back, matching the historical behaviour
+        of stamping the run timestamp before running so a crash loop can't
+        re-enter every turn.
+
+        Timing is the implementation's authority — the DB clock for SA-backed
+        adapters, never the caller's wall clock, because replicas' clocks
+        drift and a skewed replica must not shorten the shared cooldown."""
+
     async def get(self, character_id: str) -> Character | None:
         """Fetch character by id."""
 
     async def save(self, character: Character) -> None:
-        """Store character."""
+        """Store character.
+
+        Never writes the dedicated control fields (``frozen*``,
+        ``subscription_locked``, ``last_consolidated_at``) — those have their
+        own targeted operations so an unrelated aggregate write cannot
+        resurrect a consumed claim or clobber a lock."""
 
     async def delete(self, character_id: str) -> bool:
         """Remove the character. Returns True when a row was removed."""
@@ -73,8 +116,17 @@ class ConversationRepositoryPort(Protocol):
     async def get(self, conversation_id: str) -> Conversation | None:
         """Fetch conversation by id."""
 
-    async def save(self, conversation: Conversation) -> None:
-        """Store conversation."""
+    async def save(
+        self, conversation: Conversation, *, truncation: bool = False,
+    ) -> None:
+        """Store the whole conversation (replace path).
+
+        ``truncation=True`` marks a deliberate, authoritative shrink (an undo):
+        the replace applies verbatim and skips the stale-merge entirely, so a
+        concurrently-appended tail the user is truncating past is not merged back
+        (B3 — truncation is authoritative). The default (``False``) keeps the
+        optimistic-concurrency merge that preserves concurrent CAS appends.
+        """
 
     async def latest_for_character(
         self, character_id: str, *, source: str | None = "web",
@@ -126,6 +178,38 @@ class ConversationRepositoryPort(Protocol):
         """Cascade-delete all conversations (and their messages) for a character.
 
         Returns the number of conversations removed.
+        """
+
+    async def append_messages(
+        self,
+        conversation_id: str,
+        *,
+        expected_next_position: int,
+        messages: list[Message],
+        idempotency_key: str | None = None,
+    ) -> AppendResult:
+        """CAS-append ``messages`` to the tail of a conversation (LH2).
+
+        The external-chat turn machine (DR-LH0-004) forbids the
+        whole-conversation ``save()`` replace as an external concurrency
+        primitive — a lost update there would silently drop a concurrent
+        turn's rows. This appends **without clearing** existing rows: it
+        locks the conversation (``SELECT ... FOR UPDATE``; under SQLite the
+        environment is single-writer so a plain re-read suffices), verifies
+        ``max(position) + 1 == expected_next_position`` (``0`` for a
+        message-less conversation), and on match inserts each supplied message
+        at consecutive positions. A position mismatch returns
+        ``AppendResult(ok=False, conflict=True)`` and writes nothing. The
+        conversation row must already exist — the turn service resolves /
+        creates the ``source="line"`` conversation before driving the seam.
+
+        ``idempotency_key`` (B1) makes a single-message append turn-idempotent:
+        when supplied, an append whose key already exists on this conversation
+        returns the EXISTING row's ``AppendResult(ok=True)`` instead of
+        inserting a duplicate. This closes the crash window between a durable
+        user-turn append and the receipt ``record_user_turn`` — a takeover
+        re-appending under the same key adopts the original row rather than
+        writing a second copy. Only valid for a single-message append.
         """
 
 

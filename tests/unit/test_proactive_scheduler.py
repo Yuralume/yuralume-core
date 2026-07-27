@@ -71,8 +71,11 @@ class _RecordingPersonaDream:
 
 
 class _RecordingPersonaRepository:
+    def __init__(self, character_id: str, operator_id: str) -> None:
+        self._pair = (character_id, operator_id)
+
     async def list_characters_with_pending(self):
-        return [("character-1", "operator-1")]
+        return [self._pair]
 
 
 @pytest.mark.asyncio
@@ -183,7 +186,9 @@ async def test_tick_all_passes_clock_now_to_time_sensitive_subsystems() -> None:
         rest_recovery_refresher=rest,  # type: ignore[arg-type]
         pending_follow_up_dispatcher=pending,  # type: ignore[arg-type]
         persona_dream_service=dream,  # type: ignore[arg-type]
-        persona_dream_repository=_RecordingPersonaRepository(),  # type: ignore[arg-type]
+        persona_dream_repository=_RecordingPersonaRepository(
+            entity.id, entity.user_id,
+        ),  # type: ignore[arg-type]
         startup_grace_seconds=0.0,
         clock=_FrozenClock(frozen_now),
     )

@@ -5,9 +5,14 @@ import {
   type DemoConversionAction,
 } from '@/utils/demoConversionLinks'
 
+/**
+ * Classification only — the copy itself lives in the trilingual catalog
+ * under `demo.errors.*`, so the demo pages resolve it through `t()` like
+ * every other surface (plan U1-D).
+ */
 export interface DemoSessionErrorCopy {
-  title: string
-  message: string
+  titleKey: string
+  messageKey: string
   actions: DemoConversionAction[]
 }
 
@@ -15,22 +20,22 @@ export function demoSessionErrorCopy(error: unknown): DemoSessionErrorCopy {
   if (error instanceof DemoSessionLoginError) {
     if (error.code === 'demo_busy') {
       return {
-        title: 'Demo is full',
-        message: 'All public demo seats are in use. Try Tier 0 now, join the waitlist, or follow Discord for the next live-demo window.',
+        titleKey: 'demo.errors.busyTitle',
+        messageKey: 'demo.errors.busyBody',
         actions: demoRetryActions(),
       }
     }
     if (error.code === 'demo_rate_limited') {
       return {
-        title: 'Demo limit reached',
-        message: 'This browser or network has reached the demo start limit. Try Tier 0, join Discord, or use the self-host path while the public demo resets.',
+        titleKey: 'demo.errors.rateLimitedTitle',
+        messageKey: 'demo.errors.rateLimitedBody',
         actions: demoUnavailableActions(),
       }
     }
   }
   return {
-    title: 'Demo unavailable',
-    message: 'The demo session could not be started. Try the scripted character, join Discord for status, or continue through self-host.',
+    titleKey: 'demo.errors.unavailableTitle',
+    messageKey: 'demo.errors.unavailableBody',
     actions: demoUnavailableActions(),
   }
 }

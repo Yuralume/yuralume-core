@@ -31,7 +31,7 @@ def test_memory_item_defaults_to_empty_participants_and_no_world():
 def test_memory_item_carries_participants_and_location():
     refs = (
         ParticipantRef(
-            actor_kind="operator", actor_id="default", display_name="丹尼",
+            actor_kind="operator", actor_id="default", display_name="艾力",
         ),
         ParticipantRef(
             actor_kind="character", actor_id="char-b", display_name="B",
@@ -40,7 +40,7 @@ def test_memory_item_carries_participants_and_location():
     item = MemoryItem.create(
         character_id="char-1",
         kind=MemoryKind.EPISODIC,
-        content="B 帶丹尼去吃拉麵",
+        content="B 帶艾力去吃拉麵",
         participants=refs,
         location="拉麵店",
     )
@@ -63,7 +63,7 @@ def test_coerce_participants_parses_expected_shape():
         {
             "actor_kind": "operator",
             "actor_id": "default",
-            "display_name": "丹尼",
+            "display_name": "艾力",
             "role": None,
         },
         {
@@ -74,7 +74,7 @@ def test_coerce_participants_parses_expected_shape():
     ])
     assert len(refs) == 2
     assert refs[0].actor_kind == "operator"
-    assert refs[0].display_name == "丹尼"
+    assert refs[0].display_name == "艾力"
     assert refs[1].actor_kind == "character"
     assert refs[1].display_name == "B"
 

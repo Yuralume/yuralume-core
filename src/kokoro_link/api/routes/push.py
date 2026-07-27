@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime, timezone
 from typing import Deque
 
@@ -21,8 +21,18 @@ from kokoro_link.domain.entities.web_push import (
 router = APIRouter(tags=["push"])
 
 _RATE_WINDOW_SECONDS = 60.0
+# Per-process guard rail, NOT an attack defence: the buckets live in this
+# process's memory, so with N api replicas behind the round-robin the effective
+# fleet-wide ceiling is N × this number. That is deliberate — a shared counter
+# would put a DB round-trip on a preference save to stop nothing worse than a
+# stuck client retry loop. Real abuse is the edge's job.
 _RATE_LIMIT = 30
-_RATE_BUCKETS: dict[str, Deque[float]] = defaultdict(deque)
+_RATE_BUCKETS: dict[str, Deque[float]] = {}
+# Amortised eviction bookmark. Draining a bucket's expired timestamps never
+# removed the KEY, so a long-lived process accumulated one dict entry per
+# distinct ``{user}:{surface}`` forever. One sweep per window bounds the map to
+# the users actually active in that window, at O(keys) once per 60s.
+_LAST_BUCKET_SWEEP_AT = float("-inf")
 
 
 class VapidPublicKeyResponse(BaseModel):
@@ -193,9 +203,28 @@ def _preferences_payload(
     )
 
 
+def _evict_idle_buckets(now: float) -> None:
+    """Drop keys whose whole window has elapsed, at most once per window."""
+    global _LAST_BUCKET_SWEEP_AT
+    if now - _LAST_BUCKET_SWEEP_AT < _RATE_WINDOW_SECONDS:
+        return
+    _LAST_BUCKET_SWEEP_AT = now
+    idle = [
+        key
+        for key, bucket in _RATE_BUCKETS.items()
+        if not bucket or now - bucket[-1] > _RATE_WINDOW_SECONDS
+    ]
+    for key in idle:
+        _RATE_BUCKETS.pop(key, None)
+
+
 def _check_rate_limit(key: str) -> None:
     now = time.monotonic()
-    bucket = _RATE_BUCKETS[key]
+    _evict_idle_buckets(now)
+    bucket = _RATE_BUCKETS.get(key)
+    if bucket is None:
+        bucket = deque()
+        _RATE_BUCKETS[key] = bucket
     while bucket and now - bucket[0] > _RATE_WINDOW_SECONDS:
         bucket.popleft()
     if len(bucket) >= _RATE_LIMIT:

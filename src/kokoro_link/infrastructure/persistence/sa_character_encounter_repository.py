@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -115,6 +115,26 @@ class SACharacterEncounterRepository(CharacterEncounterRepositoryPort):
             )
             await session.commit()
             return int(result.rowcount or 0)
+
+    async def claim_for_run(
+        self, encounter_id: str, *, now: datetime,
+    ) -> bool:
+        moment = _as_utc(now)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(CharacterEncounterRow)
+                .where(
+                    CharacterEncounterRow.id == encounter_id,
+                    CharacterEncounterRow.status == "planned",
+                )
+                .values(
+                    status="running",
+                    started_at=moment,
+                    updated_at=moment,
+                ),
+            )
+            await session.commit()
+            return result.rowcount == 1
 
 
 def _row_to_domain(row: CharacterEncounterRow) -> CharacterEncounter:

@@ -135,7 +135,7 @@ PostgreSQL 開在 `5554`、本地 object storage 在 `9012`、內建 WhatsApp si
 
 想用自己本機的 ComfyUI 出圖？Core 不會直接跟 ComfyUI 對話——它對外只講一份精簡的正規化 HTTP 合約，稱作 **Custom Media Gateway**，由你自己實作並執行。完整規格與最小 starter FastAPI 參考 server 見 [`docs/CUSTOM_MEDIA_GATEWAY_SPEC.md`](docs/CUSTOM_MEDIA_GATEWAY_SPEC.md)（英文），也可以在後台 **管理後台 → 開發文件** 直接查閱。DIY 使用者可依此公開合約自行實作 gateway；若不想自己調校 per-model workflow，未來雲端媒體訂閱線會承接這個便利選項。
 
-想接自己的語音引擎（GPT-SoVITS、XTTS…）？Core 對 TTS 同樣只講一份精簡 HTTP 合約，稱作 **Custom TTS Server**——`GET /voices` + `POST /tts/synthesize`。完整規格與 wrap GPT-SoVITS 的最小 starter 參考 server 見 [`docs/CUSTOM_TTS_SERVER_SPEC.md`](docs/CUSTOM_TTS_SERVER_SPEC.md)（英文），也可在 **管理後台 → 開發文件** 直接查閱。若不想自架，直接改用內建 OpenAI TTS provider 走 BYOK 即可。
+想接自己的語音引擎（GPT-SoVITS、XTTS…）？Core 對 TTS 同樣只講一份精簡 HTTP 合約，稱作 **Custom TTS Server**——`GET /voices` + `POST /tts/synthesize`。完整規格與 wrap GPT-SoVITS 的最小 starter 參考 server 見 [`docs/CUSTOM_TTS_SERVER_SPEC.md`](docs/CUSTOM_TTS_SERVER_SPEC.md)（英文），也可在 **管理後台 → 開發文件** 直接查閱。不想自己寫 wrapper？[`custom-tts-kokoro`](https://github.com/Yuralume/custom-tts-kokoro) 是官方現成的參考實作，包裝開源 Kokoro-82M 模型，一行 `docker run` 就能起服務。若不想自架，直接改用內建 OpenAI TTS provider 走 BYOK 即可。
 
 自架 prompt overlay 可把檔案放在 `./prompts/tuned`，維持與 `src/kokoro_link/data/prompts/` 相同的相對路徑，並在 `.env.container` 設定 `YURALUME_PROMPT_PACK_DIR=/app/prompts/tuned` 後重啟 `app` service。compose 會把該 host 目錄唯讀掛進 app container。啟動時 app log 會出現 `Prompt pack overlay loaded` 與 overlay template 數量；若目錄是空的或不存在，會以 warning 明確提示。
 
@@ -157,10 +157,7 @@ uv run python scripts/llm_capacity_probe.py core-chat --core-url http://127.0.0.
 | `AUTH_ENABLED` | `false` 為單人模式（預設）。多使用者請設 `true` + `JWT_SECRET`。 |
 | `USER_PRIMARY_LANGUAGE` | 本地單一使用者的初始介面 + 內容語言（預設 `zh-TW`，可選 `en-US`、`ja-JP`）。單人模式下會在首次開機 seed 預設 operator，讓介面與角色回覆語言一開即正確；自架安裝腳本會用你安裝當下選的語言寫入。多使用者模式則由每位使用者在 `/auth/setup` 各自挑選。 |
 | `USER_TIMEZONE` / `KOKORO_USER_TIMEZONE` | 本地單一使用者的介面時區（IANA，如 `Asia/Taipei`），決定民用日期時間、行程與「今天」邊界；DB 與 server instant 仍為 UTC。預設 `UTC`，單人模式下同樣在首次開機 seed 預設 operator；自架安裝腳本會用主機時區自動帶入。 |
-| `YURALUME_CLOUD_ENABLED` / `YURALUME_CLOUD_*` | Hosted cloud 模式。啟用後本地 setup / user / provider 管理 surface 會鎖定，`/auth/config` 回 `mode: "cloud"`，`/auth/login` 代理到 Yuralume Cloud User service，LLM / 圖片 / 影片 / TTS 走 Yuralume Cloud Gateway；核心仍需要 `JWT_SECRET` 簽自己的短效 session token。 |
-| Hosted demo account runtime profile | Cloud login 會把 `cloud_tenant_tier` 存進本地 operator projection。自架 / local 使用者永遠解析到 default runtime profile；hosted demo 使用者解析到 demo profile，目前會限制每帳號同時 1 個角色、透過 account runtime event ledger 限制每滾動 24 小時建立 1 次角色、1 次對話生圖與 1 篇自動 LumeGram feed post，停用角色 AI 圖像候選 / portrait 生成、feed 影片生成與 TTS 合成，降低背景 proactive tick 評估頻率，並由 scheduler 驅動 character TTL reaper。reaper 會透過 `CharacterService.delete_character()` 清理過期 demo 角色，帳號無剩餘角色時呼叫 Cloud User demo-session release hook 釋放 slot。 |
-| `VITE_YURALUME_DEMO_DISCORD_CLIENT_ID` / `VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID` | Hosted demo OAuth 的 SPA client id。這些是 Vite build-time 值，必須在 build 前用 shell env、`docker compose --env-file .env.container`，或 GitHub repository variables 傳入；只在容器 runtime 補 env 不會改掉已打包的前端，`/demo/oauth/{provider}/start` 會因空 client id 顯示 `Demo unavailable`。 |
-| `VITE_YURALUME_DEMO_*_URL` | 選填 hosted demo 前端導流連結。`VITE_YURALUME_DEMO_TIER0_URL`、`VITE_YURALUME_DEMO_WAITLIST_URL`、`VITE_YURALUME_DEMO_DISCORD_URL`、`VITE_YURALUME_DEMO_SELF_HOST_URL` 會控制 demo OAuth 滿位、限流或不可用時顯示的 CTA。 |
+| `YURALUME_CLOUD_ENABLED` / `YURALUME_CLOUD_*` | 保留給官方 hosted cloud（託管部署）使用，自架環境用不到，留空即可。 |
 | `WEB_PUSH_VAPID_PUBLIC_KEY` / `WEB_PUSH_VAPID_PRIVATE_KEY` / `WEB_PUSH_VAPID_SUBJECT` | 選填 Browser Web Push 憑證。設定後玩家可在「設定 → 個人」訂閱此瀏覽器的系統通知；未設定時 push API 回 `configured=false`，執行期推播 fail-soft。舊 `KOKORO_WEB_PUSH_*` alias 仍會讀取。 |
 | `STORAGE_URL` / `STORAGE_KEY` | Object Storage endpoint，自架可走附帶的 `storage-local`。 |
 | `APP_BASE_URL` / `STORAGE_PUBLIC_URL` | 瀏覽器面向的 app origin fallback。DB 媒體 ref 預設是 `/v1/public/...`；Telegram 生成圖片發送直接讀 object storage，不需要公網圖片 URL；仍以 URL 推圖的平台優先使用 Admin **通道站台設定 → 公網 Base URL**，留空才用 `APP_BASE_URL`。`STORAGE_PUBLIC_URL` 只保留給相容外部 storage/CDN URL 反查。 |

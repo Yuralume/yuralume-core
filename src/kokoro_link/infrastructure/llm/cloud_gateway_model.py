@@ -11,14 +11,18 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudIdentityUnavailable,
 )
+from kokoro_link.contracts.generation_trigger import (
+    TRIGGER_HEADER_NAME,
+    generation_trigger_header_value,
+)
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.infrastructure.http_error_logging import (
     log_expected_refusal,
     log_http_error_response,
 )
 from kokoro_link.infrastructure.llm.cloud_refusal import (
-    ExpectedCloudRefusal,
-    classify_refusal,
+    refusal_from_response,
+    refusal_summary,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -165,6 +169,7 @@ class CloudGatewayChatModel(ChatModelPort):
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
+            TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
 
     def _require_identity(self) -> CloudGatewayIdentity:
@@ -230,21 +235,18 @@ def _raise_refusal_or_error(
     operation: str,
     context: str,
 ) -> None:
-    summary = f"{response.status_code} from {response.request.url}: {body_text[:500]}"
-    refusal = classify_refusal(response.status_code, body_text)
+    summary = refusal_summary(response, body_text)
+    refusal = refusal_from_response(response, body_text, summary=summary)
     if refusal is not None:
-        code, message = refusal
         log_expected_refusal(
             _LOGGER,
             response,
             operation=operation,
-            code=code,
-            message=message,
+            code=refusal.code,
+            message=refusal.reason,
             context=context,
         )
-        raise ExpectedCloudRefusal(
-            summary, request=response.request, response=response, code=code,
-        )
+        raise refusal
     log_http_error_response(
         _LOGGER, response, operation=operation, body_text=body_text,
     )

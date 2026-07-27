@@ -5,6 +5,15 @@ beat rows atomically in a single transaction. The beat set is small
 (< 10 rows per arc) so delete-all + re-insert is cheaper to reason
 about than per-beat diffing and doesn't measurably hurt write
 performance at our scale.
+
+Both writes are fenced by ``uq_story_arcs_active_character``, the partial
+unique index that makes "one active arc per character" a schema invariant
+instead of a service-layer hope. A violation is the cross-replica planning
+race, not a defect, so it is translated into
+:class:`~kokoro_link.contracts.story_arc.ActiveArcConflict` after a clean
+rollback — the same benign-race-recovery shape ``daily_schedules`` uses for its
+P3-Dedup constraint, except the loser must ADOPT the winner rather than replace
+it (two arcs are different stories; overwriting would destroy one).
 """
 
 from __future__ import annotations
@@ -14,10 +23,14 @@ import logging
 from datetime import date, datetime
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
-from kokoro_link.contracts.story_arc import StoryArcRepositoryPort
+from kokoro_link.contracts.story_arc import (
+    ActiveArcConflict,
+    StoryArcRepositoryPort,
+)
 from kokoro_link.domain.entities.story_arc import (
     ARC_ACTIVE,
     SCENE_ENCOUNTER,
@@ -30,6 +43,23 @@ from kokoro_link.infrastructure.persistence.models import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Only a violation of THIS index (a concurrent replica winning the character's
+# single active-arc slot) is the benign race; any other integrity failure is a
+# real defect and must surface.
+_ACTIVE_ARC_INDEX = "uq_story_arcs_active_character"
+
+# PostgreSQL names the offending index ("duplicate key value violates unique
+# constraint \"uq_story_arcs_active_character\""); SQLite names the columns
+# instead ("UNIQUE constraint failed: story_arcs.character_id"). Match either.
+# ``character_id`` carries no other unique index on this table, so the column
+# form cannot be confused with an unrelated violation.
+_SQLITE_ACTIVE_ARC_COLUMNS = "story_arcs.character_id"
+
+
+def _is_active_arc_violation(error: IntegrityError) -> bool:
+    message = str(getattr(error, "orig", error))
+    return _ACTIVE_ARC_INDEX in message or _SQLITE_ACTIVE_ARC_COLUMNS in message
 
 
 class SAStoryArcRepository(StoryArcRepositoryPort):
@@ -45,7 +75,21 @@ class SAStoryArcRepository(StoryArcRepositoryPort):
         # is still a valid row; a retry can repopulate the beats).
         async with self._session_factory() as session:
             session.add(_arc_to_row(arc))
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if not _is_active_arc_violation(exc):
+                    raise
+                # Another replica planned + inserted this character's active
+                # arc while we were planning ours. Drop ours entirely (no
+                # beats are written) and let the caller adopt the winner —
+                # the losing plan is discarded, never merged.
+                _LOGGER.info(
+                    "story arc insert lost the active slot character=%s arc=%s",
+                    arc.character_id, arc.id,
+                )
+                raise ActiveArcConflict(arc.character_id) from exc
         async with self._session_factory() as session:
             for beat in arc.beats:
                 session.add(_beat_to_row(arc.id, beat))
@@ -102,19 +146,36 @@ class SAStoryArcRepository(StoryArcRepositoryPort):
         in the second tx see a clean slate. Not atomic, but a half-
         applied state (arc without beats) is still consistent enough
         for the reader surfaces and a retry fully repopulates.
+
+        A save that would make this a *second* active arc for the character
+        raises ``ActiveArcConflict`` with nothing written (the beat delete is
+        rolled back with it), so the winner's arc and beats stay intact.
         """
         async with self._session_factory() as session:
-            existing = await session.get(StoryArcRow, arc.id)
-            if existing is None:
-                session.add(_arc_to_row(arc))
-            else:
-                _apply_arc_updates(existing, arc)
-            await session.execute(
-                delete(StoryArcBeatRow).where(
-                    StoryArcBeatRow.arc_id == arc.id,
-                ),
-            )
-            await session.commit()
+            # The whole unit of work is guarded, not just the commit: the beat
+            # delete below triggers an autoflush, so a status change that
+            # violates the active-arc index surfaces *there*, before commit.
+            try:
+                existing = await session.get(StoryArcRow, arc.id)
+                if existing is None:
+                    session.add(_arc_to_row(arc))
+                else:
+                    _apply_arc_updates(existing, arc)
+                await session.execute(
+                    delete(StoryArcBeatRow).where(
+                        StoryArcBeatRow.arc_id == arc.id,
+                    ),
+                )
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if not _is_active_arc_violation(exc):
+                    raise
+                _LOGGER.info(
+                    "story arc save lost the active slot character=%s arc=%s",
+                    arc.character_id, arc.id,
+                )
+                raise ActiveArcConflict(arc.character_id) from exc
         async with self._session_factory() as session:
             for beat in arc.beats:
                 session.add(_beat_to_row(arc.id, beat))

@@ -18,6 +18,7 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
@@ -31,6 +32,7 @@ from kokoro_link.application.services.location_context import (
     calendar_region_from_operator,
     weather_location_from_operator,
 )
+from kokoro_link.application.services.runtime_claim import RuntimeClaim
 from kokoro_link.contracts.behavioral_pattern import (
     BehavioralPatternRepositoryPort,
 )
@@ -97,6 +99,45 @@ _DIALOGUE_CONTEXT_LIMIT = 40
 # won't match when the actual day comes.
 _ROLLING_WINDOW_DAYS = 3
 
+# Generation horizon when staggering is ON (§4.1). Decoupled from the READ
+# horizon on purpose: chat / proactive read surfaces must NEVER see beyond
+# tomorrow + day-after (2 days past today), regardless of how far generation
+# runs — hence ``load_upcoming_schedules`` pins its own default to 2 rather than
+# deriving it from any generation constant.
+_STAGGER_HORIZON_DAYS = 4
+_STAGGER_IMMEDIATE_OFFSET = 1  # today (0) + tomorrow (1) always plan immediately
+_SECONDS_PER_DAY = 86400
+
+# Plan-claim key slots. ``background_runtime_leases`` rows are never reaped —
+# ``release`` only vacates ownership — so a literal ``…:{iso_date}`` key would
+# leave one permanent row per character PER DAY, the first unbounded
+# time-series in a table every other user keys by a bounded entity set. Days
+# are therefore folded onto a small ring: every date inside the widest window
+# ``ensure_window`` can request (clamped to 7) lands on a distinct slot, so
+# concurrently-planned days never collide, while the whole key space stays at
+# ``characters × _PLAN_CLAIM_SLOTS`` and recycles forever. Two dates a full
+# ring apart share a slot; the loser then waits its bounded moment and returns
+# current state — a rare slow path, never a wrong one.
+_PLAN_CLAIM_SLOTS = 16
+
+
+def _plan_claim_parts(character_id: str, target: date) -> tuple[str, str]:
+    """Key parts identifying one (character, date) plan slot."""
+    return character_id, f"d{target.toordinal() % _PLAN_CLAIM_SLOTS}"
+
+
+def _stagger_jitter_seconds(character_id: str, target: date) -> int:
+    """A stable per-(character, date) offset into the prior local day [0, 86400).
+
+    Uses SHA-256 (not Python's per-process-salted ``hash``) so the threshold is
+    identical across processes / restarts / workers — the point of staggering is
+    that the SAME character generates the SAME future day at the SAME instant no
+    matter which box computes it. Distinct characters spread across the day."""
+    digest = hashlib.sha256(
+        f"{character_id}:{target.isoformat()}".encode("utf-8"),
+    ).digest()
+    return int.from_bytes(digest[:8], "big") % _SECONDS_PER_DAY
+
 
 class ScheduleService:
     def __init__(
@@ -116,8 +157,17 @@ class ScheduleService:
         ) = None,
         operator_persona_service=None,  # noqa: ANN001 — optional app service
         operator_profile_service=None,  # noqa: ANN001 — optional, resolves primary_language
+        staggering_enabled: bool = False,
+        plan_claim: RuntimeClaim | None = None,
     ) -> None:
         self._repository = repository
+        # §4.1 schedule staggering (distributed-gated). OFF by default so the
+        # embedded / self-host generation window is byte-identical: a 3-day
+        # horizon, every day planned immediately. When ON, the generation horizon
+        # widens to 4 days and days beyond tomorrow trickle in across the PRIOR
+        # local day via a stable per-(character,date) jitter threshold, so a fleet
+        # of characters doesn't herd all their day+3 planner calls at midnight.
+        self._staggering_enabled = staggering_enabled
         self._planner = planner
         self._local_tz = local_tz
         self._conversation_repository = conversation_repository
@@ -161,6 +211,17 @@ class ScheduleService:
         # does — without this lock the LLM planner ran twice back to
         # back. Second caller waits, then hits the short-circuit.
         self._plan_locks: dict[tuple[str, date], asyncio.Lock] = {}
+        # Cross-instance counterpart of the lock above (hosted 2×api +
+        # 2×worker). The lock only serialises THIS replica, so the same race —
+        # chat send on replica A, ``/schedule/current`` poll on replica B —
+        # simply ran a full ``plan_day`` on each box: several LLM calls plus
+        # weather and calendar, twice. ``uq_daily_schedules_character_date``
+        # kept the data correct (one row survives) but the spend was already
+        # doubled and the player could watch A's plan flip to B's on refresh.
+        # This TTL claim elects exactly one planner per (character, date); the
+        # losers wait a bounded moment for the winner's row. ``None`` →
+        # self-host / SQLite keeps the historical lock-only behaviour.
+        self._plan_claim = plan_claim
 
     def set_behavioral_pattern_repository(
         self, repository: BehavioralPatternRepositoryPort | None,
@@ -228,6 +289,21 @@ class ScheduleService:
     async def timezone_for_character(self, character: Character) -> tzinfo:
         return await self._resolve_operator_timezone(character)
 
+    async def operator_for_character(
+        self, character: Character,
+    ) -> OperatorProfile | None:
+        """Public accessor for the operator profile owning ``character``.
+
+        Same façade pattern as :meth:`describe_calendar` /
+        :meth:`timezone_for_character`: background surfaces that already
+        depend on this service (e.g. the encounter life-context builder)
+        can resolve the player behind a character without each of them
+        wiring ``OperatorProfileService`` separately. ``None`` = no
+        profile service wired or lookup failed → callers fall back to
+        site-level values.
+        """
+        return await self._resolve_operator_profile(character)
+
     async def ensure_schedule(
         self,
         character: Character,
@@ -252,13 +328,8 @@ class ScheduleService:
         # weather instead of freezing "上週在下雨" into a sunny day — see
         # ``_is_stale_current_day_plan``.
         existing = await self._repository.get(character.id, target)
-        if (
-            existing is not None
-            and existing.activities
-            and existing.is_planned
-            and not self._is_stale_current_day_plan(
-                existing, target=target, local_today=local_today, local_tz=local_tz,
-            )
+        if self._is_usable_plan(
+            existing, target=target, local_today=local_today, local_tz=local_tz,
         ):
             return existing
         # Slow path: row missing, empty, seed-only, or a stale current-day
@@ -270,84 +341,205 @@ class ScheduleService:
             # Re-check under the lock — another caller may have just
             # populated the schedule while we were waiting.
             existing = await self._repository.get(character.id, target)
-            if (
-                existing is not None
-                and existing.activities
-                and existing.is_planned
-                and not self._is_stale_current_day_plan(
-                    existing, target=target, local_today=local_today,
-                    local_tz=local_tz,
-                )
+            if self._is_usable_plan(
+                existing, target=target, local_today=local_today,
+                local_tz=local_tz,
             ):
                 return existing
-            # An existing-but-empty schedule is almost always the residue
-            # of a past planner failure (pre-fix: we used to persist empty
-            # on exception). Treat it as "please retry" rather than "this
-            # day is blank" so stuck characters self-heal on the next turn.
-            # ``pre_commitments`` carries activities that must survive the
-            # plan_day call — chat-extracted seeds (e.g. "明天 7 點看電影")
-            # and, on a stale-today re-plan, any promise to the operator —
-            # so the planner is told to build the day *around* them, not
-            # overwrite them.
-            pre_commitments = self._carry_forward_commitments(existing)
-            summary = await self._summarize_recent_dialogue(character)
-            today_beat, upcoming = await self._collect_arc_beats(
-                character=character, target=target,
+            claimed = await self._claim_plan_slot(character.id, target)
+            if not claimed:
+                # Another replica is planning this day right now. Wait a
+                # bounded moment for its row rather than duplicating the work.
+                return await self._await_peer_plan(
+                    character,
+                    target=target,
+                    local_today=local_today,
+                    local_tz=local_tz,
+                )
+            try:
+                return await self._plan_and_store(
+                    character,
+                    target=target,
+                    local_today=local_today,
+                    local_tz=local_tz,
+                )
+            finally:
+                await self._release_plan_slot(character.id, target)
+
+    async def _plan_and_store(
+        self,
+        character: Character,
+        *,
+        target: date,
+        local_today: date,
+        local_tz: tzinfo,
+    ) -> DailySchedule:
+        """Run the planner for ``target`` and persist it. Claim already held."""
+        # Final re-read: the replica we just took the claim from may have
+        # finished and released between our last read and our acquire.
+        existing = await self._repository.get(character.id, target)
+        if self._is_usable_plan(
+            existing, target=target, local_today=local_today, local_tz=local_tz,
+        ):
+            return existing
+        # An existing-but-empty schedule is almost always the residue
+        # of a past planner failure (pre-fix: we used to persist empty
+        # on exception). Treat it as "please retry" rather than "this
+        # day is blank" so stuck characters self-heal on the next turn.
+        # ``pre_commitments`` carries activities that must survive the
+        # plan_day call — chat-extracted seeds (e.g. "明天 7 點看電影")
+        # and, on a stale-today re-plan, any promise to the operator —
+        # so the planner is told to build the day *around* them, not
+        # overwrite them.
+        pre_commitments = self._carry_forward_commitments(existing)
+        summary = await self._summarize_recent_dialogue(character)
+        today_beat, upcoming = await self._collect_arc_beats(
+            character=character, target=target,
+        )
+        operator = await self._resolve_operator_profile(character)
+        calendar_context = self._describe_calendar(target, operator=operator)
+        weather_context = await self._weather_for_plan(
+            target, operator=operator, local_today=local_today,
+        )
+        recurring_patterns = await self._load_recurring_patterns(
+            character.id,
+        )
+        relationship_seed = await self._load_relationship_seed(character)
+        operator_persona_lines = await self._load_operator_persona_lines(
+            character,
+        )
+        try:
+            schedule = await self._planner.plan_day(
+                character=character,
+                date_=target,
+                local_tz=local_tz,
+                recent_dialogue_summary=summary,
+                today_beat=today_beat,
+                upcoming_beats=upcoming,
+                calendar_context=calendar_context,
+                weather_context=weather_context,
+                operator_relationship_context=(
+                    "\n".join(render_initial_relationship_seed_lines(
+                        relationship_seed,
+                    ))
+                ),
+                operator_persona_lines=tuple(operator_persona_lines),
+                schedule_involvement_policy=(
+                    relationship_seed.schedule_involvement_policy
+                    if relationship_seed is not None else "none"
+                ),
+                pre_committed_activities=pre_commitments,
+                recurring_patterns=recurring_patterns,
+                operator_primary_language=_operator_language(operator),
             )
-            operator = await self._resolve_operator_profile(character)
-            calendar_context = self._describe_calendar(target, operator=operator)
-            weather_context = await self._weather_for_plan(
-                target, operator=operator, local_today=local_today,
-            )
-            recurring_patterns = await self._load_recurring_patterns(
+        except Exception:
+            # Don't persist on failure — if we saved an empty schedule,
+            # ``ensure_schedule`` would short-circuit on the next call
+            # and the character would be "activity-less" for the rest
+            # of the day. Return an ephemeral empty so the current
+            # prompt still renders, and let the next turn retry.
+            _LOGGER.exception(
+                "Schedule planning failed for character=%s; "
+                "returning ephemeral empty and will retry next turn",
                 character.id,
             )
-            relationship_seed = await self._load_relationship_seed(character)
-            operator_persona_lines = await self._load_operator_persona_lines(
-                character,
+            return DailySchedule.create(
+                character_id=character.id,
+                date_=target,
+                activities=[],
             )
-            try:
-                schedule = await self._planner.plan_day(
-                    character=character,
-                    date_=target,
-                    local_tz=local_tz,
-                    recent_dialogue_summary=summary,
-                    today_beat=today_beat,
-                    upcoming_beats=upcoming,
-                    calendar_context=calendar_context,
-                    weather_context=weather_context,
-                    operator_relationship_context=(
-                        "\n".join(render_initial_relationship_seed_lines(
-                            relationship_seed,
-                        ))
-                    ),
-                    operator_persona_lines=tuple(operator_persona_lines),
-                    schedule_involvement_policy=(
-                        relationship_seed.schedule_involvement_policy
-                        if relationship_seed is not None else "none"
-                    ),
-                    pre_committed_activities=pre_commitments,
-                    recurring_patterns=recurring_patterns,
-                    operator_primary_language=_operator_language(operator),
-                )
-            except Exception:
-                # Don't persist on failure — if we saved an empty schedule,
-                # ``ensure_schedule`` would short-circuit on the next call
-                # and the character would be "activity-less" for the rest
-                # of the day. Return an ephemeral empty so the current
-                # prompt still renders, and let the next turn retry.
-                _LOGGER.exception(
-                    "Schedule planning failed for character=%s; "
-                    "returning ephemeral empty and will retry next turn",
-                    character.id,
-                )
-                return DailySchedule.create(
-                    character_id=character.id,
-                    date_=target,
-                    activities=[],
-                )
-            await self._repository.save(schedule)
-            return schedule
+        await self._repository.save(schedule)
+        return schedule
+
+    # -- cross-instance plan claim ---------------------------------------- #
+
+    async def _claim_plan_slot(self, character_id: str, target: date) -> bool:
+        if self._plan_claim is None:
+            return True
+        return await self._plan_claim.acquire(
+            *_plan_claim_parts(character_id, target),
+        )
+
+    async def _release_plan_slot(self, character_id: str, target: date) -> None:
+        """Hand the day back immediately instead of waiting out the TTL.
+
+        Matters for the legitimate second plan of the same day — a stale
+        current-day forecast refresh, or a retry after the planner raised —
+        which must not be parked behind our own expired claim.
+        """
+        if self._plan_claim is None:
+            return
+        await self._plan_claim.release(
+            *_plan_claim_parts(character_id, target),
+        )
+
+    async def _await_peer_plan(
+        self,
+        character: Character,
+        *,
+        target: date,
+        local_today: date,
+        local_tz: tzinfo,
+    ) -> DailySchedule:
+        """Bounded wait for the replica that won the claim.
+
+        Never waits out the claim TTL: chat sits on this path, so after a few
+        seconds we return whatever the repository currently holds (or an
+        ephemeral empty, exactly like the planner-failure path). The next turn
+        short-circuits on the winner's finished row — the cost of losing the
+        race is at worst one under-informed prompt, never a hung request.
+        """
+        assert self._plan_claim is not None
+
+        async def _probe() -> DailySchedule | None:
+            candidate = await self._repository.get(character.id, target)
+            if self._is_usable_plan(
+                candidate, target=target, local_today=local_today,
+                local_tz=local_tz,
+            ):
+                return candidate
+            return None
+
+        planned = await self._plan_claim.await_peer(_probe)
+        if planned is not None:
+            return planned
+        _LOGGER.info(
+            "schedule plan claim held elsewhere; returning current state "
+            "character=%s date=%s", character.id, target,
+        )
+        current = await self._repository.get(character.id, target)
+        if current is not None:
+            return current
+        return DailySchedule.create(
+            character_id=character.id,
+            date_=target,
+            activities=[],
+        )
+
+    def _is_usable_plan(
+        self,
+        existing: DailySchedule | None,
+        *,
+        target: date,
+        local_today: date,
+        local_tz: tzinfo,
+    ) -> bool:
+        """``True`` when ``existing`` can be returned without re-planning.
+
+        A row with activities but ``is_planned=False`` is a chat-extracted
+        future-commitment seed and still needs the planner to fold a full day
+        around it; a fully-planned *today* row generated on an earlier local
+        day is a stale forecast (see :meth:`_is_stale_current_day_plan`).
+        """
+        return (
+            existing is not None
+            and bool(existing.activities)
+            and existing.is_planned
+            and not self._is_stale_current_day_plan(
+                existing, target=target, local_today=local_today,
+                local_tz=local_tz,
+            )
+        )
 
     async def ensure_window(
         self,
@@ -355,7 +547,7 @@ class ScheduleService:
         *,
         start: date | None = None,
         now: datetime | None = None,
-        days: int = _ROLLING_WINDOW_DAYS,
+        days: int | None = None,
     ) -> list[DailySchedule]:
         """Pre-plan a rolling window of ``days`` schedules from ``start``.
 
@@ -376,10 +568,28 @@ class ScheduleService:
         about and the prompt-side caller only ever shows the first three.
         """
         anchor = start or await self.today_for_character(character, now=now)
+        # Generation horizon: staggering ON widens it to 4 days; OFF keeps the
+        # historical 3. An explicit ``days`` from a caller always wins.
+        if days is None:
+            days = (
+                _STAGGER_HORIZON_DAYS
+                if self._staggering_enabled
+                else _ROLLING_WINDOW_DAYS
+            )
         span = max(1, min(7, days))
+        local_tz = await self._resolve_operator_timezone(character)
+        current_local = self._local_now(now, local_tz)
         out: list[DailySchedule] = []
         for offset in range(span):
             target = anchor + timedelta(days=offset)
+            if not self._stagger_ready(
+                character, target=target, offset=offset,
+                anchor=anchor, current_local=current_local, local_tz=local_tz,
+            ):
+                # A future day not yet due under the stable jitter threshold —
+                # it will be generated later today (during its prior local day),
+                # spread deterministically so the fleet doesn't herd at midnight.
+                continue
             try:
                 schedule = await self.ensure_schedule(
                     character, date_=target, now=now,
@@ -393,14 +603,58 @@ class ScheduleService:
             out.append(schedule)
         return out
 
+    def _local_now(self, now: datetime | None, local_tz: tzinfo) -> datetime:
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(local_tz)
+
+    def _stagger_ready(
+        self,
+        character: Character,
+        *,
+        target: date,
+        offset: int,
+        anchor: date,
+        current_local: datetime,
+        local_tz: tzinfo,
+    ) -> bool:
+        """Whether ``target`` may be generated now under §4.1 staggering.
+
+        Staggering OFF → always ready (byte-identical to the legacy window).
+        Today (offset 0) and tomorrow (offset 1) are always ready. For days
+        beyond tomorrow, ready only once ``current_local`` has crossed a stable
+        per-(character, date) threshold spread across the PRIOR local day, so
+        day+N generation trickles through day+N-1 instead of herding at midnight.
+        """
+        if not self._staggering_enabled or offset <= _STAGGER_IMMEDIATE_OFFSET:
+            return True
+        # A tick's anchor is the current local date. For explicit backfills,
+        # compare against the requested anchor's prior day so the same helper
+        # remains deterministic in tests and maintenance jobs.
+        prior_day = target - timedelta(days=1)
+        if current_local.date() <= anchor:
+            prior_day = anchor + timedelta(days=offset - 1)
+        jitter_seconds = _stagger_jitter_seconds(character.id, target)
+        threshold = datetime.combine(
+            prior_day, time.min, tzinfo=local_tz,
+        ) + timedelta(seconds=jitter_seconds)
+        return current_local >= threshold
+
     async def load_upcoming_schedules(
         self,
         character_id: str,
         *,
         start_after: date,
-        days: int = _ROLLING_WINDOW_DAYS - 1,
+        days: int = 2,
     ) -> list[DailySchedule]:
         """Return the next ``days`` schedules *strictly after* ``start_after``.
+
+        The read horizon is pinned to 2 (tomorrow + day-after) INDEPENDENTLY of
+        the generation horizon: even with §4.1 staggering generating day+3, chat
+        and proactive read surfaces must never surface a day beyond day-after, so
+        this default is a literal 2 rather than derived from any generation
+        constant (that coupling was a leak vector flagged in the mapping).
 
         Used by chat / proactive prompt builders to surface the
         upcoming-day context (tomorrow + day-after). Days that haven't

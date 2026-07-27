@@ -114,3 +114,56 @@ def test_notification_preferences_default_and_roundtrip(monkeypatch) -> None:
     assert saved.status_code == 200
     assert saved.json() == update
     assert client.get("/api/v1/push/preferences").json() == update
+
+
+def _stub_clock(monkeypatch, at: list[float]):
+    """Replace ``push.time`` so the rate-limit window can be advanced."""
+    from types import SimpleNamespace
+
+    from kokoro_link.api.routes import push
+
+    monkeypatch.setattr(
+        push, "time", SimpleNamespace(monotonic=lambda: at[0]), raising=True,
+    )
+    monkeypatch.setattr(push, "_RATE_BUCKETS", {}, raising=True)
+    monkeypatch.setattr(push, "_LAST_BUCKET_SWEEP_AT", at[0], raising=False)
+    return push
+
+
+def test_rate_limit_evicts_idle_bucket_keys(monkeypatch) -> None:
+    """The bucket map must not grow monotonically for the process lifetime.
+
+    Every distinct ``{user}:{surface}`` key used to be inserted and never
+    removed: expired timestamps were drained but the key itself stayed, so a
+    long-lived API process leaked one dict entry per user forever.
+    """
+    at = [1000.0]
+    push = _stub_clock(monkeypatch, at)
+
+    for index in range(50):
+        push._check_rate_limit(f"user-{index}:preferences")
+    assert len(push._RATE_BUCKETS) == 50
+
+    # A full window later every one of those keys is dead weight.
+    at[0] += push._RATE_WINDOW_SECONDS * 2
+    push._check_rate_limit("user-fresh:preferences")
+
+    assert set(push._RATE_BUCKETS) == {"user-fresh:preferences"}
+
+
+def test_rate_limit_still_blocks_a_burst_within_the_window(monkeypatch) -> None:
+    """Eviction must not weaken the limiter for an actively-used key."""
+    at = [1000.0]
+    push = _stub_clock(monkeypatch, at)
+
+    for _ in range(push._RATE_LIMIT):
+        push._check_rate_limit("user-1:preferences")
+
+    with pytest.raises(Exception) as excinfo:
+        push._check_rate_limit("user-1:preferences")
+    assert getattr(excinfo.value, "status_code", None) == 429
+
+    # Once the window rolls past, the same key is allowed again.
+    at[0] += push._RATE_WINDOW_SECONDS + 1
+    push._check_rate_limit("user-1:preferences")
+    assert len(push._RATE_BUCKETS["user-1:preferences"]) == 1

@@ -16,6 +16,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import type { MessagingPlatform } from '@/types/messaging'
 import { resolveWebPushNudge } from '@/utils/webPushNudge'
 import SidebarBrand from './SidebarBrand.vue'
+import CloudCreditsBadge from './CloudCreditsBadge.vue'
 import PostCreateChannelGuide from './PostCreateChannelGuide.vue'
 import AlbumPanel from './AlbumPanel.vue'
 import CharacterImagesPanel from './CharacterImagesPanel.vue'
@@ -276,6 +277,10 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
     <!-- 標題區 -->
     <SidebarBrand :subtitle="t('playerSidebar.brandSubtitle')" />
 
+    <!-- 螢火餘額徽章：僅 hosted（cloud）模式且拿得到餘額時渲染，
+         self-host 這裡完全不輸出任何節點。 -->
+    <CloudCreditsBadge />
+
     <!-- 頁籤 -->
     <div class="tabs" role="tablist" :aria-label="t('playerSidebar.tabs.ariaLabel')">
       <button
@@ -472,6 +477,7 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
 
         <CharacterImagesPanel
           :character="selectedCharacter"
+          :show-technical-hints="!cloudMode"
           @updated="emit('characterUpdated', $event)"
         />
         <p class="admin-link-hint">

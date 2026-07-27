@@ -15,12 +15,31 @@
 # per-character locale preferences. Free-form, but use BCP-47
 # (zh-TW / ja-JP / en-US ...).
 #
-# region (optional) binds an ``emergency`` source to a deployment region
-# code (TW / JP / US ...). A region-bound emergency feed is seeded
-# ENABLED only when the deployment region matches; otherwise it lands
-# disabled (geographic alerts are meaningless to an overseas self-host).
-# The gate binds to region/timezone, NOT language — an en-US operator in
-# Taiwan still wants Taiwan alerts. Non-emergency sources ignore region.
+# region (optional, TW / JP / US ...) declares that a source's content is
+# only meaningful to people living in that place. OMIT IT for anything a
+# reader anywhere could care about — that is the common case, and an
+# over-tagged pool silently starves players in small regions.
+#
+# It does two things:
+#
+#  1. Curation (all categories): a character is only offered events from
+#     region-less sources plus its own player's region, so a player in
+#     Japan never reads Taiwanese local news. A player with no country on
+#     their profile — the self-host default — is never filtered, so
+#     self-host behaviour is exactly as it was before the field existed.
+#     Persisted per source and editable in Admin → World events; the seed
+#     only backfills rows that have no region yet.
+#  2. Emergency seeding: a region-bound ``emergency`` feed is seeded
+#     ENABLED only when the deployment region matches, otherwise disabled
+#     (civil alerts are noise for an overseas self-host). This gate binds
+#     to region/timezone, NOT language — an en-US operator living in
+#     Taiwan still wants Taiwan alerts.
+#
+# region is orthogonal to locale: locale is the language the feed
+# publishes in, region is who the content is *for*. A Taiwanese agency
+# reporting world news in zh-TW is locale zh-TW + region TW; a Japanese
+# outlet covering anime that fans read worldwide is locale ja-JP with no
+# region at all.
 
 sources:
   - id: bbc-world
@@ -35,13 +54,20 @@ sources:
     feed_url: https://feeds.feedburner.com/rsscna/intworld
     category: news
     locale: zh-TW
+    region: TW
     enabled: true
 
+  # NHK 主要ニュース (cat0). Shipped under the legacy ``nhk-easy`` id —
+  # renaming the id would strand the existing DB row (the seed never
+  # deletes) and poll the same URL twice, so only the display name moved.
+  # region: JP — Japanese domestic headlines are for people living there;
+  # see the hosted default pack note at the bottom of this file.
   - id: nhk-easy
-    name: NHK ニュース
+    name: NHK 主要ニュース
     feed_url: https://www3.nhk.or.jp/rss/news/cat0.xml
     category: news
     locale: ja-JP
+    region: JP
     enabled: true
 
   - id: ncdr-all-alerts
@@ -62,6 +88,7 @@ sources:
     feed_url: https://www.ithome.com.tw/rss
     category: tech
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: hackernews-front
@@ -108,6 +135,7 @@ sources:
     feed_url: https://trends.google.com/trending/rss?geo=TW
     category: culture
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: google-news-meme-tw
@@ -115,6 +143,7 @@ sources:
     feed_url: https://news.google.com/rss/search?q=%E7%B6%B2%E8%B7%AF%E8%BF%B7%E5%9B%A0&hl=zh-TW&gl=TW&ceid=TW:zh-Hant
     category: culture
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: ptt-c-chat
@@ -122,6 +151,7 @@ sources:
     feed_url: https://www.ptt.cc/atom/C_Chat.xml
     category: anime
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: ptt-mobilecomm
@@ -129,6 +159,7 @@ sources:
     feed_url: https://www.ptt.cc/atom/MobileComm.xml
     category: tech
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: ptt-pc-shopping
@@ -136,6 +167,7 @@ sources:
     feed_url: https://www.ptt.cc/atom/PC_Shopping.xml
     category: tech
     locale: zh-TW
+    region: TW
     enabled: true
 
   # Product launches, technology news, engineering communities, and
@@ -245,6 +277,7 @@ sources:
     feed_url: https://gnn.gamer.com.tw/rss.xml
     category: gaming
     locale: zh-TW
+    region: TW
     enabled: true
 
   - id: 4gamer
@@ -280,4 +313,52 @@ sources:
     feed_url: https://udn.com/rssfeed/news/2/6649?ch=news
     category: lifestyle
     locale: zh-TW
+    region: TW
     enabled: true
+
+  # Hosted default pack (2026-07-26 owner selection).
+  #
+  # Two halves with different region semantics:
+  #
+  #  * JP pack (region: JP) — outlets whose day-to-day coverage is
+  #    Japanese domestic life. A hosted player in Taiwan gets no value
+  #    from NHK's 主要ニュース rundown, so these are curated only into
+  #    JP players' pools (plus ``nhk-easy`` above, same pack).
+  #  * Global pack (no region) — international wires plus science and
+  #    technology coverage a reader anywhere can use. Do NOT tag these
+  #    US just because they publish in en-US; region is who the content
+  #    is for, not where the newsroom sits.
+  - id: nhk-science
+    name: NHK 科学・医療
+    feed_url: https://www3.nhk.or.jp/rss/news/cat3.xml
+    category: science
+    locale: ja-JP
+    region: JP
+    enabled: true
+
+  - id: itmedia-news
+    name: ITmedia NEWS
+    feed_url: https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml
+    category: tech
+    locale: ja-JP
+    region: JP
+    enabled: true
+
+  - id: npr-top-stories
+    name: NPR Top Stories
+    feed_url: https://feeds.npr.org/1001/rss.xml
+    category: news
+    locale: en-US
+    enabled: true
+
+  - id: ars-technica
+    name: Ars Technica
+    feed_url: https://feeds.arstechnica.com/arstechnica/index
+    category: tech
+    locale: en-US
+    enabled: true
+
+  # BBC News World (https://feeds.bbci.co.uk/news/world/rss.xml) is the
+  # sixth entry of the owner's global pack — it already ships at the top
+  # of this file as ``bbc-world`` (locale en-GB, region-less), so it is
+  # deliberately not repeated here.

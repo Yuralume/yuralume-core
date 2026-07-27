@@ -89,7 +89,7 @@ def _build_persona() -> OperatorPersona:
         character_id=_CHAR_ID,
         operator_id=_OP_ID,
         layer1_identity={
-            "name": _field("name", 1, "丹尼", conf=0.9),
+            "name": _field("name", 1, "艾力", conf=0.9),
             "occupation": _field("occupation", 1, "工程師", conf=0.8),
         },
         layer2_life={
@@ -176,7 +176,7 @@ def test_get_persona_returns_snapshot():
     # Layer dicts come back as lists sorted by confidence desc.
     layer1_keys = [f["field_key"] for f in body["layer1_identity"]]
     assert layer1_keys == ["name", "occupation"]
-    assert body["layer1_identity"][0]["value"] == "丹尼"
+    assert body["layer1_identity"][0]["value"] == "艾力"
     assert body["interaction_strength"]["familiarity_band"] == "close"
     assert body["pending_candidates"][0]["field_key"] == "diet"
     assert "關於對方" in body["prompt_preview_lines"]

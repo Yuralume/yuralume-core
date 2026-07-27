@@ -2,7 +2,10 @@
 
 Inbound flow (platform-agnostic once the adapter has normalised payload):
 
-1. Debounce by ``platform_message_id`` — webhook retries don't double-fire
+1. Debounce by ``platform_message_id`` — webhook retries don't double-fire.
+   Two layers: the process-local ``InboundDebouncer`` as a cheap front gate,
+   then the durable ``InboundReceiptPort`` claim so a retry the load balancer
+   lands on a *different* api replica can't re-run the whole turn
 2. Load the ``MessagingAccount`` referenced by ``message.account_id``;
    drop silently if gone / disabled
 3. Apply the account's ``allowed_sender_refs`` allowlist — anything
@@ -21,13 +24,25 @@ Inbound flow (platform-agnostic once the adapter has normalised payload):
 
 No platform-specific logic lives here — adapters handle that upstream
 (webhook parsing) and downstream (REST calls to the platform).
+
+**Conversation-busy rollback.** Step 5 runs under the per-conversation turn
+lease, which rejects a delivery that overlaps a sibling turn. That rejection
+happens before anything is written, so it must not consume the delivery: after
+a bounded retry the dispatcher gives back *both* dedup stamps (durable receipt
+and in-process debounce) and re-raises, leaving the transport free to
+re-deliver. Every other failure keeps the historical semantics — swallowed,
+stamps retained — because a turn that crashed mid-flight may already have
+appended the user message and charged for it.
 """
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from enum import Enum
 
 from kokoro_link.application.dto.chat import PresenceFramePayload, SendChatMessageRequest
 from kokoro_link.application.services.chat_service import ChatService
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.outbound_message_segments import (
     send_segmented_outbound,
 )
@@ -39,6 +54,7 @@ from kokoro_link.contracts.messaging import (
     OutboundAttachment,
     OutboundMessage,
 )
+from kokoro_link.contracts.inbound_receipts import InboundReceiptPort
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.domain.entities.channel_binding import ChannelBinding
 from kokoro_link.domain.entities.conversation import Conversation
@@ -54,6 +70,36 @@ from kokoro_link.infrastructure.messaging.inbound_placeholders import (
 _LOGGER = logging.getLogger(__name__)
 
 
+DEFAULT_BUSY_RETRY_ATTEMPTS = 3
+"""Total ``send_message`` attempts before a busy conversation is handed back.
+
+Only worth a small budget: the sibling turn holding the lease is an LLM turn
+that usually runs for tens of seconds, so retrying here just catches the tail
+of one that is about to finish. The real recovery is the transport's
+re-delivery — but the Discord / WhatsApp gateways have no re-delivery at all,
+which is why the budget is not zero."""
+
+DEFAULT_BUSY_RETRY_DELAY_SECONDS = 1.5
+"""Pause between busy attempts. Kept short: the webhook routes run the whole
+turn inside the request handler, so this delay is spent against the platform's
+own request timeout."""
+
+
+class _ClaimOutcome(Enum):
+    """What the durable receipt claim decided about this delivery."""
+
+    OWNED = "owned"
+    """This caller inserted the receipt — and is therefore the only one
+    allowed to release it again."""
+
+    DUPLICATE = "duplicate"
+    """Another instance owns the delivery; drop it."""
+
+    DEGRADED = "degraded"
+    """The ledger is unwired or unreachable. Proceed on the in-process
+    debouncer alone, and never release a row we cannot prove we wrote."""
+
+
 class MessagingDispatcher:
     def __init__(
         self,
@@ -64,6 +110,9 @@ class MessagingDispatcher:
         chat_service: ChatService,
         adapters: dict[Platform, ChannelAdapterPort],
         debouncer: InboundDebouncer | None = None,
+        receipt_repository: InboundReceiptPort | None = None,
+        busy_retry_attempts: int = DEFAULT_BUSY_RETRY_ATTEMPTS,
+        busy_retry_delay_seconds: float = DEFAULT_BUSY_RETRY_DELAY_SECONDS,
         public_base_url: str = "",
         public_base_url_provider: Callable[[], Awaitable[str]] | None = None,
         operator_language_resolver: (
@@ -76,6 +125,12 @@ class MessagingDispatcher:
         self._chat = chat_service
         self._adapters = {p.value: a for p, a in adapters.items()}
         self._debouncer = debouncer
+        # Durable cross-instance twin of the debouncer. ``None`` on the
+        # no-DB / in-memory path, where behaviour stays exactly what it was:
+        # a single process is fully covered by the debouncer alone.
+        self._receipts = receipt_repository
+        self._busy_retry_attempts = max(1, busy_retry_attempts)
+        self._busy_retry_delay_seconds = max(0.0, busy_retry_delay_seconds)
         # Relative URLs (``/v1/public/...``) become absolute before
         # delivery to external platforms or adapters that self-fetch
         # before upload. Empty base_url means "don't rewrite", which
@@ -97,6 +152,10 @@ class MessagingDispatcher:
                 message.chat_ref,
                 message.platform_message_id,
             )
+            return
+
+        claim = await self._claim_delivery(message)
+        if claim is _ClaimOutcome.DUPLICATE:
             return
 
         account = await self._accounts.get(message.account_id)
@@ -151,8 +210,25 @@ class MessagingDispatcher:
             ),
         )
         try:
-            reply = await self._chat.send_message(request)
+            reply = await self._send_turn(request, binding_id=binding.id)
+        except ConversationBusyError:
+            # Nothing was written: the lease refuses *before* the turn starts.
+            # Give the delivery back so the transport can re-deliver it, and
+            # let the caller map that to its own retry semantics.
+            await self._rollback_delivery(message, claim)
+            _LOGGER.warning(
+                "inbound handed back to the transport — conversation busy "
+                "binding=%s conversation=%s %s/%s id=%s",
+                binding.id,
+                conversation_id,
+                message.platform.value,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+            raise
         except Exception:
+            # Every other failure keeps the dedup stamps: the turn may have
+            # written partial state, and re-running it would double-charge.
             _LOGGER.exception("chat_service failed for binding %s", binding.id)
             return
 
@@ -181,6 +257,103 @@ class MessagingDispatcher:
                 reply_context=message.reply_context,
             ),
         )
+
+    async def _send_turn(
+        self, request: SendChatMessageRequest, *, binding_id: str,
+    ):  # noqa: ANN202 — ChatReplyResponse, typed at the call site
+        """Run the turn, retrying a bounded number of times while busy.
+
+        Raises :class:`ConversationBusyError` once the budget is spent; the
+        caller owns the rollback.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._chat.send_message(request)
+            except ConversationBusyError:
+                if attempt >= self._busy_retry_attempts:
+                    raise
+                _LOGGER.info(
+                    "conversation busy for binding %s — retry %d/%d",
+                    binding_id, attempt, self._busy_retry_attempts - 1,
+                )
+                if self._busy_retry_delay_seconds:
+                    await asyncio.sleep(self._busy_retry_delay_seconds)
+
+    async def _claim_delivery(self, message: InboundMessage) -> _ClaimOutcome:
+        """Take the durable at-most-once claim on this inbound delivery.
+
+        ``DUPLICATE`` means another instance already owns this delivery (a
+        platform retry that landed on a different replica) and the caller must
+        drop it, which is exactly the debouncer's drop semantics.
+
+        A ledger failure (DB blip) must not swallow a real user message, so it
+        degrades to the pre-existing in-process-only protection rather than
+        dropping the turn — reported as ``DEGRADED`` so a later rollback knows
+        there is no row of ours to delete.
+        """
+        if self._receipts is None:
+            return _ClaimOutcome.DEGRADED
+        try:
+            claimed = await self._receipts.try_claim(
+                message.platform.value,
+                message.account_id,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "inbound receipt claim failed %s/%s id=%s — proceeding on "
+                "in-process debounce only",
+                message.platform.value,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+            return _ClaimOutcome.DEGRADED
+        if not claimed:
+            _LOGGER.info(
+                "dropping cross-instance duplicate inbound %s/%s id=%s",
+                message.platform.value,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+            return _ClaimOutcome.DUPLICATE
+        return _ClaimOutcome.OWNED
+
+    async def _rollback_delivery(
+        self, message: InboundMessage, claim: _ClaimOutcome,
+    ) -> None:
+        """Un-stamp a delivery that produced no side effects.
+
+        Both dedup layers have to be rolled back or the re-delivery is eaten:
+        the durable receipt blocks other replicas for the retention window, the
+        in-process debounce entry blocks this one for its TTL — and the polling
+        connector re-delivers within seconds. ``DEGRADED``/``DUPLICATE`` claims
+        are never released: we cannot prove the row is ours, and deleting
+        another instance's claim would re-open a delivery it is still running.
+        """
+        if self._debouncer is not None:
+            self._debouncer.forget(message)
+        if claim is not _ClaimOutcome.OWNED or self._receipts is None:
+            return
+        try:
+            await self._receipts.release_claim(
+                message.platform.value,
+                message.account_id,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+        except Exception:
+            # The delivery is now stuck behind its own receipt until retention
+            # expires, so this is the diagnostic that explains a lost message.
+            _LOGGER.exception(
+                "inbound receipt release failed %s/%s id=%s — the platform's "
+                "re-delivery of this message will be suppressed",
+                message.platform.value,
+                message.chat_ref,
+                message.platform_message_id,
+            )
 
     async def _resolve_operator_language(self, character_id: str) -> str:
         """Resolve the owning-operator content language for a character.

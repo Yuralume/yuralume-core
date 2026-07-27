@@ -83,6 +83,37 @@ class InMemoryOperatorProfileRepository(OperatorProfileRepositoryPort):
                 updated += 1
         return updated
 
+    async def set_identity_locale(
+        self,
+        operator_id: str,
+        *,
+        timezone_id: str | None = None,
+        primary_language: str | None = None,
+    ) -> OperatorProfile | None:
+        """Twin of the SA targeted locale update (G2).
+
+        The SA ``save`` refuses to move these two columns on an existing
+        row, so the hosted locale-change flow must go through here; this
+        twin exists so unit tests exercise the same seam."""
+        normalised = (operator_id or "").strip()
+        profile = self._profiles.get(normalised)
+        if profile is None:
+            return None
+        updated = profile.update_identity_locale(
+            timezone_id=(
+                normalise_timezone_id(timezone_id)
+                if timezone_id is not None
+                else None
+            ),
+            primary_language=(
+                normalise_language_tag(primary_language)
+                if primary_language is not None
+                else None
+            ),
+        )
+        self._profiles[normalised] = updated
+        return updated
+
     async def list_all(self) -> list[OperatorProfile]:
         return list(self._profiles.values())
 

@@ -167,6 +167,7 @@ def _story_to_row(story: FusionStory) -> FusionStoryRow:
         status=story.status,
         head_version=story.head_version,
         error_message=story.error_message,
+        error_code=story.error_code,
         created_at=story.created_at,
         updated_at=story.updated_at,
     )
@@ -185,6 +186,7 @@ def _apply_updates(row: FusionStoryRow, story: FusionStory) -> None:
     row.status = story.status
     row.head_version = story.head_version
     row.error_message = story.error_message
+    row.error_code = story.error_code
     row.updated_at = story.updated_at
 
 
@@ -242,6 +244,7 @@ def _row_to_story(
         head_version=row.head_version,
         versions=tuple(versions),
         error_message=row.error_message,
+        error_code=row.error_code,
         created_at=_ensure_aware(row.created_at),
         updated_at=_ensure_aware(row.updated_at),
     )

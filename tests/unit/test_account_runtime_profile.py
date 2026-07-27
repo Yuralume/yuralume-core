@@ -74,6 +74,7 @@ async def test_resolver_maps_cloud_demo_tenant_to_demo_profile() -> None:
     assert profile.character_ttl.days == 3
     assert profile.album_generation_enabled is False
     assert profile.strict_no_fallback is True
+    assert profile.background_activity_multiplier == 6
 
 
 @pytest.mark.asyncio
@@ -153,6 +154,9 @@ async def test_resolver_paid_tier_defaults_when_port_unwired() -> None:
 def test_parser_full_payload_maps_every_knob() -> None:
     profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
         "proactive_tick_multiplier": 3,
+        "background_activity_multiplier": 4,
+        "idle_downshift_days": 7,
+        "idle_multiplier": 5,
         "character_ttl_days": 14,
         "max_characters": 8,
         "daily_character_create_limit": 2,
@@ -168,6 +172,9 @@ def test_parser_full_payload_maps_every_knob() -> None:
 
     assert profile.name == "plus"
     assert profile.proactive_tick_multiplier == 3
+    assert profile.background_activity_multiplier == 4
+    assert profile.idle_downshift_days == 7
+    assert profile.idle_multiplier == 5
     assert profile.character_ttl == timedelta(days=14)
     assert profile.max_characters == 8
     assert profile.daily_character_create_limit == 2
@@ -223,6 +230,41 @@ def test_parser_ignores_invalid_typed_values_per_knob() -> None:
     assert profile.background_judge_model_pin is None
     # A single bad knob does not poison the valid ones.
     assert profile.tts_enabled is False
+
+
+def test_parser_rejects_frequency_knobs_above_contract_maximum(caplog) -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "proactive_tick_multiplier": 289,
+        "background_activity_multiplier": 600,
+        "idle_multiplier": 289,
+        "idle_downshift_days": 3651,
+    })
+
+    assert profile.proactive_tick_multiplier == 1
+    assert profile.background_activity_multiplier == 1
+    assert profile.idle_multiplier == 1
+    assert profile.idle_downshift_days is None
+    assert "ignoring invalid proactive_tick_multiplier=289" in caplog.text
+    assert "ignoring invalid background_activity_multiplier=600" in caplog.text
+    assert "ignoring invalid idle_multiplier=289" in caplog.text
+    assert "ignoring invalid idle_downshift_days=3651" in caplog.text
+
+
+def test_effective_multipliers_apply_idle_factor_and_clamp(caplog) -> None:
+    profile = AccountRuntimeProfile(
+        name="plus",
+        proactive_tick_multiplier=49,
+        background_activity_multiplier=72,
+        idle_downshift_days=7,
+        idle_multiplier=6,
+    )
+
+    assert profile.effective_proactive_multiplier(idle=False) == 49
+    assert profile.effective_background_multiplier(idle=False) == 72
+    assert profile.effective_proactive_multiplier(idle=True) == 288
+    assert profile.effective_background_multiplier(idle=True) == 288
+    assert "clamped effective proactive multiplier" in caplog.text
+    assert "clamped effective background multiplier" in caplog.text
 
 
 def test_parser_character_ttl_days_mapping_and_invalid() -> None:

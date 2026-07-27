@@ -29,6 +29,7 @@ import {
 import type { AuthUser, BuildInfo } from '@/utils/api/auth'
 import { useLocale } from '@/composables/useLocale'
 import { useTimezone } from '@/composables/useTimezone'
+import { notifyIdentityChanged } from '@/utils/identityLifecycle'
 
 const TOKEN_KEY = 'kokoro_auth_token'
 
@@ -42,6 +43,11 @@ const buildInfo = ref<BuildInfo | null>(null)
 // pending follow-ups, subsystem health metrics, persona drift / pattern
 // timelines. Default false so the public build hides them.
 const debugUiEnabled = ref<boolean>(false)
+// Absolute URL of the account Portal, advertised by hosted deployments only
+// (self-host leaves it null). Drives the "back to the account centre" exits
+// and the credit badge's top-up deep link — every consumer gates on it being
+// non-null so self-host renders exactly as before.
+const portalUrl = ref<string | null>(null)
 const token = ref<string | null>(localStorage.getItem(TOKEN_KEY))
 const currentUser = ref<AuthUser | null>(null)
 const bootstrapping = ref<boolean>(false)
@@ -55,13 +61,23 @@ function applyUserRuntimePreferences(user: AuthUser | null): void {
   useTimezone().applyUserTimezone(user.timezone_id)
 }
 
+/**
+ * The single chokepoint for "the identity behind every request changed":
+ * login, demo / cloud session exchange, first-admin setup, logout and the
+ * 401 bounce all land here. Per-identity caches are told from this one
+ * place so no new sign-in path can forget to drop the previous player's
+ * data (see `@/utils/identityLifecycle` for why it is a broadcast and not
+ * a direct call).
+ */
 function persistToken(next: string | null): void {
+  const changed = token.value !== next
   token.value = next
   if (next) {
     localStorage.setItem(TOKEN_KEY, next)
   } else {
     localStorage.removeItem(TOKEN_KEY)
   }
+  if (changed) notifyIdentityChanged()
 }
 
 /**
@@ -79,6 +95,7 @@ async function bootstrapAuth(): Promise<void> {
     mode.value = config.mode === 'cloud' ? 'cloud' : 'self_host'
     buildInfo.value = config.build_info ?? null
     debugUiEnabled.value = config.debug_ui_enabled === true
+    portalUrl.value = (config.portal_url ?? '').trim() || null
 
     if (config.auth_enabled && token.value) {
       // Validate stored token. If it doesn't resolve to a user the
@@ -168,6 +185,20 @@ async function setup(
   applyUserRuntimePreferences(res.user)
 }
 
+/**
+ * Re-read `GET /auth/me`.
+ *
+ * The hosted locale lifecycle (plan G2) lives on that payload:
+ * `needs_locale_confirmation` drives the blocking onboarding gate and
+ * `location_hint` drives the "you seem to be somewhere else" bar. Both are
+ * server-owned, so after confirming / changing / accepting anything the SPA
+ * re-reads rather than guessing the next state locally.
+ */
+async function refreshMe(): Promise<void> {
+  currentUser.value = await fetchMe()
+  applyUserRuntimePreferences(currentUser.value)
+}
+
 function logout(): void {
   persistToken(null)
   currentUser.value = null
@@ -184,15 +215,32 @@ export function useAuth() {
     cloudMode: computed(() => mode.value === 'cloud'),
     buildInfo: computed(() => buildInfo.value),
     debugUiEnabled: computed(() => debugUiEnabled.value),
+    portalUrl: computed(() => portalUrl.value),
     currentUser: computed(() => currentUser.value),
     token: computed(() => token.value),
     isAuthenticated: computed(
       () => authEnabled.value === false || currentUser.value !== null,
     ),
     isAdmin: computed(() => currentUser.value?.is_admin === true),
+    /**
+     * Hosted-only: this player has not yet acknowledged the GeoIP-seeded
+     * place / timezone / language. Double-gated on cloud mode so a stale
+     * flag could never block a self-host operator.
+     */
+    needsLocaleConfirmation: computed(
+      () => mode.value === 'cloud'
+        && currentUser.value?.needs_locale_confirmation === true,
+    ),
+    /** Hosted-only relocation suggestion; never an applied fact. */
+    locationHint: computed(
+      () => (mode.value === 'cloud'
+        ? currentUser.value?.location_hint ?? null
+        : null),
+    ),
 
     // actions
     bootstrapAuth,
+    refreshMe,
     login,
     loginWithDemoSession,
     loginWithCloudSession,

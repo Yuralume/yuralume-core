@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -118,6 +118,44 @@ class SACharacterRepository(CharacterRepositoryPort):
             )
             await session.commit()
             return bool(result.rowcount)
+
+    async def claim_consolidation_slot(
+        self, character_id: str, *, cooldown: timedelta,
+    ) -> bool:
+        """Cross-replica cooldown + single-flight claim in one UPDATE.
+
+        ``now`` and the cutoff both come from the DB clock, so replicas with
+        skewed wall clocks cannot shorten the shared cooldown. The UPDATE's
+        predicate is re-evaluated against the committed row after any
+        concurrent writer releases its row lock, so of two racing claimers
+        exactly one gets ``rowcount == 1``. Targeted update: it never races the
+        character's aggregate ``save()`` on unrelated fields."""
+        async with self._session_factory() as session:
+            now = await self._db_now(session)
+            cutoff = now - cooldown
+            result = await session.execute(
+                update(CharacterRow)
+                .where(
+                    CharacterRow.id == character_id,
+                    or_(
+                        CharacterRow.last_consolidated_at.is_(None),
+                        CharacterRow.last_consolidated_at < cutoff,
+                    ),
+                )
+                .values(last_consolidated_at=now)
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    @staticmethod
+    async def _db_now(session: AsyncSession) -> datetime:
+        raw = (
+            await session.execute(select(func.current_timestamp()))
+        ).scalar_one()
+        if isinstance(raw, str):
+            # SQLite renders CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS'.
+            raw = datetime.fromisoformat(raw)
+        return _ensure_utc(raw)
 
     async def get(self, character_id: str) -> Character | None:
         async with self._session_factory() as session:

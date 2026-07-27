@@ -1,8 +1,9 @@
 """Regenerate the Core feature-key manifest contract artifact.
 
 Writes the canonical ``contracts/feature-key-manifest.json`` at the *Cloud repo
-root* (the parent of the Core project) and the bundled copy under the Cloud User
-service resources so the Java control-plane can load it from the classpath.
+root* (the parent of the Core project), the bundled copy under the Cloud User
+service resources so the Java control-plane can load it from the classpath, and
+the admin-console mirror the vitest byte-compare guards.
 
 Run after adding/removing a routable feature key:
 
@@ -27,8 +28,20 @@ from kokoro_link.application.services.feature_key_manifest import (  # noqa: E40
     build_feature_key_manifest,
 )
 
-# Repo root is the parent of the embedded Core project.
-_REPO_ROOT = _CORE_ROOT.parent
+# Core can be embedded directly under the Cloud repository or checked out as a
+# sibling in a shared workspace (the hosted deployment layout). Prefer the
+# sibling Cloud repository only when its contract consumers actually exist;
+# otherwise retain the historical parent layout.
+_WORKSPACE_ROOT = _CORE_ROOT.parent
+_SIBLING_CLOUD_ROOT = _WORKSPACE_ROOT / "yuralume-cloud"
+_REPO_ROOT = (
+    _SIBLING_CLOUD_ROOT
+    if (
+        (_SIBLING_CLOUD_ROOT / "services" / "user").is_dir()
+        and (_SIBLING_CLOUD_ROOT / "admin-console").is_dir()
+    )
+    else _WORKSPACE_ROOT
+)
 CANONICAL_PATH = _REPO_ROOT / "contracts" / "feature-key-manifest.json"
 USER_SERVICE_COPY = (
     _REPO_ROOT
@@ -40,12 +53,19 @@ USER_SERVICE_COPY = (
     / "contracts"
     / "feature-key-manifest.json"
 )
+ADMIN_CONSOLE_COPY = (
+    _REPO_ROOT
+    / "admin-console"
+    / "src"
+    / "contracts"
+    / "feature-key-manifest.json"
+)
 
 
 def main() -> int:
     manifest = build_feature_key_manifest()
     payload = manifest.to_json()
-    for target in (CANONICAL_PATH, USER_SERVICE_COPY):
+    for target in (CANONICAL_PATH, USER_SERVICE_COPY, ADMIN_CONSOLE_COPY):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(payload, encoding="utf-8")
         print(f"wrote {target} ({manifest.content_hash})")

@@ -48,6 +48,13 @@ export interface FusionStory {
   head_version: number
   full_text: string
   error_message: string | null
+  /**
+   * Machine-readable failure reason for a `failed` job (plan U4b), from
+   * an open set the backend forwards verbatim. `insufficient_credits`
+   * is the only value the SPA acts on; anything else (or `null`, for an
+   * ordinary crash) falls through to the generic failure copy.
+   */
+  error_code?: string | null
   progress: FusionStoryProgress
   beats: FusionStoryBeat[]
   versions: FusionStoryVersion[]
@@ -63,6 +70,7 @@ export interface FusionStorySummary {
   status: FusionStoryStatus
   head_version: number
   error_message: string | null
+  error_code?: string | null
   progress: FusionStoryProgress
   total_chars: number
   created_at: string

@@ -7,6 +7,10 @@ import httpx
 import pytest
 
 from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
+from kokoro_link.contracts.generation_trigger import (
+    GenerationTrigger,
+    generation_trigger_scope,
+)
 from kokoro_link.infrastructure.llm.cloud_gateway_model import (
     CloudGatewayChatModel,
 )
@@ -55,7 +59,8 @@ async def test_cloud_gateway_model_posts_openai_shape_with_cloud_headers(
         ),
     )
 
-    result = await model.generate("Say hi", model="preset-fast")
+    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+        result = await model.generate("Say hi", model="preset-fast")
 
     assert result == "hello from gateway"
     assert seen["url"] == "https://gateway.example/v1/chat/completions"
@@ -67,6 +72,7 @@ async def test_cloud_gateway_model_posts_openai_shape_with_cloud_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "chat"
     assert headers["x-yuralume-character"] == "chr_abc"
+    assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("llm-")
     assert model.last_request_id == headers["x-request-id"]
     payload = seen["payload"]

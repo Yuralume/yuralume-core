@@ -19,11 +19,13 @@ to debug "why didn't the character message me?" or "why did it again".
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from kokoro_link.contracts.calendar_context import CalendarContextPort
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
@@ -49,7 +51,6 @@ from kokoro_link.contracts.messaging import (
     ChannelBindingRepositoryPort,
     MessagingAccountRepositoryPort,
     OutboundAttachment,
-    OutboundMessage,
 )
 from kokoro_link.contracts.prompt import PromptToolDescriptor
 from kokoro_link.contracts.register_profile import (
@@ -77,6 +78,30 @@ from kokoro_link.application.services.proactive_event_bus import (
     ProactiveEvent,
     ProactiveEventBus,
 )
+from kokoro_link.application.services.proactive_delivery.eligible_binding import (
+    find_eligible_proactive_binding,
+)
+from kokoro_link.application.services.proactive_delivery.line_conversation_recorder import (  # noqa: E501
+    HostedLineConversationRecorder,
+)
+from kokoro_link.application.services.proactive_delivery.local_adapter import (
+    LocalDeliveryTarget,
+    LocalMessagingProactiveDeliveryAdapter,
+)
+from kokoro_link.application.services.proactive_delivery.envelope_hash import (
+    compute_envelope_hash,
+)
+from kokoro_link.contracts.external_proactive import (
+    DeliveryAcceptance,
+    ENVELOPE_KIND_PROACTIVE,
+    ExternalProactiveDeliveryPort,
+    ProactiveEnvelope,
+    ProactiveSegment,
+    envelope_to_payload,
+)
+from kokoro_link.contracts.external_proactive_ledger import (
+    ExternalProactiveEventRepositoryPort,
+)
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
@@ -84,9 +109,6 @@ from kokoro_link.application.services.location_context import (
     calendar_region_from_operator,
     prompt_location_fact,
     weather_location_from_operator,
-)
-from kokoro_link.application.services.outbound_message_segments import (
-    send_segmented_outbound,
 )
 from kokoro_link.application.services.persona_curiosity_observability import (
     persona_curiosity_plan_summary,
@@ -133,6 +155,7 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
 )
 
 if TYPE_CHECKING:
+    from kokoro_link.contracts.visible_slots import VisibleSlotPort
     from kokoro_link.application.services.deferred_intent_service import (
         DeferredIntentService,
     )
@@ -176,6 +199,11 @@ _SEED_OR_OBSERVED_PROVENANCE = frozenset(
 # "ignored for days" streak stays visible to the decider; the prompt
 # itself only quotes the first few verbatim to bound length.
 _RECENT_SENT_LIMIT = 8
+
+# The hosted proactive path records its assistant turn on the character's
+# ``source="line"`` conversation — the same thread the inbound external-chat
+# turn machine (DR-LH0-004) drives, so proactive + reply share one timeline.
+_SOURCE_LINE = "line"
 
 
 class ProactiveDispatcher:
@@ -229,6 +257,17 @@ class ProactiveDispatcher:
         reply_quality_gate_enabled: bool = False,
         reply_quality_gate_max_retries: int = 1,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
+        visible_slot_port: "VisibleSlotPort | None" = None,
+        external_delivery: ExternalProactiveDeliveryPort | None = None,
+        local_delivery: ExternalProactiveDeliveryPort | None = None,
+        hosted_delivery: ExternalProactiveDeliveryPort | None = None,
+        proactive_event_ledger: (
+            ExternalProactiveEventRepositoryPort | None
+        ) = None,
+        proactive_envelope_ttl_seconds: float = 3600.0,
+        hosted_identity_resolver: (
+            Callable[[str], Awaitable["tuple[str, str] | None"]] | None
+        ) = None,
     ) -> None:
         self._characters = character_repository
         self._conversations = conversation_repository
@@ -289,6 +328,57 @@ class ProactiveDispatcher:
             int(reply_quality_gate_max_retries),
         )
         self._subscription_access_guard = subscription_access_guard
+        self._visible_slot_port = visible_slot_port
+        # §8.3 — only the *external* sink is routed through the port; the web /
+        # history / SSE sink stays in this dispatcher. When no adapter is
+        # injected we default to the self-host messaging adapter built from the
+        # same repositories + platform adapters, so behaviour is byte-identical
+        # to the former inline ``_deliver`` (existing tests wire no port).
+        self._external_delivery: ExternalProactiveDeliveryPort = (
+            external_delivery
+            if external_delivery is not None
+            else LocalMessagingProactiveDeliveryAdapter(
+                account_repository=account_repository,
+                binding_repository=binding_repository,
+                conversation_repository=conversation_repository,
+                adapters=adapters,
+            )
+        )
+        # H4: the local-binding path and the hosted-channel path must NEVER
+        # share one adapter — a hosted deployment that also has a self-host
+        # binding would otherwise feed the local binding's identity into the
+        # hosted adapter. Each path resolves to its dedicated port; both default
+        # to ``external_delivery`` so single-adapter (self-host / legacy test)
+        # wiring is byte-identical.
+        self._local_delivery: ExternalProactiveDeliveryPort = (
+            local_delivery if local_delivery is not None else self._external_delivery
+        )
+        self._hosted_delivery: ExternalProactiveDeliveryPort = (
+            hosted_delivery
+            if hosted_delivery is not None
+            else self._external_delivery
+        )
+        # DR-LH0-005 pre-send ledger. Optional: unset (self-host default) skips
+        # the durable record entirely and delivers exactly as before; when wired
+        # the immutable envelope is durably saved BEFORE ``accept`` so a lost
+        # response re-sends the same event without re-running judge / decider.
+        self._proactive_event_ledger = proactive_event_ledger
+        self._proactive_envelope_ttl = timedelta(
+            seconds=max(1.0, proactive_envelope_ttl_seconds),
+        )
+        # LH4 Core-C — hosted routing. When set (hosted mode), a character with
+        # no local messaging binding can still route its proactive push to the
+        # Cloud Channel: the resolver reverse-maps the character to its owner's
+        # cloud ``(tenant_id, account_id)`` projection. ``None`` (self-host /
+        # local) keeps the external gate single-path — behaviour byte-identical
+        # to before, so no existing proactive test changes.
+        self._hosted_identity_resolver = hosted_identity_resolver
+        # M8: shared idempotent line-history recorder — the dispatcher records
+        # right after acceptance; the retry worker re-records accepted rows whose
+        # append never landed. One implementation keeps them in step.
+        self._line_conversation_recorder = HostedLineConversationRecorder(
+            conversation_repository=conversation_repository,
+        )
 
     async def evaluate(
         self,
@@ -296,6 +386,7 @@ class ProactiveDispatcher:
         character_id: str,
         trigger: ProactiveTrigger,
         now: datetime | None = None,
+        logical_slot: str | None = None,
     ) -> ProactiveAttempt:
         when = self._resolve_now(now)
         character = await self._characters.get(character_id)
@@ -395,9 +486,36 @@ class ProactiveDispatcher:
                 now=when,
             )
 
+        # P3-Dedup §3.4 — claim the tick slot AFTER the gate passes and BEFORE
+        # composing / delivering. A distributed reclaimed job racing the
+        # original on the same character loses the claim here and returns
+        # without any provider call, so the visible send happens at most once.
+        # ``logical_slot=None`` (manual / API evaluate) skips the claim entirely
+        # — the unconstrained current behaviour. The claim NEVER raises into the
+        # tick: a slot-store failure fails open (send proceeds).
+        if not await self._claim_visible_slot(character_id, logical_slot):
+            return await self._log(
+                character_id=character_id,
+                trigger=trigger,
+                outcome=ProactiveOutcome.SLOT_TAKEN,
+                reason=f"visible slot already claimed: {logical_slot}",
+                now=when,
+            )
+
         eligible = await self._find_eligible_binding(character_id)
         web_enabled = bool(character.accepts_web_proactive)
-        if eligible is None and not web_enabled:
+        # LH4 Core-C hosted dual-path. With no local binding, a hosted
+        # deployment can still route the push to the Cloud Channel. Resolving
+        # the cloud identity + cost-preflight sits HERE — the position
+        # equivalent to the NO_BINDING gate — so a cloud-unmapped or
+        # channel-ineligible character is skipped BEFORE the decider spends
+        # any LLM budget (cheap-gate order preserved). ``None`` when self-host
+        # (no resolver), no cloud mapping, or the channel is not eligible; all
+        # three collapse to the same "nowhere hosted to push" semantics.
+        hosted_target: tuple[str, str] | None = None
+        if eligible is None:
+            hosted_target = await self._resolve_hosted_target(character_id)
+        if eligible is None and hosted_target is None and not web_enabled:
             return await self._log(
                 character_id=character_id,
                 trigger=trigger,
@@ -589,10 +707,23 @@ class ProactiveDispatcher:
         # dropped (the text message still goes out on its own so the
         # user isn't left with an empty push waiting on a broken
         # ComfyUI). Audit rows are written by the orchestrator.
+        # Tool invocations are audited against the conversation they belong to.
+        # Local path → the binding's conversation id; hosted path → the
+        # character's ``source="line"`` conversation (the same thread the
+        # proactive turn lands on below). ``None`` when neither exists yet,
+        # matching the local behaviour for an unbound conversation.
+        if binding is not None:
+            tool_conversation_id = binding.conversation_id
+        elif hosted_target is not None:
+            tool_conversation_id = await self._latest_line_conversation_id(
+                character.id,
+            )
+        else:
+            tool_conversation_id = None
         attachments = await self._execute_decision_tools(
             character=character,
             decision=decision,
-            conversation_id=(binding.conversation_id if binding else None),
+            conversation_id=tool_conversation_id,
         )
 
         # Fan out: web (if opted in) + messaging binding (if any).
@@ -617,16 +748,50 @@ class ProactiveDispatcher:
                 _LOGGER.exception("proactive web delivery crashed")
         if binding is not None and account is not None:
             try:
-                await self._deliver(
-                    binding=binding, account=account, text=decision.message,
+                acceptance = await self._deliver_external(
+                    character=character,
+                    binding=binding,
+                    account=account,
+                    text=decision.message,
                     attachments=attachments,
                     locale=operator_primary_language,
+                    when=when,
                 )
-                delivered += 1
-                external_delivered = True
-                binding_id_for_log = binding.id
+                if acceptance.delivered:
+                    delivered += 1
+                    external_delivered = True
+                    binding_id_for_log = acceptance.delivery_id or binding.id
+                else:
+                    _LOGGER.warning(
+                        "proactive external delivery not accepted "
+                        "character=%s reason=%s",
+                        character_id, acceptance.reason,
+                    )
             except Exception:
                 _LOGGER.exception("proactive messaging delivery crashed")
+        elif hosted_target is not None:
+            try:
+                acceptance = await self._deliver_hosted(
+                    character=character,
+                    tenant_id=hosted_target[0],
+                    account_id=hosted_target[1],
+                    text=decision.message,
+                    attachments=attachments,
+                    locale=operator_primary_language,
+                    when=when,
+                )
+                if acceptance.delivered:
+                    delivered += 1
+                    external_delivered = True
+                    binding_id_for_log = acceptance.delivery_id
+                else:
+                    _LOGGER.warning(
+                        "proactive hosted delivery not accepted "
+                        "character=%s reason=%s",
+                        character_id, acceptance.reason,
+                    )
+            except Exception:
+                _LOGGER.exception("proactive hosted delivery crashed")
 
         if delivered == 0:
             await self._release_event_seed(character_id, seed_item_id)
@@ -829,79 +994,290 @@ class ProactiveDispatcher:
             return character
         return character.with_state(recovered_state)
 
+    async def _claim_visible_slot(
+        self, character_id: str, logical_slot: str | None,
+    ) -> bool:
+        """Try to own this character's proactive slot for ``logical_slot``.
+
+        Returns ``True`` (proceed) when there is nothing to claim (no slot
+        port wired, or ``logical_slot is None`` = manual/API path) or the
+        claim succeeds. Returns ``False`` only when the slot is verifiably
+        already owned by another executor. A slot-store error fails OPEN
+        (returns ``True``) — a claim failure must never suppress a legitimate
+        single-runner send."""
+        if self._visible_slot_port is None or logical_slot is None:
+            return True
+        from kokoro_link.contracts.visible_slots import SLOT_KIND_PROACTIVE
+
+        try:
+            return await self._visible_slot_port.claim(
+                character_id, SLOT_KIND_PROACTIVE, logical_slot,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive: visible slot claim crashed; failing open "
+                "character=%s slot=%s", character_id, logical_slot,
+            )
+            return True
+
     async def _find_eligible_binding(
         self, character_id: str,
     ) -> tuple[ChannelBinding, MessagingAccount] | None:
-        accounts = await self._accounts.list_for_character(character_id)
-        candidates: list[tuple[ChannelBinding, MessagingAccount]] = []
-        for account in accounts:
-            if not account.enabled:
-                continue
-            bindings = await self._bindings.list_for_account(account.id)
-            for binding in bindings:
-                if binding.enabled and binding.accepts_proactive:
-                    candidates.append((binding, account))
-        if not candidates:
-            return None
-        # Prefer the most recently touched binding.
-        candidates.sort(key=lambda pair: pair[0].updated_at, reverse=True)
-        return candidates[0]
+        # The dispatcher still resolves the local binding for its pre-decider
+        # NO_BINDING gate, the tool-invocation conversation id, and the SENT
+        # ``binding_id`` audit — all self-host-messaging facts. The external
+        # *send* itself is routed through ``self._external_delivery`` (§8.3).
+        # One shared helper keeps this and the local adapter's resolution from
+        # drifting.
+        return await find_eligible_proactive_binding(
+            account_repository=self._accounts,
+            binding_repository=self._bindings,
+            character_id=character_id,
+        )
 
-    async def _deliver(
+    async def _deliver_external(
         self,
         *,
+        character: Character,
         binding: ChannelBinding,
         account: MessagingAccount,
         text: str,
-        attachments: tuple[OutboundAttachment, ...] = (),
-        locale: str = "zh-TW",
-    ) -> None:
-        conversation_id = binding.conversation_id
-        updated_binding = binding
-        if conversation_id is None:
-            from kokoro_link.domain.entities.conversation import Conversation
+        attachments: tuple[OutboundAttachment, ...],
+        locale: str,
+        when: datetime,
+    ) -> DeliveryAcceptance:
+        """Build the immutable envelope and hand it to the LOCAL-binding
+        delivery port.
 
-            conversation = Conversation.start(
-                character_id=account.character_id,
-                source=account.platform.value,
-            )
-            await self._conversations.save(conversation)
-            updated_binding = binding.with_conversation(conversation.id)
-            await self._bindings.save(updated_binding)
-            conversation_id = conversation.id
+        H4: the local-binding path deliberately does NOT write the pre-send
+        ledger. The ledger + retry worker exist for the HOSTED Cloud-Channel
+        path, whose HTTP response can be lost; the retry worker re-sends every
+        pending/accepted-unrecorded ledger row through the HOSTED adapter. A
+        local-binding event written here would therefore be re-sent to the Cloud
+        Channel — the wrong endpoint entirely. Local delivery is synchronous and
+        has no lost-response window (same as a self-host single container, which
+        wires no ledger at all), so it needs no ledger entry.
 
-        conversation = await self._conversations.get(conversation_id)
-        if conversation is None:
-            from kokoro_link.domain.entities.conversation import Conversation
-
-            conversation = Conversation.start(
-                character_id=account.character_id,
-                source=account.platform.value,
-            )
-            await self._conversations.save(conversation)
-            updated_binding = updated_binding.with_conversation(conversation.id)
-            await self._bindings.save(updated_binding)
-        appended = conversation.append(
-            Message(role=MessageRole.ASSISTANT, content=text),
+        L12: the gate-resolved ``(binding, account)`` is handed to the adapter
+        as an explicit target so the send is pinned to the endpoint the gate
+        authorised, never re-resolved to a binding that shifted mid-tick.
+        """
+        envelope = self._build_proactive_envelope(
+            character=character,
+            account=account,
+            text=text,
+            attachments=attachments,
+            locale=locale,
+            when=when,
         )
-        await self._conversations.save(appended)
+        return await self._local_delivery.accept(
+            envelope, target=LocalDeliveryTarget(binding=binding, account=account),
+        )
 
-        adapter = self._adapters.get(account.platform.value)
-        if adapter is None:
-            raise RuntimeError(
-                f"no adapter registered for platform {account.platform.value}",
+    def _build_proactive_envelope(
+        self,
+        *,
+        character: Character,
+        account: MessagingAccount,
+        text: str,
+        attachments: tuple[OutboundAttachment, ...],
+        locale: str,
+        when: datetime,
+    ) -> ProactiveEnvelope:
+        # Self-host: the tenant is the owning operator, the account is the
+        # resolved local messaging account.
+        tenant_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        return self._make_envelope(
+            tenant_id=tenant_id,
+            account_id=account.id,
+            character_id=character.id,
+            text=text,
+            attachments=attachments,
+            locale=locale,
+            when=when,
+        )
+
+    def _make_envelope(
+        self,
+        *,
+        tenant_id: str,
+        account_id: str,
+        character_id: str,
+        text: str,
+        attachments: tuple[OutboundAttachment, ...],
+        locale: str,
+        when: datetime,
+    ) -> ProactiveEnvelope:
+        return ProactiveEnvelope(
+            event_id=uuid4().hex,
+            tenant_id=tenant_id,
+            account_id=account_id,
+            character_id=character_id,
+            kind=ENVELOPE_KIND_PROACTIVE,
+            segments=(ProactiveSegment(text=text),),
+            attachments=tuple(attachments),
+            locale=locale,
+            created_at=when,
+            expires_at=when + self._proactive_envelope_ttl,
+        )
+
+    async def _resolve_hosted_target(
+        self, character_id: str,
+    ) -> tuple[str, str] | None:
+        """Hosted dual-path gate (LH4 Core-C).
+
+        Resolve the character's cloud ``(tenant_id, account_id)`` and confirm
+        the Channel will accept a proactive push now. ``None`` — self-host (no
+        resolver), no cloud mapping, OR the non-authoritative cost preflight is
+        not eligible — collapses to NO_BINDING-gate semantics: there is nowhere
+        hosted to push, so the caller skips the hosted path (and the decider).
+        """
+        if self._hosted_identity_resolver is None:
+            return None
+        identity = await self._resolve_hosted_identity(character_id)
+        if identity is None:
+            return None
+        try:
+            eligibility = await self._hosted_delivery.check_eligibility(
+                character_id,
             )
-        await send_segmented_outbound(
-            adapter,
-            OutboundMessage(
-                platform=account.platform,
-                chat_ref=updated_binding.chat_ref,
+        except Exception:
+            _LOGGER.exception(
+                "proactive hosted: check_eligibility crashed character=%s",
+                character_id,
+            )
+            return None
+        if not eligibility.eligible:
+            return None
+        return identity
+
+    async def _resolve_hosted_identity(
+        self, character_id: str,
+    ) -> tuple[str, str] | None:
+        if self._hosted_identity_resolver is None:
+            return None
+        try:
+            return await self._hosted_identity_resolver(character_id)
+        except Exception:
+            _LOGGER.exception(
+                "proactive hosted: identity resolve failed character=%s",
+                character_id,
+            )
+            return None
+
+    async def _latest_line_conversation_id(
+        self, character_id: str,
+    ) -> str | None:
+        try:
+            conversation = await self._conversations.latest_for_character(
+                character_id, source=_SOURCE_LINE,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive hosted: latest line conversation lookup failed "
+                "character=%s", character_id,
+            )
+            return None
+        return conversation.id if conversation is not None else None
+
+    async def _deliver_hosted(
+        self,
+        *,
+        character: Character,
+        tenant_id: str,
+        account_id: str,
+        text: str,
+        attachments: tuple[OutboundAttachment, ...],
+        locale: str,
+        when: datetime,
+    ) -> DeliveryAcceptance:
+        """Hosted external send (LH4 Core-C).
+
+        Mirrors :meth:`_deliver_external`'s pre-send-ledger discipline (record
+        BEFORE ``accept``, settle after) but builds the envelope from the cloud
+        ``(tenant_id, account_id)`` rather than a local messaging account. On an
+        accepted send the proactive turn is recorded on the character's
+        ``source="line"`` conversation — the "send-then-record" parity with the
+        self-host adapter's ``_deliver``.
+        """
+        envelope = self._make_envelope(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            character_id=character.id,
+            text=text,
+            attachments=attachments,
+            locale=locale,
+            when=when,
+        )
+        await self._record_pre_send(envelope, now=when)
+        acceptance = await self._hosted_delivery.accept(envelope)
+        await self._settle_pre_send(envelope, acceptance, now=when)
+        if acceptance.delivered:
+            # M8: the accepted send and its line-history row share one
+            # lifecycle. Record the turn; only mark ``conversation_recorded``
+            # when the append actually landed — a failed append leaves the
+            # accepted ledger row for the retry worker to re-append idempotently
+            # instead of being silently lost.
+            recorded = await self._line_conversation_recorder.record(
+                event_id=envelope.event_id,
+                character_id=character.id,
                 text=text,
-                credentials=account.credentials,
-                attachments=attachments,
-                locale=locale,
+                when=when,
+            )
+            if recorded and self._proactive_event_ledger is not None:
+                await self._proactive_event_ledger.mark_conversation_recorded(
+                    envelope.event_id, now=when,
+                )
+        return acceptance
+
+    async def _record_pre_send(
+        self, envelope: ProactiveEnvelope, *, now: datetime,
+    ) -> None:
+        if self._proactive_event_ledger is None:
+            return
+        await self._proactive_event_ledger.save_pre_send(
+            event_id=envelope.event_id,
+            tenant_id=envelope.tenant_id,
+            account_id=envelope.account_id,
+            character_id=envelope.character_id,
+            kind=envelope.kind,
+            envelope_json=json.dumps(
+                envelope_to_payload(envelope),
+                ensure_ascii=False,
+                sort_keys=True,
             ),
+            payload_hash=compute_envelope_hash(envelope),
+            expires_at=envelope.expires_at,
+            now=now,
         )
+
+    async def _settle_pre_send(
+        self,
+        envelope: ProactiveEnvelope,
+        acceptance: DeliveryAcceptance,
+        *,
+        now: datetime,
+    ) -> None:
+        """Close out the ledger row per the channel's acceptance. Best-effort:
+        a ledger write failure must not fail an already-delivered send."""
+        if self._proactive_event_ledger is None:
+            return
+        try:
+            if acceptance.delivered:
+                await self._proactive_event_ledger.mark_accepted(
+                    envelope.event_id, now=now,
+                )
+            else:
+                await self._proactive_event_ledger.mark_terminal(
+                    envelope.event_id,
+                    reason=acceptance.reason or "channel rejected delivery",
+                    now=now,
+                )
+        except Exception:
+            _LOGGER.exception(
+                "proactive pre-send ledger settle failed event=%s",
+                envelope.event_id,
+            )
 
     async def _deliver_web(
         self,
@@ -953,6 +1329,7 @@ class ProactiveDispatcher:
                 role=MessageRole.ASSISTANT,
                 content=text,
                 attachments=message_attachments,
+                created_at=when,
             ),
         )
         await self._conversations.save(appended)
@@ -1673,7 +2050,12 @@ class ProactiveDispatcher:
 
         eligible = await self._find_eligible_binding(character_id)
         web_enabled = bool(character.accepts_web_proactive)
-        if eligible is None and not web_enabled:
+        # Same LH4 Core-C hosted dual-path as ``evaluate``: no local binding but
+        # a resolvable, channel-eligible cloud identity is a valid hosted sink.
+        hosted_target: tuple[str, str] | None = None
+        if eligible is None:
+            hosted_target = await self._resolve_hosted_target(character_id)
+        if eligible is None and hosted_target is None and not web_enabled:
             return await self._log(
                 character_id=character_id,
                 trigger=trigger,
@@ -1707,17 +2089,54 @@ class ProactiveDispatcher:
                 )
         if binding is not None and account is not None:
             try:
-                await self._deliver(
-                    binding=binding, account=account, text=body,
+                acceptance = await self._deliver_external(
+                    character=character,
+                    binding=binding,
+                    account=account,
+                    text=body,
                     attachments=attachments,
                     locale=await self._load_operator_language(character),
+                    when=when,
                 )
-                delivered += 1
-                external_delivered = True
-                binding_id_for_log = binding.id
+                if acceptance.delivered:
+                    delivered += 1
+                    external_delivered = True
+                    binding_id_for_log = acceptance.delivery_id or binding.id
+                else:
+                    _LOGGER.warning(
+                        "pre-composed external delivery not accepted "
+                        "character=%s reason=%s",
+                        character_id, acceptance.reason,
+                    )
             except Exception:
                 _LOGGER.exception(
                     "pre-composed messaging delivery crashed character=%s",
+                    character_id,
+                )
+        elif hosted_target is not None:
+            try:
+                acceptance = await self._deliver_hosted(
+                    character=character,
+                    tenant_id=hosted_target[0],
+                    account_id=hosted_target[1],
+                    text=body,
+                    attachments=attachments,
+                    locale=await self._load_operator_language(character),
+                    when=when,
+                )
+                if acceptance.delivered:
+                    delivered += 1
+                    external_delivered = True
+                    binding_id_for_log = acceptance.delivery_id
+                else:
+                    _LOGGER.warning(
+                        "pre-composed hosted delivery not accepted "
+                        "character=%s reason=%s",
+                        character_id, acceptance.reason,
+                    )
+            except Exception:
+                _LOGGER.exception(
+                    "pre-composed hosted delivery crashed character=%s",
                     character_id,
                 )
 

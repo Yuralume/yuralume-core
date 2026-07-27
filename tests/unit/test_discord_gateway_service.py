@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.discord_gateway_service import (
     DiscordGatewayService,
 )
@@ -74,6 +75,57 @@ async def test_gateway_message_dispatches_through_messaging_pipeline() -> None:
     binding = await harness.binding_repository.find(account.id, "channel-1")
     assert binding is not None
     assert binding.conversation_id is not None
+
+    gateway.release.set()
+    await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_busy_conversation_does_not_tear_down_the_gateway() -> None:
+    """Discord never re-delivers, so an escaping error only costs the socket.
+
+    The dispatcher re-raises ``ConversationBusyError`` for transports that can
+    re-deliver; this connector cannot, so it must absorb it instead of letting
+    it unwind the live Gateway connection (which would drop every other chat on
+    the account and still not bring the message back).
+    """
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    await create_discord_account(
+        harness,
+        character_id=character.id,
+        bot_token="DISCORD-TOKEN",
+        allowed_sender_refs=("user-1",),
+    )
+
+    async def _busy(*_args, **_kwargs):
+        raise ConversationBusyError("conv-1")
+
+    harness.chat_service.send_message = _busy
+    gateway = _FakeGatewayClient(
+        {
+            "id": "message-1",
+            "channel_id": "channel-1",
+            "content": "hello from discord",
+            "author": {"id": "user-1"},
+        },
+    )
+    service = DiscordGatewayService(
+        account_repository=harness.account_repository,
+        character_repository=harness.character_repository,
+        dispatcher=harness.dispatcher,
+        gateway_client=gateway,
+        message_parser=parse_message_create,
+        attachment_downloader=_download_attachment,
+        uploads_dir=Path("."),
+        sync_interval_seconds=999,
+    )
+
+    await service.sync_once()
+    # ``connected`` is set only when ``on_message_create`` returned normally.
+    await asyncio.wait_for(gateway.connected.wait(), timeout=1)
+
+    assert harness.discord_adapter.sent == []
 
     gateway.release.set()
     await service.stop()

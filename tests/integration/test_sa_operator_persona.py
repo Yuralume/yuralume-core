@@ -53,7 +53,7 @@ async def _ensure_operator(session_factory: sessionmaker) -> None:
     profile = await profile_repo.get_default()
     if profile is None:
         await profile_repo.save(
-            OperatorProfile(id=DEFAULT_OPERATOR_ID, display_name="丹尼"),
+            OperatorProfile(id=DEFAULT_OPERATOR_ID, display_name="艾力"),
         )
 
 
@@ -255,9 +255,9 @@ async def test_confirmed_and_pending_coexist(
     confirmed = ProfileField(
         field_key="name",
         layer=1,
-        value="丹尼",
+        value="艾力",
         confidence=0.9,
-        evidence_refs=(_evidence("我叫丹尼"),),
+        evidence_refs=(_evidence("我叫艾力"),),
         last_updated=datetime.now(timezone.utc),
         update_count=2,
         source="extraction",
@@ -276,7 +276,7 @@ async def test_confirmed_and_pending_coexist(
     await repo.upsert_candidate(char_id, _OP_ID, pending_dup)
 
     persona = await repo.get(char_id, _OP_ID)
-    assert persona.layer1_identity["name"].value == "丹尼"
+    assert persona.layer1_identity["name"].value == "艾力"
     assert any(c.proposed_value == "阿丹" for c in persona.pending_candidates)
     assert await repo.count_pending(char_id, _OP_ID) == 1
 
@@ -388,9 +388,9 @@ async def test_get_row_scope_resolves_owner_for_candidate_and_field(
         ProfileField(
             field_key="name",
             layer=1,
-            value="丹尼",
+            value="艾力",
             confidence=0.9,
-            evidence_refs=(_evidence("我叫丹尼"),),
+            evidence_refs=(_evidence("我叫艾力"),),
             last_updated=datetime.now(timezone.utc),
             update_count=2,
             source="extraction",

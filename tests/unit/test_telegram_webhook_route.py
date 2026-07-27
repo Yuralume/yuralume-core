@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.domain.value_objects.delivery_mode import DeliveryMode
 from tests.unit._messaging_harness import (
     build_messaging_app_client,
@@ -160,3 +161,32 @@ async def test_invalid_json_returns_400() -> None:
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_busy_conversation_asks_telegram_to_re_deliver() -> None:
+    """A busy turn must leave the delivery re-deliverable, not swallowed.
+
+    The dispatcher rolls the delivery's dedup stamps back and re-raises; if the
+    route still answered 200 the message would simply be gone, because Telegram
+    only re-delivers an update it was not acked for.
+    """
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_telegram_account(harness, character_id=character.id)
+
+    async def _busy(*_args, **_kwargs):
+        raise ConversationBusyError("conv-1")
+
+    harness.chat_service.send_message = _busy
+    client = build_messaging_app_client(harness)
+    await _set_site_telegram_delivery_mode(client, DeliveryMode.WEBHOOK)
+
+    response = client.post(
+        f"/api/v1/messaging/telegram/webhook/{account.webhook_slug}",
+        json=_update(),
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert harness.telegram_adapter.sent == []

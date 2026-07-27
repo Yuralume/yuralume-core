@@ -16,6 +16,10 @@ from kokoro_link.api.dependencies import (
     get_container,
     get_current_user_id,
 )
+from kokoro_link.api.routes._cloud_errors import (
+    insufficient_credits_detail,
+    insufficient_credits_guard,
+)
 from kokoro_link.application.dto.character import CharacterResponse
 from kokoro_link.application.dto.chat import (
     ChatReplyResponse,
@@ -25,6 +29,10 @@ from kokoro_link.application.dto.chat import (
 from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
     ChatSubscriptionFrozen,
+)
+from kokoro_link.application.services.chat_turn_lease import (
+    CONVERSATION_BUSY_CODE,
+    ConversationBusyError,
 )
 from kokoro_link.application.services.turn_undo_service import (
     NoJournalError, UndoResult,
@@ -299,6 +307,28 @@ async def undo_last_turn(
     return UndoTurnResponse.from_result(result)
 
 
+def _conversation_busy_http_error(
+    error: ConversationBusyError,
+) -> HTTPException:
+    """409 for "this conversation already has a turn in flight".
+
+    A dedicated status + structured code so it stays distinguishable from the
+    existing chat outcomes: 403 ``subscription_frozen`` (entitlement), 404
+    (unknown/foreign character or conversation), 429 (demo message cap). 409 is
+    the accurate shape — the request is well-formed and authorized, it just
+    conflicts with the conversation's current state, and retrying after the
+    in-flight turn lands will succeed.
+    """
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": CONVERSATION_BUSY_CODE,
+            "message": str(error),
+            "conversation_id": error.conversation_id,
+        },
+    )
+
+
 @router.post("/chat/messages", response_model=ChatReplyResponse)
 async def send_chat_message(
     payload: SendChatMessageRequest,
@@ -314,9 +344,12 @@ async def send_chat_message(
             detail="Character not found",
         )
     try:
-        return await container.chat_service.send_message(
-            payload, current_user_id=current_user_id,
-        )
+        with insufficient_credits_guard():
+            return await container.chat_service.send_message(
+                payload, current_user_id=current_user_id,
+            )
+    except ConversationBusyError as error:
+        raise _conversation_busy_http_error(error) from error
     except ChatSubscriptionFrozen as error:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -346,9 +379,14 @@ async def send_chat_message_stream(
             detail="Character not found",
         )
     try:
-        token_stream, finalizer = await container.chat_service.send_message_stream(
-            payload, current_user_id=current_user_id,
-        )
+        with insufficient_credits_guard():
+            token_stream, finalizer = (
+                await container.chat_service.send_message_stream(
+                    payload, current_user_id=current_user_id,
+                )
+            )
+    except ConversationBusyError as error:
+        raise _conversation_busy_http_error(error) from error
     except ChatSubscriptionFrozen as error:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -364,6 +402,11 @@ async def send_chat_message_stream(
 
     async def event_generator() -> AsyncIterator[str]:
         collected: list[str] = []
+        # Once ``finish`` has been handed the turn it owns the lease release,
+        # even when the client disconnect below unblocks us early — the
+        # shielded finalize keeps running and must still hold the conversation
+        # until the assistant message lands.
+        finalize_started = False
 
         # Send conversation_id immediately so frontend can track it
         yield f"data: {json.dumps({'conversation_id': finalizer.conversation_id})}\n\n"
@@ -380,11 +423,27 @@ async def send_chat_message_stream(
             # logs the CancelledError traceback from inside
             # ``_concurrency_py3k.greenlet_spawn``. Data integrity wins:
             # the assistant reply always lands in the DB.
+            finalize_started = True
             response = await asyncio.shield(finalizer.finish(full_text))
             # mode='json' so datetime/UUID fields become primitives; otherwise json.dumps
             # raises TypeError mid-stream, the connection closes without the final event,
             # and the client is left waiting with no way to unstick its UI state.
             yield f"data: {json.dumps({'done': True, 'response': response.model_dump(mode='json')})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as error:
+            # The 200 + SSE headers are already on the wire, so an
+            # out-of-credits refusal cannot become a 402 status here — it
+            # travels as a terminal ``error`` frame instead, mirroring the
+            # sync route's structured detail. Everything else keeps the old
+            # behaviour (propagate, no final event).
+            detail = insufficient_credits_detail(error)
+            if detail is None:
+                raise
+            _LOGGER.info(
+                "chat stream stopped: insufficient credits (conversation %s)",
+                finalizer.conversation_id,
+            )
+            yield f"data: {json.dumps({'error': detail})}\n\n"
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             # Browser closed the tab / navigated away mid-generation.
@@ -397,6 +456,19 @@ async def send_chat_message_stream(
                 finalizer.conversation_id,
             )
             raise
+        finally:
+            # Covers the streams that never reach ``finish`` (upstream error
+            # mid-generation, client disconnect before the final token) so the
+            # next turn on this conversation is accepted immediately rather
+            # than after the lease TTL. Never allowed to mask the real error.
+            if not finalize_started:
+                try:
+                    await finalizer.release_turn_lease()
+                except Exception:  # pragma: no cover - defensive
+                    _LOGGER.exception(
+                        "chat turn lease release failed for conversation %s",
+                        finalizer.conversation_id,
+                    )
 
     return StreamingResponse(
         event_generator(),

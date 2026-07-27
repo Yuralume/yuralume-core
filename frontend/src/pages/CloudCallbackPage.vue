@@ -12,6 +12,15 @@ const { t } = useI18n()
 const loading = ref(true)
 const error = ref<string | null>(null)
 
+// A hosted player who never had a Core password cannot do anything useful at
+// /login — sending them there is a dead end at the exact moment entry failed.
+// When the deployment advertised a Portal we send them back to re-issue an
+// entry code instead; the /login fallback stays for deployments without one.
+const portalHref = computed(() => {
+  const base = (auth.portalUrl.value ?? '').trim().replace(/\/+$/, '')
+  return base || null
+})
+
 const title = computed(() => {
   if (loading.value) return t('auth.cloudCallback.loadingTitle')
   if (error.value) return t('auth.cloudCallback.errorTitle')
@@ -44,7 +53,10 @@ onMounted(async () => {
       <p v-else-if="error">{{ error }}</p>
       <p v-else>{{ t('auth.cloudCallback.redirecting') }}</p>
       <div v-if="error" class="actions">
-        <RouterLink class="button button-ghost" to="/login">
+        <a v-if="portalHref" class="button button-ghost" :href="portalHref">
+          {{ t('auth.cloudCallback.backToPortal') }}
+        </a>
+        <RouterLink v-else class="button button-ghost" to="/login">
           {{ t('auth.cloudCallback.backToLogin') }}
         </RouterLink>
       </div>

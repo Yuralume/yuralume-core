@@ -25,6 +25,7 @@ from kokoro_link.api.contracts.build_info import (
     BuildInfoResponse,
     build_info_response,
 )
+from kokoro_link.api.contracts.player_locale import LocationHintResponse
 from kokoro_link.api.dependencies import (
     get_container,
     get_current_user,
@@ -89,6 +90,12 @@ class AuthConfigResponse(BaseModel):
     needs_setup: bool
     mode: str = "self_host"
     debug_ui_enabled: bool = False
+    portal_url: str | None = None
+    """Cloud Portal (account centre) origin, cloud mode only (U2).
+
+    Additive and optional: self-host always serves ``None`` so the existing
+    front-end contract is unchanged, and the SPA renders the "back to account
+    centre" entry points only when a value is present."""
     build_info: BuildInfoResponse
     """Mirror of ``AppSettings.debug_ui_enabled`` (env
     ``KOKORO_DEBUG_UI_ENABLED``). Lets the SPA decide whether to
@@ -217,6 +224,25 @@ class UserResponse(BaseModel):
             longitude=user.longitude,
             location_label=user.location_label,
         )
+
+
+class MeResponse(UserResponse):
+    """``GET /auth/me`` view — the profile plus hosted lifecycle flags (G2).
+
+    Strictly additive and cloud-only in effect: self-host always serves
+    ``needs_locale_confirmation=false`` with no hint, so the long-standing
+    ``UserResponse`` contract every other auth endpoint returns is
+    untouched. Only this endpoint carries the extra fields, so login /
+    setup / user-CRUD payloads keep their exact previous shape.
+    """
+
+    needs_locale_confirmation: bool = False
+    """True while a hosted player has not yet acknowledged the GeoIP-seeded
+    place / timezone / language. Drives the onboarding confirmation gate."""
+    location_hint: LocationHintResponse | None = None
+    """Present only when a recent login came from a different country than
+    the stored one. A suggestion the player accepts or dismisses — the
+    profile is never rewritten behind their back."""
 
 
 class AuthTokenResponse(BaseModel):
@@ -545,6 +571,31 @@ async def _seed_missing_location_from_login(
     return updated
 
 
+async def _record_login_location_hint(
+    *,
+    user: OperatorProfile,
+    location: GeoLocation | None,
+    container: ServiceContainer,
+) -> None:
+    """Note a re-login from a different country as a *hint* only (G-4).
+
+    The player may have set their location by hand, and a business trip or
+    a VPN exit node must never silently relocate the world their characters
+    perceive — so the profile is left alone and the SPA gets to ask. Fully
+    fail-soft: a GeoIP miss or a preference-store error must never turn a
+    successful login into an error.
+    """
+    service = getattr(container, "player_locale_service", None)
+    if service is None or location is None:
+        return
+    try:
+        await service.record_location_hint(
+            user.id, location=location, profile=user,
+        )
+    except Exception as exc:  # noqa: BLE001 - login must not fail on a hint
+        _LOGGER.info("Failed to record location hint for %s: %s", user.id, exc)
+
+
 # ----------------------------------------------------------------------
 # Public probes
 # ----------------------------------------------------------------------
@@ -565,11 +616,17 @@ async def get_auth_config(
     settings = getattr(container, "app_settings", None)
     debug_ui_enabled = bool(getattr(settings, "debug_ui_enabled", False))
     cloud_mode = is_cloud_mode(container)
+    cloud = getattr(settings, "cloud", None)
+    # Cloud-only: a stray env value must never leak into the self-host contract.
+    portal_url = (
+        (getattr(cloud, "portal_url", None) or None) if cloud_mode else None
+    )
     return AuthConfigResponse(
         auth_enabled=_is_auth_enabled(container),
         needs_setup=False if cloud_mode else needs_setup,
         mode="cloud" if cloud_mode else "self_host",
         debug_ui_enabled=debug_ui_enabled,
+        portal_url=portal_url,
         build_info=build_info_response(get_build_info()),
     )
 
@@ -698,6 +755,9 @@ async def create_demo_session_login(
         )
     except AuthError as exc:
         raise _translate_auth_error(exc) from exc
+    await _record_login_location_hint(
+        user=user, location=location, container=container,
+    )
     return AuthTokenResponse(user=UserResponse.from_domain(user), token=token)
 
 
@@ -734,16 +794,46 @@ async def create_cloud_session_login(
         )
     except AuthError as exc:
         raise _translate_auth_error(exc) from exc
+    await _record_login_location_hint(
+        user=user, location=location, container=container,
+    )
     return AuthTokenResponse(user=UserResponse.from_domain(user), token=token)
 
 
-@router.get("/me", response_model=UserResponse)
+@router.get("/me", response_model=MeResponse)
 async def get_me(
     user: OperatorProfile = Depends(get_current_user),
-) -> UserResponse:
+    container: ServiceContainer = Depends(get_container),
+) -> MeResponse:
     """Return the bearer-token holder's profile. In disabled-auth
-    mode, returns the default operator."""
-    return UserResponse.from_domain(user)
+    mode, returns the default operator.
+
+    In cloud mode the payload also carries the locale-lifecycle flags (G2).
+    Both are resolved fail-soft: a preference-store hiccup must degrade to
+    "nothing to confirm, no hint" rather than block the SPA's startup
+    probe."""
+    base = UserResponse.from_domain(user).model_dump()
+    needs_confirmation = False
+    hint_response: LocationHintResponse | None = None
+    service = getattr(container, "player_locale_service", None)
+    if service is not None and is_cloud_mode(container):
+        try:
+            needs_confirmation = await service.needs_confirmation(user.id)
+            hint = await service.get_location_hint(user.id, profile=user)
+            hint_response = (
+                LocationHintResponse.from_domain(hint) if hint else None
+            )
+        except Exception as exc:  # noqa: BLE001 - startup probe must not fail
+            _LOGGER.info(
+                "Locale lifecycle projection failed for %s: %s", user.id, exc,
+            )
+            needs_confirmation = False
+            hint_response = None
+    return MeResponse(
+        **base,
+        needs_locale_confirmation=needs_confirmation,
+        location_hint=hint_response,
+    )
 
 
 @router.post("/me/password", response_model=UserResponse)

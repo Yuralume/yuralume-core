@@ -4,14 +4,22 @@ Lets an operator trigger the ingest or curate pass on demand instead
 of waiting for the WorldEventScheduler tick (default 30 / 60 min).
 """
 
+import logging
+from dataclasses import replace
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from kokoro_link.api.dependencies import get_container, require_admin
+from kokoro_link.application.services.rss_source_region_retag_service import (
+    RssSourceRegionRetagService,
+)
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.contracts.rss_source import RssSourceRepositoryPort
 from kokoro_link.domain.entities.rss_source import RssSource
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/admin/world-events",
@@ -31,6 +39,9 @@ class FeedCreateRequest(BaseModel):
     feed_url: str = Field(min_length=1)
     category: str = "news"
     locale: str = "zh-TW"
+    region: str | None = None
+    """Content region (``TW`` / ``JP`` …). Omitted / blank = global source,
+    curated for every player regardless of where they live."""
     enabled: bool = True
 
 
@@ -41,6 +52,11 @@ class FeedUpdateRequest(BaseModel):
     feed_url: str | None = None
     category: str | None = None
     locale: str | None = None
+    region: str | None = None
+    """``None`` keeps the current region (the shared partial-update
+    convention); an **empty string** clears it back to global. Region needs
+    the explicit clear that the other fields don't, because "no region" is
+    a meaningful setting rather than an unset one."""
     enabled: bool | None = None
 
 
@@ -77,6 +93,10 @@ async def create_source(
             feed_url=payload.feed_url,
             category=payload.category,
             locale=payload.locale,
+            region=payload.region,
+            # An explicit region on create — including an explicit clear —
+            # is an operator decision the YAML seed must not later undo.
+            region_locked=payload.region is not None,
             enabled=payload.enabled,
         )
     except ValueError as exc:
@@ -97,8 +117,6 @@ async def update_source(
     current = await repository.get(source_id)
     if current is None:
         raise HTTPException(404, f"unknown feed: {source_id}")
-    from dataclasses import replace
-
     try:
         updated = replace(
             current,
@@ -110,6 +128,14 @@ async def update_source(
             if payload.category is not None
             else current.category,
             locale=payload.locale if payload.locale is not None else current.locale,
+            # "" clears to global; the entity normalises blank → None.
+            region=payload.region if payload.region is not None else current.region,
+            # Touching the field at all pins it: "cleared to global" has to
+            # be as durable as "tagged TW", and NULL alone can't say which
+            # of the two a row is in (see ``RssSource.region_locked``).
+            region_locked=(
+                True if payload.region is not None else current.region_locked
+            ),
             enabled=payload.enabled
             if payload.enabled is not None
             else current.enabled,
@@ -117,7 +143,46 @@ async def update_source(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     await repository.upsert(updated)
-    return _source_status_payload(updated)
+    retagged = 0
+    if updated.region != current.region:
+        retagged = await _retag_ingested_events(
+            container,
+            repository=repository,
+            ingested_source_name=current.name,
+            region=updated.region,
+        )
+    return {**_source_status_payload(updated), "events_retagged": retagged}
+
+
+async def _retag_ingested_events(
+    container: ServiceContainer,
+    *,
+    repository: RssSourceRepositoryPort,
+    ingested_source_name: str,
+    region: str | None,
+) -> int:
+    """Carry the region edit down onto the events already in the pool.
+
+    Best-effort by construction (the pool's only back-link is the source
+    name) and never fatal: the registry write is what the operator asked
+    for, and the ingest pass repairs whatever this misses."""
+    events = getattr(container, "world_event_repository", None)
+    if events is None:
+        return 0
+    service = RssSourceRegionRetagService(
+        rss_source_repository=repository,
+        world_event_repository=events,
+    )
+    try:
+        return await service.retag(
+            ingested_source_name=ingested_source_name, region=region,
+        )
+    except Exception:  # noqa: BLE001 — the source edit itself already landed
+        logger.warning(
+            "world_event region retag failed", exc_info=True,
+            extra={"source_name": ingested_source_name},
+        )
+        return 0
 
 
 @router.delete("/sources/{source_id}", status_code=204)
@@ -147,6 +212,7 @@ async def trigger_ingest(
         "events_persisted": report.events_persisted,
         "events_skipped_dedup": report.events_skipped_dedup,
         "events_skipped_embed": report.events_skipped_embed,
+        "events_region_corrected": report.events_region_corrected,
         "errors": list(report.errors),
     }
 
@@ -173,6 +239,8 @@ def _source_status_payload(source: RssSource) -> dict:
         "feed_url": source.feed_url,
         "category": source.category,
         "locale": source.locale,
+        "region": source.region,
+        "region_locked": source.region_locked,
         "enabled": source.enabled,
         "health_status": _health_status(source),
         "last_success_at": _isoformat(source.last_success_at),

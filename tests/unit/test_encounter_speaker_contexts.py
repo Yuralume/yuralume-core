@@ -48,8 +48,12 @@ class _Provider:
 class _FakeLifeBuilder:
     def __init__(self, per_character: dict[str, CharacterLifeContext]) -> None:
         self._per_character = per_character
+        self.ambient_references: dict[str, str | None] = {}
 
-    async def build(self, character, *, now, local_tz=None):
+    async def build(self, character, *, now, local_tz=None, ambient_reference=None):
+        self.ambient_references[character.id] = (
+            ambient_reference.id if ambient_reference is not None else None
+        )
         return self._per_character[character.id]
 
 
@@ -156,6 +160,23 @@ async def test_speaker_contexts_include_life_and_topic_history_buckets() -> None
     assert "被拉去看亮亮的東西" in b_text
     assert "約 1 天前" in a_text
     assert "聊祭典準備" in a_text
+
+
+@pytest.mark.asyncio
+async def test_both_speakers_share_the_initiating_side_ambient_reference() -> None:
+    # HOSTED_PLAYER_GEO_ADAPTATION_PLAN §7-4: a cross-player encounter
+    # happens in one place, so both life contexts must resolve their
+    # weather/holiday facts from the initiating side (encounter side A),
+    # not one sky per speaker.
+    char_a, char_b = _char("a"), _char("b")
+    builder = _FakeLifeBuilder({"a": _life(), "b": CharacterLifeContext()})
+    runner = _runner(
+        encounter_repository=_FakeEncounterRepo([]),
+        life_context_builder=builder,
+    )
+    current = SimpleNamespace(id="enc-now", relationship_id="rel-1")
+    await runner._speaker_contexts(char_a, char_b, now=_NOW, encounter=current)
+    assert builder.ambient_references == {"a": "a", "b": "a"}
 
 
 @pytest.mark.asyncio

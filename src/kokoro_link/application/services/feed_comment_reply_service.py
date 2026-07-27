@@ -85,6 +85,10 @@ from kokoro_link.contracts.feed_comment_reply import (
     FeedCommentReplyInput,
 )
 from kokoro_link.contracts.memory import MemoryRepositoryPort
+from kokoro_link.contracts.visible_slots import (
+    SLOT_KIND_FEED_REPLY,
+    VisibleSlotPort,
+)
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.feed_comment import (
     LOCAL_COMMENTER_ID,
@@ -162,6 +166,7 @@ class FeedCommentReplyService:
         daily_cap: int = _DEFAULT_DAILY_CAP,
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         notification_service: NotificationService | None = None,
+        visible_slot_port: VisibleSlotPort | None = None,
     ) -> None:
         self._posts = post_repository
         self._comments = comment_repository
@@ -189,17 +194,30 @@ class FeedCommentReplyService:
         # drift into a different language than the post they're on.
         self._operator_profile_service = operator_profile_service
         self._notification_service = notification_service
+        self._visible_slot_port = visible_slot_port
 
     async def tick(
         self,
         character: Character,
         *,
         now: datetime | None = None,
+        logical_slot: str | None = None,
     ) -> FeedComment | None:
         """One pass for ``character``. Returns the reply that landed,
         or ``None`` when nothing was warranted this tick."""
         when = now or datetime.now(timezone.utc)
         if not self._is_enabled(character):
+            return None
+        # P3-Dedup §3.4 — claim the reply pass for this tick bucket before
+        # scanning / composing. A distributed reclaimed job racing the original
+        # on the same character loses the claim and skips the whole pass, so the
+        # visible reply is authored at most once per bucket. ``logical_slot`` is
+        # ``None`` off the tick path (no manual pass exists) → claim skipped.
+        if not await self._claim_reply_slot(character.id, logical_slot):
+            _LOGGER.debug(
+                "feed reply: slot already claimed, skipping pass character=%s "
+                "slot=%s", character.id, logical_slot,
+            )
             return None
         local_tz = await self._resolve_operator_timezone(character)
         if await self._is_high_busy(character, when):
@@ -261,6 +279,28 @@ class FeedCommentReplyService:
     # ------------------------------------------------------------------
     # Gates
     # ------------------------------------------------------------------
+
+    async def _claim_reply_slot(
+        self, character_id: str, logical_slot: str | None,
+    ) -> bool:
+        """Own this character's reply pass for ``logical_slot``.
+
+        ``True`` (proceed) when nothing to claim (no slot port, or off-tick
+        ``logical_slot is None``) or the claim wins. ``False`` only when the
+        slot is verifiably owned by another executor. A slot-store error fails
+        OPEN — a claim failure must never suppress a single-runner reply."""
+        if self._visible_slot_port is None or logical_slot is None:
+            return True
+        try:
+            return await self._visible_slot_port.claim(
+                character_id, SLOT_KIND_FEED_REPLY, logical_slot,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "feed reply: visible slot claim crashed; failing open "
+                "character=%s slot=%s", character_id, logical_slot,
+            )
+            return True
 
     def _is_enabled(self, character: Character) -> bool:
         # Reuse the same toggle that controls auto-posts: a character

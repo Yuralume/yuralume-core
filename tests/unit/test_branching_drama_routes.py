@@ -7,6 +7,9 @@ from fastapi.testclient import TestClient
 
 from kokoro_link.api.dependencies import get_container, get_current_user_id
 from kokoro_link.api.routes.branching_drama import router
+from kokoro_link.application.services.branching_drama_service import (
+    BranchingGenerationInProgress,
+)
 from kokoro_link.domain.entities.branching_drama import (
     STATUS_READY,
     BranchingDrama,
@@ -111,3 +114,30 @@ def test_get_branching_drama_first_scene_image_path_is_null_without_root_image()
 
     assert response.status_code == 200
     assert response.json()["first_scene_image_path"] is None
+
+
+class _BusyBranchingDramaServiceStub(_BranchingDramaServiceStub):
+    """Advance always reports another replica owning the generation."""
+
+    async def advance_session(self, session_id: str, **_kwargs):  # noqa: ANN003, ANN201
+        raise BranchingGenerationInProgress(self.drama.id, "node-1")
+
+
+def test_advance_returns_409_when_another_replica_is_generating() -> None:
+    client = _client(
+        _Container(
+            _BusyBranchingDramaServiceStub(
+                drama=_ready_drama(),
+                root=_root_node(None),
+            ),
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/branching-dramas/drama-1/sessions/session-1/advance",
+    )
+
+    # 409, NOT the terminal 400 that ValueError maps to: the condition is
+    # transient and the client should simply retry.
+    assert response.status_code == 409
+    assert "another replica" in response.json()["detail"]

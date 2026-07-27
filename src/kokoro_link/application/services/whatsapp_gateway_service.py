@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
 from kokoro_link.contracts.messaging import (
     InboundMessage,
@@ -197,7 +198,20 @@ class WhatsAppGatewayService:
                 account_id=account.id,
                 attachment_urls=parsed.photo_refs,
             )
-            await self._dispatcher.handle_inbound(inbound)
+            try:
+                await self._dispatcher.handle_inbound(inbound)
+            except ConversationBusyError:
+                # Same reasoning as the Discord gateway: this handler runs on a
+                # live sidecar socket that has no re-delivery, so an escaping
+                # exception costs the connection without saving the message.
+                _LOGGER.warning(
+                    "whatsapp message dropped — conversation stayed busy "
+                    "account=%s chat=%s id=%s",
+                    account.id,
+                    inbound.chat_ref,
+                    inbound.platform_message_id,
+                )
+                return
             await self._accounts.mark_gateway_success(
                 account.id,
                 owner_id=self._owner_id,

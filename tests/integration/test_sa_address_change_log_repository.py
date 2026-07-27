@@ -29,7 +29,7 @@ async def _setup(session_factory: sessionmaker) -> str:
     profile_repo = SAOperatorProfileRepository(session_factory)
     if await profile_repo.get_default() is None:
         await profile_repo.save(
-            OperatorProfile(id=DEFAULT_OPERATOR_ID, display_name="丹尼"),
+            OperatorProfile(id=DEFAULT_OPERATOR_ID, display_name="艾力"),
         )
     character_repo = SACharacterRepository(session_factory)
     character = Character.create(

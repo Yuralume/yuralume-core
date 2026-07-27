@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 import {
   getNotificationPreferences,
@@ -17,6 +18,7 @@ import {
 } from '@/utils/pushNotifications'
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const rootEl = ref<HTMLElement | null>(null)
 const flashing = ref(false)
@@ -39,7 +41,7 @@ const supportMessage = computed(() => {
     return t('playerSidebar.webNotifications.unsupported')
   }
   if (supportState.value === 'unconfigured') {
-    return t('playerSidebar.webNotifications.unconfigured')
+    return pt('playerSidebar.webNotifications.unconfigured')
   }
   if (supportState.value === 'denied') {
     return t('playerSidebar.webNotifications.denied')

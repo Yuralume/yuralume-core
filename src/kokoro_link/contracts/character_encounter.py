@@ -36,3 +36,16 @@ class CharacterEncounterRepositoryPort(Protocol):
 
     async def delete_for_character(self, character_id: str) -> int:
         """Delete encounters involving the character."""
+
+    async def claim_for_run(
+        self, encounter_id: str, *, now: datetime,
+    ) -> bool:
+        """Atomically claim a ``planned`` encounter for running (P3-Dedup §3.4).
+
+        CAS ``UPDATE ... SET status='running', started_at, updated_at WHERE
+        id=? AND status='planned'``; returns ``True`` only for the caller that
+        won the transition. Under a distributed race exactly one runner claims
+        the encounter and produces the visible transcript/reflection; the loser
+        gets ``False`` and must not run. ``list_runnable`` only surfaces
+        ``planned`` rows, so single-runner behaviour is unchanged (the claim
+        always succeeds for a due encounter)."""

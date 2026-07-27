@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.telegram_polling_service import (
     TelegramPollingService,
 )
@@ -279,3 +280,41 @@ async def test_duplicate_bot_token_accounts_are_not_polled(
     assert stored_second is not None
     assert "Duplicate Telegram bot token" in (stored_first.polling_last_error or "")
     assert "Duplicate Telegram bot token" in (stored_second.polling_last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_busy_conversation_leaves_the_offset_for_the_next_sweep(
+    tmp_path: Path,
+) -> None:
+    """Polling's re-delivery *is* the un-advanced offset.
+
+    The dispatcher hands the delivery back (dedup stamps rolled back), so the
+    sweep must stop before ``advance_polling_offset`` — the next poll ~2s later
+    re-fetches the same update and runs it for real. It is also not an account
+    error: nothing is wrong with the bot.
+    """
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_telegram_account(
+        harness,
+        character_id=character.id,
+        delivery_mode=DeliveryMode.POLLING,
+    )
+
+    async def _busy(*_args, **_kwargs):
+        raise ConversationBusyError("conv-1")
+
+    harness.chat_service.send_message = _busy
+    client = FakeTelegramPollingClient(
+        [{"ok": True, "result": [_telegram_message_update(update_id=10, message_id=7)]}],
+    )
+    service = _service(harness, client, tmp_path)
+
+    result = await service.poll_once()
+
+    assert result.dispatched == 0
+    assert result.errors == ()
+    stored = await harness.account_repository.get(account.id)
+    assert stored is not None
+    assert stored.polling_offset != 11
+    assert stored.polling_last_error is None

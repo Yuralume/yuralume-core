@@ -29,6 +29,8 @@ import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { formatDateTime } from '@/i18n/formatters'
 import { resolveSceneImageUrl } from '@/utils/sceneImage'
+import { isInsufficientCreditsFailure } from '@/utils/studioFailure'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 
 const { t } = useI18n()
 const { locale } = useLocale()
@@ -62,6 +64,16 @@ const isBusy = computed(() => {
 
 const isReady = computed(
   () => selectedDrama.value?.status === 'ready',
+)
+
+/**
+ * Generation is 202 + poll, so an exhausted balance can only surface as a
+ * code on the failed drama. It is the one failure the player can fix, so it
+ * gets the shared top-up card in place of the raw error line; unknown codes
+ * and plain crashes keep the existing generic detail.
+ */
+const outOfCredits = computed(
+  () => isInsufficientCreditsFailure(selectedDrama.value),
 )
 
 const progressPercent = computed(() => {
@@ -137,6 +149,7 @@ async function refreshSelected(silent = false) {
         total_segments: next.total_segments,
         status: next.status,
         error_message: next.error_message,
+        error_code: next.error_code ?? null,
         created_at: next.created_at,
         updated_at: next.updated_at,
       }
@@ -432,7 +445,14 @@ onBeforeUnmount(stopPolling)
           <p v-if="selectedDrama.warning" class="bd-page__warning">
             {{ selectedDrama.warning }}
           </p>
-          <p v-if="selectedDrama.error_message" class="bd-page__error-detail">
+          <InsufficientCreditsNotice
+            v-if="outOfCredits"
+            class="bd-page__credits-notice"
+          />
+          <p
+            v-else-if="selectedDrama.error_message"
+            class="bd-page__error-detail"
+          >
             {{ selectedDrama.error_message }}
           </p>
           <div class="bd-page__detail-prompt">
@@ -915,6 +935,9 @@ onBeforeUnmount(stopPolling)
 .bd-page__error-detail {
   font-size: 12px;
   color: var(--color-danger);
+  margin: 0;
+}
+.bd-page__credits-notice {
   margin: 0;
 }
 

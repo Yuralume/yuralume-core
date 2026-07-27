@@ -319,6 +319,12 @@ class BranchingDrama:
     total_segments: int
     status: str
     error_message: str | None = None
+    error_code: str | None = None
+    """Machine-readable reason for a ``failed`` status, when there is one.
+
+    Set only for deliberate cloud-gateway refusals (``insufficient_credits``
+    and friends) so the polling client can offer a top-up affordance instead
+    of the generic failure copy. ``None`` for ordinary crashes."""
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
 
@@ -386,7 +392,13 @@ class BranchingDrama:
         status: str,
         *,
         error_message: str | None = None,
+        error_code: str | None = None,
     ) -> BranchingDrama:
+        """Transition status, replacing both failure fields wholesale.
+
+        Omitting them clears them — a drama that reaches ``ready`` must not
+        keep advertising the reason an earlier run failed.
+        """
         if status not in _VALID_DRAMA_STATUSES:
             raise ValueError(
                 f"with_status: {status!r} not in "
@@ -396,6 +408,7 @@ class BranchingDrama:
             self,
             status=status,
             error_message=error_message,
+            error_code=error_code,
             updated_at=_utcnow(),
         )
 

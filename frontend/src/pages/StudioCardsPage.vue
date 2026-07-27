@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import { UiButton } from '@/components/ui'
 import CharacterCardFace from '@/components/CharacterCardFace.vue'
@@ -11,6 +12,7 @@ import type { ArcSeries } from '@/types/arcSeries'
 import type { Character } from '@/types/character'
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const characters = ref<Character[]>([])
 const series = ref<ArcSeries[]>([])
@@ -252,7 +254,7 @@ function totalSeriesMembers(items: ArcSeries[]): number {
         </div>
 
         <p v-if="selectedCharacter" class="field-hint">
-          {{ t('studio.cards.bundleHint') }}
+          {{ pt('studio.cards.bundleHint') }}
         </p>
         <p v-if="error" class="studio-cards-page__error">{{ error }}</p>
 

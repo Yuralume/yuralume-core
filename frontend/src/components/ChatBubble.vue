@@ -9,10 +9,13 @@ import {
   updateTurnOperatorFeedback,
 } from '@/utils/api/observability'
 import { synthesizeCharacterTTS, TTSDisabledError } from '@/utils/api/tts'
+import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { useAuth } from '@/composables/useAuth'
+import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
 import { revealDelaysFor, splitAssistantBubbles } from '@/utils/chatSegments'
 import { clampSeedPrompt, composeMomentSeed } from '@/utils/fusionSeed'
 import { stashStudioSeed } from '@/utils/studioSeedTransfer'
+import { isTTSPlaybackEligible } from '@/utils/ttsAvailability'
 
 const { t } = useI18n()
 const { isAdmin } = useAuth()
@@ -24,6 +27,7 @@ type TTSStatus = 'idle' | 'loading' | 'playing' | 'unavailable' | 'error'
 const props = defineProps<{
   message: ChatMessage
   characterId?: string | null
+  ttsAvailable?: boolean
   animateReveal?: boolean
   textMessageMode?: boolean
 }>()
@@ -31,6 +35,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   revealComplete: []
   revealProgress: []
+  /**
+   * Voicing this bubble was refused for lack of credits. The bubble has no
+   * room for the explanation card, so the chat panel renders the one shared
+   * notice for the whole conversation.
+   */
+  insufficientCredits: []
 }>()
 
 const imageAttachments = computed<MessageAttachment[]>(() =>
@@ -59,11 +69,12 @@ const speechText = computed<string>(() => {
     .trim()
 })
 
-const ttsEligible = computed(
-  () => props.message.role === 'assistant'
-    && !!props.characterId
-    && speechText.value.length > 0,
-)
+const ttsEligible = computed(() => isTTSPlaybackEligible({
+  channelAvailable: props.ttsAvailable === true,
+  isAssistantMessage: props.message.role === 'assistant',
+  characterId: props.characterId,
+  speechText: speechText.value,
+}))
 
 const feedbackEligible = computed(
   () => isAdmin.value
@@ -166,7 +177,16 @@ async function handlePlayClick() {
       )
       url = resp.audio_url
       cachedAudioUrl.value = url
+      // Synthesis is a charged, player-initiated action (replays hit the
+      // server cache and cost nothing, hence only on a fresh URL).
+      refreshCloudCreditsAfterAction()
     } catch (err) {
+      if (isInsufficientCreditsError(err)) {
+        ttsStatus.value = 'error'
+        ttsErrorMsg.value = t('credits.insufficient.title')
+        emit('insufficientCredits')
+        return
+      }
       if (err instanceof TTSDisabledError) {
         ttsStatus.value = 'unavailable'
         ttsErrorMsg.value = err.message

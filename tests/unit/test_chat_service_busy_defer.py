@@ -223,6 +223,7 @@ def _build_chat_service(
     proactive_attempt_repository=None,
     operator_persona_service=None,
     relationship_seed_repository=None,
+    release_enqueuer=None,
 ):
     character_repository = InMemoryCharacterRepository()
     conversation_repository = InMemoryConversationRepository()
@@ -254,6 +255,8 @@ def _build_chat_service(
         relationship_seed_repository=relationship_seed_repository,
         journal_repository=journal_repository,
     )
+    if release_enqueuer is not None:
+        chat_service.set_pending_follow_up_release_enqueuer(release_enqueuer)
     character_service = CharacterService(
         character_repository,
         conversation_repository=conversation_repository,
@@ -711,3 +714,114 @@ async def test_no_schedule_skips_decider() -> None:
         ),
     )
     assert decider.calls == []
+
+
+class _SpyReleaseEnqueuer:
+    """Records the follow-up rows handed to the distributed release enqueuer."""
+
+    def __init__(self) -> None:
+        self.rows: list[Any] = []
+
+    async def enqueue(self, row, *, now=None) -> bool:  # noqa: ANN001
+        self.rows.append(row)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_brief_defer_enqueues_event_driven_release_job() -> None:
+    activity = _busy_activity()
+    decider = _ScriptedDecider([
+        BusyDecision(
+            mode=BusyReplyMode.BRIEF_DEFER,
+            brief_reply="先回，等會議結束我再好好回你",
+            defer_until=activity.end_at,
+            defer_reason="會議中",
+        ),
+    ])
+    pending_repo = InMemoryPendingFollowUpRepository()
+    enqueuer = _SpyReleaseEnqueuer()
+    chat, character_service, conversation_repository = _build_chat_service(
+        decider=decider,
+        schedule_service=_StubScheduleService(current_activity=activity),
+        pending_repo=pending_repo,
+        release_enqueuer=enqueuer,
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Airi", personality=["責任感重"], interests=[]),
+    )
+
+    reply = await chat.send_message(
+        SendChatMessageRequest(character_id=created.id, message="晚餐想吃什麼"),
+    )
+
+    # The new pending row was handed to the distributed enqueuer exactly once.
+    open_row = await pending_repo.find_open_for_conversation(reply.conversation_id)
+    assert open_row is not None
+    assert [r.id for r in enqueuer.rows] == [open_row.id]
+    assert enqueuer.rows[0].scheduled_for == activity.end_at
+
+
+@pytest.mark.asyncio
+async def test_embedded_path_writes_row_without_enqueuer() -> None:
+    # No enqueuer wired (self-host / embedded): the row is still persisted and the
+    # turn succeeds — zero path difference from before Phase 5.
+    activity = _busy_activity()
+    decider = _ScriptedDecider([
+        BusyDecision(
+            mode=BusyReplyMode.BRIEF_DEFER,
+            brief_reply="先回，晚點找你",
+            defer_until=activity.end_at,
+            defer_reason="會議中",
+        ),
+    ])
+    pending_repo = InMemoryPendingFollowUpRepository()
+    chat, character_service, conversation_repository = _build_chat_service(
+        decider=decider,
+        schedule_service=_StubScheduleService(current_activity=activity),
+        pending_repo=pending_repo,
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Airi", personality=[], interests=[]),
+    )
+
+    reply = await chat.send_message(
+        SendChatMessageRequest(character_id=created.id, message="晚餐想吃什麼"),
+    )
+
+    open_row = await pending_repo.find_open_for_conversation(reply.conversation_id)
+    assert open_row is not None
+    assert open_row.status == PendingFollowUpStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_scheduled_promise_write_point_enqueues_release_job() -> None:
+    # The second write point (_persist_message_promises) also enqueues the
+    # event-driven release for the promised instant.
+    pending_repo = InMemoryPendingFollowUpRepository()
+    enqueuer = _SpyReleaseEnqueuer()
+    chat, character_service, _ = _build_chat_service(
+        decider=_ScriptedDecider([]),
+        schedule_service=_StubScheduleService(current_activity=None),
+        pending_repo=pending_repo,
+        release_enqueuer=enqueuer,
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Airi", personality=[], interests=[]),
+    )
+    scheduled = datetime.now(timezone.utc) + timedelta(hours=6)
+    promise = SimpleNamespace(
+        scheduled_for_iso=scheduled.isoformat(),
+        intent="叫使用者起床",
+        source_text="明天早上叫我起床",
+    )
+
+    await chat._persist_message_promises(
+        character_id=created.id,
+        conversation_id="conv-promise",
+        promises=[promise],
+    )
+
+    assert len(enqueuer.rows) == 1
+    row = enqueuer.rows[0]
+    assert row.is_scheduled_promise is True
+    assert row.promise_intent == "叫使用者起床"

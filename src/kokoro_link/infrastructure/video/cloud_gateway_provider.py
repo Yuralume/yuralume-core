@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Mapping
 from urllib.parse import urljoin
 from uuid import uuid4
@@ -11,11 +12,17 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentityResolverPort,
     CloudResourceContext,
 )
+from kokoro_link.contracts.generation_trigger import (
+    TRIGGER_HEADER_NAME,
+    generation_trigger_header_value,
+)
 from kokoro_link.contracts.video_provider import (
     VideoGenerationError,
     VideoNoOutputError,
     VideoTimeoutError,
 )
+from kokoro_link.infrastructure.http_error_logging import log_expected_refusal
+from kokoro_link.infrastructure.llm.cloud_refusal import refusal_from_response
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_visual_identity_lines,
 )
@@ -23,12 +30,13 @@ from kokoro_link.infrastructure.prompt.visual_subject import (
     render_character_visual_subject_lines,
 )
 
-
 ASPECT_TO_RATIO: dict[str, str] = {
     "portrait": "9:16",
     "landscape": "16:9",
     "square": "1:1",
 }
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CloudGatewayVideoProvider:
@@ -126,6 +134,7 @@ class CloudGatewayVideoProvider:
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
+            TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
 
 
@@ -197,6 +206,18 @@ async def _download_bytes(
 
 def _json_or_raise(response: httpx.Response) -> Mapping:
     if response.status_code >= 400:
+        refusal = refusal_from_response(response, response.text)
+        if refusal is not None:
+            log_expected_refusal(
+                _LOGGER,
+                response,
+                operation="cloud video gateway",
+                code=refusal.code,
+                message=refusal.reason,
+            )
+            raise VideoGenerationError(
+                f"video gateway refused ({refusal.code})",
+            ) from refusal
         raise VideoGenerationError(
             f"video gateway error {response.status_code}: {response.text}",
         )

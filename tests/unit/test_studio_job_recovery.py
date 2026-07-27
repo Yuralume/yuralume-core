@@ -34,6 +34,10 @@ from kokoro_link.application.services.branching_drama_service import (
 from kokoro_link.application.services.fusion_story_service import (
     FusionStoryService,
 )
+from kokoro_link.application.services.studio_execution_lease import (
+    LEASE_ABANDONED,
+    StudioExecutionLease,
+)
 from kokoro_link.application.services.studio_job_recovery import (
     StudioJobRecoveryService,
 )
@@ -78,6 +82,9 @@ from kokoro_link.infrastructure.repositories.in_memory_branching_drama import (
 )
 from kokoro_link.infrastructure.repositories.in_memory_fusion_stories import (
     InMemoryFusionStoryRepository,
+)
+from kokoro_link.infrastructure.repositories.in_memory_background_jobs import (
+    InMemoryBackgroundCoordinatorLease,
 )
 from kokoro_link.infrastructure.repositories.in_memory_studio_jobs import (
     InMemoryStudioJobRepository,
@@ -220,6 +227,8 @@ def _fusion_rig(
     planner=None,
     writer=None,
     notifications=None,
+    execution_lease=None,
+    lease_heartbeat_interval_seconds=None,
 ):
     repo = InMemoryFusionStoryRepository()
     chars = {"c-a": _make_character("a"), "c-b": _make_character("b")}
@@ -236,6 +245,8 @@ def _fusion_rig(
         critic=_ScriptedCritic(),  # type: ignore[arg-type]
         jobs=jobs,
         notifications=notifications,
+        execution_lease=execution_lease,
+        lease_heartbeat_interval_seconds=lease_heartbeat_interval_seconds,
     )
     return repo, service, planner, writer, polisher
 
@@ -395,11 +406,13 @@ def _recovery(
     *,
     fusion: FusionStoryService | None = None,
     branching: BranchingDramaService | None = None,
+    execution_lease=None,
 ) -> StudioJobRecoveryService:
     return StudioJobRecoveryService(
         jobs=jobs,
         fusion_story_service=fusion,
         branching_drama_service=branching,
+        execution_lease=execution_lease,
     )
 
 
@@ -663,7 +676,9 @@ class _ScriptedDirector:
         return TONE_NEUTRAL
 
 
-def _branching_rig(*, jobs: InMemoryStudioJobRepository | None):
+def _branching_rig(
+    *, jobs: InMemoryStudioJobRepository | None, execution_lease=None,
+):
     repo = InMemoryBranchingDramaRepository()
     chars = {"c-a": _make_character("a"), "c-b": _make_character("b")}
     planner = _ScriptedDramaPlanner()
@@ -674,6 +689,7 @@ def _branching_rig(*, jobs: InMemoryStudioJobRepository | None):
         planner=planner,  # type: ignore[arg-type]
         director=_ScriptedDirector(),  # type: ignore[arg-type]
         jobs=jobs,
+        execution_lease=execution_lease,
     )
     return repo, service, planner
 
@@ -774,3 +790,211 @@ class TestBranchingJobs:
         assert planner.root_calls == 1
         roots = await repo.get_nodes_at_depth(drama.id, 0)
         assert len(roots) == 1
+
+
+# ── per-target execution lease (Phase 4 前置) ─────────────────────────
+
+
+class _SlowWriter:
+    """Writer that yields between beats so a heartbeat task can interleave."""
+
+    def __init__(self, *, delay: float = 0.02) -> None:
+        self.calls: list[int] = []
+        self._delay = delay
+
+    async def write_beat(
+        self,
+        *,
+        prompt,  # noqa: ARG002
+        outline,  # noqa: ARG002
+        beat: FusionBeatPlan,
+        briefs,  # noqa: ARG002
+        previously_summary="",  # noqa: ARG002
+        previous_tail="",  # noqa: ARG002
+        regenerate_hint=None,  # noqa: ARG002
+    ) -> str:
+        self.calls.append(beat.sequence)
+        await asyncio.sleep(self._delay)
+        return f"PROSE-{beat.sequence} 內容。"
+
+
+class _LostAfterAcquireLease:
+    """Duck-typed lease that acquires once, then reports every heartbeat lost."""
+
+    ttl_seconds = 30
+
+    async def acquire(self, target_id, *, now=None):  # noqa: ANN001, ARG002
+        return 1
+
+    async def heartbeat(self, target_id, epoch, *, now=None):  # noqa: ANN001, ARG002
+        return False
+
+    async def release(self, target_id):  # noqa: ANN001
+        return None
+
+
+class TestExecutionLease:
+    @pytest.mark.asyncio
+    async def test_inmemory_lease_create_is_behaviour_parity(self) -> None:
+        """A single process with an in-memory lease reaches READY exactly like
+        the lock-only path — the lease is always free when the runner acquires."""
+        jobs = InMemoryStudioJobRepository()
+        lease = StudioExecutionLease(
+            InMemoryBackgroundCoordinatorLease(), owner_id="A",
+        )
+        _, service, _, _, _ = _fusion_rig(jobs=jobs, execution_lease=lease)
+        story = await service.create(
+            character_ids=["c-a", "c-b"], prompt="提示",
+        )
+        await _await_story_terminal(service, story.id)
+        final = await service.get(story.id)
+        assert final is not None and final.status == STATUS_READY
+        finished = await _await_job_finished(jobs, story_job_id(jobs, story.id))
+        assert finished.status == JOB_STATUS_SUCCEEDED
+
+    @pytest.mark.asyncio
+    async def test_iterate_busy_error_semantics_unchanged(self) -> None:
+        """The only user-facing 'already generating' gate is the existing
+        terminal check — the lease adds no new error shape."""
+        jobs = InMemoryStudioJobRepository()
+        lease = StudioExecutionLease(
+            InMemoryBackgroundCoordinatorLease(), owner_id="A",
+        )
+        repo, service, _, _, _ = _fusion_rig(jobs=jobs, execution_lease=lease)
+        story = _story_in_writing(filled_beats=1)  # non-terminal
+        await repo.add(story)
+        with pytest.raises(ValueError, match="busy"):
+            await service.iterate_polish(story.id)
+
+    @pytest.mark.asyncio
+    async def test_runner_skips_when_target_leased_elsewhere(self) -> None:
+        """A runner whose target is held by another replica abandons without
+        driving or clobbering the story (no LLM pass, status untouched)."""
+        jobs = InMemoryStudioJobRepository()
+        backend = InMemoryBackgroundCoordinatorLease()
+        mine = StudioExecutionLease(backend, owner_id="A")
+        other = StudioExecutionLease(backend, owner_id="B")
+        repo, service, planner, writer, _ = _fusion_rig(
+            jobs=jobs, execution_lease=mine,
+        )
+        story = FusionStory.create_pending(
+            character_ids=["c-a", "c-b"], prompt="提示",
+        )
+        await repo.add(story)
+        # Another replica holds the target's lease.
+        assert await other.acquire(story.id) == 1
+
+        characters = [_make_character("a"), _make_character("b")]
+        briefs = await service._brief_builder.build_many(characters)  # type: ignore[attr-defined]
+        from kokoro_link.application.services.fusion_story_service import (
+            _PipelineContext,
+        )
+        ctx = _PipelineContext(
+            story_id=story.id, prompt="提示",
+            characters=characters, briefs=briefs,
+        )
+        result = await service._run_full_pipeline(ctx)  # type: ignore[attr-defined]
+
+        assert result == LEASE_ABANDONED
+        assert planner.calls == 0 and writer.calls == []
+        after = await service.get(story.id)
+        assert after is not None and after.status != STATUS_FAILED
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_midrun_abandons_without_clobber(self) -> None:
+        """A lease stolen mid-run aborts the pipeline: the story is NOT marked
+        failed and the job is NOT finalized — the reclaiming replica owns them."""
+        jobs = InMemoryStudioJobRepository()
+        writer = _SlowWriter(delay=0.02)
+        _, service, planner, _, _ = _fusion_rig(
+            jobs=jobs,
+            writer=writer,
+            execution_lease=_LostAfterAcquireLease(),  # type: ignore[arg-type]
+            lease_heartbeat_interval_seconds=0.001,
+        )
+        story = await service.create(
+            character_ids=["c-a", "c-b"], prompt="提示",
+        )
+        job = await _single_job(jobs)
+        # Give the pipeline time to abandon on the lost heartbeat.
+        for _ in range(200):
+            current = await jobs.get(job.id)
+            live_tasks = [t for t in service._tasks.values() if not t.done()]  # type: ignore[attr-defined]
+            if not live_tasks:
+                break
+            await asyncio.sleep(0.01)
+
+        final = await service.get(story.id)
+        assert final is not None and final.status != STATUS_FAILED
+        # Job left RUNNING (abandoned, not finalized) — the lease owner finalizes.
+        after = await jobs.get(job.id)
+        assert after is not None and after.status == JOB_STATUS_RUNNING
+
+    @pytest.mark.asyncio
+    async def test_recovery_skips_target_leased_by_another_replica(self) -> None:
+        """Recovery counts a lease_skip and leaves the job + story untouched when
+        another replica already holds the target's lease."""
+        jobs = InMemoryStudioJobRepository()
+        backend = InMemoryBackgroundCoordinatorLease()
+        mine = StudioExecutionLease(backend, owner_id="A")
+        other = StudioExecutionLease(backend, owner_id="B")
+        repo, service, planner, writer, _ = _fusion_rig(
+            jobs=jobs, execution_lease=mine,
+        )
+        story = _story_in_writing(filled_beats=2)
+        await repo.add(story)
+        job = StudioGenerationJob.create(
+            kind=JOB_KIND_FUSION_CREATE, target_id=story.id, params={},
+        )
+        await jobs.add(job)
+        assert await other.acquire(story.id) == 1
+
+        report = await _recovery(
+            jobs, fusion=service, execution_lease=mine,
+        ).recover()
+
+        assert report["lease_skipped"] == 1
+        assert report["resumed"] == 0 and report["superseded"] == 0
+        assert planner.calls == 0 and writer.calls == []
+        untouched = await jobs.get(job.id)
+        assert untouched is not None
+        assert untouched.status == JOB_STATUS_RUNNING
+        after = await service.get(story.id)
+        assert after is not None and after.status == STATUS_WRITING
+
+    @pytest.mark.asyncio
+    async def test_recovery_redrives_when_lease_free(self) -> None:
+        """With the lease free, recovery claims the target and hands it to the
+        runner (which renews the same lease and releases it), reaching READY."""
+        jobs = InMemoryStudioJobRepository()
+        lease = StudioExecutionLease(
+            InMemoryBackgroundCoordinatorLease(), owner_id="A",
+        )
+        repo, service, planner, writer, _ = _fusion_rig(
+            jobs=jobs, execution_lease=lease,
+        )
+        story = _story_in_writing(filled_beats=2)
+        await repo.add(story)
+        job = StudioGenerationJob.create(
+            kind=JOB_KIND_FUSION_CREATE, target_id=story.id, params={},
+        )
+        await jobs.add(job)
+
+        report = await _recovery(
+            jobs, fusion=service, execution_lease=lease,
+        ).recover()
+        await _await_story_terminal(service, story.id)
+
+        assert report["resumed"] == 1 and report["lease_skipped"] == 0
+        final = await service.get(story.id)
+        assert final is not None and final.status == STATUS_READY
+        assert writer.calls == [2, 3]
+        finished = await _await_job_finished(jobs, job.id)
+        assert finished.status == JOB_STATUS_SUCCEEDED
+
+
+def story_job_id(jobs: InMemoryStudioJobRepository, story_id: str) -> str:
+    for job in jobs._jobs.values():  # type: ignore[attr-defined]
+        if job.target_id == story_id:
+            return job.id
+    raise AssertionError(f"no job for story {story_id}")

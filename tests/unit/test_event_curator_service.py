@@ -134,6 +134,7 @@ async def _seed_event(
     embedding: tuple[float, ...],
     category: str = "news",
     age_days: int = 1,
+    source_region: str | None = None,
 ) -> WorldEvent:
     event = WorldEvent(
         id=str(uuid4()),
@@ -144,6 +145,7 @@ async def _seed_event(
         published_at=_now() - timedelta(days=age_days),
         fetched_at=_now(),
         category=category,
+        source_region=source_region,
         topic_tags=(),
         embedding=list(embedding),
     )
@@ -308,3 +310,179 @@ async def test_no_character_or_operator_relevance_noops() -> None:
     )
 
     assert await curator.curate(char) == 0
+
+
+# --- Region narrowing (HOSTED_PLAYER_GEO G3) --------------------------------
+#
+# The event pool is site-wide, but a hosted deployment serves players all
+# over the world. A source tagged with a region is only material for
+# players living there; an untagged source is global. The operator's own
+# region comes from ``operator_profiles.country_code``, and an operator
+# without one — the self-host default — is never filtered at all.
+
+
+class _FakeOperatorProfileService:
+    """Two-line stand-in for ``OperatorProfileService.get_for_user``."""
+
+    def __init__(self, country_code: str | None, *, raises: bool = False) -> None:
+        self._country_code = country_code
+        self._raises = raises
+        self.asked_for: list[str] = []
+
+    async def get_for_user(self, user_id: str):
+        self.asked_for.append(user_id)
+        if self._raises:
+            raise RuntimeError("profile store down")
+        return SimpleNamespace(country_code=self._country_code)
+
+
+def _region_curator(
+    events: InMemoryWorldEventRepository,
+    inbox: InMemoryCharacterEventInboxRepository,
+    profile_service: _FakeOperatorProfileService | None,
+) -> EventCuratorService:
+    return EventCuratorService(
+        world_event_repository=events,
+        inbox_repository=inbox,
+        embedder=_FakeEmbedder({"遊戲": (1.0, 0.0)}),
+        operator_profile_service=profile_service,  # type: ignore[arg-type]
+        match_threshold=0.5,
+    )
+
+
+async def _seed_region_matrix(events: InMemoryWorldEventRepository) -> None:
+    vec = (1.0, 0.0)
+    await _seed_event(events, title="遊戲 JP", embedding=vec, source_region="JP")
+    await _seed_event(events, title="遊戲 TW", embedding=vec, source_region="TW")
+    await _seed_event(events, title="遊戲 全球", embedding=vec, source_region=None)
+
+
+async def _curated_titles(
+    curator: EventCuratorService,
+    events: InMemoryWorldEventRepository,
+    inbox: InMemoryCharacterEventInboxRepository,
+    char: Character,
+) -> set[str]:
+    await curator.curate(char)
+    rows = await inbox.list_for_character(char.id)
+    by_id = {}
+    for row in rows:
+        event = await events.get(row.world_event_id)
+        by_id[row.world_event_id] = event.title
+    return set(by_id.values())
+
+
+@pytest.mark.asyncio
+async def test_operator_region_keeps_own_region_and_global_only() -> None:
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    await _seed_region_matrix(events)
+    char = _make_character(interests=["遊戲"])
+    profiles = _FakeOperatorProfileService("JP")
+
+    titles = await _curated_titles(
+        _region_curator(events, inbox, profiles), events, inbox, char,
+    )
+
+    assert titles == {"遊戲 JP", "遊戲 全球"}
+    assert profiles.asked_for == [char.user_id]
+
+
+@pytest.mark.asyncio
+async def test_operator_region_matching_is_case_insensitive() -> None:
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    await _seed_region_matrix(events)
+    char = _make_character(interests=["遊戲"])
+
+    titles = await _curated_titles(
+        _region_curator(events, inbox, _FakeOperatorProfileService(" jp ")),
+        events, inbox, char,
+    )
+
+    assert titles == {"遊戲 JP", "遊戲 全球"}
+
+
+@pytest.mark.asyncio
+async def test_operator_without_country_code_sees_every_region() -> None:
+    """Self-host parity: no country on the profile → no filtering, which
+    is exactly the behaviour that shipped before the column existed."""
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    await _seed_region_matrix(events)
+    char = _make_character(interests=["遊戲"])
+
+    titles = await _curated_titles(
+        _region_curator(events, inbox, _FakeOperatorProfileService(None)),
+        events, inbox, char,
+    )
+
+    assert titles == {"遊戲 JP", "遊戲 TW", "遊戲 全球"}
+
+
+@pytest.mark.asyncio
+async def test_unwired_profile_service_sees_every_region() -> None:
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    await _seed_region_matrix(events)
+    char = _make_character(interests=["遊戲"])
+
+    titles = await _curated_titles(
+        _region_curator(events, inbox, None), events, inbox, char,
+    )
+
+    assert titles == {"遊戲 JP", "遊戲 TW", "遊戲 全球"}
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_failure_falls_back_to_unfiltered() -> None:
+    """World awareness must not go quiet because a profile read blew up."""
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    await _seed_region_matrix(events)
+    char = _make_character(interests=["遊戲"])
+
+    titles = await _curated_titles(
+        _region_curator(
+            events, inbox, _FakeOperatorProfileService("JP", raises=True),
+        ),
+        events, inbox, char,
+    )
+
+    assert titles == {"遊戲 JP", "遊戲 TW", "遊戲 全球"}
+
+
+@pytest.mark.asyncio
+async def test_region_narrowing_runs_before_relevance_ranking() -> None:
+    """The pool cap is applied by the repository. If the region filter ran
+    after ranking, a neighbouring region's volume could fill the window
+    and leave this player with nothing."""
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    vec = (1.0, 0.0)
+    # The neighbouring region is both louder and fresher, so an unfiltered
+    # window of two would be entirely TW and the JP player would starve.
+    for index in range(5):
+        await _seed_event(
+            events,
+            title=f"遊戲 TW {index}",
+            embedding=vec,
+            source_region="TW",
+            age_days=1,
+        )
+    await _seed_event(
+        events, title="遊戲 JP", embedding=vec, source_region="JP", age_days=3,
+    )
+    char = _make_character(interests=["遊戲"])
+    curator = EventCuratorService(
+        world_event_repository=events,
+        inbox_repository=inbox,
+        embedder=_FakeEmbedder({"遊戲": vec}),
+        operator_profile_service=_FakeOperatorProfileService("JP"),  # type: ignore[arg-type]
+        match_threshold=0.5,
+        candidate_pool_size=2,
+    )
+
+    titles = await _curated_titles(curator, events, inbox, char)
+
+    assert titles == {"遊戲 JP"}

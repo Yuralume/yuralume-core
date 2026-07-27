@@ -44,7 +44,12 @@ class _StubArcService:
     last_mark_kwargs: dict | None = None
 
     async def next_beat_due(
-        self, character_id: str, *, today: date,  # noqa: ARG002
+        self,
+        character_id: str,
+        *,
+        today: date,  # noqa: ARG002
+        retry_policy=None,  # noqa: ANN001, ARG002
+        retry_at=None,  # noqa: ANN001, ARG002
     ) -> tuple[StoryArc, StoryArcBeat] | None:
         self.next_beat_due_calls += 1
         self.last_today = today
@@ -242,6 +247,9 @@ async def test_scene_service_failure_falls_back_to_notification_candidate() -> N
     )
 
     assert arc_service.mark_attempt_calls == 1
+    assert arc_service.last_mark_kwargs is not None
+    assert arc_service.last_mark_kwargs["source"] == "scene_simulation"
+    assert arc_service.last_mark_kwargs["result"] == "failed"
     assert result.attempted_beat_id == beat.id
     assert result.should_notify is True
     assert result.realized_event_id is None

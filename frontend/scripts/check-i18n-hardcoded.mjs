@@ -91,6 +91,14 @@ const completedFiles = [
   'src/components/PlayerScheduleCard.vue',
   'src/components/PostCreateChannelGuide.vue',
   'src/components/PlayerSidebar.vue',
+  'src/components/CloudCreditsBadge.vue',
+  'src/components/InsufficientCreditsNotice.vue',
+  'src/components/PortalAccountLink.vue',
+  'src/components/CitySearchField.vue',
+  'src/components/FirstLoginLocaleGate.vue',
+  'src/components/LocationHintBanner.vue',
+  'src/components/PlayerPlaceLocaleSettings.vue',
+  'src/pages/CloudCallbackPage.vue',
   'src/pages/BranchingDramaPage.vue',
   'src/pages/FusionStoryPage.vue',
   'src/pages/MemoirPage.vue',
@@ -98,6 +106,14 @@ const completedFiles = [
   'src/components/ChatFirstTurnGuide.vue',
   'src/components/ChatPanel.vue',
   'src/utils/api/worldEvents.ts',
+  // Demo conversion copy moved into the trilingual catalog (plan U1-D);
+  // these modules now own links/classification only, never display strings.
+  'src/utils/demoConversionLinks.ts',
+  'src/utils/demoSessionErrors.ts',
+  'src/pages/DemoOAuthStartPage.vue',
+  'src/pages/DemoOAuthCallbackPage.vue',
+  'src/composables/usePlayerCopy.ts',
+  'src/utils/studioFailure.ts',
   // Plan #1/#13 root cause lived here, outside the old allowlist. The
   // presence-frame factories no longer hard-code a zh display_name, so
   // this file is now gated too (and src/types is scanned below).

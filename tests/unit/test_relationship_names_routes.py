@@ -64,7 +64,7 @@ def _container(seed=None) -> tuple[_Container, InMemoryAddressChangeLogRepositor
 def test_patch_updates_names_and_writes_log() -> None:
     container, change_log = _container(
         CharacterOperatorRelationshipSeed(
-            character_id="c1", operator_id="alice", user_address_name="丹尼",
+            character_id="c1", operator_id="alice", user_address_name="艾力",
         )
     )
     client = _client(container)
@@ -85,7 +85,7 @@ def test_patch_updates_names_and_writes_log() -> None:
     )
     assert latest is not None
     assert latest.new_value == "阿丹"
-    assert latest.old_value == "丹尼"
+    assert latest.old_value == "艾力"
 
 
 def test_patch_empty_body_is_400() -> None:

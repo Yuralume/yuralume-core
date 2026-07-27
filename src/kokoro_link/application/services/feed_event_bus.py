@@ -31,6 +31,10 @@ class FeedPostEvent:
     content_text: str
     image_url: str | None
     created_at: datetime
+    event_id: int | None = None
+    """Durable outbox row id when rehydrated from the Phase 4 PostgreSQL outbox;
+    ``None`` on the in-memory backend so the SSE frame carries no ``id:`` (wire
+    output unchanged for self-host). See :class:`ProactiveEvent.event_id`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,10 @@ class FeedCommentReplyEvent:
     content_text: str
     unread_count: int
     created_at: datetime
+    event_id: int | None = None
+    """Durable outbox row id when rehydrated from the Phase 4 PostgreSQL outbox;
+    ``None`` on the in-memory backend so the SSE frame carries no ``id:`` (wire
+    output unchanged for self-host). See :class:`ProactiveEvent.event_id`."""
 
 
 # Union type for everything the bus may carry. Listed inline because

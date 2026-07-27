@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import {
   buildDemoOAuthAuthorizeUrl,
   supportedDemoOAuthProvider,
@@ -11,16 +12,17 @@ import {
   type DemoConversionAction,
 } from '@/utils/demoConversionLinks'
 
+const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const loading = ref(true)
-const error = ref<string | null>(null)
+const errorKey = ref<string | null>(null)
 const actions = ref<DemoConversionAction[]>([])
 
 onMounted(async () => {
   const provider = supportedDemoOAuthProvider(String(route.params.provider || ''))
   if (!provider) {
-    error.value = 'Unsupported demo provider.'
+    errorKey.value = 'demo.start.unsupportedProvider'
     actions.value = demoUnavailableActions()
     loading.value = false
     return
@@ -33,7 +35,7 @@ onMounted(async () => {
       await buildDemoOAuthAuthorizeUrl(provider, { clientIds }),
     )
   } catch {
-    error.value = 'The live demo is not available right now.'
+    errorKey.value = 'demo.start.startFailed'
     actions.value = demoUnavailableActions()
     loading.value = false
   }
@@ -47,23 +49,25 @@ function backToLogin(): void {
 <template>
   <main class="demo-oauth-start">
     <section class="panel">
-      <h1>{{ loading ? 'Opening demo' : 'Demo unavailable' }}</h1>
-      <p v-if="loading">Redirecting to your verified sign-in.</p>
-      <p v-else>{{ error }}</p>
+      <h1>
+        {{ loading ? t('demo.start.openingTitle') : t('demo.start.unavailableTitle') }}
+      </h1>
+      <p v-if="loading">{{ t('demo.start.openingBody') }}</p>
+      <p v-else-if="errorKey">{{ t(errorKey) }}</p>
       <div v-if="!loading" class="actions">
         <a
           v-for="action in actions"
-          :key="action.label"
+          :key="action.labelKey"
           class="button"
           :class="`button-${action.variant}`"
           :href="action.href"
           :target="action.external ? '_blank' : undefined"
           :rel="action.external ? 'noopener noreferrer' : undefined"
         >
-          {{ action.label }}
+          {{ t(action.labelKey) }}
         </a>
         <button class="button button-ghost" type="button" @click="backToLogin">
-          Back to login
+          {{ t('demo.actions.backToLogin') }}
         </button>
       </div>
     </section>

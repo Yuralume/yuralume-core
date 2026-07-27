@@ -62,6 +62,7 @@ class SABranchingDramaRepository(BranchingDramaRepositoryPort):
                 row.total_segments = drama.total_segments
                 row.status = drama.status
                 row.error_message = drama.error_message
+                row.error_code = drama.error_code
                 row.updated_at = drama.updated_at
             await session.commit()
 
@@ -227,6 +228,7 @@ def _drama_to_row(d: BranchingDrama) -> BranchingDramaRow:
     row.total_segments = d.total_segments
     row.status = d.status
     row.error_message = d.error_message
+    row.error_code = d.error_code
     row.created_at = d.created_at
     row.updated_at = d.updated_at
     return row
@@ -242,6 +244,7 @@ def _row_to_drama(r: BranchingDramaRow) -> BranchingDrama:
         total_segments=r.total_segments,
         status=r.status,
         error_message=r.error_message,
+        error_code=r.error_code,
         created_at=r.created_at,
         updated_at=r.updated_at,
     )

@@ -25,3 +25,20 @@ class ScheduleRepositoryPort(Protocol):
 
     async def delete_for_character(self, character_id: str) -> int:
         """Cascade delete all schedules for a character."""
+
+    async def claim_memorialize(self, activity_ids: list[str]) -> set[str]:
+        """Atomically mark activities as ``memorialized`` (P3-Dedup §3.4).
+
+        CAS ``UPDATE schedule_activities SET memorialized=true WHERE id IN
+        (...) AND memorialized=false``; returns exactly the ids this caller
+        flipped ``false → true``. Under a single runner every id is claimed
+        (behaviour identical to marking after the write); under a distributed
+        race only one runner claims a given activity and proceeds to write
+        its episodic memory, so the visible memory is never double-written."""
+
+    async def release_memorialize(self, activity_ids: list[str]) -> None:
+        """Undo a claim: reset ``memorialized=false`` for ``activity_ids``.
+
+        Called only when the memory write that a claim gated fails (embedder
+        outage / persist error) so the activity stays eligible for the next
+        pass — preserving the single-runner retry semantics exactly."""

@@ -32,6 +32,11 @@ from dataclasses import dataclass, replace
 from datetime import date as date_type, datetime, timedelta, timezone, tzinfo
 from typing import Iterable
 
+from kokoro_link.application.services.beat_retry_policy import BeatRetryPolicy
+from kokoro_link.application.services.studio_execution_lease import (
+    StudioExecutionLease,
+    StudioLeaseSession,
+)
 from kokoro_link.contracts.arc_template import ArcTemplateRepositoryPort
 from kokoro_link.contracts.arc_template_translator import (
     ArcTemplateTranslatorPort,
@@ -41,6 +46,7 @@ from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story import StoryEventRepositoryPort
 from kokoro_link.contracts.story_arc import (
+    ActiveArcConflict,
     StoryArcPlannerPort,
     StoryArcRepositoryPort,
     StoryArcSeasonContext,
@@ -76,6 +82,20 @@ _LOGGER = logging.getLogger(__name__)
 _DEFAULT_DURATION_DAYS = 21
 _DEFAULT_BEAT_COUNT = 5
 _DEFAULT_RECHECK_ATTEMPT_THRESHOLD = 2
+
+_ARC_INSERT_MAX_ATTEMPTS = 2
+"""``start_new_arc`` re-abandon retries. Two writers need one extra pass; the
+cap bounds any pathological ping-pong."""
+
+_ARC_PLAN_LEASE_PREFIX = "story_arc_plan:"
+"""Cross-replica claim namespace for lazy arc planning, one key per character.
+
+Layered on the per-target TTL lease (``background_runtime_leases`` via
+``StudioExecutionLease``) exactly like the daily story-event roll. The
+in-process ``_plan_locks`` below only serialize callers inside ONE process, but
+``ensure_active_arc`` is driven from api replicas (chat prompt assembly, REST)
+*and* the worker's proactive scheduler: without this claim two processes each
+run a full multi-call ``plan_arc`` and each persist an active arc."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +146,8 @@ class StoryArcService:
         recheck_attempt_threshold: int = _DEFAULT_RECHECK_ATTEMPT_THRESHOLD,
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         template_translator: "ArcTemplateTranslatorPort | None" = None,
+        execution_lease: StudioExecutionLease | None = None,
+        lease_heartbeat_interval_seconds: float | None = None,
     ) -> None:
         self._repository = repository
         self._planner = planner
@@ -156,11 +178,24 @@ class StoryArcService:
         # bind is low-frequency but a cache keeps repeat binds free and
         # stable. Keyed on the source template id + target lang.
         self._translation_cache: dict[tuple[str, str], ArcTemplate] = {}
+        # Cross-replica claim on the character's arc planning. ``None`` → the
+        # historical single-process behaviour (self-host, lease-less test rigs).
+        self._execution_lease = execution_lease
+        self._lease_heartbeat_interval = lease_heartbeat_interval_seconds
         # Per-character lock so a chat + proactive-scheduler race can't
         # trigger two concurrent ``plan_arc`` LLM calls on the first
         # arc of the character's lifetime. Second caller waits, then
-        # hits the short-circuit once the arc is persisted.
+        # hits the short-circuit once the arc is persisted. Process-local: it
+        # saves a DB round-trip for same-process callers, the lease above
+        # covers the cross-process case.
         self._plan_locks: dict[str, asyncio.Lock] = {}
+
+    def _plan_lease_session(self, character_id: str) -> StudioLeaseSession:
+        return StudioLeaseSession(
+            self._execution_lease,
+            f"{_ARC_PLAN_LEASE_PREFIX}{character_id}",
+            heartbeat_interval_seconds=self._lease_heartbeat_interval,
+        )
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -181,49 +216,99 @@ class StoryArcService:
         ``open_new_season=False`` preserves first-arc lazy creation but
         keeps completed-arc season decisions out of latency-sensitive
         callers such as chat prompt assembly.
+
+        Everything that WRITES — completing a stale arc, planning, persisting
+        — happens under the per-character lease claim, so read-only callers
+        (and losing replicas) never mutate arc state. The read fast path below
+        stays lock-free and lease-free: a live active arc is returned straight
+        away, which is the overwhelmingly common case on the chat hot path.
         """
         target_today = today or self._today()
-        completed_now: StoryArc | None = None
         existing = await self._repository.get_active_for_character(character.id)
-        if existing is not None:
-            if self._is_arc_stale(existing, target_today):
-                completed = existing.with_status(ARC_COMPLETED)
-                await self._repository.save(completed)
-                completed_now = completed
-                existing = None
-            else:
-                return existing
+        if existing is not None and not self._is_arc_stale(existing, target_today):
+            return existing
         if not auto_start:
+            # Read path. A stale arc is reported as "no arc" exactly as before;
+            # its completion write is deferred to the next writing caller
+            # rather than fired from a read (two replicas polling a read
+            # surface would otherwise both mark it completed).
             return None
         lock = self._plan_locks.setdefault(character.id, asyncio.Lock())
         async with lock:
-            # Re-check — another concurrent caller may have just
-            # finished planning while we were waiting for the lock.
+            # Re-check — another concurrent caller in THIS process may have
+            # just finished planning while we were waiting for the lock.
             existing = await self._repository.get_active_for_character(
                 character.id,
             )
-            if existing is not None:
-                if self._is_arc_stale(existing, target_today):
-                    completed_now = existing.with_status(ARC_COMPLETED)
-                    await self._repository.save(completed_now)
-                else:
-                    return existing
-            completed_arc = completed_now or await self._latest_completed_arc(
-                character.id,
-            )
+            if existing is not None and not self._is_arc_stale(
+                existing, target_today,
+            ):
+                return existing
+            async with self._plan_lease_session(character.id) as lease:
+                if not lease.acquired:
+                    # Another replica is planning this character's arc right
+                    # now. Never block on it: ``ensure_active_arc`` sits on the
+                    # chat turn / proactive tick and every caller is
+                    # opportunistic, so the next pass picks the arc up.
+                    _LOGGER.info(
+                        "story arc planning: claimed by another replica "
+                        "character=%s", character.id,
+                    )
+                    return await self._repository.get_active_for_character(
+                        character.id,
+                    )
+                # Third check, now under the claim: the replica that just
+                # released the lease may have planned an arc between our read
+                # above and our own claim.
+                return await self._plan_under_claim(
+                    character=character,
+                    today=target_today,
+                    open_new_season=open_new_season,
+                )
+
+    async def _plan_under_claim(
+        self,
+        *,
+        character: Character,
+        today: date_type,
+        open_new_season: bool,
+    ) -> StoryArc | None:
+        """Inner worker — caller holds the per-character lock AND lease."""
+        completed_now: StoryArc | None = None
+        existing = await self._repository.get_active_for_character(character.id)
+        if existing is not None:
+            if self._is_arc_stale(existing, today):
+                completed_now = existing.with_status(ARC_COMPLETED)
+                await self._repository.save(completed_now)
+            else:
+                return existing
+        completed_arc = completed_now or await self._latest_completed_arc(
+            character.id,
+        )
+        try:
             if character.arc_series_id:
                 return await self._ensure_series_arc(
                     character=character,
-                    today=target_today,
+                    today=today,
                     completed_arc=completed_arc,
                     open_new_season=open_new_season,
                 )
             return await self._ensure_non_series_arc(
                 character=character,
-                today=target_today,
+                today=today,
                 completed_arc=completed_arc,
                 open_new_season=open_new_season,
             )
+        except ActiveArcConflict:
+            # Last-resort backstop: the DB refused a second active arc (a
+            # replica whose lease had lapsed, or a pre-lease deployment still
+            # running). Adopt the winner instead of retrying — our plan is
+            # discarded, never merged into someone else's story.
+            _LOGGER.warning(
+                "story arc planning lost the active slot at write time "
+                "character=%s; adopting the persisted arc", character.id,
+            )
+            return await self._repository.get_active_for_character(character.id)
 
     async def _ensure_non_series_arc(
         self,
@@ -393,14 +478,12 @@ class StoryArcService:
                 template_id,
             )
             return None
-        existing = await self._repository.get_active_for_character(character.id)
-        if existing is not None:
-            await self._repository.save(self._abandon_arc_entity(existing))
+        await self._abandon_active_arc(character.id)
         localized = await self._localize_template(template, character=character)
         arc = localized.materialise(
             character_id=character.id, start_date=start,
         )
-        await self._repository.add(arc)
+        await self._add_as_only_active(arc)
         await self._series_repository.save_progress(
             progress.with_started_member(index=member_index, arc_id=arc.id),
         )
@@ -436,10 +519,7 @@ class StoryArcService:
         to nudge the arc; ``hint`` is for ad-hoc LLM steering.)
         """
         start = today or self._today()
-        existing = await self._repository.get_active_for_character(character.id)
-        if existing is not None:
-            abandoned = self._abandon_arc_entity(existing)
-            await self._repository.save(abandoned)
+        await self._abandon_active_arc(character.id)
 
         arc = None
         if not force_llm:
@@ -473,8 +553,34 @@ class StoryArcService:
                     summary, continuation,
                 ),
             )
-        await self._repository.add(arc)
+        await self._add_as_only_active(arc)
         return arc
+
+    async def _abandon_active_arc(self, character_id: str) -> None:
+        existing = await self._repository.get_active_for_character(character_id)
+        if existing is not None:
+            await self._repository.save(self._abandon_arc_entity(existing))
+
+    async def _add_as_only_active(self, arc: StoryArc) -> None:
+        """Insert ``arc``, re-abandoning a racing winner if one appeared.
+
+        ``start_new_arc`` promises the character ends up with exactly this arc
+        active, so a writer that slipped in between our abandon and our insert
+        is superseded the same way any pre-existing arc is. Bounded: two
+        writers need one extra pass, and the cap stops a pathological
+        ping-pong from looping forever."""
+        for attempt in range(_ARC_INSERT_MAX_ATTEMPTS):
+            try:
+                await self._repository.add(arc)
+                return
+            except ActiveArcConflict:
+                if attempt == _ARC_INSERT_MAX_ATTEMPTS - 1:
+                    raise
+                _LOGGER.info(
+                    "story arc insert raced a new active arc character=%s; "
+                    "superseding it", arc.character_id,
+                )
+                await self._abandon_active_arc(arc.character_id)
 
     async def _materialise_from_template_if_bound(
         self,
@@ -825,7 +931,12 @@ class StoryArcService:
         return await self._repository.get_active_for_character(character_id)
 
     async def next_beat_due(
-        self, character_id: str, *, today: date_type | None = None,
+        self,
+        character_id: str,
+        *,
+        today: date_type | None = None,
+        retry_policy: BeatRetryPolicy | None = None,
+        retry_at: datetime | None = None,
     ) -> tuple[StoryArc, StoryArcBeat] | None:
         """Return today's (or earliest overdue) pending arc beat.
 
@@ -844,7 +955,35 @@ class StoryArcService:
         if not candidates:
             return None
         candidates.sort(key=lambda b: (b.scheduled_date, b.sequence))
-        return arc, candidates[0]
+        beat = candidates[0]
+        if retry_policy is not None:
+            now = retry_at or datetime.now(timezone.utc)
+            if not retry_policy.allows(beat, now=now):
+                return None
+        return arc, beat
+
+    async def next_future_beat_date(
+        self,
+        character_id: str,
+        *,
+        after: date_type,
+    ) -> date_type | None:
+        """Scheduled civil date of the earliest pending beat strictly after ``after``.
+
+        Used by the distributed beat-due chain to jump its next recheck straight
+        to the day a future beat lands (§ beat_due precision) instead of polling
+        every 300s. ``None`` when there is no active arc or no future pending beat
+        (the chain then keeps its base 300s recheck cadence). Read-only.
+        """
+        arc = await self._repository.get_active_for_character(character_id)
+        if arc is None:
+            return None
+        future = [
+            b.scheduled_date
+            for b in arc.beats
+            if b.status == BEAT_PENDING and b.scheduled_date > after
+        ]
+        return min(future) if future else None
 
     async def mark_beat_play_attempted(
         self,

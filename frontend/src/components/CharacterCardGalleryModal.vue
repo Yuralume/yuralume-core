@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { CloseOutlined, LeftOutlined, RightOutlined } from '@ant-design/icons-vue'
 import CharacterCardFace from '@/components/CharacterCardFace.vue'
 import CharacterCardThumb from '@/components/CharacterCardThumb.vue'
@@ -39,6 +40,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 
 const slideDirection = ref<'prev' | 'next'>('next')
 
@@ -269,10 +271,10 @@ function handleWindowKeydown(event: KeyboardEvent) {
           role="note"
         >
           <p class="character-card-gallery__st-title">
-            {{ t('playerSidebar.characterCards.sillytavern.title') }}
+            {{ pt('playerSidebar.characterCards.sillytavern.title') }}
           </p>
           <p class="character-card-gallery__st-line">
-            {{ t('playerSidebar.characterCards.sillytavern.normalized') }}
+            {{ pt('playerSidebar.characterCards.sillytavern.normalized') }}
           </p>
           <p
             v-if="droppedFields.length"
@@ -282,7 +284,7 @@ function handleWindowKeydown(event: KeyboardEvent) {
             <span
               v-for="(dropped, index) in droppedFields"
               :key="dropped"
-            >{{ index > 0 ? t('common.listSeparator') : '' }}{{ t(`playerSidebar.characterCards.sillytavern.dropped.${dropped}`) }}</span>
+            >{{ index > 0 ? t('common.listSeparator') : '' }}{{ pt(`playerSidebar.characterCards.sillytavern.dropped.${dropped}`) }}</span>
           </p>
         </div>
 

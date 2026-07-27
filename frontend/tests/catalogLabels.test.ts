@@ -64,6 +64,7 @@ const GLOBAL_FEATURE_KEYS = [
   'busy_follow_up',
   'scheduled_promise',
   'proactive_intention',
+  'proactive_message',
   'tts_translate',
   'card_translate',
   'arc_template_translate',

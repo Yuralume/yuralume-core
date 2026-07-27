@@ -227,6 +227,62 @@ def test_cloud_mode_requires_service_settings(
         AppSettings.from_env(project_root=tmp_path)
 
 
+def _base_cloud_env(monkeypatch, tmp_path: Path) -> None:
+    """Storage + cloud-enabled env shared by the role-matrix tests."""
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("DEPLOYMENT_MODE", "container")
+    monkeypatch.setenv("STORAGE_PROVIDER", "http")
+    monkeypatch.setenv("STORAGE_URL", "http://storage-local:9000")
+    monkeypatch.setenv("STORAGE_KEY", "secret")
+    monkeypatch.setenv("STORAGE_PUBLIC_URL", "http://127.0.0.1:9012")
+    monkeypatch.setenv("APP_BASE_URL", "https://app.example.test")
+    monkeypatch.setenv("YURALUME_CLOUD_ENABLED", "true")
+    # A distributed role only boots on the postgres queue backend, which itself
+    # requires a database — the coordinator's sole hard dependency.
+    monkeypatch.setenv("YURALUME_BACKGROUND_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app",
+    )
+    for key in (
+        "YURALUME_PROCESS_ROLE",
+        "YURALUME_CLOUD_USER_SERVICE_URL",
+        "YURALUME_CLOUD_GATEWAY_URL",
+        "YURALUME_CLOUD_DEPLOYMENT_TOKEN",
+        "YURALUME_CLOUD_DEPLOYMENT_ID",
+        "YURALUME_CLOUD_DEPLOYMENT_AUDIENCE",
+        "YURALUME_CLOUD_USER_INTERNAL_CREDENTIAL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_coordinator_role_boots_without_cloud_deployment_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """sol #1: the coordinator holds no provider/federation credential (it only
+    enqueues against the durable queue), so cloud mode must NOT force it to carry
+    the deployment token the other roles need — it would crash its boot."""
+    _base_cloud_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("YURALUME_PROCESS_ROLE", "coordinator")
+
+    settings = AppSettings.from_env(project_root=tmp_path)
+
+    assert settings.process.role == "coordinator"
+    assert settings.cloud.active is True
+    assert settings.cloud.deployment_token == ""  # absent, and that is allowed
+
+
+def test_worker_role_still_requires_cloud_deployment_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The exemption is coordinator-only: the worker executes gateway-backed
+    ticks, so it must still fail-fast when the deployment token is missing."""
+    _base_cloud_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("YURALUME_PROCESS_ROLE", "worker")
+
+    with pytest.raises(RuntimeError, match="YURALUME_CLOUD_DEPLOYMENT_TOKEN"):
+        AppSettings.from_env(project_root=tmp_path)
+
+
 def test_app_settings_loads_whatsapp_sidecar_url(
     tmp_path: Path, monkeypatch,
 ) -> None:

@@ -71,6 +71,15 @@ _TEXTS: dict[str, dict[str, str]] = {
             "もう一度言ってくれる？）"
         ),
     },
+    # --- chat: image succeeded but the no-tools final hop still emitted JSON ---
+    "chat.image_tool_final_reply_failed": {
+        "zh-TW": "（圖片已經傳好了，只是剛剛想接著說的話卡住了。）",
+        "en-US": (
+            "(The picture was sent, but what I was going to say afterward "
+            "got stuck.)"
+        ),
+        "ja-JP": "（画像は送れたけど、そのあとに言おうとした言葉が詰まっちゃった。）",
+    },
     # --- LINE outbound: attachment URL failed LINE's requirements ---
     "channel.line.attachment_url_invalid": {
         "zh-TW": "（附件 URL 不符 LINE 要求）{label}",

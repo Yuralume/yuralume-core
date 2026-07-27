@@ -16,6 +16,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type {
   AddStoryArcBeatPayload,
@@ -73,6 +74,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pt } = usePlayerCopy()
 const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 
@@ -195,7 +197,7 @@ async function submitNewArc() {
       beat_count: newArcBeatCount.value,
     })
     if (invalidReason) {
-      errorMsg.value = t(`story.arcPanel.newArc.validation.${invalidReason}`)
+      errorMsg.value = pt(`story.arcPanel.newArc.validation.${invalidReason}`)
       return
     }
   }
@@ -219,7 +221,7 @@ async function submitNewArc() {
 async function handleRegenerate() {
   if (!activeArc.value) return
   if (!await confirmDialog({
-    content: t('story.arcPanel.confirm.regenerate'),
+    content: pt('story.arcPanel.confirm.regenerate'),
   })) return
   busy.value = true
   errorMsg.value = null
@@ -235,7 +237,7 @@ async function handleRegenerate() {
 async function handleAbandon() {
   if (!activeArc.value) return
   if (!await confirmDialog({
-    content: t('story.arcPanel.confirm.abandon'),
+    content: pt('story.arcPanel.confirm.abandon'),
     danger: true,
   })) return
   busy.value = true
@@ -314,7 +316,7 @@ async function saveBeat(beat: StoryArcBeat) {
     activeArc.value = await updateStoryArcBeat(beat.id, payload)
     editingBeatId.value = null
   } catch (err) {
-    errorMsg.value = extractError(err) ?? t('story.arcPanel.errors.updateBeatFailed')
+    errorMsg.value = extractError(err) ?? pt('story.arcPanel.errors.updateBeatFailed')
   } finally {
     savingBeat.value = false
   }
@@ -323,7 +325,7 @@ async function saveBeat(beat: StoryArcBeat) {
 async function handleDeleteBeat(beat: StoryArcBeat) {
   if (beat.status === 'realized') return
   if (!await confirmDialog({
-    content: t('story.arcPanel.confirm.deleteBeat', { title: beat.title }),
+    content: pt('story.arcPanel.confirm.deleteBeat', { title: beat.title }),
     okText: t('common.actions.delete'),
     danger: true,
   })) return
@@ -333,7 +335,7 @@ async function handleDeleteBeat(beat: StoryArcBeat) {
     activeArc.value = await deleteStoryArcBeat(beat.id)
     if (editingBeatId.value === beat.id) editingBeatId.value = null
   } catch (err) {
-    errorMsg.value = extractError(err) ?? t('story.arcPanel.errors.deleteBeatFailed')
+    errorMsg.value = extractError(err) ?? pt('story.arcPanel.errors.deleteBeatFailed')
   } finally {
     savingBeat.value = false
   }
@@ -366,7 +368,7 @@ async function submitAddBeat() {
     activeArc.value = await addStoryArcBeat(activeArc.value.id, payload)
     addBeatOpen.value = false
   } catch (err) {
-    errorMsg.value = extractError(err) ?? t('story.arcPanel.errors.addBeatFailed')
+    errorMsg.value = extractError(err) ?? pt('story.arcPanel.errors.addBeatFailed')
   } finally {
     savingBeat.value = false
   }
@@ -393,7 +395,7 @@ function statusLabel(s: string): string {
     completed: 'story.arcPanel.status.completed',
     abandoned: 'story.arcPanel.status.abandoned',
   }[s]
-  return key ? t(key) : s
+  return key ? pt(key) : s
 }
 
 function sceneTypeLabel(s: string): string {
@@ -447,7 +449,7 @@ defineExpose({
     <div class="arc-header">
       <h3 class="section-title">{{ t('story.arcPanel.title') }}</h3>
       <p class="arc-hint">
-        {{ t('story.arcPanel.hint') }}
+        {{ pt('story.arcPanel.hint') }}
       </p>
       <!-- 範本綁定狀態列 — 跟「開新劇情」時走的路徑相連 -->
       <div v-if="characterId" class="template-bar">
@@ -455,7 +457,7 @@ defineExpose({
         <span v-if="arcTemplateId" class="template-pill bound">
           {{ t('story.arcPanel.template.bound', { id: arcTemplateId }) }}
         </span>
-        <span v-else class="template-pill llm">{{ t('story.arcPanel.template.unbound') }}</span>
+        <span v-else class="template-pill llm">{{ pt('story.arcPanel.template.unbound') }}</span>
         <button class="chip-btn small" @click="openTemplatePicker">
           {{ arcTemplateId ? t('story.arcPanel.template.changeOrClear') : t('story.arcPanel.template.choose') }}
         </button>
@@ -525,7 +527,7 @@ defineExpose({
         <div class="beats-section">
           <div class="beats-title">{{ t('story.arcPanel.beats.title') }}</div>
           <div v-if="sortedBeats.length === 0" class="empty-hint small">
-            {{ t('story.arcPanel.beats.empty') }}
+            {{ pt('story.arcPanel.beats.empty') }}
           </div>
           <ul v-else class="beat-list">
             <li
@@ -570,7 +572,7 @@ defineExpose({
                     class="chip-btn"
                     :disabled="beat.status === 'realized' || savingBeat"
                     @click="beginEditBeat(beat)"
-                  >{{ beat.status === 'realized' ? t('story.arcPanel.status.lockedRealized') : t('common.actions.edit') }}</button>
+                  >{{ beat.status === 'realized' ? pt('story.arcPanel.status.lockedRealized') : t('common.actions.edit') }}</button>
                   <button
                     class="chip-btn danger"
                     :disabled="beat.status === 'realized' || savingBeat"
@@ -672,7 +674,7 @@ defineExpose({
             v-else
             class="add-btn"
             @click="openAddBeat"
-          >{{ t('story.arcPanel.actions.addBeat') }}</button>
+          >{{ pt('story.arcPanel.actions.addBeat') }}</button>
         </div>
       </div>
 
@@ -703,10 +705,10 @@ defineExpose({
               <div class="modal-title">{{ t('story.arcPanel.newArc.title') }}</div>
               <div class="modal-hint">
                 <template v-if="arcTemplateId">
-                  {{ t('story.arcPanel.newArc.templateHint', { id: arcTemplateId }) }}
+                  {{ pt('story.arcPanel.newArc.templateHint', { id: arcTemplateId }) }}
                 </template>
                 <template v-else>
-                  {{ t('story.arcPanel.newArc.llmHint') }}
+                  {{ pt('story.arcPanel.newArc.llmHint') }}
                 </template>
               </div>
             </div>
@@ -734,7 +736,7 @@ defineExpose({
                   />
                 </label>
                 <label class="field-small">
-                  <span class="field-label">{{ t('story.arcPanel.newArc.beatCountLabel') }}</span>
+                  <span class="field-label">{{ pt('story.arcPanel.newArc.beatCountLabel') }}</span>
                   <input
                     type="number"
                     v-model.number="newArcBeatCount"
@@ -746,7 +748,7 @@ defineExpose({
                 </label>
               </div>
               <div v-if="!arcTemplateId" class="field-hint">
-                {{ t('story.arcPanel.newArc.durationRangeHint', {
+                {{ pt('story.arcPanel.newArc.durationRangeHint', {
                   min: ARC_DURATION_MIN_DAYS,
                   max: ARC_DURATION_MAX_DAYS,
                 }) }}

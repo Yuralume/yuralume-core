@@ -8,7 +8,7 @@ generation hot path is an in-process O(1) lookup (§3.2.3).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
@@ -26,12 +26,16 @@ class CloudRoutingProfile:
     disabled_features: frozenset[str]
     catalog_version: int
     routing_policy_version: int
+    # Optional until the User control-plane contract exposes embedding routes.
+    # Missing field must remain a graceful env/default-preset fallback.
+    embedding_feature_presets: dict[str, str] = field(default_factory=dict)
 
     def preset_for(self, capability: str, feature_key: str) -> str | None:
         mapping = {
             "llm": self.llm_feature_presets,
             "image": self.image_feature_presets,
             "video": self.video_feature_presets,
+            "embedding": self.embedding_feature_presets,
             "tts": self.tts_voice_defaults,
         }.get(capability, {})
         return mapping.get(feature_key)
@@ -60,6 +64,7 @@ class CloudRoutingProfile:
             llm_feature_presets=_string_map(payload.get("llm_feature_presets")),
             image_feature_presets=_string_map(payload.get("image_feature_presets")),
             video_feature_presets=_string_map(payload.get("video_feature_presets")),
+            embedding_feature_presets=_string_map(payload.get("embedding_feature_presets")),
             tts_voice_defaults=_string_map(payload.get("tts_voice_defaults")),
             strict_no_fallback=bool(payload.get("strict_no_fallback", False)),
             disabled_features=frozenset(_string_list(payload.get("disabled_features"))),

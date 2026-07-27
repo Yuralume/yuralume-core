@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from kokoro_link.contracts.weather_context import WeatherLocation
 from kokoro_link.infrastructure.weather.open_meteo_provider import (
     NullWeatherProvider,
     OpenMeteoWeatherProvider,
@@ -135,6 +136,70 @@ def test_malformed_payload_returns_empty_string() -> None:
 
 def test_null_provider_always_empty() -> None:
     assert asyncio.run(NullWeatherProvider().describe()) == ""
+
+
+# --- bounded payload cache (G0.2) ------------------------------------------
+#
+# Self-host asks about one location forever, so the cache used to be an
+# unbounded dict. Hosted resolves weather per *player*, so the key space grows
+# with the player base and the dict became a slow leak in every prompt-rendering
+# process. These pin the bound and the LRU ordering.
+
+
+def _location(lat: float) -> WeatherLocation:
+    return WeatherLocation(
+        latitude=lat, longitude=121.0, label="x", timezone_id="auto",
+    )
+
+
+def test_cache_evicts_least_recently_used_beyond_maxsize() -> None:
+    client = _StubClient(json_payload=_GOOD_PAYLOAD)
+    provider = OpenMeteoWeatherProvider(
+        latitude=None,
+        longitude=None,
+        location_label="x",
+        http_client=client,  # type: ignore[arg-type]
+        max_cached_locations=3,
+    )
+    now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    for lat in (1.0, 2.0, 3.0):
+        asyncio.run(provider.describe(now=now, location=_location(lat)))
+    assert client.calls == 3
+    assert len(provider._cache_payloads) == 3
+
+    # Touch the oldest so it is no longer the eviction candidate.
+    asyncio.run(provider.describe(now=now, location=_location(1.0)))
+    assert client.calls == 3  # served from cache
+
+    # A fourth distinct location evicts lat=2.0 (now the LRU), not lat=1.0.
+    asyncio.run(provider.describe(now=now, location=_location(4.0)))
+    assert len(provider._cache_payloads) == 3
+    assert client.calls == 4
+    asyncio.run(provider.describe(now=now, location=_location(1.0)))
+    assert client.calls == 4  # still cached
+    asyncio.run(provider.describe(now=now, location=_location(2.0)))
+    assert client.calls == 5  # was evicted → refetched
+
+
+def test_expired_entry_is_dropped_rather_than_left_occupying_a_slot() -> None:
+    client = _StubClient(json_payload=_GOOD_PAYLOAD)
+    provider = OpenMeteoWeatherProvider(
+        latitude=None,
+        longitude=None,
+        location_label="x",
+        cache_ttl_seconds=60,
+        http_client=client,  # type: ignore[arg-type]
+        max_cached_locations=8,
+    )
+    now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+    asyncio.run(provider.describe(now=now, location=_location(1.0)))
+    assert len(provider._cache_payloads) == 1
+    # Past the TTL: the stale entry is replaced, never duplicated.
+    asyncio.run(
+        provider.describe(now=now + timedelta(minutes=2), location=_location(1.0)),
+    )
+    assert client.calls == 2
+    assert len(provider._cache_payloads) == 1
 
 
 def test_missing_daily_arrays_skip_high_low() -> None:

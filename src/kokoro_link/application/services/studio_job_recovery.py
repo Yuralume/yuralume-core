@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     from kokoro_link.application.services.fusion_story_service import (
         FusionStoryService,
     )
+    from kokoro_link.application.services.studio_execution_lease import (
+        StudioExecutionLease,
+    )
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,11 +49,16 @@ class StudioJobRecoveryService:
         jobs: StudioJobRepositoryPort,
         fusion_story_service: "FusionStoryService | None" = None,
         branching_drama_service: "BranchingDramaService | None" = None,
+        execution_lease: "StudioExecutionLease | None" = None,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
     ) -> None:
         self._jobs = jobs
         self._fusion = fusion_story_service
         self._branching = branching_drama_service
+        # Per-target cross-replica lease (Phase 4 前置). ``None`` → no gating
+        # (self-host / lease-less rigs): a single recovering process is the only
+        # driver, exactly as before.
+        self._lease = execution_lease
         self._retention_days = retention_days
 
     async def recover(self) -> dict[str, int]:
@@ -65,6 +73,9 @@ class StudioJobRecoveryService:
             "failed": 0,
             "superseded": 0,
             "pruned": 0,
+            # Targets another replica is already recovering/executing (its
+            # lease was live) — skipped this pass, not failed.
+            "lease_skipped": 0,
         }
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(
@@ -91,30 +102,73 @@ class StudioJobRecoveryService:
         for job in interrupted:
             by_target.setdefault(job.target_id, []).append(job)
 
-        for target_jobs in by_target.values():
-            target_jobs.sort(key=lambda job: job.created_at)
-            for stale in target_jobs[:-1]:
+        for target_id, target_jobs in by_target.items():
+            # Cross-replica gate: try to claim the target before touching any of
+            # its rows. A live lease held elsewhere means another replica is
+            # already recovering/executing this target — skip the whole target
+            # (supersede + re-drive) so we never double-drive it. The lease is
+            # kept for a re-driven ("resumed") target — the spawned runner
+            # renews the SAME lease (same owner_id) and releases it — and
+            # released here otherwise so a finalized/failed target does not
+            # pin the lease until TTL.
+            claimed = True
+            if self._lease is not None:
+                claimed = await self._try_claim(target_id)
+                if not claimed:
+                    report["lease_skipped"] += 1
+                    continue
+            outcome = "failed"
+            try:
+                target_jobs.sort(key=lambda job: job.created_at)
+                for stale in target_jobs[:-1]:
+                    try:
+                        await self._jobs.save(stale.with_status(
+                            JOB_STATUS_FAILED,
+                            error_message="superseded by a newer job",
+                        ))
+                        report["superseded"] += 1
+                    except Exception:
+                        _LOGGER.exception(
+                            "studio job supersede failed job=%s", stale.id,
+                        )
+                newest = target_jobs[-1]
                 try:
-                    await self._jobs.save(stale.with_status(
-                        JOB_STATUS_FAILED,
-                        error_message="superseded by a newer job",
-                    ))
-                    report["superseded"] += 1
+                    outcome = await self._dispatch(newest)
                 except Exception:
                     _LOGGER.exception(
-                        "studio job supersede failed job=%s", stale.id,
+                        "studio job recovery failed job=%s kind=%s",
+                        newest.id, newest.kind,
                     )
-            newest = target_jobs[-1]
-            try:
-                outcome = await self._dispatch(newest)
-            except Exception:
-                _LOGGER.exception(
-                    "studio job recovery failed job=%s kind=%s",
-                    newest.id, newest.kind,
-                )
-                outcome = "failed"
-            report[outcome] = report.get(outcome, 0) + 1
+                    outcome = "failed"
+                report[outcome] = report.get(outcome, 0) + 1
+            finally:
+                if self._lease is not None and outcome != "resumed":
+                    # No runner will own the lease (target finalized/failed
+                    # synchronously) — release it now rather than wait for TTL.
+                    try:
+                        await self._lease.release(target_id)
+                    except Exception:
+                        _LOGGER.exception(
+                            "studio recovery: lease release failed target=%s",
+                            target_id,
+                        )
         return report
+
+    async def _try_claim(self, target_id: str) -> bool:
+        """Acquire the target's lease; ``False`` when held by another replica.
+
+        Fail-soft: a lease-store error must not stop recovery — treat it as
+        claimed so the single-replica / degraded path still re-drives (the
+        runner's own lease attempt remains the last-line guard)."""
+        assert self._lease is not None
+        try:
+            epoch = await self._lease.acquire(target_id)
+        except Exception:
+            _LOGGER.exception(
+                "studio recovery: lease acquire failed target=%s", target_id,
+            )
+            return True
+        return epoch is not None
 
     async def _dispatch(self, job: StudioGenerationJob) -> str:
         if job.kind in FUSION_JOB_KINDS and self._fusion is not None:

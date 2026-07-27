@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,14 @@ import httpx
 from kokoro_link.contracts.geo_location import GeoLocation, GeoLocationPort
 
 _LOGGER = logging.getLogger(__name__)
+
+_PENDING_CLOSES: set[asyncio.Task] = set()
+"""Strong refs for in-flight fire-and-forget client teardowns.
+
+``asyncio`` only holds a weak reference to a running task, so a bare
+``create_task`` for a close can be garbage-collected mid-flight and leave the
+socket open — the exact leak :meth:`IpApiGeoLocationProvider.release` exists to
+prevent."""
 
 DEFAULT_ENDPOINT = "http://ip-api.com/json/"
 DEFAULT_TIMEOUT_SECONDS = 3.0
@@ -32,7 +41,34 @@ class IpApiGeoLocationProvider(GeoLocationPort):
         self._timeout_seconds = max(0.5, float(timeout_seconds))
         self._cache_ttl_seconds = max(60, int(cache_ttl_seconds))
         self._http = http_client or httpx.AsyncClient()
+        # Only a client we created is ours to close; an injected one belongs to
+        # the caller (tests, shared pools) and must outlive this adapter.
+        self._owns_client = http_client is None
+        self._released = False
         self._cache: dict[str, tuple[datetime, GeoLocation | None]] = {}
+
+    def release(self) -> None:
+        """Close the HTTP client this adapter created, if any.
+
+        Called when a superseded instance is dropped after a site-settings
+        change (see
+        :mod:`kokoro_link.bootstrap.site_settings_providers`) — without it,
+        every GeoIP settings edit would strand one connection pool for the
+        life of the process. Idempotent, synchronous and fire-and-forget: it
+        must never block or fail the lookup that triggered the swap.
+        """
+        if not self._owns_client or self._released:
+            return
+        self._released = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop to close on (sync teardown / interpreter shutdown).
+            # Dropping the reference lets the GC reclaim the socket.
+            return
+        task = loop.create_task(self._http.aclose())
+        _PENDING_CLOSES.add(task)
+        task.add_done_callback(_PENDING_CLOSES.discard)
 
     async def locate(self, ip: str) -> GeoLocation | None:
         clean_ip = _normalise_public_ip(ip)

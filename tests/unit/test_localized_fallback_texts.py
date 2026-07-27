@@ -44,6 +44,23 @@ class TestLocalizedFallbackText:
         assert "抱歉" not in ja
         assert "ごめん" in ja
 
+    def test_image_success_final_reply_fallback_is_localized_and_not_retry_copy(
+        self,
+    ) -> None:
+        zh = localized_fallback_text(
+            "chat.image_tool_final_reply_failed", "zh-TW",
+        )
+        en = localized_fallback_text(
+            "chat.image_tool_final_reply_failed", "en-US",
+        )
+        ja = localized_fallback_text(
+            "chat.image_tool_final_reply_failed", "ja-JP",
+        )
+        assert "圖片已經傳好了" in zh
+        assert "picture was sent" in en
+        assert "画像は送れた" in ja
+        assert "再說一次" not in zh
+
     def test_named_param_formatting(self) -> None:
         out = localized_fallback_text(
             "channel.line.attachment_label", "en-US", label="report.pdf",
