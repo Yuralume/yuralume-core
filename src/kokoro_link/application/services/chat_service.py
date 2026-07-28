@@ -42,6 +42,9 @@ from kokoro_link.application.services.studio_execution_lease import (
 from kokoro_link.application.services.cloud_identity_context import (
     bind_cloud_actor,
 )
+from kokoro_link.application.services.cloud_billing_context import (
+    cloud_billing_operation,
+)
 from kokoro_link.application.services.auto_consolidation_trigger import (
     AutoConsolidationTrigger,
 )
@@ -933,12 +936,18 @@ class ChatService:
         async def summarize(message: Message) -> Message:
             if message.content_mode is not MessageContentMode.NSFW:
                 return message
-            summary = await summarizer.summarize(
-                character=character,
-                message=message,
-                model=metered_model,
-                model_id=model_id,
-            )
+            # User and assistant summaries execute as sibling tasks. Give each
+            # semantic branch a stable identity so scheduling order cannot swap
+            # or collide their durable billing keys on a turn retry.
+            with cloud_billing_operation(
+                f"nsfw-safe-summary:{message.role.value}",
+            ):
+                summary = await summarizer.summarize(
+                    character=character,
+                    message=message,
+                    model=metered_model,
+                    model_id=model_id,
+                )
             if not summary:
                 return message
             return replace(message, safe_summary=summary)

@@ -1,7 +1,8 @@
 """Recoverable external-chat turn orchestrator (LH2, DR-LH0-004).
 
-The single entry point (:meth:`ExternalChatTurnService.execute`) for the
-hosted LINE official-channel Cloud service's ``POST .../external-chat/turns``.
+The HTTP entry point (:meth:`ExternalChatTurnService.accept`) durably claims
+a hosted LINE official-channel turn and detaches its drive from the request;
+:meth:`ExternalChatTurnService.execute` remains the inline compatibility seam.
 It turns one wire request into an outcome the route serialises verbatim, while
 driving the turn through the durable receipt state machine so a retried /
 crashed delivery converges on exactly one user turn, one assistant turn and one
@@ -13,13 +14,15 @@ byte-identical response snapshot:
               → COMPLETED
 
 Every conversation write goes through the fenced :class:`TurnExecutionAdapter`
-(never the whole-conversation ``save()``), and the LLM is run at most once —
-a ``GENERATED`` or ``COMMITTED`` recovery finalises from the stored snapshot
-and never re-calls ChatService.
+(never the whole-conversation ``save()``). A ``GENERATED`` or ``COMMITTED``
+recovery finalises from the stored snapshot and never re-calls ChatService; an
+expired ``PROCESSING`` attempt may be re-driven under the same durable turn
+and stable Cloud billing scope.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -27,6 +30,9 @@ from dataclasses import dataclass
 
 from kokoro_link.application.dto.chat import PresenceFramePayload, SendChatMessageRequest
 from kokoro_link.application.dto.external_chat import ExternalChatTurnCommand
+from kokoro_link.application.services.cloud_billing_context import (
+    cloud_billing_scope,
+)
 from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
     ChatService,
@@ -58,6 +64,7 @@ from kokoro_link.application.services.external_chat_roster_service import (
 )
 from kokoro_link.contracts.external_chat_turn import (
     Claimed,
+    ClaimOrGetResult,
     CommittedRecovery,
     CompletedReplay,
     ExternalChatTurnReceipt,
@@ -90,6 +97,9 @@ _AUTHENTICATED_CALLER = "cloud-channel"
 
 _RETRY_AFTER_SECONDS = 3
 _OPAQUE_NOT_FOUND_MESSAGE = "not found"
+_BACKGROUND_MAX_CONCURRENCY = 64
+_BACKGROUND_TIMEOUT_SECONDS = 900.0
+_SHUTDOWN_DRAIN_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +134,9 @@ class ExternalChatTurnService:
         roster_service: ExternalChatRosterService,
         operator_profile_repository: OperatorProfileRepositoryPort,
         object_storage: ObjectStoragePort,
+        background_max_concurrency: int = _BACKGROUND_MAX_CONCURRENCY,
+        background_timeout_seconds: float = _BACKGROUND_TIMEOUT_SECONDS,
+        shutdown_drain_seconds: float = _SHUTDOWN_DRAIN_SECONDS,
     ) -> None:
         self._receipts = receipt_repository
         self._chat_service = chat_service
@@ -131,12 +144,62 @@ class ExternalChatTurnService:
         self._roster = roster_service
         self._operators = operator_profile_repository
         self._object_storage = object_storage
+        # asyncio only keeps weak task references. A turn must survive the
+        # request that accepted it, so retain every driver until its done
+        # callback has observed the outcome.
+        self._background_tasks: dict[asyncio.Task[None], _Fence] = {}
+        self._background_max_concurrency = max(1, background_max_concurrency)
+        self._background_timeout_seconds = max(0.001, background_timeout_seconds)
+        self._shutdown_drain_seconds = max(0.001, shutdown_drain_seconds)
+        self._stopping = False
 
     async def execute(self, command: ExternalChatTurnCommand) -> TurnResult:
+        """Drive a claimed turn inline (legacy/service-level compatibility)."""
+        result = await self._claim_or_get(command)
+        return await self._resolve_claim(result, command, background=False)
+
+    async def accept(self, command: ExternalChatTurnCommand) -> TurnResult:
+        """Durably claim a turn and return before its model/tool work runs.
+
+        Fresh and retryable claims are driven by a strongly-referenced task.
+        The Channel polls with the same request id until the durable receipt
+        becomes a byte-identical completed or terminal replay.
+        """
+        result = await self._claim_or_get(command)
+        return await self._resolve_claim(result, command, background=True)
+
+    async def stop(self) -> None:
+        """Cancel and drain request-detached drivers before DB shutdown."""
+        self._stopping = True
+        tracked = dict(self._background_tasks)
+        tasks = tuple(tracked)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _done, pending = await asyncio.wait(
+                tasks, timeout=self._shutdown_drain_seconds,
+            )
+            for task in pending:
+                task.cancel()
+        # A task cancelled before its coroutine's first instruction never runs
+        # its CancelledError handler. Explicitly fence every snapshot claim;
+        # completed/terminal receipts make this a harmless no-op.
+        for fence in tracked.values():
+            try:
+                await self._fail_retryable(
+                    fence, status=503, code="turn_cancelled",
+                    message="turn driver cancelled",
+                )
+            except Exception:  # noqa: BLE001 - shutdown remains fail-soft
+                _LOG.exception("external-chat shutdown cleanup failed")
+
+    async def _claim_or_get(
+        self, command: ExternalChatTurnCommand,
+    ) -> ClaimOrGetResult:
         canonical_hash = compute_canonical_request_hash(
             _build_canonical_payload(command),
         )
-        result = await self._receipts.claim_or_get(
+        return await self._receipts.claim_or_get(
             authenticated_caller=_AUTHENTICATED_CALLER,
             request_id=command.request_id,
             canonical_request_hash=canonical_hash,
@@ -147,13 +210,16 @@ class ExternalChatTurnService:
             character_id=command.character_id,
             requested_conversation_id=command.conversation_id,
         )
+
+    async def _resolve_claim(
+        self, result: ClaimOrGetResult, command: ExternalChatTurnCommand,
+        *, background: bool,
+    ) -> TurnResult:
         match result:
             case HashConflict():
                 return _hash_conflict_result()
             case InProgress():
-                return TurnResult(
-                    202, None, retry_after_seconds=_RETRY_AFTER_SECONDS,
-                )
+                return _in_progress_result()
             case CompletedReplay(response_snapshot_json=snapshot):
                 return _completed_result(snapshot)
             case TerminalReplay(terminal_error_json=terminal):
@@ -163,11 +229,95 @@ class ExternalChatTurnService:
             case GeneratedRecovery(receipt=receipt):
                 return await self._finalize_generated(receipt, command)
             case Claimed(receipt=receipt):
-                return await self._drive(receipt, command)
-        # ``claim_or_get`` returns a sealed union; the match is exhaustive.
+                if background:
+                    fence = _Fence(
+                        receipt.turn_id, receipt.owner_id or "",
+                        receipt.lease_version,
+                    )
+                    if (
+                        self._stopping
+                        or len(self._background_tasks)
+                        >= self._background_max_concurrency
+                    ):
+                        return await self._fail_retryable(
+                            fence, status=503, code="turn_capacity",
+                            message="turn driver capacity unavailable",
+                        )
+                    self._start_background_drive(receipt, command)
+                    return _in_progress_result()
+                return await self._drive_scoped(receipt, command)
         raise AssertionError(  # pragma: no cover
             f"unhandled claim_or_get result {result!r}",
         )
+
+    def _start_background_drive(
+        self, receipt: ExternalChatTurnReceipt, command: ExternalChatTurnCommand,
+    ) -> None:
+        fence = _Fence(receipt.turn_id, receipt.owner_id or "", receipt.lease_version)
+        task = asyncio.create_task(
+            self._drive_background(receipt, command),
+            name=f"external-chat-turn-{receipt.turn_id}",
+        )
+        self._background_tasks[task] = fence
+        task.add_done_callback(self._background_done)
+
+    def _background_done(self, task: asyncio.Task[None]) -> None:
+        self._background_tasks.pop(task, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            _LOG.error(
+                "external-chat detached driver terminated unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _drive_background(
+        self, receipt: ExternalChatTurnReceipt, command: ExternalChatTurnCommand,
+    ) -> None:
+        fence = _Fence(receipt.turn_id, receipt.owner_id or "", receipt.lease_version)
+        try:
+            await asyncio.wait_for(
+                self._drive_scoped(receipt, command),
+                timeout=self._background_timeout_seconds,
+            )
+        except TimeoutError:
+            await self._fail_retryable(
+                fence, status=503, code="turn_timeout",
+                message="turn execution deadline exceeded",
+            )
+        except asyncio.CancelledError:
+            # Process shutdown must not leave a live lease waiting for expiry.
+            # Mark the same durable turn retryable while the DB is still alive.
+            try:
+                await self._fail_retryable(
+                    fence, status=503, code="turn_cancelled",
+                    message="turn driver cancelled",
+                )
+            except Exception:  # noqa: BLE001 - shutdown remains fail-soft
+                _LOG.exception(
+                    "external-chat cancelled driver cleanup failed",
+                )
+            raise
+        except Exception:  # noqa: BLE001 - detached task must be observed
+            _LOG.exception("external-chat detached driver failed")
+            try:
+                await self._fail_retryable(
+                    fence, status=503, code="unavailable",
+                    message="detached turn driver failed",
+                )
+            except Exception:  # noqa: BLE001 - retain original diagnostic
+                _LOG.exception(
+                    "external-chat detached driver failure cleanup failed",
+                )
+
+    async def _drive_scoped(
+        self, receipt: ExternalChatTurnReceipt, command: ExternalChatTurnCommand,
+    ) -> TurnResult:
+        # A receipt takeover rebuilds the same scope, so each nested Cloud
+        # Gateway operation derives the same billing idempotency key.
+        with cloud_billing_scope(f"external-chat:{receipt.turn_id}"):
+            return await self._drive(receipt, command)
 
     # -- Claimed: full drive ------------------------------------------------ #
 
@@ -662,6 +812,12 @@ def _find_character(
         if character.character_id == character_id:
             return character
     return None
+
+
+def _in_progress_result() -> TurnResult:
+    return TurnResult(
+        202, None, retry_after_seconds=_RETRY_AFTER_SECONDS,
+    )
 
 
 def _completed_result(snapshot_json: str | None) -> TurnResult:

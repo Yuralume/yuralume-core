@@ -29,6 +29,14 @@ class _FakeScheduler:
         self.stopped = True
 
 
+class _FakeExternalChatTurns:
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+
 class _FakeRecovery:
     def __init__(self) -> None:
         self.called = False
@@ -71,6 +79,17 @@ def test_role_api_starts_no_background_but_runs_studio_recovery() -> None:
     assert telegram.started is False
     # Studio executes in-process, so recovery rides with the api role.
     assert studio.called is True
+
+
+def test_role_api_stops_request_detached_external_chat_turns() -> None:
+    app = _app_for_role("api")
+    turns = _FakeExternalChatTurns()
+    app.state.container.external_chat_turn_service = turns
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+    assert turns.stop_calls == 1
 
 
 def test_role_background_serves_only_health_and_starts_schedulers() -> None:

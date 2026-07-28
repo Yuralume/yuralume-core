@@ -8,6 +8,9 @@ from uuid import uuid4
 
 import httpx
 
+from kokoro_link.application.services.cloud_billing_context import (
+    billing_idempotency_headers,
+)
 from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentityResolverPort,
     CloudResourceContext,
@@ -116,7 +119,7 @@ class CloudGatewayImageProvider:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     f"{self._base_url}/v1/images/generations",
-                    headers=await self._headers(character),
+                    headers=await self._headers(character, payload),
                     json=payload,
                 )
                 data = _json_or_raise(response, "image")
@@ -153,13 +156,13 @@ class CloudGatewayImageProvider:
             if isinstance(amount, int | float):
                 self.last_cost_amount_usd = float(amount)
 
-    async def _headers(self, character) -> dict[str, str]:
+    async def _headers(self, character, payload: dict) -> dict[str, str]:
         identity = await self._identity_resolver.resolve_context(
             CloudResourceContext.for_character(character),
         )
         request_id = f"img-{uuid4().hex}"
         self.last_request_id = request_id
-        return {
+        headers = {
             "Authorization": f"Bearer {self._deployment_token}",
             "X-Yuralume-Deployment": self._deployment_id,
             "X-Yuralume-Audience": self._audience,
@@ -170,6 +173,12 @@ class CloudGatewayImageProvider:
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
+        headers.update(billing_idempotency_headers(
+            capability="image",
+            feature_key=self._feature_key,
+            payload=payload,
+        ))
+        return headers
 
 
 def _build_prompt(

@@ -6,6 +6,7 @@ import logging
 import httpx
 import pytest
 
+from kokoro_link.application.services.cloud_billing_context import cloud_billing_scope
 from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
 from kokoro_link.contracts.generation_trigger import (
     GenerationTrigger,
@@ -78,6 +79,48 @@ async def test_cloud_gateway_model_posts_openai_shape_with_cloud_headers(
     payload = seen["payload"]
     assert payload["model"] == "preset-fast"
     assert payload["messages"][1] == {"role": "user", "content": "Say hi"}
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_model_sends_stable_billing_key_only_in_durable_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+    )
+
+    await model.generate("same")
+    with cloud_billing_scope("external-chat:turn-1"):
+        await model.generate("same")
+    with cloud_billing_scope("external-chat:turn-1"):
+        await model.generate("same")
+
+    assert "x-yuralume-billing-idempotency-key" not in seen[0]
+    assert seen[1]["x-yuralume-billing-idempotency-key"] == (
+        seen[2]["x-yuralume-billing-idempotency-key"]
+    )
 
 
 @pytest.mark.asyncio
