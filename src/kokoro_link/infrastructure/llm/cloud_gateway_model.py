@@ -7,9 +7,6 @@ from uuid import uuid4
 
 import httpx
 
-from kokoro_link.application.services.cloud_billing_context import (
-    billing_idempotency_headers,
-)
 from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudIdentityUnavailable,
@@ -87,7 +84,7 @@ class CloudGatewayChatModel(ChatModelPort):
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 f"{self._base_url}/v1/chat/completions",
-                headers=self._headers(payload),
+                headers=self._headers(),
                 json=payload,
             )
             _raise_with_body(response, context=self._refusal_log_context())
@@ -111,7 +108,7 @@ class CloudGatewayChatModel(ChatModelPort):
             async with client.stream(
                 "POST",
                 f"{self._base_url}/v1/chat/completions",
-                headers=self._headers(payload),
+                headers=self._headers(),
                 json=payload,
             ) as response:
                 if response.status_code >= 400:
@@ -158,11 +155,11 @@ class CloudGatewayChatModel(ChatModelPort):
             payload["stream"] = True
         return payload
 
-    def _headers(self, payload: dict) -> dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         identity = self._require_identity()
         request_id = f"llm-{uuid4().hex}"
         self.last_request_id = request_id
-        headers = {
+        return {
             "Authorization": f"Bearer {self._deployment_token}",
             "X-Yuralume-Deployment": self._deployment_id,
             "X-Yuralume-Audience": self._audience,
@@ -174,12 +171,6 @@ class CloudGatewayChatModel(ChatModelPort):
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
-        headers.update(billing_idempotency_headers(
-            capability="llm",
-            feature_key=self._feature_key,
-            payload=payload,
-        ))
-        return headers
 
     def _require_identity(self) -> CloudGatewayIdentity:
         if self._identity is None:

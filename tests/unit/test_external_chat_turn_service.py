@@ -10,16 +10,10 @@ source="line" self-heal, and the runtime-limit → 429 / generic → 503 mapping
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import pytest
 
-from kokoro_link.application.services.cloud_billing_context import (
-    BILLING_IDEMPOTENCY_HEADER,
-    billing_idempotency_headers,
-    cloud_billing_scope,
-)
 from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
 )
@@ -33,13 +27,8 @@ from kokoro_link.application.services.external_chat_roster_service import (
     RosterCharacterView,
 )
 from kokoro_link.application.services.external_chat_turn_service import (
-    TurnResult,
     _AUTHENTICATED_CALLER,
     _build_canonical_payload,
-)
-from kokoro_link.api.routes.external_chat import (
-    ExternalChatTurnRequestModel,
-    create_external_chat_turn,
 )
 from kokoro_link.contracts.external_chat_turn import ExternalChatTurnState
 from kokoro_link.contracts.object_storage import ObjectMetadata
@@ -79,39 +68,6 @@ async def _preclaim(harness, command, *, canonical_hash: str | None = None):
 
 
 # --- happy path ------------------------------------------------------------ #
-
-
-class _AcceptOnlyTurnService:
-    def __init__(self) -> None:
-        self.accept_calls = 0
-
-    async def accept(self, command):
-        self.accept_calls += 1
-        return TurnResult(202, None, retry_after_seconds=3)
-
-    async def execute(self, command):  # pragma: no cover - regression tripwire
-        raise AssertionError("HTTP route must not drive the turn inline")
-
-
-async def test_http_route_uses_request_detached_accept() -> None:
-    service = _AcceptOnlyTurnService()
-    container = type("Container", (), {"external_chat_turn_service": service})()
-    request = ExternalChatTurnRequestModel(
-        request_id="line:evt-route",
-        tenant_id="tenant-A",
-        account_id="account-A",
-        character_id=CHARACTER_ID,
-        message="hello",
-        attachments=[],
-        channel="line",
-        contract_version=1,
-    )
-
-    response = await create_external_chat_turn(request, container)
-
-    assert response.status_code == 202
-    assert response.headers["retry-after"] == "3"
-    assert service.accept_calls == 1
 
 
 async def test_happy_path_full_chain() -> None:
@@ -176,166 +132,6 @@ async def test_in_progress_returns_202_with_retry_after() -> None:
     assert result.retry_after_seconds == 3
     # The in-progress turn was never touched; the LLM never ran.
     assert harness.model.generate_calls == 0
-
-
-class _BlockingDelegatingChatService:
-    def __init__(self, delegate: object) -> None:
-        self._delegate = delegate
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.billing_key: str | None = None
-
-    async def send_message(
-        self, request, *, current_user_id=None, external_turn=None,
-    ):
-        self.billing_key = billing_idempotency_headers(
-            capability="llm",
-            feature_key="chat",
-            payload={"probe": True},
-        ).get(BILLING_IDEMPOTENCY_HEADER)
-        self.started.set()
-        await self.release.wait()
-        return await self._delegate.send_message(
-            request,
-            current_user_id=current_user_id,
-            external_turn=external_turn,
-        )
-
-
-async def test_accept_returns_202_while_strongly_tracked_task_drives_turn() -> None:
-    harness = await build_harness()
-    blocker = _BlockingDelegatingChatService(harness.chat_service)
-    harness.turn_service._chat_service = blocker
-    command = make_command()
-
-    first = await harness.turn_service.accept(command)
-
-    assert first.status_code == 202
-    assert first.body_json is None
-    assert first.retry_after_seconds == 3
-    await asyncio.wait_for(blocker.started.wait(), timeout=1)
-    assert len(harness.turn_service._background_tasks) == 1
-    receipt_id = next(iter(harness.receipt_repo._records))
-    with cloud_billing_scope(f"external-chat:{receipt_id}"):
-        expected_key = billing_idempotency_headers(
-            capability="llm",
-            feature_key="chat",
-            payload={"probe": True},
-        )[BILLING_IDEMPOTENCY_HEADER]
-    assert blocker.billing_key == expected_key
-    assert (await harness.turn_service.accept(command)).status_code == 202
-
-    blocker.release.set()
-    for _ in range(100):
-        replay = await harness.turn_service.accept(command)
-        if replay.status_code == 200:
-            break
-        await asyncio.sleep(0.01)
-    else:  # pragma: no cover - deterministic task should finish promptly
-        raise AssertionError("background external-chat turn did not complete")
-
-    assert json.loads(replay.body_json)["request_id"] == command.request_id
-    assert harness.model.generate_calls == 1
-    assert not harness.turn_service._background_tasks
-
-
-async def test_stop_cancels_background_turn_and_makes_claim_retryable() -> None:
-    harness = await build_harness()
-    blocker = _BlockingDelegatingChatService(harness.chat_service)
-    harness.turn_service._chat_service = blocker
-    command = make_command()
-
-    assert (await harness.turn_service.accept(command)).status_code == 202
-    await asyncio.wait_for(blocker.started.wait(), timeout=1)
-
-    await harness.turn_service.stop()
-    await harness.turn_service.stop()  # idempotent shutdown
-
-    assert not harness.turn_service._background_tasks
-    receipt_id = next(iter(harness.receipt_repo._records))
-    receipt = await harness.receipt_repo.get(receipt_id)
-    assert receipt.state is ExternalChatTurnState.FAILED_RETRYABLE
-    assert receipt.last_error_code == "turn_cancelled"
-
-
-async def test_stop_marks_task_cancelled_before_driver_first_instruction() -> None:
-    harness = await build_harness()
-    command = make_command(request_id="line:evt-cancel-before-start")
-
-    assert (await harness.turn_service.accept(command)).status_code == 202
-    # Do not yield between accept and stop: this covers cancellation before the
-    # detached coroutine has had a chance to enter its own try/except.
-    await harness.turn_service.stop()
-
-    receipt_id = next(iter(harness.receipt_repo._records))
-    receipt = await harness.receipt_repo.get(receipt_id)
-    assert receipt.state is ExternalChatTurnState.FAILED_RETRYABLE
-    assert receipt.last_error_code == "turn_cancelled"
-
-
-async def test_background_turn_deadline_marks_receipt_retryable() -> None:
-    harness = await build_harness()
-    blocker = _BlockingDelegatingChatService(harness.chat_service)
-    harness.turn_service._chat_service = blocker
-    harness.turn_service._background_timeout_seconds = 0.01
-    command = make_command(request_id="line:evt-deadline")
-
-    assert (await harness.turn_service.accept(command)).status_code == 202
-    for _ in range(100):
-        if not harness.turn_service._background_tasks:
-            break
-        await asyncio.sleep(0.01)
-
-    receipt_id = next(iter(harness.receipt_repo._records))
-    receipt = await harness.receipt_repo.get(receipt_id)
-    assert receipt.state is ExternalChatTurnState.FAILED_RETRYABLE
-    assert receipt.last_error_code == "turn_timeout"
-
-
-async def test_background_capacity_fails_new_claim_closed() -> None:
-    harness = await build_harness()
-    blocker = _BlockingDelegatingChatService(harness.chat_service)
-    harness.turn_service._chat_service = blocker
-    harness.turn_service._background_max_concurrency = 1
-
-    first = await harness.turn_service.accept(
-        make_command(request_id="line:evt-capacity-1"),
-    )
-    await asyncio.wait_for(blocker.started.wait(), timeout=1)
-    second = await harness.turn_service.accept(
-        make_command(request_id="line:evt-capacity-2"),
-    )
-
-    assert first.status_code == 202
-    assert second.status_code == 503
-    receipts = list(harness.receipt_repo._records.values())
-    rejected = next(
-        receipt for receipt in receipts
-        if receipt.request_id == "line:evt-capacity-2"
-    )
-    assert rejected.state is ExternalChatTurnState.FAILED_RETRYABLE
-    assert rejected.last_error_code == "turn_capacity"
-    await harness.turn_service.stop()
-
-
-async def test_background_driver_observes_exception_and_marks_retryable() -> None:
-    harness = await build_harness(
-        chat_service_override=_RaisingChatService(RuntimeError("boom")),
-    )
-    command = make_command()
-
-    assert (await harness.turn_service.accept(command)).status_code == 202
-    for _ in range(100):
-        if not harness.turn_service._background_tasks:
-            break
-        await asyncio.sleep(0.01)
-    else:  # pragma: no cover - deterministic task should finish promptly
-        raise AssertionError("failing background turn did not terminate")
-
-    receipt_id = next(iter(harness.receipt_repo._records))
-    receipt = await harness.receipt_repo.get(receipt_id)
-    assert receipt.state is ExternalChatTurnState.FAILED_RETRYABLE
-    assert receipt.last_error_code == "unavailable"
 
 
 async def test_hash_conflict_returns_409() -> None:

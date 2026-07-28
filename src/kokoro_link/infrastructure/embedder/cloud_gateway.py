@@ -8,9 +8,6 @@ from collections.abc import Sequence
 
 import httpx
 
-from kokoro_link.application.services.cloud_billing_context import (
-    billing_idempotency_headers,
-)
 from kokoro_link.application.services.cloud_identity_context import current_cloud_actor
 from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
@@ -166,7 +163,7 @@ class CloudGatewayEmbedder(EmbedderPort):
         try:
             response = await client.post(
                 f"{self._base_url}/v1/embeddings",
-                headers=self._headers(identity, payload),
+                headers=self._headers(identity),
                 json=payload,
             )
             response.raise_for_status()
@@ -217,14 +214,10 @@ class CloudGatewayEmbedder(EmbedderPort):
             )
         return [vector for vector in ordered if vector is not None]
 
-    def _headers(
-        self,
-        identity: CloudGatewayIdentity,
-        payload: dict[str, object],
-    ) -> dict[str, str]:
+    def _headers(self, identity: CloudGatewayIdentity) -> dict[str, str]:
         request_id = f"embedding-{uuid.uuid4().hex}"
         self.last_request_id = request_id
-        headers = {
+        return {
             "Authorization": f"Bearer {self._deployment_token}",
             "X-Yuralume-Deployment": self._deployment_id,
             "X-Yuralume-Audience": self._audience,
@@ -236,9 +229,3 @@ class CloudGatewayEmbedder(EmbedderPort):
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }
-        headers.update(billing_idempotency_headers(
-            capability="embedding",
-            feature_key=self._feature_key,
-            payload=payload,
-        ))
-        return headers

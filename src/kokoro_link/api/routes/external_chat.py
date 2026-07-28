@@ -487,10 +487,9 @@ async def create_external_chat_turn(
 ) -> Response:
     """Claim, execute (or replay) one recoverable external-chat turn.
 
-    The turn service returns an opaque, already-serialised outcome: a fresh
-    durable claim returns 202 immediately and is driven outside this request;
-    a later 200 carries its byte-identical response snapshot, while 202 means
-    the same request is still processing (retry after the header delay),
+    The turn service returns an opaque, already-serialised outcome: a 200
+    carries the byte-identical response snapshot (fresh or replayed), a 202
+    means the same request is still processing (retry after the header delay),
     and 404 / 409 carry stable error envelopes safe to replay."""
     service = container.external_chat_turn_service
     if service is None:
@@ -520,7 +519,7 @@ async def create_external_chat_turn(
         conversation_id=request.conversation_id,
         conversation_id_present="conversation_id" in request.model_fields_set,
     )
-    result = await service.accept(command)
+    result = await service.execute(command)
     headers: dict[str, str] = {}
     if result.retry_after_seconds is not None:
         headers["Retry-After"] = str(result.retry_after_seconds)

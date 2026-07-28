@@ -4,9 +4,8 @@ Drives the REAL :class:`ExternalChatTurnService` over the SA receipt repo and
 the SA conversation repo on Postgres, so the guarantees the in-memory twins
 cannot prove hold under true overlapping transactions:
 
-* the route function durably accepts with 202, then polling the same
-  request id replays 200 after the background driver persists a
-  ``source="line"`` conversation + user/assistant rows in PG;
+* the route function's happy path persists a ``source="line"`` conversation +
+  user/assistant rows in PG and returns the 200 snapshot;
 * two concurrent deliveries of the same ``request_id`` resolve to exactly one
   200 (the driver) and one 202 (in-progress), never two drives;
 * an expired-lease GENERATED receipt is taken over and finalised from its
@@ -103,41 +102,24 @@ async def test_route_happy_path_persists_line_conversation_in_pg(
     container = SimpleNamespace(external_chat_turn_service=harness.turn_service)
     command = make_command(request_id="line:pg:evt-happy-1")
 
-    first = await create_external_chat_turn(
+    response = await create_external_chat_turn(
         request=_request_model(command), container=container,
     )
 
-    assert first.status_code == 202
-    assert first.headers["retry-after"] == "3"
-    assert first.body == b""
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["request_id"] == command.request_id
+    assert body["character"]["character_id"] == CHARACTER_ID
+    assert harness.model.generate_calls == 1
 
-    try:
-        for _ in range(200):
-            response = await create_external_chat_turn(
-                request=_request_model(command), container=container,
-            )
-            if response.status_code == 200:
-                break
-            assert response.status_code == 202
-            await asyncio.sleep(0.01)
-        else:  # pragma: no cover - local PG completion is deterministic
-            raise AssertionError("background PG turn did not complete")
-
-        body = json.loads(response.body)
-        assert body["request_id"] == command.request_id
-        assert body["character"]["character_id"] == CHARACTER_ID
-        assert harness.model.generate_calls == 1
-
-        # The turn is durably COMPLETED and the conversation lives in PG.
-        receipt = await harness.receipt_repo.get(body["turn_id"])
-        assert receipt.state is ExternalChatTurnState.COMPLETED
-        conversation = await harness.conversation_repo.get(body["conversation_id"])
-        assert conversation.source == "line"
-        assert [m.role for m in conversation.messages] == [
-            MessageRole.USER, MessageRole.ASSISTANT,
-        ]
-    finally:
-        await harness.turn_service.stop()
+    # The turn is durably COMPLETED and the conversation lives in PG.
+    receipt = await harness.receipt_repo.get(body["turn_id"])
+    assert receipt.state is ExternalChatTurnState.COMPLETED
+    conversation = await harness.conversation_repo.get(body["conversation_id"])
+    assert conversation.source == "line"
+    assert [m.role for m in conversation.messages] == [
+        MessageRole.USER, MessageRole.ASSISTANT,
+    ]
 
 
 async def test_concurrent_same_request_one_200_one_202(session_factory) -> None:

@@ -6,9 +6,6 @@ from uuid import uuid4
 
 import httpx
 
-from kokoro_link.application.services.cloud_billing_context import (
-    billing_idempotency_headers,
-)
 from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudGatewayIdentityResolverPort,
@@ -136,7 +133,7 @@ class CloudGatewayTTSAdapter:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     f"{self._base_url}/v1/tts/synthesize",
-                    headers=self._identity_headers(identity, payload),
+                    headers=self._identity_headers(identity),
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
@@ -189,11 +186,7 @@ class CloudGatewayTTSAdapter:
                 return voice
         return self._default_voice_id.strip()
 
-    def _identity_headers(
-        self,
-        identity: CloudGatewayIdentity,
-        payload: dict[str, object],
-    ) -> dict[str, str]:
+    def _identity_headers(self, identity: CloudGatewayIdentity) -> dict[str, str]:
         headers = self._base_headers(request_prefix="tts")
         headers.update({
             "X-Yuralume-Tenant": identity.tenant_id,
@@ -202,11 +195,6 @@ class CloudGatewayTTSAdapter:
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         })
-        headers.update(billing_idempotency_headers(
-            capability="tts",
-            feature_key=_TTS_FEATURE_KEY,
-            payload=payload,
-        ))
         return headers
 
     def _base_headers(self, *, request_prefix: str) -> dict[str, str]:

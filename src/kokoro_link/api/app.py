@@ -203,7 +203,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         # (memory default / background writer / bare container), so the start /
         # stop below is a natural no-op off the postgres backend.
         realtime_dispatcher = getattr(container, "realtime_dispatcher", None)
-        external_chat_turn_service = container.external_chat_turn_service
 
         # Boot-time seed/sync batch, serialised across processes by a
         # PostgreSQL advisory lock. Seven Hosted processes come up at once and
@@ -310,17 +309,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            # Request-detached external turns still need the database to mark a
-            # cancelled claim retryable, so drain them before any shared engine
-            # or refresher teardown.
-            if external_chat_turn_service is not None:
-                try:
-                    await external_chat_turn_service.stop()
-                except Exception as exc:  # fail-soft: never mask shutdown
-                    print(
-                        "[lifespan] external chat turn stop failed: "
-                        f"{exc!r}"
-                    )
             # Stop the LISTEN/poll-driven components first so their loops unwind
             # before the shared engine's pool is disposed below.
             if runtime_config_refresher is not None:
