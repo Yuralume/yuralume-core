@@ -29,12 +29,31 @@ from kokoro_link.application.dto.chat import (
 from kokoro_link.application.services.account_runtime_profile import (
     PermissiveAccountRuntimeProfileResolver,
 )
+from kokoro_link.application.services.cloud_action_billing_service import (
+    ActionChargeHandle,
+    CloudActionBillingService,
+    NullActionBillingService,
+)
+from kokoro_link.application.services.quota_overage_service import (
+    CHAT_IMAGE_OVERAGE,
+    OVERAGE_DENIED_DAILY_LIMIT,
+    OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+    OVERAGE_DENIED_PRICE_CHANGED,
+    OVERAGE_DENIED_TIER_OFF,
+    OVERAGE_DENIED_UNAVAILABLE,
+    OverageGrant,
+    QuotaOverageService,
+)
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
 from kokoro_link.application.services.chat_turn_lease import (
     ChatTurnLease,
     release_turn_lease,
+)
+from kokoro_link.application.services.drain_state import (
+    ActiveTurn,
+    DrainState,
 )
 from kokoro_link.application.services.studio_execution_lease import (
     StudioLeaseSession,
@@ -52,6 +71,9 @@ from kokoro_link.application.services.feature_keys import (
 )
 from kokoro_link.application.services.feed_reaction_memorializer import (
     FeedReactionMemorializer,
+)
+from kokoro_link.application.services.goal_review_service import (
+    DailyGoalReviewService,
 )
 from kokoro_link.application.services.goal_service import GoalService
 from kokoro_link.application.services.location_context import prompt_location_fact
@@ -196,10 +218,17 @@ from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
 )
+from kokoro_link.contracts.cloud_action_billing import (
+    ACTION_CHAT,
+    ACTION_IMAGE_CHAT_TOOL,
+    client_quoted_price_scope,
+    prepaid_action_scope,
+)
 from kokoro_link.contracts.generation_trigger import (
     GenerationTrigger,
     generation_trigger_scope,
 )
+from kokoro_link.contracts.interaction_context import interaction_scope
 from kokoro_link.domain.entities.generation_usage import (
     CAPABILITY_LLM,
     STATUS_FAILED,
@@ -288,6 +317,9 @@ from kokoro_link.infrastructure.prompt.address_change import (
 from kokoro_link.domain.services.address_resolver import (
     resolve_character_address,
     resolve_player_address,
+)
+from kokoro_link.domain.services.mirrored_message_dedup import (
+    dedupe_mirrored_messages,
 )
 from kokoro_link.domain.value_objects.address_change_event import (
     DIRECTION_CHARACTER,
@@ -392,6 +424,59 @@ def _compute_idle_minutes(state: CharacterState, now: datetime) -> float | None:
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
     return max(0.0, (now - last).total_seconds() / 60.0)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatImageQuotaDecision:
+    """May this turn generate a picture, and did the player buy the slot?
+
+    ``error`` is written for the model, not the player: the tool loop feeds it
+    back as a failed tool outcome and the character says it in her own words,
+    which is how every other tool refusal in this loop already works.
+    """
+
+    error: str | None = None
+    overage: "OverageGrant | None" = None
+
+
+_CHAT_IMAGE_ALLOWED = ChatImageQuotaDecision()
+
+
+#: Directives appended when the player had *opted in* to overage but the
+#: purchase did not happen. Without one of these the character would say
+#: "I've hit my daily limit" to somebody who deliberately turned on paying
+#: past it — accurate but baffling.
+_CHAT_IMAGE_OVERAGE_HINTS = {
+    OVERAGE_DENIED_INSUFFICIENT_CREDITS: (
+        "；超限加購未能完成，因為螢火不足。"
+        "請告訴玩家今天先用文字陪他，補充螢火之後隨時可以再要圖。"
+    ),
+    OVERAGE_DENIED_DAILY_LIMIT: (
+        "；今天的超限加購次數也用完了。"
+        "請告訴玩家今天的圖到此為止，明天可以再來。"
+    ),
+    OVERAGE_DENIED_UNAVAILABLE: (
+        "；超限加購此刻無法完成。"
+        "請告訴玩家這不是他的問題，稍後再試一次即可。"
+    ),
+    # The price outgrew what the player agreed to, so the switch was turned
+    # back off. Foreground is the only place this can be *said*, and it must be
+    # said: silently not drawing would look like the feature broke.
+    OVERAGE_DENIED_PRICE_CHANGED: (
+        "；超限加購的價格調整了，原本的同意已經自動取消，這次沒有扣款。"
+        "請告訴玩家可以到設定裡用新價格重新打開，之後再要圖。"
+    ),
+}
+
+
+def _chat_image_limit_message(limit: int, grant: "OverageGrant") -> str:
+    """The over-quota directive, plus why the paid escape hatch didn't open."""
+    base = (
+        "account runtime profile daily chat image limit reached "
+        f"({limit}/24h)"
+    )
+    hint = _CHAT_IMAGE_OVERAGE_HINTS.get(grant.denied_reason or "")
+    return base if hint is None else base + hint
 
 
 @dataclass(frozen=True, slots=True)
@@ -664,6 +749,22 @@ def _last_prompt_pack_hash(prompt_context_builder: object) -> str:
     return str(getattr(prompt_context_builder, "last_prompt_pack_hash", "") or "")
 
 
+def _turn_client_quotes(
+    payload: SendChatMessageRequest,
+) -> dict[str, float | None]:
+    """The prices this client displayed, keyed by the action they bind (R9).
+
+    Two entries because one send can raise two charges: the turn itself, and
+    the picture the model may decide to draw inside it. Absent fields stay
+    ``None`` and the charge falls back to Core's price cache, so a client that
+    predates R9 behaves exactly as before.
+    """
+    return {
+        ACTION_CHAT: payload.quoted_price_cr,
+        ACTION_IMAGE_CHAT_TOOL: payload.quoted_image_price_cr,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class TurnPrelude:
     """Everything resolved BEFORE a turn claims its conversation.
@@ -679,6 +780,12 @@ class TurnPrelude:
     it outside the lease cannot corrupt a concurrent turn. Keeping the runtime
     message-cap check out here also preserves the existing precedence: a demo
     account over its cap still gets 429, never 409.
+
+    ``active_turn`` rides along because the drain counter is claimed *before*
+    any of the above runs (see ``_begin_turn``): the prelude is itself work a
+    SIGKILL would destroy, so it must be visible to ``active_turns`` rather
+    than counted only once it is over. Whoever receives the prelude owns
+    releasing the handle.
     """
 
     character: Character
@@ -686,6 +793,7 @@ class TurnPrelude:
     conversation: Conversation
     content_mode: MessageContentMode
     presence_frame: PresenceFrame
+    active_turn: ActiveTurn
 
 
 class ChatService:
@@ -704,6 +812,7 @@ class ChatService:
         goal_service: GoalService | None = None,
         goal_reviewer: GoalReviewerPort | None = None,
         goal_review_interval: int = _DEFAULT_GOAL_REVIEW_INTERVAL,
+        daily_goal_review_service: DailyGoalReviewService | None = None,
         self_repetition_extractor: "SelfRepetitionExtractorPort | None" = None,
         self_repetition_interval: int = _DEFAULT_SELF_REPETITION_INTERVAL,
         behavioral_pattern_repository: BehavioralPatternRepositoryPort | None = None,
@@ -774,6 +883,11 @@ class ChatService:
         clock: ClockPort | None = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
         turn_lease: ChatTurnLease | None = None,
+        drain_state: DrainState | None = None,
+        action_billing: (
+            "CloudActionBillingService | NullActionBillingService | None"
+        ) = None,
+        quota_overage: QuotaOverageService | None = None,
     ) -> None:
         self._character_repository = character_repository
         self._conversation_repository = conversation_repository
@@ -787,6 +901,12 @@ class ChatService:
         self._goal_service = goal_service
         self._goal_reviewer = goal_reviewer
         self._goal_review_interval = max(1, goal_review_interval)
+        # Optional (CF2) — the time-triggered daily review. ChatService keeps
+        # its own turn-count cadence untouched; it only *records* each review
+        # it runs into the shared per-(character, civil day) claim, so the
+        # scheduled pass does not pay for a second review of a list the chat
+        # path already converged hours earlier.
+        self._daily_goal_review = daily_goal_review_service
         self._self_repetition_extractor = self_repetition_extractor
         self._self_repetition_interval = max(1, self_repetition_interval)
         self._behavioral_patterns = behavioral_pattern_repository
@@ -881,6 +1001,22 @@ class ChatService:
         # container always wires one, so both hosted replicas and a single
         # self-host process serialize a conversation's player turns.
         self._turn_lease = turn_lease
+        # GD1-A rolling-deploy drain switch. ``None`` → nothing is counted and
+        # nothing is ever refused, which is also what a wired-but-never-drained
+        # replica does: self-host processes are never sent a drain request, so
+        # the container wires this unconditionally at zero behavioural cost.
+        self._drain_state = drain_state
+        # AP2: under ``billing_shape=action_fixed`` the whole turn — every tool
+        # hop and the ``image_recognition`` call included — is paid for by one
+        # charge taken at turn start. The null object keeps self-host and every
+        # token-billed tier on exactly the path they had before.
+        self._action_billing: (
+            CloudActionBillingService | NullActionBillingService
+        ) = action_billing or NullActionBillingService()
+        # AP4: the paid escape hatch from ``daily_chat_image_limit``. ``None``
+        # (self-host, legacy tests) means the limit stays a hard wall, exactly
+        # as it was before overage existed.
+        self._quota_overage = quota_overage
         self._pending_tasks: set[asyncio.Task] = set()
 
     def _resolve_now(self, now: datetime | None = None) -> datetime:
@@ -1151,6 +1287,9 @@ class ChatService:
                 uploads_dir=self._uploads_dir,
                 public_base_url=self._public_base_url,
                 object_storage=self._object_storage,
+                prefer_public_image_urls=bool(
+                    getattr(recognition_model, "prefers_public_image_urls", False),
+                ),
             )
             if not converted:
                 _LOGGER.warning(
@@ -1503,7 +1642,42 @@ class ChatService:
 
         Shared verbatim by the non-streaming and streaming entry points; see
         :class:`TurnPrelude` for why this must stay outside the turn lease.
+
+        Also the one place a turn can be refused for GD1-A drain, and it is
+        refused on the *first* line: everything below already costs the player
+        something a killed replica would waste — ``_maybe_unfreeze_on_interaction``
+        writes, the action charge that follows reserves credits, the turn lease
+        that follows that locks the conversation for its TTL. A 503 here leaves
+        no trace at all, which is the entire point of refusing rather than
+        starting work the SIGKILL will destroy.
+
+        The same first line also *admits* the turn — one atomic refuse-or-count
+        rather than a check here and a count several awaits later. The prelude
+        below is exactly the stretch that used to be invisible to the deploy's
+        ``active_turns`` poll; a turn is now either refused or counted from the
+        instant it is allowed in. The handle travels on the returned prelude and
+        is released here on every failure path, so the only way it survives this
+        method is on the success path, where the caller takes ownership.
         """
+        active_turn = self._admit_turn()
+        try:
+            return await self._resolve_turn_prelude(
+                payload,
+                current_user_id=current_user_id,
+                active_turn=active_turn,
+            )
+        except BaseException:
+            active_turn.release()
+            raise
+
+    async def _resolve_turn_prelude(
+        self,
+        payload: SendChatMessageRequest,
+        *,
+        current_user_id: str | None,
+        active_turn: ActiveTurn,
+    ) -> TurnPrelude:
+        """The prelude body proper — see :meth:`_begin_turn` for the contract."""
         character = await self._load_character_with_recovery(payload.character_id)
         owner_user_id = getattr(character, "user_id", DEFAULT_OPERATOR_ID)
         # Owner verification: the route already short-circuits, but the
@@ -1544,7 +1718,18 @@ class ChatService:
             conversation=conversation,
             content_mode=content_mode,
             presence_frame=presence_frame,
+            active_turn=active_turn,
         )
+
+    @staticmethod
+    def _turn_operator_id(prelude: TurnPrelude) -> str:
+        """Whose wallet pays for this turn.
+
+        The character's owner, not the caller: proactive follow-ups and the
+        messaging dispatcher drive turns with no request user at all, and the
+        owner is the account the hosted tenant hangs off in every case.
+        """
+        return getattr(prelude.character, "user_id", "") or DEFAULT_OPERATOR_ID
 
     async def _acquire_turn_lease(
         self, conversation_id: str,
@@ -1554,6 +1739,22 @@ class ChatService:
         if self._turn_lease is None:
             return None
         return await self._turn_lease.acquire(conversation_id)
+
+    def _admit_turn(self) -> ActiveTurn:
+        """Refuse-or-count this turn against the drain gauge (GD1-A).
+
+        One synchronous call so the drain check and the ``active_turns``
+        increment cannot be separated by an await; see
+        ``DrainState.try_enter_turn`` for why that matters. The handle releases
+        idempotently; on the streaming path it travels to the finalizer next to
+        the lease, because that is where the turn genuinely ends.
+
+        An unwired drain state yields an inert handle rather than ``None`` so
+        the call sites stay branch-free.
+        """
+        if self._drain_state is None:
+            return ActiveTurn()
+        return self._drain_state.try_enter_turn()
 
     async def send_message(
         self,
@@ -1570,17 +1771,35 @@ class ChatService:
         so that path stays exactly as it was.
         """
         prelude = await self._begin_turn(payload, current_user_id=current_user_id)
-        if external_turn is not None:
-            return await self._send_message_turn(
-                payload, prelude, external_turn=external_turn,
-            )
-        lease = await self._acquire_turn_lease(prelude.conversation.id)
-        try:
-            return await self._send_message_turn(
-                payload, prelude, external_turn=None,
-            )
-        finally:
-            await release_turn_lease(lease)
+        # GD1-A: the drain slot was claimed by ``_begin_turn`` and is released
+        # here, at the outermost scope, so it spans the *whole* turn — charge,
+        # lease, body — instead of only the part after the conversation was
+        # claimed. External-chat (LH2) turns are covered by the same finally:
+        # they own a different lease but the work is just as expensive to lose.
+        with prelude.active_turn:
+            # R9: bind both this turn's charge and any picture it spawns to the
+            # numbers the *player's* screen showed, not to this replica's cache.
+            with client_quoted_price_scope(_turn_client_quotes(payload)):
+                async with self._action_billing.action(
+                    ACTION_CHAT,
+                    operator_id=self._turn_operator_id(prelude),
+                    quoted_price_cr=payload.quoted_price_cr,
+                    interaction_id=(
+                        external_turn.stable_turn_id()
+                        if external_turn is not None else None
+                    ),
+                ):
+                    if external_turn is not None:
+                        return await self._send_message_turn(
+                            payload, prelude, external_turn=external_turn,
+                        )
+                    lease = await self._acquire_turn_lease(prelude.conversation.id)
+                    try:
+                        return await self._send_message_turn(
+                            payload, prelude, external_turn=None,
+                        )
+                    finally:
+                        await release_turn_lease(lease)
 
     async def _send_message_turn(
         self,
@@ -1599,14 +1818,8 @@ class ChatService:
         conversation = prelude.conversation
         content_mode = prelude.content_mode
         presence_frame = prelude.presence_frame
-        # History is merged across every source (web / telegram / line / …)
-        # — the character is a single person on every channel, so the
-        # prompt should see one unified timeline rather than only this
-        # surface's silo. The new turn is still persisted to the surface-
-        # bound ``conversation`` below; cross-source merging only affects
-        # what the LLM remembers, not where writes land.
-        recent_messages = await self._conversation_repository.recent_messages_for_character(
-            payload.character_id, limit=_RECENT_MESSAGE_LIMIT,
+        recent_messages = await self._load_unified_recent_messages(
+            character_id=payload.character_id, conversation=conversation,
         )
         prompt_recent_messages, older_dialogue_summary = (
             await self._prepare_prompt_dialogue_context(
@@ -2019,15 +2232,48 @@ class ChatService:
         error) frees the conversation immediately instead of after the TTL.
         """
         prelude = await self._begin_turn(payload, current_user_id=current_user_id)
-        lease = await self._acquire_turn_lease(prelude.conversation.id)
+        # GD1-A: already counted — ``_begin_turn`` admitted the turn before it
+        # resolved anything. From here the handle only has two destinations: the
+        # finalizer (success, where the turn genuinely ends) or a release on the
+        # way out of any failure path below.
+        active_turn = prelude.active_turn
+        # The action charge outlives this call, so it cannot use the
+        # ``action()`` context manager: the turn is only finished when the
+        # finalizer persists the assistant message. The interaction *scope*
+        # however only has to cover this call — ``_stream_capturing`` opens the
+        # upstream request and pulls its first chunk here, so the outbound
+        # headers are built inside the scope even though the remaining chunks
+        # are consumed by the route.
+        # R9: the quote scope spans the charge *and* the tool cycle, which is
+        # where an ``image_chat_tool`` charge would be raised. It does not have
+        # to reach the finalizer — that closes charges, it never opens one.
         try:
-            token_stream, finalizer = await self._start_message_stream(
-                payload, prelude,
-            )
+            with client_quoted_price_scope(_turn_client_quotes(payload)):
+                charge = await self._action_billing.begin(
+                    ACTION_CHAT,
+                    operator_id=self._turn_operator_id(prelude),
+                    quoted_price_cr=payload.quoted_price_cr,
+                )
+                try:
+                    lease = await self._acquire_turn_lease(prelude.conversation.id)
+                except BaseException:
+                    await self._action_billing.release(charge)
+                    raise
+                try:
+                    with interaction_scope(charge.context if charge else None):
+                        token_stream, finalizer = await self._start_message_stream(
+                            payload, prelude,
+                        )
+                except BaseException:
+                    await release_turn_lease(lease)
+                    await self._action_billing.release(charge)
+                    raise
         except BaseException:
-            await release_turn_lease(lease)
+            active_turn.release()
             raise
         finalizer.attach_turn_lease(lease)
+        finalizer.attach_active_turn(active_turn)
+        finalizer.attach_action_charge(charge)
         return token_stream, finalizer
 
     async def _start_message_stream(
@@ -2040,14 +2286,8 @@ class ChatService:
         conversation = prelude.conversation
         content_mode = prelude.content_mode
         presence_frame = prelude.presence_frame
-        # History is merged across every source (web / telegram / line / …)
-        # — the character is a single person on every channel, so the
-        # prompt should see one unified timeline rather than only this
-        # surface's silo. The new turn is still persisted to the surface-
-        # bound ``conversation`` below; cross-source merging only affects
-        # what the LLM remembers, not where writes land.
-        recent_messages = await self._conversation_repository.recent_messages_for_character(
-            payload.character_id, limit=_RECENT_MESSAGE_LIMIT,
+        recent_messages = await self._load_unified_recent_messages(
+            character_id=payload.character_id, conversation=conversation,
         )
         prompt_recent_messages, older_dialogue_summary = (
             await self._prepare_prompt_dialogue_context(
@@ -2425,6 +2665,7 @@ class ChatService:
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
+                include_operator_status=payload.operator_persona_enabled,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_context, image_urls = await _prepare_vision_prompt(
@@ -3622,6 +3863,7 @@ class ChatService:
                     turn_register_profile=register_profile,
                     reply_diversity_evidence=diversity_evidence,
                     retry_directive=retry_directive,
+                    include_operator_status=operator_persona_enabled,
                 )
                 prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
                 prompt, image_urls = await _prepare_vision_prompt(
@@ -3856,6 +4098,7 @@ class ChatService:
                 material_digest=material_digest,
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
+                include_operator_status=operator_persona_enabled,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_for_model, image_urls = await _prepare_vision_prompt(
@@ -4000,22 +4243,6 @@ class ChatService:
                 )
                 force_final_reply = True
                 continue
-            if call.name == _FORCED_IMAGE_TOOL_NAME:
-                quota_error = await self._reserve_runtime_chat_image_quota(
-                    character=character,
-                    now=now,
-                )
-                if quota_error is not None:
-                    tool_outcomes.append(
-                        ToolOutcomeMessage(
-                            tool_name=call.name,
-                            ok=False,
-                            output_text="",
-                            error=quota_error,
-                        ),
-                    )
-                    force_final_reply = True
-                    continue
             # Guard against a stuck model re-emitting the exact same
             # tool call in a loop. If we've already run this call this
             # turn, don't run it again — break out with whatever text
@@ -4046,15 +4273,48 @@ class ChatService:
                 force_final_reply = True
                 continue
             seen_calls.add(call_key)
-            try:
-                invocation, result = await self._tool_orchestrator.execute(
-                    character=character, call=call,
-                    conversation_id=conversation.id,
-                    recent_dialogue=recent_dialogue,
-                    user_attachment_urls=resolved_user_attachment_urls,
+            # The quota (and its AP4 paid extension) is reserved here rather
+            # than earlier so the duplicate-call guards above cannot consume a
+            # slot — or spend 螢火 — on a call that will never run.
+            image_overage: OverageGrant | None = None
+            if call.name == _FORCED_IMAGE_TOOL_NAME:
+                quota = await self._reserve_runtime_chat_image_quota(
+                    character=character,
+                    now=now,
                 )
+                if quota.error is not None:
+                    tool_outcomes.append(
+                        ToolOutcomeMessage(
+                            tool_name=call.name,
+                            ok=False,
+                            output_text="",
+                            error=quota.error,
+                        ),
+                    )
+                    force_final_reply = True
+                    continue
+                image_overage = quota.overage
+            try:
+                # An over-quota picture is bought once, at the overage price
+                # (which the plan requires to be >= the base price). Declaring
+                # the prepayment here stops the image tool raising a second,
+                # ``image_chat_tool`` charge for the very same picture — and
+                # scopes its Gateway call to the charge that did pay for it.
+                with prepaid_action_scope(
+                    ACTION_IMAGE_CHAT_TOOL,
+                    image_overage.charge.context
+                    if image_overage is not None and image_overage.charge
+                    else None,
+                ):
+                    invocation, result = await self._tool_orchestrator.execute(
+                        character=character, call=call,
+                        conversation_id=conversation.id,
+                        recent_dialogue=recent_dialogue,
+                        user_attachment_urls=resolved_user_attachment_urls,
+                    )
             except Exception:
                 _LOGGER.exception("chat tool-use: orchestrator crashed")
+                await self._quota_overage_release(image_overage)
                 tool_outcomes.append(
                     ToolOutcomeMessage(
                         tool_name=call.name, ok=False,
@@ -4062,6 +4322,13 @@ class ChatService:
                     ),
                 )
                 continue
+            # A picture the player paid extra for and never received is the
+            # one outcome this feature cannot afford, so the purchase only
+            # settles once the tool actually produced something.
+            if result.ok:
+                await self._quota_overage_settle(image_overage)
+            else:
+                await self._quota_overage_release(image_overage)
             if call.name == _FORCED_IMAGE_TOOL_NAME:
                 image_tool_executed = True
             tool_outcomes.append(
@@ -4167,6 +4434,7 @@ class ChatService:
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
+                include_operator_status=operator_persona_enabled,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_for_model, image_urls = await _prepare_vision_prompt(
@@ -4238,23 +4506,26 @@ class ChatService:
         *,
         character: Character,
         now: datetime,
-    ) -> str | None:
+    ) -> ChatImageQuotaDecision:
         profile = await self._account_runtime_profile_resolver.resolve_for_operator(
             character.user_id,
         )
         limit = profile.daily_chat_image_limit
         if limit is None:
-            return None
+            return _CHAT_IMAGE_ALLOWED
         if self._account_runtime_usage_repository is None:
             _LOGGER.error(
                 "chat image runtime quota ledger is not configured "
                 "(operator=%s)",
                 character.user_id,
             )
-            return (
-                "account runtime profile chat image quota ledger is not "
-                "configured"
+            return ChatImageQuotaDecision(
+                error=(
+                    "account runtime profile chat image quota ledger is not "
+                    "configured"
+                ),
             )
+        overage: OverageGrant | None = None
         try:
             used = await self._account_runtime_usage_repository.count_events(
                 operator_id=character.user_id,
@@ -4263,10 +4534,16 @@ class ChatService:
                 until=now,
             )
             if used >= limit:
-                return (
-                    "account runtime profile daily chat image limit reached "
-                    f"({limit}/24h)"
+                overage = await self._authorise_chat_image_overage(
+                    character, now,
                 )
+                if not overage.granted:
+                    return ChatImageQuotaDecision(
+                        error=_chat_image_limit_message(limit, overage),
+                    )
+            # The base counter keeps counting past the limit: it is the record
+            # of how many pictures were actually sent, and the *purchase*
+            # counter (not this one) is what bounds the overage.
             await self._account_runtime_usage_repository.record_event(
                 operator_id=character.user_id,
                 event_type=ACCOUNT_RUNTIME_EVENT_CHAT_IMAGE,
@@ -4277,8 +4554,33 @@ class ChatService:
                 "chat image runtime quota check failed (operator=%s)",
                 character.user_id,
             )
-            return "account runtime profile chat image quota is unavailable"
-        return None
+            await self._quota_overage_release(overage)
+            return ChatImageQuotaDecision(
+                error="account runtime profile chat image quota is unavailable",
+            )
+        return ChatImageQuotaDecision(overage=overage)
+
+    async def _authorise_chat_image_overage(
+        self, character: Character, now: datetime,
+    ) -> OverageGrant:
+        """AP4: may this player buy one picture past the tier allowance?
+
+        Never raises — an unwired service (self-host, most tests) and every
+        refusal alike come back as a denial, so the caller's fall-through is
+        the historical "over the limit means no picture today"."""
+        if self._quota_overage is None:
+            return OverageGrant(denied_reason=OVERAGE_DENIED_TIER_OFF)
+        return await self._quota_overage.authorise(
+            CHAT_IMAGE_OVERAGE, operator_id=character.user_id, now=now,
+        )
+
+    async def _quota_overage_settle(self, grant: OverageGrant | None) -> None:
+        if self._quota_overage is not None:
+            await self._quota_overage.settle(grant)
+
+    async def _quota_overage_release(self, grant: OverageGrant | None) -> None:
+        if self._quota_overage is not None:
+            await self._quota_overage.release(grant)
 
     async def _ensure_runtime_message_session_available(
         self,
@@ -4558,6 +4860,40 @@ class ChatService:
             _LOGGER.exception("chat: feed post query failed")
             return ()
         return tuple(recent)
+
+    async def _load_unified_recent_messages(
+        self,
+        *,
+        character_id: str,
+        conversation: Conversation | None = None,
+    ) -> list[Message]:
+        """Fetch the character's cross-source history for prompt material.
+
+        History is merged across every source (web / telegram / line / …)
+        — the character is a single person on every channel, so the prompt
+        should see one unified timeline rather than only this surface's
+        silo. The new turn is still persisted to the surface-bound
+        ``conversation`` by the caller; cross-source merging only affects
+        what the LLM remembers, not where writes land.
+
+        The merge, however, also pulls in **outbound fan-out duplicates**:
+        one proactive push delivered to both the web thread and a bound
+        messaging thread exists as two rows, so the same sentence used to
+        reach the prompt twice — once in 「近期對話」 and once more in the
+        「你本對話最近自己說過的話」 rail (four appearances in the observed
+        dump), and the diversity embedding then compared a line against its
+        own mirror and reported 1.000 self-similarity. Collapsing the
+        mirrors here — at the single load point every downstream block
+        (transcript, self-lines rail, diversity evidence, tool context)
+        reads from — fixes all of them at once. Both DB rows are untouched.
+        """
+        recent = await self._conversation_repository.recent_messages_for_character(
+            character_id, limit=_RECENT_MESSAGE_LIMIT,
+        )
+        return dedupe_mirrored_messages(
+            recent,
+            preferred=conversation.messages if conversation is not None else (),
+        )
 
     async def _prepare_prompt_dialogue_context(
         self,
@@ -5406,7 +5742,12 @@ class ChatService:
             )
             return []
         anchor = ensure_utc(before)
-        prior = [m for m in recent if ensure_utc(m.created_at) < anchor]
+        # Same cross-channel mirror collapse the live load point applies
+        # (see ``_load_unified_recent_messages``) — otherwise a fanned-out
+        # proactive push reaches the post-turn extractors twice and can be
+        # written into long-term memory as if it had been said twice.
+        deduped = dedupe_mirrored_messages(recent)
+        prior = [m for m in deduped if ensure_utc(m.created_at) < anchor]
         return prior[-_RECENT_MESSAGE_LIMIT:]
 
     async def _do_post_turn(
@@ -6075,10 +6416,19 @@ class ChatService:
                 active_goals=active,
                 recent_messages=recent,
                 operator_primary_language=operator_language,
+                # CF2: without the owner's civil day the reviewer cannot tell
+                # a goal frozen on 「明早」 from one that is still ahead, so a
+                # date-bound goal would stay active forever.
+                now=self._resolve_now(),
+                local_tz=await self._goal_review_timezone(character),
             )
         except Exception:
             _LOGGER.exception("Goal review crashed")
             return
+        # Record the day as covered even when the verdict was "no change" —
+        # the list WAS reviewed, and paying for a second identical pass hours
+        # later would be pure waste.
+        await self._note_daily_goal_review(character)
         if not result.status_changes and not result.new_goals:
             return
         try:
@@ -6089,6 +6439,25 @@ class ChatService:
         except Exception:
             _LOGGER.exception("Failed to apply goal review result")
 
+    async def _goal_review_timezone(self, character: Character):  # noqa: ANN201
+        """The owning operator's timezone, or UTC when unresolvable."""
+        if self._schedule_service is None:
+            return timezone.utc
+        try:
+            return await self._schedule_service.timezone_for_character(character)
+        except Exception:
+            _LOGGER.exception("Goal review timezone resolve failed")
+            return timezone.utc
+
+    async def _note_daily_goal_review(self, character: Character) -> None:
+        """Tell the daily trigger this character's list was reviewed today."""
+        if self._daily_goal_review is None:
+            return
+        try:
+            await self._daily_goal_review.note_reviewed(character)
+        except Exception:
+            _LOGGER.exception("Failed to record daily goal review claim")
+
     async def _call_goal_reviewer(
         self,
         *,
@@ -6096,25 +6465,28 @@ class ChatService:
         active_goals,  # noqa: ANN001 - list[CharacterGoal]
         recent_messages,  # noqa: ANN001 - list[Message]
         operator_primary_language: str,
+        now: datetime | None = None,
+        local_tz=None,  # noqa: ANN001 - tzinfo | None
     ):
-        """Invoke the goal reviewer, passing the operator language only
-        when the wired reviewer accepts it. Older / stub reviewers that
-        predate the language kwarg keep working (they fall back to their
-        own default) instead of raising a TypeError."""
+        """Invoke the goal reviewer, passing each optional kwarg only when
+        the wired reviewer accepts it. Older / stub reviewers that predate
+        the language or calendar kwargs keep working (they fall back to
+        their own defaults) instead of raising a TypeError."""
         reviewer = self._goal_reviewer
         assert reviewer is not None
-        if _accepts_keyword(reviewer.review, "operator_primary_language"):
-            return await reviewer.review(
-                character=character,
-                active_goals=active_goals,
-                recent_messages=recent_messages,
-                operator_primary_language=operator_primary_language,
-            )
-        return await reviewer.review(
-            character=character,
-            active_goals=active_goals,
-            recent_messages=recent_messages,
-        )
+        kwargs = {
+            "character": character,
+            "active_goals": active_goals,
+            "recent_messages": recent_messages,
+        }
+        for name, value in (
+            ("operator_primary_language", operator_primary_language),
+            ("now", now),
+            ("local_tz", local_tz),
+        ):
+            if value is not None and _accepts_keyword(reviewer.review, name):
+                kwargs[name] = value
+        return await reviewer.review(**kwargs)
 
     def _read_self_repetition_hint(self, conversation_id: str) -> str | None:
         """Return the cached anti-repetition hint for this conversation.
@@ -6378,12 +6750,29 @@ def _to_vision_url(
     return None
 
 
+def _absolute_public_vision_url(
+    url: str,
+    *,
+    public_base_url: str,
+) -> str | None:
+    """Promote a trusted storage media ref to a provider-fetchable URL."""
+    if url.startswith(("http://", "https://")):
+        return url
+    if (
+        public_base_url
+        and url.startswith(("/v1/public/", "/uploads/"))
+    ):
+        return f"{public_base_url.rstrip('/')}{url}"
+    return None
+
+
 async def _to_vision_url_with_storage(
     url: str,
     *,
     uploads_dir: Path | None,
     public_base_url: str,
     object_storage: ObjectStoragePort | None,
+    prefer_public_image_urls: bool = False,
 ) -> str | None:
     if object_storage is not None and url and not url.startswith("data:"):
         object_key = object_storage.object_key_from_url(url)
@@ -6396,6 +6785,18 @@ async def _to_vision_url_with_storage(
                         object_key, metadata.size_bytes,
                     )
                     return None
+                if prefer_public_image_urls and metadata is not None:
+                    public_url = _absolute_public_vision_url(
+                        metadata.url,
+                        public_base_url=public_base_url,
+                    )
+                    if public_url is not None:
+                        return public_url
+                    _LOGGER.warning(
+                        "storage image object %s has no provider-fetchable "
+                        "public URL; falling back to bounded inline handling",
+                        object_key,
+                    )
                 data = await object_storage.get_bytes(object_key=object_key)
                 if len(data) > _MAX_INLINE_IMAGE_BYTES:
                     _LOGGER.warning(
@@ -6533,6 +6934,9 @@ async def _prepare_vision_prompt(
                 uploads_dir=uploads_dir,
                 public_base_url=public_base_url,
                 object_storage=object_storage,
+                prefer_public_image_urls=bool(
+                    getattr(model, "prefers_public_image_urls", False),
+                ),
             )
             if converted:
                 resolved.append(converted)
@@ -6964,6 +7368,14 @@ class StreamFinalizer:
         # The streaming turn is only finished once the assistant message is
         # persisted here, so the finalizer — not the starter — owns the release.
         self._turn_lease_session: StudioLeaseSession | None = None
+        # GD1-A in-flight turn handle, handed over alongside the lease. Same
+        # lifetime, same owner, same idempotent release — a drained replica must
+        # not read ``active_turns 0`` while a stream is still writing.
+        self._active_turn: ActiveTurn | None = None
+        # AP2 action charge for this turn, handed over by
+        # ``send_message_stream`` — the streaming turn is only paid for once
+        # the assistant message lands, so the finalizer owns closing it.
+        self._action_charge: ActionChargeHandle | None = None
 
     @property
     def conversation_id(self) -> str:
@@ -6973,15 +7385,49 @@ class StreamFinalizer:
         """Take ownership of the turn's conversation lease."""
         self._turn_lease_session = session
 
+    def attach_active_turn(self, active_turn: "ActiveTurn | None") -> None:
+        """Take ownership of this turn's drain counter slot (GD1-A)."""
+        self._active_turn = active_turn
+
+    def attach_action_charge(self, charge: "ActionChargeHandle | None") -> None:
+        """Take ownership of closing the turn's action charge."""
+        self._action_charge = charge
+
     async def release_turn_lease(self) -> None:
-        """Release the conversation lease. Idempotent — the route calls it in a
-        ``finally`` to cover streams that never reach :meth:`finish`."""
-        session, self._turn_lease_session = self._turn_lease_session, None
-        await release_turn_lease(session)
+        """Release everything an unfinished turn still holds.
+
+        Idempotent — the route calls it in a ``finally`` to cover streams that
+        never reach :meth:`finish`. That is also the only hook an abandoned
+        stream offers, so releasing the action charge belongs here too:
+        otherwise a client that disconnected mid-generation would leave the
+        player's credits reserved until upstream expiry. :meth:`finish`
+        settles first, so by the time it reaches this the charge is closed and
+        the call below is a no-op.
+        """
+        try:
+            session, self._turn_lease_session = self._turn_lease_session, None
+            await release_turn_lease(session)
+            charge, self._action_charge = self._action_charge, None
+            await self._service._action_billing.release(charge)
+        finally:
+            # In a ``finally`` because a lease/charge release that throws must
+            # not strand the counter: a stuck ``active_turns`` would burn the
+            # deploy's whole 180s budget waiting for a turn that already ended.
+            active_turn, self._active_turn = self._active_turn, None
+            if active_turn is not None:
+                active_turn.release()
 
     async def finish(self, assistant_text: str) -> ChatReplyResponse:
         try:
-            return await self._finish_turn(assistant_text)
+            response = await self._finish_turn(assistant_text)
+        except BaseException:
+            charge, self._action_charge = self._action_charge, None
+            await self._service._action_billing.release(charge)
+            raise
+        else:
+            charge, self._action_charge = self._action_charge, None
+            await self._service._action_billing.settle(charge)
+            return response
         finally:
             # The lease covers the turn up to and including the assistant
             # message's persistence, which ``_finish_turn`` awaits. The

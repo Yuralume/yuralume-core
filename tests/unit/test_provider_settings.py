@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import httpx
 from fastapi.testclient import TestClient
 
 from kokoro_link.api.app import create_app
+from kokoro_link.bootstrap.settings import AppSettings, _load_cloud_settings
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.infrastructure.security.provider_secret_cipher import (
     ProviderSecretCipher,
@@ -227,8 +229,24 @@ def test_admin_provider_catalog_lists_byok_providers(monkeypatch) -> None:
 
 
 def test_cloud_mode_locks_admin_provider_catalog(monkeypatch) -> None:
+    # Env-driven Cloud boot now correctly requires PostgreSQL. This unit needs
+    # the explicit-construction seam so it can exercise the cloud route policy
+    # with the in-memory repositories instead of pretending a database exists.
+    _configure_env(monkeypatch)
+    settings = AppSettings.from_env()
     _configure_cloud_env(monkeypatch)
-    client = TestClient(create_app())
+    settings = replace(
+        settings,
+        cloud=_load_cloud_settings(role=settings.process.role),
+        auth=replace(
+            settings.auth,
+            enabled=True,
+            jwt_secret="provider-cloud-test-secret-at-least-32-bytes",
+            bootstrap_admin_email="",
+            bootstrap_admin_password="",
+        ),
+    )
+    client = TestClient(create_app(settings))
     container = client.app.state.container
 
     async def seed() -> None:

@@ -31,6 +31,13 @@ from kokoro_link.application.services.feed_event_bus import (
     FeedEventBus,
     FeedPostEvent,
 )
+from kokoro_link.application.services.cloud_action_billing_service import (
+    ActionChargeHandle,
+)
+from kokoro_link.application.services.quota_overage_service import (
+    OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+    OverageGrant,
+)
 from kokoro_link.application.services.visual_generation_style import (
     VisualGenerationStyleService,
 )
@@ -319,6 +326,182 @@ async def test_demo_runtime_profile_blocks_second_auto_feed_post_within_24h() ->
         since=base - timedelta(minutes=1),
         until=base + timedelta(days=2),
     ) == 2
+
+
+class _StubFeedOverage:
+    """Stands in for ``QuotaOverageService`` at the feed seam."""
+
+    def __init__(self, *, granted: bool = True) -> None:
+        self._granted = granted
+        self.authorised: list[str] = []
+        self.settled = 0
+        self.settle_gateway_delivered: list[bool] = []
+        self.released = 0
+
+    async def authorise(self, item, *, operator_id, now) -> OverageGrant:
+        self.authorised.append(item.key)
+        if not self._granted:
+            return OverageGrant(
+                denied_reason=OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+            )
+        return OverageGrant(
+            charge=ActionChargeHandle(
+                action_key=item.action_key,
+                charge_id="chg-feed",
+                interaction_id="int-feed",
+            ),
+        )
+
+    async def settle(
+        self, grant: OverageGrant | None, *, gateway_delivered: bool = True,
+    ) -> None:
+        if grant is not None and grant.charge is not None:
+            self.settled += 1
+            self.settle_gateway_delivered.append(gateway_delivered)
+
+    async def release(self, grant: OverageGrant | None) -> None:
+        if grant is not None and grant.charge is not None:
+            self.released += 1
+
+
+def _overage_service(
+    *,
+    overage: _StubFeedOverage,
+    collector,
+    composer,
+    repo: InMemoryFeedPostRepository,
+    usage: InMemoryAccountRuntimeUsageRepository,
+) -> FeedComposerService:
+    return FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        cooldown=timedelta(0),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=usage,
+        quota_overage=overage,
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorised_overage_lets_the_character_keep_posting() -> None:
+    """AP4: the player pre-authorised paying past ``daily_feed_post_limit``."""
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    overage = _StubFeedOverage(granted=True)
+    collector = _SequentialCollector([
+        [_candidate(source=FeedSource.beat("b1"))],
+        [_candidate(source=FeedSource.beat("b2"))],
+    ])
+    composer = _ScriptedComposer([
+        FeedComposerOutput(content_text="第一篇。"),
+        FeedComposerOutput(content_text="加購的第二篇。"),
+    ])
+    service = _overage_service(
+        overage=overage, collector=collector, composer=composer,
+        repo=repo, usage=usage,
+    )
+    character = replace(_make_character(), id="aiko")
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+
+    first = await service.tick(character, now=base)
+    second = await service.tick(character, now=base + timedelta(hours=2))
+
+    assert first is not None
+    assert second is not None
+    # Only the over-limit tick consults the paid path.
+    assert overage.authorised == ["feed_post"]
+    assert overage.settled == 1
+    assert overage.released == 0
+    # C2' exception: composing a post is background work the Gateway never
+    # waives, so the covered-call cross-check would refund every purchase —
+    # while the post the player bought is live in the feed.
+    assert overage.settle_gateway_delivered == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_overage_keeps_the_day_quiet_without_erroring() -> None:
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    overage = _StubFeedOverage(granted=False)
+    collector = _SequentialCollector([
+        [_candidate(source=FeedSource.beat("b1"))],
+        [_candidate(source=FeedSource.beat("b2"))],
+    ])
+    composer = _ScriptedComposer([
+        FeedComposerOutput(content_text="第一篇。"),
+        FeedComposerOutput(content_text="不該出現的第二篇。"),
+    ])
+    service = _overage_service(
+        overage=overage, collector=collector, composer=composer,
+        repo=repo, usage=usage,
+    )
+    character = replace(_make_character(), id="aiko")
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+
+    await service.tick(character, now=base)
+    second = await service.tick(character, now=base + timedelta(hours=2))
+
+    assert second is None
+    # The refused tick never even collected candidates — the old silent skip.
+    assert collector.calls == 1
+    assert overage.settled == 0
+    assert overage.released == 0
+
+
+@pytest.mark.asyncio
+async def test_a_bought_post_that_never_materialises_is_refunded() -> None:
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    overage = _StubFeedOverage(granted=True)
+    collector = _SequentialCollector([
+        [_candidate(source=FeedSource.beat("b1"))],
+        [],  # nothing worth posting on the tick the player paid for
+    ])
+    composer = _ScriptedComposer([FeedComposerOutput(content_text="第一篇。")])
+    service = _overage_service(
+        overage=overage, collector=collector, composer=composer,
+        repo=repo, usage=usage,
+    )
+    character = replace(_make_character(), id="aiko")
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+
+    await service.tick(character, now=base)
+    second = await service.tick(character, now=base + timedelta(hours=2))
+
+    assert second is None
+    assert overage.settled == 0
+    assert overage.released == 1
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_a_bought_post_refunds_and_reraises() -> None:
+    class _ExplodingCollector:
+        calls = 0
+
+        async def collect(self, character, *, now, local_tz):
+            self.calls += 1
+            if self.calls == 1:
+                return [_candidate(source=FeedSource.beat("b1"))]
+            raise RuntimeError("candidate collection blew up")
+
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    overage = _StubFeedOverage(granted=True)
+    service = _overage_service(
+        overage=overage,
+        collector=_ExplodingCollector(),
+        composer=_ScriptedComposer([FeedComposerOutput(content_text="第一篇。")]),
+        repo=repo, usage=usage,
+    )
+    character = replace(_make_character(), id="aiko")
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+
+    await service.tick(character, now=base)
+    with pytest.raises(RuntimeError):
+        await service.tick(character, now=base + timedelta(hours=2))
+
+    assert overage.released == 1
 
 
 @pytest.mark.asyncio

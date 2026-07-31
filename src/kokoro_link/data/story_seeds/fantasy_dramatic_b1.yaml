@@ -1,0 +1,122 @@
+# Fantasy dramatic seeds — batch b1.
+#
+# Tension hooks for fantasy-frame characters: enough to open a scene,
+# never enough to close one. The expander LLM adapts occupation,
+# geography and stakes to the character's own world; seeds only name
+# roles (旅人、貴族、長輩), never persons or IP, and never decide how
+# the player reacts or how the story ends.
+pack_id: fantasy_dramatic_b1
+language: zh-TW
+
+seeds:
+  # --- Requests & temptations --------------------------------------
+  - external_id: fdr1:quest:001
+    seed_text: 布告板上貼出一張報酬高得不對勁的委託，沒人敢接、卻也沒人敢撕下來
+    tags: [quest, temptation, suspicion]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 45
+
+  - external_id: fdr1:stranger:002
+    seed_text: 兜帽旅人指名要一樣照理說不該存在的東西，開價驚人、來歷成謎
+    tags: [stranger, mystery, moral-dilemma]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  - external_id: fdr1:forbidden:003
+    seed_text: 整理舊屋遺物時翻出一本封著鎖的禁忌之書，翻開與否成了良心的拉鋸
+    tags: [temptation, secret, moral-dilemma]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 75
+
+  # --- Threats to livelihood ---------------------------------------
+  - external_id: fdr1:shortage:004
+    seed_text: 常用的材料一夜之間全面缺貨，僅存的貨源似乎被誰刻意收走了
+    tags: [scarcity, mystery, conflict]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 45
+
+  - external_id: fdr1:reputation:005
+    seed_text: 經手的東西害人出了怪狀況，得在信譽崩盤之前查清是自己出錯還是有人動了手腳
+    tags: [reputation, investigation, pressure]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  - external_id: fdr1:rival:006
+    seed_text: 對街突然開了一間同行的店，價格與手藝的較勁一觸即發
+    tags: [rivalry, competition, pride]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 60
+
+  - external_id: fdr1:order:007
+    seed_text: 掌權的貴族下了一筆期限苛刻的大訂單，推掉會得罪權貴、接下又幾乎不可能完成
+    tags: [power, dilemma, pressure]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  # --- Omens & the uncanny -----------------------------------------
+  - external_id: fdr1:omen:008
+    seed_text: 走了多年的小徑一夜之間變了樣，鳥獸集體遷走，整片森林像在警告什麼
+    tags: [omen, unease, nature]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 45
+
+  - external_id: fdr1:seal:009
+    seed_text: 村外古碑出現了裂痕，平時和藹的長輩們一看到就集體變了臉色
+    tags: [seal, secret, foreboding]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 90
+
+  # --- People & bonds ----------------------------------------------
+  - external_id: fdr1:familiar:010
+    seed_text: 朝夕相處的小夥伴徹夜未歸，森林邊緣只找到牠留下的一撮毛
+    tags: [loss, urgency, search]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  - external_id: fdr1:amnesia:011
+    seed_text: 從河裡救起一個失去記憶的人，他身上帶著誰也不認得的奇怪紋章
+    tags: [stranger, mystery, rescue]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 90
+
+  - external_id: fdr1:theft:012
+    seed_text: 市集接連失竊，所有線索偏偏都指向自己最熟識的那個人
+    tags: [suspicion, friendship, investigation]
+    world_frames: [fantasy]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 75

@@ -228,6 +228,26 @@ class ShadowCoordinator:
     def snapshot(self) -> ShadowCounters:
         return ShadowCounters(**self._counters.as_dict())
 
+    async def owns_live_lease(self, *, now: datetime | None = None) -> bool:
+        """Confirm this incarnation still owns the durable coordinator lease."""
+        resolved = self._resolve_now(now)
+        try:
+            current = await self._lease.current(COORDINATOR_LEASE_NAME)
+        except Exception:
+            _LOGGER.exception(
+                "shadow coordinator: live lease verification failed; "
+                "failing closed",
+            )
+            return False
+        if current is None or self._epoch is None:
+            return False
+        owner_id, epoch, lease_until = current
+        return (
+            owner_id == self._owner_id
+            and epoch == self._epoch
+            and ensure_utc(lease_until) >= resolved
+        )
+
     # -- loop -------------------------------------------------------------- #
 
     async def _run(self) -> None:

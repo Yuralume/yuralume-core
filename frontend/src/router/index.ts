@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { useAuth } from '@/composables/useAuth'
+import { signInRouteFor } from '@/utils/sessionRedirect'
 
 // Phase 3 結束後 admin 子頁全部接到真正的 page 元件；AdminPlaceholder 留著
 // 給未來新增 admin 入口時當佔位用。每個 admin route 都是 lazy-loaded。
@@ -161,6 +162,16 @@ const router = createRouter({
       meta: { layout: 'auth', public: true },
     },
     {
+      // Where an expired hosted session lands. /login is a dead end for a
+      // hosted player (their Cloud account is OAuth-only, no password), so
+      // this screen points back at the Portal instead. Reached only when the
+      // deployment advertised one — see `@/utils/sessionRedirect`.
+      path: '/session-expired',
+      name: 'session-expired',
+      component: () => import('@/pages/SessionExpiredPage.vue'),
+      meta: { layout: 'auth', public: true },
+    },
+    {
       path: '/',
       name: 'stage',
       component: () => import('@/pages/StagePage.vue'),
@@ -263,10 +274,14 @@ router.beforeEach(async (to) => {
 
   const isPublic = Boolean(to.meta?.public)
 
-  // Disabled mode: route freely; the login / setup screens are
+  // Disabled mode: route freely; the login / setup / expiry screens are
   // dead ends so bounce home instead.
   if (!auth.authEnabled.value) {
-    if (to.name === 'login' || to.name === 'setup') {
+    if (
+      to.name === 'login'
+      || to.name === 'setup'
+      || to.name === 'session-expired'
+    ) {
       return { path: '/' }
     }
     return true
@@ -281,19 +296,20 @@ router.beforeEach(async (to) => {
   }
 
   if (isPublic) {
-    // /login should bounce home if already authenticated.
-    if (to.name === 'login' && auth.isAuthenticated.value) {
+    // A signed-in player has nothing to do on either sign-in surface.
+    if (
+      (to.name === 'login' || to.name === 'session-expired')
+      && auth.isAuthenticated.value
+    ) {
       return { path: '/' }
     }
     return true
   }
 
   if (!auth.isAuthenticated.value) {
-    const here = to.fullPath
-    return {
-      name: 'login',
-      query: here === '/' ? {} : { redirect: here },
-    }
+    // Same rule the 401 interceptors use: hosted players go to the Portal
+    // exit, everyone else to the password form.
+    return signInRouteFor({ portalUrl: auth.portalUrl.value }, to.fullPath)
   }
 
   // Admin-only routes: when auth is enabled, gate behind is_admin so

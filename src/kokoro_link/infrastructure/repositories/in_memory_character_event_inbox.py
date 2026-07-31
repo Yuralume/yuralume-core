@@ -22,7 +22,8 @@ class InMemoryCharacterEventInboxRepository:
 
     async def add_many(
         self, items: list[CharacterEventInboxItem],
-    ) -> None:
+    ) -> int:
+        inserted = 0
         for item in items:
             # Mirror unique (character_id, world_event_id) — skip rather
             # than overwrite so the curator can rerun without erasing
@@ -35,6 +36,8 @@ class InMemoryCharacterEventInboxRepository:
             if duplicate:
                 continue
             self._store[item.id] = item
+            inserted += 1
+        return inserted
 
     async def list_for_character(
         self,

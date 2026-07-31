@@ -238,6 +238,7 @@ def _arc_to_row(arc: StoryArc) -> StoryArcRow:
         theme=arc.theme,
         tone=arc.tone,
         source_template_id=arc.source_template_id,
+        source_seed_ids=json.dumps(list(arc.source_seed_ids), ensure_ascii=False),
         start_date=arc.start_date.isoformat(),
         end_date=arc.end_date.isoformat(),
         status=arc.status,
@@ -252,6 +253,7 @@ def _apply_arc_updates(row: StoryArcRow, arc: StoryArc) -> None:
     row.theme = arc.theme
     row.tone = arc.tone
     row.source_template_id = arc.source_template_id
+    row.source_seed_ids = json.dumps(list(arc.source_seed_ids), ensure_ascii=False)
     row.start_date = arc.start_date.isoformat()
     row.end_date = arc.end_date.isoformat()
     row.status = arc.status
@@ -296,6 +298,9 @@ def _row_to_arc(row: StoryArcRow, beats: list[StoryArcBeat]) -> StoryArc:
         # where the column reads back as None (raw SQL inserts, etc.)
         tone=row.tone or "daily",
         source_template_id=getattr(row, "source_template_id", None),
+        source_seed_ids=_decode_source_seed_ids(
+            getattr(row, "source_seed_ids", None),
+        ),
         start_date=date.fromisoformat(row.start_date),
         end_date=date.fromisoformat(row.end_date),
         status=row.status,
@@ -361,6 +366,33 @@ def _decode_scene_characters(raw: str | None) -> tuple[str, ...]:
         for entry in decoded
         if isinstance(entry, str) and entry.strip()
     )
+
+
+def _decode_source_seed_ids(raw: str | None) -> tuple[str, ...]:
+    """Best-effort decode of the JSON-encoded seed-provenance id list.
+
+    Same forgiving contract as ``_decode_scene_characters``: missing /
+    malformed JSON (including rows written before this column existed,
+    which read back as ``NULL`` via ``getattr`` above) degrades to an
+    empty tuple rather than blocking arc load. Non-string entries are
+    filtered here too, but the dedupe/truncate/cap invariants are left
+    to ``StoryArc.__post_init__`` (``_normalise_source_seed_ids`` runs on
+    every construction), so this only has to get from Text to a list.
+    """
+    if not raw:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        _LOGGER.warning(
+            "story_arcs.source_seed_ids decode failed raw=%r — "
+            "treating as empty",
+            raw,
+        )
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(entry for entry in decoded if isinstance(entry, str))
 
 
 def _ensure_aware(value: datetime) -> datetime:

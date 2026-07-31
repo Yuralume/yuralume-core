@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from kokoro_link.api.dependencies import get_current_user
+from kokoro_link.api.dependencies import get_current_user, is_cloud_mode
 from kokoro_link.application.exceptions import CharacterNotOwned
 
 from kokoro_link.api.routes.album import router as album_router
@@ -40,6 +40,10 @@ from kokoro_link.api.routes.chat_assist import router as chat_assist_router
 from kokoro_link.api.routes.chat import router as chat_router
 from kokoro_link.api.routes.auth_locale import router as auth_locale_router
 from kokoro_link.api.routes.cloud_credits import router as cloud_credits_router
+from kokoro_link.api.routes.cloud_pricing import router as cloud_pricing_router
+from kokoro_link.api.routes.cloud_announcements import (
+    router as cloud_announcements_router,
+)
 from kokoro_link.api.routes.geo import router as geo_router
 from kokoro_link.api.routes.events import router as events_router
 from kokoro_link.api.routes.feed import router as feed_router
@@ -57,6 +61,9 @@ from kokoro_link.api.routes.external_chat import (
 from kokoro_link.api.routes.internal_cloud import (
     router as internal_cloud_router,
 )
+from kokoro_link.api.routes.internal_drain import (
+    router as internal_drain_router,
+)
 from kokoro_link.api.routes.internal_metrics import (
     router as internal_metrics_router,
 )
@@ -67,6 +74,7 @@ from kokoro_link.api.routes.messaging import router as messaging_router
 from kokoro_link.api.routes.nsfw_mode import router as nsfw_mode_router
 from kokoro_link.api.routes.experiments import router as experiments_router
 from kokoro_link.api.routes.observability import router as observability_router
+from kokoro_link.api.routes.operator import overage_router
 from kokoro_link.api.routes.operator import router as operator_router
 from kokoro_link.api.routes.operator_persona import (
     router as operator_persona_router,
@@ -90,6 +98,10 @@ from kokoro_link.api.routes.ui import router as ui_router
 from kokoro_link.api.routes.usage import router as usage_router
 from kokoro_link.api.routes.version import router as version_router
 from kokoro_link.api.routes.world_events import router as world_events_router
+from kokoro_link.application.services.drain_state import (
+    SERVER_DRAINING_CODE,
+    ServerDrainingError,
+)
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessLocked,
 )
@@ -117,6 +129,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
+    # Third-party request-line logs can contain credentials embedded in URLs
+    # (Telegram Bot API tokens are part of the path).  Apply these floors even
+    # when Uvicorn has already installed root handlers and we skip basicConfig.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     # Uvicorn's --log-level only touches uvicorn.* loggers. Without
     # configuring the root logger here, application _LOGGER.info(...)
     # calls are filtered by Python's WARNING default. Driven by
@@ -275,10 +292,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except Exception as exc:  # fail-soft
                 print(f"[lifespan] studio job recovery failed: {exc!r}")
 
-        # Role-gated startup: character/world-event schedulers and messaging
-        # connectors run only where the matrix allows (HOSTED_CORE_SCALING
-        # §2.1). The api role starts neither (background owns them); the all
-        # role starts both. Shutdown mirrors exactly — only stop what started.
+        # Role-gated startup: embedded schedulers and messaging connectors run
+        # only where the matrix allows (HOSTED_CORE_SCALING §2.1). A dedicated
+        # coordinator starts only the lease-gated world-event singleton below.
+        # Shutdown mirrors exactly — only stop what started.
         if matrix.start_schedulers:
             if proactive is not None:
                 await proactive.start()
@@ -287,10 +304,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         # §2.1 dedicated roles: the durable coordinator/worker loops are gated
         # independently of the embedded scheduler. ``all`` / ``background`` set
         # both flags (they ride together, as before); the dedicated
-        # ``coordinator`` / ``worker`` roles start exactly one loop in a process
-        # that starts no embedded scheduler at all.
+        # ``worker`` starts exactly its queue loop; ``coordinator`` starts its
+        # durable loop followed by the lease-gated world-event singleton.
         if matrix.run_background_coordinator and shadow_coordinator is not None:
             await shadow_coordinator.start()
+        if matrix.start_world_event_scheduler and not matrix.start_schedulers:
+            if shadow_coordinator is None:
+                raise RuntimeError(
+                    "dedicated world-event scheduler requires coordinator lease",
+                )
+            if world_event_scheduler is not None:
+                await world_event_scheduler.start()
         if matrix.run_background_worker and shadow_worker is not None:
             await shadow_worker.start()
         if matrix.start_connectors:
@@ -344,6 +368,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             # embedded schedulers.
             if matrix.run_background_worker and shadow_worker is not None:
                 await shadow_worker.stop()
+            if matrix.start_world_event_scheduler and not matrix.start_schedulers:
+                if world_event_scheduler is not None:
+                    await world_event_scheduler.stop()
             if matrix.run_background_coordinator and shadow_coordinator is not None:
                 await shadow_coordinator.stop()
             if matrix.start_schedulers:
@@ -396,6 +423,27 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             },
         )
 
+    # GD1-A: a turn that starts on a draining replica is refused before it costs
+    # the player anything. One handler rather than a per-route ``except`` so
+    # every transport that drives a turn (web chat, external chat, messaging
+    # webhooks) answers the same way — the refusal has to be uniform precisely
+    # because it is the fallback for the case where the router did NOT stop
+    # sending this replica traffic.
+    @app.exception_handler(ServerDrainingError)
+    async def _server_draining_handler(
+        request: Request, exc: ServerDrainingError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": SERVER_DRAINING_CODE,
+                    "message": str(exc),
+                },
+            },
+            headers={"Retry-After": "1"},
+        )
+
     # M11: external-chat internal routes answer credential-gate (401/503) and
     # request-validation (422) failures with the same ErrorEnvelope as their
     # other errors. The validation handler is a no-op for every non-external-chat
@@ -412,6 +460,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # JWT), kept off the /api/v1 operator surface.
     if matrix.serve_metrics_route:
         app.include_router(internal_metrics_router, prefix="/api/internal/v1")
+        # GD1-A drain switch. Same gate, same prefix, same bearer channel as the
+        # scrape above: both are this replica's loopback management surface and
+        # the deploy script reaches them over the same port in the same step.
+        app.include_router(internal_drain_router, prefix="/api/internal/v1")
     if not matrix.serve_api_routes:
         # background role: schedulers/connectors run headless; nothing else is
         # mounted, so a representative /api/v1 route 404s by construction.
@@ -451,6 +503,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # the handlers 404 outside cloud mode, matching /auth/cloud/session — so the
     # self-host route inventory is unchanged.
     app.include_router(cloud_credits_router, prefix="/api/v1", dependencies=_auth_dep)
+    # AP3 price list + AP4 overage switches. Mounted *conditionally*, unlike the
+    # older cloud routers above: those predate the rule and 404 in-handler, but
+    # a route that exists only to 404 still shows up in a self-host install's
+    # OpenAPI inventory. Hosted-only surfaces added from AP3 on are simply
+    # absent there, so self-host's API surface is unchanged by this line.
+    if is_cloud_mode(container):
+        app.include_router(cloud_pricing_router, prefix="/api/v1", dependencies=_auth_dep)
+        app.include_router(overage_router, prefix="/api/v1", dependencies=_auth_dep)
+        # AN1 notice-board dot. Conditional for the same reason as the two
+        # above: a self-host install has no Cloud board, so the route should be
+        # absent from its inventory rather than present-and-404ing.
+        app.include_router(
+            cloud_announcements_router, prefix="/api/v1", dependencies=_auth_dep,
+        )
     # G2 hosted locale lifecycle + city search. Same unconditional mount /
     # in-handler 404: self-host's route inventory is unchanged, and both
     # already carry their own per-handler bearer dependency (the locale

@@ -14,6 +14,10 @@ from kokoro_link.domain.entities.behavioral_pattern import BehavioralPattern
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
 from kokoro_link.domain.entities.story_arc import StoryArcBeat
+from kokoro_link.domain.entities.story_event import StoryEvent
+from kokoro_link.domain.services.recent_activity_digest import (
+    RecentDayActivities,
+)
 
 
 class SchedulePlannerPort(Protocol):
@@ -33,6 +37,9 @@ class SchedulePlannerPort(Protocol):
         operator_persona_lines: tuple[str, ...] = (),
         schedule_involvement_policy: str = "none",
         pre_committed_activities: tuple[ScheduleActivity, ...] = (),
+        expired_operator_commitments: tuple[ScheduleActivity, ...] = (),
+        recent_activity_digest: tuple[RecentDayActivities, ...] = (),
+        recent_story_events: tuple[StoryEvent, ...] = (),
         recurring_patterns: tuple[BehavioralPattern, ...] = (),
         operator_primary_language: str = "zh-TW",
     ) -> DailySchedule:
@@ -71,6 +78,36 @@ class SchedulePlannerPort(Protocol):
         with new activities, (c) treat them as fixed in time — do not
         shift them. Empty tuple = no pre-existing commitments; the
         planner has free rein.
+
+        ``expired_operator_commitments`` are shared plans / invitations
+        from recent days whose slot came and went without the operator
+        acting on them (``operator_invite_expired`` /
+        ``operator_confirmed_lapsed``, stamped by the schedule service's
+        expiry sweep). They are supplied as **facts to know, never
+        material to use**: the model is told they are over and must not
+        reschedule them — not even reworded, moved, or relocated. This
+        exists because dialogue summaries and story beats keep echoing
+        old appointments, and without the explicit "this one is dead"
+        signal the planner re-hatches the same invitation day after day.
+        They are deliberately kept out of ``pre_committed_activities``;
+        that list is for live promises only.
+
+        ``recent_activity_digest`` is what the character already has on
+        the books for the civil days immediately before ``date_``: one
+        entry per day, each holding that day's activity descriptions in
+        clock order (see
+        :mod:`kokoro_link.domain.services.recent_activity_digest`). It
+        exists so the planner can tell a fresh day from a re-run of the
+        last one — without it, a single one-off ("重看某部作品的第 4 話")
+        was landing on three separate days of the same rolling window,
+        because each day was planned in complete ignorance of its
+        neighbours. Supplied as facts only: the planner is told to keep
+        distinctive / one-off activities off the repeat list and to give
+        a returning theme visible progress, while explicitly exempting
+        routine (sleep, meals, commute, observed habits) — that
+        judgement is the model's, never a code-side similarity test.
+        Empty tuple = no stored history for those days (a new character,
+        or a gap in planning).
 
         ``calendar_context`` is a pre-rendered natural-language block
         describing today's real-world civil calendar (weekday, national
@@ -111,6 +148,23 @@ class SchedulePlannerPort(Protocol):
         ``schedule_involvement_policy`` is one of ``none``,
         ``mention_only``, ``invite_required`` or ``shared_allowed`` and
         controls how strongly the planner may include the user.
+
+        ``recent_story_events`` are the character's story events (gacha
+        rolls + realized arc beats) for the civil days around ``date_``
+        — the day being planned and the days just before it (SE1,
+        STORY_SEED_ENRICHMENT_PLAN §3). Each carries a short LLM-written
+        first-person narrative of something that happened to the
+        character. They are supplied as **inspiration, never
+        instructions**: the planner may let the day continue, respond to
+        or close out one of these experiences, or ignore them entirely;
+        it must not re-enact one verbatim, and the anti-repetition
+        rules apply to anything it picks up. Without this input the
+        planner's only "what has been going on" signal was the dialogue
+        summary — mostly the character's own proactive output echoed
+        back — which is how schedules went stale while story events
+        happened invisibly next door. Empty tuple = no events recorded
+        or no repository wired; planner behaviour is unchanged from
+        before this input existed.
 
         ``recurring_patterns`` is a snapshot of statistically observed
         recurrences from prior weeks (HUMANIZATION_ROADMAP §3.3) —

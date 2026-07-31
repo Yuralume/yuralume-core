@@ -38,7 +38,12 @@ from kokoro_link.domain.entities.emotion_event import EmotionEvent
 from kokoro_link.domain.entities.feed_post import FeedPost
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
-from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
+from kokoro_link.domain.entities.schedule import (
+    DailySchedule,
+    ScheduleActivity,
+    has_expired_operator_commitment,
+    without_expired_operator_commitments,
+)
 from kokoro_link.domain.entities.operator_persona import OperatorPersona
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
@@ -76,8 +81,8 @@ from kokoro_link.infrastructure.prompt.state_tone import (
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
+    format_civil_days_ago_label,
     format_gap_duration_label,
-    format_relative_past_label,
     render_current_time_fact_lines,
     render_subjective_time_topical_hint,
     time_of_day_hint,
@@ -89,6 +94,9 @@ from kokoro_link.infrastructure.prompt.memory_lines import (
 from kokoro_link.infrastructure.prompt.register_blocks import (
     render_diversity_evidence_block,
     render_turn_register_block,
+)
+from kokoro_link.infrastructure.prompt.weather_freshness import (
+    render_weather_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
 
@@ -331,6 +339,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         resolved_player_address: "ResolvedAddress | None" = None,
         resolved_character_address: "ResolvedAddress | None" = None,
         address_change_lines: "list[str] | None" = None,
+        include_operator_status: bool = True,
     ) -> str:
         # ``vision_markers`` carries the cross-turn image inventory:
         # which 1-based ``[圖 N]`` tags belong to which turn. The
@@ -385,6 +394,8 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
             aspirations=character.aspirations,
             goals=active_goals or [],
             current_intent=pending_state.current_intent,
+            now=ref_now,
+            local_tz=local_tz,
         )
         timing_block = _render_timing_block(
             now=ref_now,
@@ -414,6 +425,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         pending_invites_block = _render_pending_invites_block(
             pending=pending_invite_activities or [],
             local_tz=local_tz,
+            now=ref_now,
         )
         upcoming_days_block = _render_upcoming_days_block(
             upcoming_day_schedules or [],
@@ -493,6 +505,16 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         presence_frame_block = _render_presence_frame_block(
             presence_frame_model,
             operator_language=getattr(operator, "primary_language", None),
+            operator=operator,
+            # The identity / language blocks above read ``operator``
+            # unconditionally — pre-existing behaviour on shared channels,
+            # left alone. The *status* is different: it is a first-person
+            # claim about what the person on the other end is doing right
+            # now, so it may only be rendered when the caller knows that
+            # person is the account owner.
+            include_operator_status=include_operator_status,
+            now=ref_now,
+            local_tz=local_tz,
         )
         instructions_footer = get_default_loader().render(
             "chat/instructions_footer",
@@ -766,9 +788,44 @@ def _clip(value: str, limit: int) -> str:
     return text[:limit].rstrip() + "…"
 
 
+_STAGE_PRESENCE_GUIDANCE = (
+    "- 這是玩家選擇的站內同場互動：玩家宣告此刻與你同場，你不需要質疑他是怎麼出現的，"
+    "也不必要求他先改用訊息或先約好才能繼續。",
+    "- 但同場不代表你的行程消失：請依你目前的行程與處境自然回應——在外面或忙碌時，"
+    "可以演出驚訝、抽空陪他一下，或明說現在不方便；在家或休息時，可以演出日常共處；"
+    "他的出現在你的計畫之外時，依你的性格演出意外感，不要寫成早就約好。",
+    "- 洗澡、情緒崩潰、深度獨處這類私密或脆弱的時段，你可以自然設界——迴避、請他稍等、"
+    "隔著門說話都行；用演出設界，不是拒絕互動。",
+    "- 不要虛構玩家的行動與位置細節：他做了什麼、站在哪裡、身上有什麼，"
+    "只能依他的訊息與你已知的資訊，其餘保留不確定。",
+)
+"""Stage co-presence guidance (SCENE_ACCESS_JUDGE_RETIREMENT_PLAN §2).
+
+Replaces the retired judge's out-of-narrative blocking copy. The four
+points carry the judge prompt's intent — co-presence is not teleportation,
+privacy still holds, the player's actions are not ours to invent — but
+hand the judgement to the main model *inside* the scene instead of
+refusing the turn before it starts.
+"""
+
+_OPERATOR_STATUS_FRESHNESS_LINE = (
+    "- 這是他自述的近況，不是硬性事實，也沒有固定有效期限："
+    "請依內容語意與設定時間距今多久，自行判斷它現在還算不算數；"
+    "明顯過期就只當一段舊近況參考，不要拿它否定他這一輪說的話。"
+)
+
+_OPERATOR_STATUS_CLIP = 200
+"""Prompt-budget guard for a free-text field with no length limit."""
+
+
 def _render_presence_frame_block(
     presence_frame: "PresenceFrame | None",
     operator_language: str | None = None,
+    *,
+    operator: "OperatorProfile | None" = None,
+    include_operator_status: bool = True,
+    now: datetime | None = None,
+    local_tz: tzinfo = timezone.utc,
 ) -> list[str]:
     frame = presence_frame or PresenceFrame.web_stage()
     uses_texting_style = _presence_frame_uses_texting_style(frame)
@@ -784,17 +841,16 @@ def _render_presence_frame_block(
     lines = [
         "互動語境：",
         f"- 當前介面：{channel_label}（{frame.surface.value} / {frame.channel.value}）。",
+        # D4: the operator's self-reported situation is context for both
+        # branches — on the stage it explains why they showed up, on the
+        # phone it explains why they are only texting. Withheld entirely
+        # when the turn may not come from the profile's owner.
+        *(
+            _render_operator_status_lines(operator, now=now, local_tz=local_tz)
+            if include_operator_status else []
+        ),
     ]
-    access_context = frame.access_context
-    if access_context is AccessContext.NOT_PLAUSIBLE:
-        lines.append(
-            "- 使用者目前不合理出現在你的當前場景。請不要描寫使用者已經在你身邊、"
-            "房間內、家中或可直接觸碰你。",
-        )
-        lines.append(
-            "- 若需要同場，應先透過文字訊息約定或邀請；本輪請以保持距離的方式自然回應。",
-        )
-    elif uses_texting_style:
+    if uses_texting_style:
         lines.append(
             "- 這是文字訊息對話：你收到的是對方傳來的訊息，不是面對面場景。",
         )
@@ -803,11 +859,7 @@ def _render_presence_frame_block(
             "觸碰對方或和對方面對面做動作。",
         )
     else:
-        reason = frame.co_presence_reason or _access_context_label(access_context)
-        lines.append(
-            f"- 這是站內同場互動；同場理由：{reason}。這個理由是本輪可共處的邊界，請依它自然回應。",
-        )
-        lines.append(f"- {_access_context_boundary(access_context)}")
+        lines.extend(_STAGE_PRESENCE_GUIDANCE)
 
     if uses_texting_style:
         lines.extend(_render_texting_style_lines())
@@ -831,12 +883,65 @@ def _render_presence_frame_block(
     return lines
 
 
+def _render_operator_status_lines(
+    operator: "OperatorProfile | None",
+    *,
+    now: datetime | None,
+    local_tz: tzinfo,
+) -> list[str]:
+    """Hand the operator's self-reported "current status" to the model.
+
+    D4 of the judge retirement: this field used to feed only the
+    stage-access judge. It is plain narrative context now — both
+    timestamps are handed over so the model can weigh freshness
+    semantically. Deliberately **no TTL and no code-side expiry**: a stale
+    status is still shown with its age rather than silently dropped, since
+    "出差到下週" set nine days ago may still be true and only the model can
+    tell. No status = no line at all, so an unset field leaves no trace.
+    """
+    if operator is None:
+        return []
+    status = _clip(operator.current_status or "", _OPERATOR_STATUS_CLIP)
+    if not status:
+        return []
+    set_at = operator.current_status_set_at
+    if set_at is None:
+        when = "未記錄設定時間"
+    else:
+        when = f"設定於 {_format_status_time(set_at, local_tz)}"
+    if now is not None:
+        when = f"{when}，現在是 {_format_status_time(now, local_tz)}"
+    return [
+        f"- 玩家自己填的「目前狀態」：{status}（{when}）。",
+        _OPERATOR_STATUS_FRESHNESS_LINE,
+    ]
+
+
+def _format_status_time(value: datetime, local_tz: tzinfo) -> str:
+    """Full date, year included.
+
+    A month/day stamp renders a status set one year ago identically to one
+    set minutes ago ("07/30 21:40" both times), and the freshness line asks
+    the model to weigh exactly that distance — so the year has to be on the
+    wire or the instruction is unanswerable. There is no TTL to lean on:
+    a stale status is deliberately still shown (see
+    ``_render_operator_status_lines``), which makes the timestamp the only
+    signal of its age."""
+    return to_timezone(value, local_tz).strftime("%Y-%m-%d %H:%M")
+
+
 def _presence_frame_uses_texting_style(frame: PresenceFrame) -> bool:
+    """Whether this turn is phone-texting rather than same-place acting.
+
+    Stage turns never are: legacy verdict values already folded onto
+    ``PLAYER_DECLARED`` in ``PresenceFrame.__post_init__``, so the only way
+    a ``web_stage`` frame reads as texting is an explicit
+    ``text_message_only`` declaration (a pre-retirement blocked frame
+    replayed from stored metadata).
+    """
     return (
-        frame.access_context is AccessContext.NOT_PLAUSIBLE
-        or frame.access_context
-        in {AccessContext.TEXT_MESSAGE_ONLY, AccessContext.REMOTE_STAGE}
-        or frame.surface is not ChatSurface.WEB_STAGE
+        frame.surface is not ChatSurface.WEB_STAGE
+        or frame.access_context is AccessContext.TEXT_MESSAGE_ONLY
     )
 
 
@@ -873,23 +978,6 @@ def _render_texting_style_lines() -> list[str]:
         "- 每則訊息之間空一行。不要為了拆而拆；自然短句優先。",
     ]
 
-
-def _access_context_label(access_context: AccessContext) -> str:
-    return {
-        AccessContext.PUBLIC_ENCOUNTER: "公共場所偶遇",
-        AccessContext.INVITED_VISIT: "角色邀請或願意接待",
-        AccessContext.SCHEDULED_MEETUP: "雙方事先約好的見面",
-        AccessContext.ESTABLISHED_ROUTINE: "熟人之間已形成的日常共處慣例",
-    }.get(access_context, "可解釋的同場互動")
-
-
-def _access_context_boundary(access_context: AccessContext) -> str:
-    return {
-        AccessContext.PUBLIC_ENCOUNTER: "這代表你們在開放或公共場景中合理相遇；不要假設已熟識或能進入私人空間。",
-        AccessContext.INVITED_VISIT: "這代表有邀請或接待脈絡；仍需尊重當下活動與角色邊界，不要擴張成無條件進入私領域。",
-        AccessContext.SCHEDULED_MEETUP: "這代表有事先約定；可承接約定場景，但不要超出約定內容。",
-        AccessContext.ESTABLISHED_ROUTINE: "這代表已有日常共處慣例；可自然互動，但仍需尊重休息、脆弱或高度私密狀態。",
-    }.get(access_context, "請依可抵達理由維持互動邊界。")
 
 def _render_operator_language_block(
     operator: "OperatorProfile | None",
@@ -1624,23 +1712,102 @@ def _format_memory_line(item: MemoryItem, *, now: datetime | None = None) -> str
     return format_memory_line(item, now=now)
 
 
+_DIRECTION_GOALS_MAX = 10
+"""How many medium-term goals the chat prompt will surface at once.
+
+A proactive-heavy account accumulates goals faster than the reviewer
+retires them (the review used to be chat-turn-driven only) — the 7/28
+芊璃 dump injected 28, most of them near-duplicates, one a zombie whose
+「明早」 had expired days earlier. The cap is a rendering-side backstop,
+not a substitute for the reviewer's soft limit: even with the lifecycle
+fixed, the section must never be able to drown the prompt again.
+"""
+
+
+def _goal_created_sort_key(goal: CharacterGoal) -> float:
+    """Epoch seconds for ``created_at``, oldest-possible when unknown."""
+    created = goal.created_at
+    if created is None:
+        return float("-inf")
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created.timestamp()
+
+
+def _select_prompt_goals(
+    goals: list[CharacterGoal], *, limit: int = _DIRECTION_GOALS_MAX,
+) -> tuple[list[CharacterGoal], int]:
+    """Rank goals by priority then recency and cut to ``limit``.
+
+    Purely structural field ordering — no inspection of ``content`` — so
+    the LLM-first rule holds: which goals matter is decided by the goal
+    reviewer writing ``priority``, not by this renderer reading prose.
+    Returns the kept goals plus how many were dropped so the caller can
+    disclose the truncation.
+    """
+    ordered = sorted(
+        goals,
+        key=lambda goal: (-goal.priority, -_goal_created_sort_key(goal)),
+    )
+    if limit <= 0:
+        return [], len(ordered)
+    return ordered[:limit], max(0, len(ordered) - limit)
+
+
+def _goal_created_tag(
+    goal: CharacterGoal, now: datetime | None, local_tz: tzinfo,
+) -> str:
+    """Program-stamped 「（N 天前立下）」 suffix — twin of the proactive
+    dispatcher's ``_goal_age_tag``.
+
+    A goal's text is frozen at write time, so a relative word inside it
+    ("明早一起出門") silently re-points at every new day it is read on.
+    Stamping how old the goal itself is gives the model the one fact it
+    needs to notice that "明早" is not tomorrow.
+
+    Counted in **civil days** (`format_civil_days_ago_label`), not elapsed
+    duration: the calendar boundary is the thing that expires a dated
+    commitment. A goal written at 23:50 last night reads 「1 天前立下」 and
+    its 「明早」 is already spent, where the duration bucket would have said
+    「約 8 小時前」 and left the model to guess whether a midnight passed —
+    exactly the cross-day blindness this plan exists to fix. Empty when
+    there is no reference clock or the timestamp is in the future (clock
+    skew), so legacy/replay callers render exactly as before.
+    """
+    label = format_civil_days_ago_label(goal.created_at, now, local_tz=local_tz)
+    return f"（{label}立下）" if label else ""
+
+
 def _render_direction_block(
     *,
     aspirations: list[str],
     goals: list[CharacterGoal],
     current_intent: str | None,
+    now: datetime | None = None,
+    local_tz: tzinfo = timezone.utc,
 ) -> list[str]:
     lines: list[str] = ["角色目標（僅供內部參考，請勿在回覆中條列背誦）："]
     if aspirations:
+        # Long-term aspirations are authored once at profile creation and
+        # never accumulate, so they are deliberately not capped.
         lines.append("長期追求：")
         lines.extend(f"- {item}" for item in aspirations)
     else:
         lines.append("長期追求：- 無")
 
     if goals:
+        visible, dropped = _select_prompt_goals(goals)
         lines.append("中期目標：")
-        for goal in goals:
-            lines.append(f"- [{goal.status.value} | 優先{goal.priority}] {goal.content}")
+        for goal in visible:
+            lines.append(
+                f"- [{goal.status.value} | 優先{goal.priority}] "
+                f"{goal.content}{_goal_created_tag(goal, now, local_tz)}"
+            )
+        if dropped:
+            lines.append(
+                f"（另有 {dropped} 條優先度較低或較久沒動的目標未列出；"
+                "先照顧上面這些就好。）"
+            )
     else:
         lines.append("中期目標：- 無")
 
@@ -1810,8 +1977,13 @@ def _render_upcoming_days_block(
     Both branches emit; an empty ``upcoming`` list still renders the
     vagueness instruction so the model knows the rule even when no
     upcoming day is pre-planned yet (cold start, fake provider, etc.).
+
+    Blocks carrying a retired operator commitment are stripped first
+    (plan §2 P1c) — a lapsed 刨冰 invite that survived into a future day's
+    row would be re-announced here as a plan the user never agreed to.
     """
     lines: list[str] = []
+    upcoming = [without_expired_operator_commitments(sched) for sched in upcoming]
     if upcoming and today_local is not None:
         lines.append(
             "接下來幾天的行程（**這是你已經規劃好的計畫**；使用者問起明天 / 後天時，"
@@ -1904,24 +2076,11 @@ def _render_weather_block(weather_context: str) -> list[str]:
     啡廳" in tomorrow's schedule and won't contradict the feed post
     text.
 
-    We append a *freshness-authority* directive (not a behavioural one):
-    the live weather fact is fresh every turn, but the conversation
-    history / memory / schedule the model also reads can still be soaked
-    in last week's rain. Without telling the model the current fact wins,
-    it keeps echoing "記得帶傘" after the sky has cleared. The directive
-    only sets precedence (use the current fact, don't continue an
-    outdated weather state); it never tells the character how to react to
-    the weather, so the LLM-first red line stays intact.
+    The fact + freshness-authority pairing now lives in
+    :mod:`~kokoro_link.infrastructure.prompt.weather_freshness` so the
+    proactive decider / intention judge splice the identical wording.
     """
-    weather = weather_context.strip()
-    if not weather:
-        return []
-    return [
-        weather,
-        "（以上為此刻真實天氣事實層。若近期對話、記憶、貼文或行程描述隱含的天氣"
-        "與此刻不一致——例如先前在下雨、現在已轉晴——一律以此刻天氣事實為準，"
-        "不要延續已經過時的天氣狀態或提醒。）",
-    ]
+    return render_weather_fact_lines(weather_context)
 
 
 def _render_calendar_block(calendar_context: str) -> list[str]:
@@ -2072,14 +2231,42 @@ def _render_completed_today_block(
     return lines
 
 
+def _is_window_past(activity: ScheduleActivity, now: datetime | None) -> bool:
+    """``True`` when the activity's whole window is already behind ``now``.
+
+    Structured timestamp comparison, deliberately deterministic — schema
+    data, not a reading of the description text.
+    """
+    if now is None:
+        return False
+    moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return activity.end_at <= moment
+
+
 def _render_pending_invites_block(
     *,
     pending: list[ScheduleActivity],
     local_tz: tzinfo,
+    now: datetime | None = None,
 ) -> list[str]:
-    if not pending:
+    """Render the one open invite the character is still hoping to ask about.
+
+    Two structural exclusions (plan §2 P1c): an activity the expiry sweep
+    already retired is a record of a commitment, not a commitment; and an
+    invite whose entire window has passed can no longer be 「找機會問出口」
+    in the future tense — surfacing either is exactly how the 7/26 刨冰
+    plan kept resurfacing as tomorrow's plan on 7/29. Callers normally
+    pre-filter (``ScheduleService.resolve_pending_invites_from_schedules``),
+    but the renderer owns the rail too so no future call site can bypass it.
+    """
+    live = [
+        activity for activity in pending
+        if not has_expired_operator_commitment(activity)
+        and not _is_window_past(activity, now)
+    ]
+    if not live:
         return []
-    activity = pending[0]
+    activity = live[0]
     location = f"（{activity.location}）" if activity.location else ""
     return [
         "尚未確認的邀請（只是一個想問對方的念頭；對方還沒答應，不要說成已約好）：",

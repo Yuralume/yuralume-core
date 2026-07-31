@@ -146,6 +146,17 @@ def test_connector_postgres_has_no_realtime_component() -> None:
     assert wiring.rehydrator is None
 
 
+def test_connector_postgres_does_not_emit_false_realtime_loss_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Messaging connectors do not publish proactive/feed realtime-bus events;
+    # treating ``start_connectors`` as a realtime publisher makes every healthy
+    # dedicated connector boot look like player-event loss.
+    _wire("connector", backend="postgres")
+
+    assert "reaches no SSE subscriber" not in caplog.text
+
+
 def test_memory_backend_is_pure_passthrough_every_role() -> None:
     for role in ("all", "api", "background", "coordinator", "worker", "connector"):
         wiring = _wire(role, backend="memory")

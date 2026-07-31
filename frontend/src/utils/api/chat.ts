@@ -10,6 +10,15 @@ import {
   insufficientCreditsFromBody,
   insufficientCreditsFromStreamFrame,
 } from '@/utils/api/insufficientCredits'
+import {
+  priceChangedFromBody,
+  priceChangedFromStreamFrame,
+} from '@/utils/api/priceChanged'
+import {
+  ACTION_CHAT,
+  ACTION_IMAGE_CHAT_TOOL,
+  useActionPricing,
+} from '@/composables/useActionPricing'
 
 /**
  * Re-exported so chat call sites can catch every typed chat outcome from one
@@ -146,6 +155,36 @@ export async function markConversationRead(characterId: string): Promise<Charact
 }
 
 /**
+ * Attach the prices this client is quoting to a chat send (plan R9).
+ *
+ * The server binds the charge to a price and refuses (`409 price_changed`)
+ * when it moved — but "the price we quoted" was, until now, read from the
+ * server's own process-local cache. With several hosted replicas, or right
+ * after a back-office edit, that number is not necessarily the one this
+ * player's screen showed. Sending it from here closes that gap: the charge is
+ * bound to what was actually on screen when they pressed send.
+ *
+ * Both fields are optional and dropped when nothing is quotable (self-host, a
+ * token-billed tier, a price list that has not loaded) — the server then falls
+ * back to its cache exactly as before. Nothing is gained by lying: a low quote
+ * is refused, never charged.
+ *
+ * Set on the transport rather than at each call site so every chat entry point
+ * — composer, retry, external surfaces — carries the same binding.
+ */
+function withQuotedPrices(req: SendChatMessageRequest): SendChatMessageRequest {
+  const pricing = useActionPricing()
+  const chat = pricing.priceOf(ACTION_CHAT)
+  const image = pricing.priceOf(ACTION_IMAGE_CHAT_TOOL)
+  if (chat === null && image === null) return req
+  return {
+    ...req,
+    ...(chat === null ? {} : { quoted_price_cr: chat.price_cr }),
+    ...(image === null ? {} : { quoted_image_price_cr: image.price_cr }),
+  }
+}
+
+/**
  * Send a chat message and stream the assistant reply via SSE.
  * Falls back to non-streaming if the streaming endpoint is not available.
  */
@@ -153,7 +192,7 @@ export async function sendChatMessage(req: SendChatMessageRequest): Promise<Chat
   const res = await authedFetch('/api/v1/chat/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
+    body: JSON.stringify(withQuotedPrices(req)),
   })
   if (!res.ok) {
     throw await chatErrorFromResponse(res, 'Chat request failed')
@@ -174,7 +213,7 @@ export async function sendChatMessageStream(
   const res = await authedFetch('/api/v1/chat/messages/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
+    body: JSON.stringify(withQuotedPrices(req)),
   })
   if (!res.ok) {
     throw await chatErrorFromResponse(res, 'Stream chat request failed')
@@ -205,6 +244,7 @@ export async function sendChatMessageStream(
         if (streamErrors.length === 0) {
           streamErrors.push(
             insufficientCreditsFromStreamFrame(parsed)
+            ?? priceChangedFromStreamFrame(parsed)
             ?? new ChatStreamProtocolError(
               'stream_error_frame',
               streamErrorFrameMessage(parsed.error),
@@ -280,6 +320,10 @@ async function chatErrorFromResponse(
   // typed treatment as the other entitlement outcomes below.
   const creditsError = insufficientCreditsFromBody({ detail }, response.status)
   if (creditsError) return creditsError
+  // A stale fixed-action quote (409) — nothing ran and nothing was charged;
+  // the panel asks the player to resend at the refreshed price.
+  const priceError = priceChangedFromBody({ detail }, response.status)
+  if (priceError) return priceError
   if (response.status === 429 && isSessionMessageLimit(detail)) {
     return new ChatRuntimeLimitError({
       code: 'max_messages_per_session',

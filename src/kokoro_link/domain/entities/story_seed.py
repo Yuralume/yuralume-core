@@ -25,8 +25,44 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 
+SEED_TIER_DAILY = "daily"
+SEED_TIER_DRAMATIC = "dramatic"
+SEED_TIERS = (SEED_TIER_DAILY, SEED_TIER_DRAMATIC)
+"""``daily`` feeds the everyday gacha; ``dramatic`` seeds are one-line
+scene openers consumed by the impromptu-episode layer and are excluded
+from the daily rotation (STORY_SEED_ENRICHMENT_PLAN §1)."""
+
+SEED_REGION_GLOBAL = "global"
+KNOWN_SEED_REGIONS = (SEED_REGION_GLOBAL, "tw", "jp", "west")
+"""First-wave controlled vocabulary for ``StorySeed.regions``. ``global``
+is the wildcard — always drawable. The entity itself keeps ``regions``
+open (same as ``world_frames``); the pack importer and the bundled-pack
+quality gate enforce this vocabulary so a typo can't create a silently
+undrawable seed."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _validate_tier(tier: str) -> str:
+    cleaned = (tier or "").strip()
+    if cleaned not in SEED_TIERS:
+        raise ValueError(
+            f"StorySeed.tier must be one of {SEED_TIERS}, got {tier!r}",
+        )
+    return cleaned
+
+
+def _normalise_regions(
+    regions: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if not regions:
+        return (SEED_REGION_GLOBAL,)
+    cleaned = tuple(
+        str(region).strip() for region in regions if str(region).strip()
+    )
+    return cleaned or (SEED_REGION_GLOBAL,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +80,15 @@ class StorySeed:
     thoughts — universal across settings). Non-universal seeds list
     specific frames (e.g. ``["modern"]`` for a seed about checking
     social media)."""
+    tier: str = SEED_TIER_DAILY
+    """Pacing tier — see ``SEED_TIERS``. ``daily`` micro-events feed the
+    everyday gacha; ``dramatic`` scene-openers never enter the daily
+    rotation and are consumed by the story-scene layer instead."""
+    regions: tuple[str, ...] = (SEED_REGION_GLOBAL,)
+    """Cultural-region fit, semantics mirroring ``world_frames``: a set
+    with ``global`` as the wildcard. Regional flavour (手搖飲 / 部活 /
+    自販機) is carried by this field, never by translation. See
+    ``KNOWN_SEED_REGIONS`` for the first-wave vocabulary."""
     weight: float = 1.0
     """Relative draw weight. Higher = more likely to be picked. Used
     by the gacha service when several seeds pass the cooldown/frame
@@ -83,6 +128,8 @@ class StorySeed:
         seed_text: str,
         tags: list[str] | tuple[str, ...] | None = None,
         world_frames: list[str] | tuple[str, ...] | None = None,
+        tier: str = SEED_TIER_DAILY,
+        regions: list[str] | tuple[str, ...] | None = None,
         weight: float = 1.0,
         cooldown_days: int = 7,
         enabled: bool = True,
@@ -99,6 +146,8 @@ class StorySeed:
             seed_text=trimmed,
             tags=tuple(tags or ()),
             world_frames=tuple(world_frames or ("any",)),
+            tier=_validate_tier(tier),
+            regions=_normalise_regions(regions),
             weight=max(0.0, float(weight)),
             cooldown_days=max(0, int(cooldown_days)),
             enabled=enabled,
@@ -129,6 +178,8 @@ class StorySeed:
         seed_text: str | None = None,
         tags: list[str] | tuple[str, ...] | None = None,
         world_frames: list[str] | tuple[str, ...] | None = None,
+        tier: str | None = None,
+        regions: list[str] | tuple[str, ...] | None = None,
         weight: float | None = None,
         cooldown_days: int | None = None,
         enabled: bool | None = None,
@@ -139,6 +190,10 @@ class StorySeed:
             tags=self.tags if tags is None else tuple(tags),
             world_frames=(
                 self.world_frames if world_frames is None else tuple(world_frames)
+            ),
+            tier=self.tier if tier is None else _validate_tier(tier),
+            regions=(
+                self.regions if regions is None else _normalise_regions(regions)
             ),
             weight=(
                 self.weight if weight is None else max(0.0, float(weight))
@@ -158,3 +213,15 @@ class StorySeed:
         if "any" in self.world_frames:
             return True
         return frame in self.world_frames
+
+    def fits_region(self, region: str | None) -> bool:
+        """True when this seed can be drawn for a player in ``region``.
+
+        ``global`` seeds fit everyone. ``region=None`` means the player's
+        region is unknown — only ``global`` seeds pass, so an unmapped
+        locale never sees mismatched regional flavour."""
+        if SEED_REGION_GLOBAL in self.regions:
+            return True
+        if region is None:
+            return False
+        return region in self.regions

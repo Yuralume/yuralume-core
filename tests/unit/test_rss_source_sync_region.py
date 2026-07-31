@@ -103,6 +103,68 @@ sources:
 """
 
 
+_RETIRED = """
+sources:
+  - id: retired-feed
+    name: Retired feed
+    feed_url: https://example.com/dead.xml
+    category: news
+    locale: en-US
+    enabled: true
+    retired: true
+"""
+
+
+@pytest.mark.asyncio
+async def test_retired_seed_is_disabled_on_first_insert(tmp_path: Path) -> None:
+    repo = InMemoryRssSourceRepository()
+
+    await RssSourceSyncService(
+        repository=repo, seed_path=_seed(tmp_path, _RETIRED),
+    ).sync()
+
+    source = await repo.get("retired-feed")
+    assert source is not None
+    assert source.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_retired_seed_disables_existing_canonical_url(
+    tmp_path: Path,
+) -> None:
+    repo = InMemoryRssSourceRepository()
+    seed = _seed(tmp_path, _RETIRED.replace("retired: true", "retired: false"))
+    await RssSourceSyncService(repository=repo, seed_path=seed).sync()
+    assert (await repo.get("retired-feed")).enabled is True
+
+    seed.write_text(_RETIRED, encoding="utf-8")
+    await RssSourceSyncService(repository=repo, seed_path=seed).sync()
+
+    assert (await repo.get("retired-feed")).enabled is False
+
+
+@pytest.mark.asyncio
+async def test_retired_seed_preserves_operator_replacement_url(
+    tmp_path: Path,
+) -> None:
+    repo = InMemoryRssSourceRepository()
+    seed = _seed(tmp_path, _RETIRED.replace("retired: true", "retired: false"))
+    await RssSourceSyncService(repository=repo, seed_path=seed).sync()
+    current = await repo.get("retired-feed")
+    await repo.upsert(replace(
+        current,
+        feed_url="https://operator.example/replacement.xml",
+        enabled=True,
+    ))
+
+    seed.write_text(_RETIRED, encoding="utf-8")
+    await RssSourceSyncService(repository=repo, seed_path=seed).sync()
+
+    source = await repo.get("retired-feed")
+    assert source.feed_url == "https://operator.example/replacement.xml"
+    assert source.enabled is True
+
+
 @pytest.mark.asyncio
 async def test_seed_persists_region_and_leaves_global_sources_null(
     tmp_path: Path,

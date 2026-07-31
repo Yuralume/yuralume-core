@@ -97,6 +97,7 @@ def _build_prompt(context: StoryArcSeasonContext) -> str:
         )
     return get_default_loader().render(
         "story/season_decider",
+        arc_history_block=_arc_history_block(context.arc_history),
         character_name=character.name,
         character_summary=character.summary or "（未設定）",
         today=context.today.isoformat(),
@@ -110,6 +111,21 @@ def _build_prompt(context: StoryArcSeasonContext) -> str:
         continuation_summary=context.continuation_summary or "（無）",
         recent_dialogue_summary=context.recent_dialogue_summary or "（無）",
     )
+
+
+def _arc_history_block(arc_history: tuple[str, ...]) -> str:
+    """Render the anti-repetition history, or nothing at all.
+
+    The placeholder sits on its own line between the completed-arc block
+    and the series block, so an empty history collapses that line to the
+    blank separator the template already had — the rendered prompt is then
+    byte-identical to the pre-AE0 one. A non-empty history supplies its
+    own surrounding blank lines.
+    """
+    if not arc_history:
+        return ""
+    lines = "\n".join(f"- {entry}" for entry in arc_history)
+    return f"\n歷史 story arc（由舊到新）：\n{lines}\n"
 
 
 def _parse_decision(raw: str) -> StoryArcSeasonDecision | None:

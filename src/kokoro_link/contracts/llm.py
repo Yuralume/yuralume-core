@@ -63,6 +63,14 @@ class ChatModelPort(Protocol):
     routing entry (per feature / group / active_model) may override
     this connection-level flag for calls resolved through it, since one
     aggregator connection can front both vision and text-only models."""
+    prefers_public_image_urls: bool
+    """Whether storage-backed images should use an absolute public URL.
+
+    Hosted Cloud sets this because image bytes must not be base64-expanded
+    into the bounded Core-to-Gateway JSON body. Direct/self-host adapters keep
+    it false and retain the reliable inline-data behavior. Decorators must
+    forward the value from their inner adapter.
+    """
 
     async def generate(
         self,

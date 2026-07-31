@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from ipaddress import ip_address
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from kokoro_link.api.contracts.build_info import (
@@ -27,6 +27,7 @@ from kokoro_link.api.contracts.build_info import (
 )
 from kokoro_link.api.contracts.player_locale import LocationHintResponse
 from kokoro_link.api.dependencies import (
+    bearer_token_from_header,
     get_container,
     get_current_user,
     is_cloud_mode,
@@ -798,6 +799,53 @@ async def create_cloud_session_login(
         user=user, location=location, container=container,
     )
     return AuthTokenResponse(user=UserResponse.from_domain(user), token=token)
+
+
+@router.post("/refresh", response_model=AuthTokenResponse)
+async def refresh_session(
+    authorization: str | None = Header(default=None),
+    user: OperatorProfile = Depends(get_current_user),
+    container: ServiceContainer = Depends(get_container),
+) -> AuthTokenResponse:
+    """Slide an active session forward so a player at the keyboard is never
+    evicted mid-play.
+
+    Renewal is *pull*, not automatic: the SPA calls this only after real user
+    interaction, so an abandoned tab cannot hold a session open indefinitely.
+    :meth:`JWTService.renew` carries the session anchor forward and refuses
+    once the deployment's absolute lifetime is reached — a hosted player then
+    returns through the Portal, which re-runs the account/tier gate. Renewal
+    deliberately does *not* re-introspect Cloud on every call: the tier bridge
+    already freezes a lapsed tenant's characters out of band, and putting a
+    hot upstream call on this path would fail a player's whole session
+    whenever the User service hiccuped.
+
+    Header-only by design — accepting the SSE ``?access_token=`` fallback here
+    would write a freshly minted credential into every access log on the path.
+    """
+    if not _is_auth_enabled(container):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="session refresh is unavailable when auth is disabled",
+        )
+    jwt_service = getattr(container, "jwt_service", None)
+    if jwt_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="auth service not configured",
+        )
+    token = bearer_token_from_header(authorization)
+    renewed = jwt_service.renew(token) if token else None
+    if renewed is None:
+        # Invalid, expired, and past-the-cap collapse into one answer: the
+        # client's move is identical (sign in again) and the distinction
+        # would tell a prober which tokens were once real.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="session cannot be renewed",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return AuthTokenResponse(user=UserResponse.from_domain(user), token=renewed)
 
 
 @router.get("/me", response_model=MeResponse)

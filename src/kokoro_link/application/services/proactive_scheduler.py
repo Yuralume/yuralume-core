@@ -45,6 +45,9 @@ from kokoro_link.application.services.feed_comment_reply_service import (
 from kokoro_link.application.services.feed_composer_service import (
     FeedComposerService,
 )
+from kokoro_link.application.services.goal_review_service import (
+    DailyGoalReviewService,
+)
 from kokoro_link.application.services.pending_follow_up_dispatcher import (
     PendingFollowUpDispatcher,
 )
@@ -63,6 +66,9 @@ from kokoro_link.application.services.runtime_activity_gate import (
 )
 from kokoro_link.application.services.schedule_memorializer import ScheduleMemorializer
 from kokoro_link.application.services.schedule_service import ScheduleService
+from kokoro_link.application.services.schedule_weather_drift_service import (
+    ScheduleWeatherDriftService,
+)
 from kokoro_link.application.services.social_tick_executor import (
     SocialTickExecutor,
 )
@@ -149,6 +155,8 @@ class ProactiveScheduler:
         character_social_knowledge_service: CharacterSocialKnowledgeService | None = None,
         peer_knowledge_interval_seconds: float = _DEFAULT_PEER_KNOWLEDGE_INTERVAL_SECONDS,
         schedule_memorializer: ScheduleMemorializer | None = None,
+        schedule_weather_drift: ScheduleWeatherDriftService | None = None,
+        goal_review_service: DailyGoalReviewService | None = None,
         persona_dream_service: PersonaDreamService | None = None,
         persona_dream_repository: OperatorPersonaRepositoryPort | None = None,
         account_runtime_profile_resolver: (
@@ -231,6 +239,16 @@ class ProactiveScheduler:
         # Chat still calls the same idempotent service per turn, but the
         # scheduler covers characters the user has not opened today.
         self._schedule_memorializer = schedule_memorializer
+        # Optional — intra-day weather-drift correction of today's remaining
+        # schedule blocks. Runs inside the schedule-ensure step so a sky that
+        # turned since planning stops leaking into chat / proactive / feed,
+        # all three of which read the same schedule prose.
+        self._schedule_weather_drift = schedule_weather_drift
+        # Optional — daily goal-list convergence (CF2). Runs on every tick;
+        # its own per-(character, civil day) DB claim decides whether the
+        # review is actually paid for, so a proactive-heavy account whose
+        # player rarely types still gets its goals reviewed daily.
+        self._goal_review_service = goal_review_service
         # Optional — operator-persona "dream" consolidation pass.
         # Runs per (character_id, operator_id) pair since each
         # character's persona is independent (no shared facts across
@@ -306,6 +324,8 @@ class ProactiveScheduler:
             beat_due_checker=self._beat_due_checker,
             schedule_service=self._schedule_service,
             schedule_memorializer=self._schedule_memorializer,
+            schedule_weather_drift=self._schedule_weather_drift,
+            goal_review_service=self._goal_review_service,
             feed_composer=self._feed_composer,
             feed_comment_reply=self._feed_comment_reply,
             dispatcher=self._dispatcher,

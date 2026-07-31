@@ -9,7 +9,6 @@ type StarterKey = 'stageGreeting' | 'stageCurrent' | 'dmGreeting' | 'dmCheckIn'
 const props = defineProps<{
   characterName: string
   mode: ChatGuideMode
-  stageBlocked?: boolean
   context: string
 }>()
 
@@ -20,13 +19,13 @@ const emit = defineEmits<{
 const { t } = useI18n()
 
 const starterKeys = computed<StarterKey[]>(() => (
-  props.mode === 'dm' || props.stageBlocked
+  props.mode === 'dm'
     ? ['dmGreeting', 'dmCheckIn']
     : ['stageGreeting', 'stageCurrent']
 ))
 
 const modeHint = computed(() => (
-  props.mode === 'dm' || props.stageBlocked
+  props.mode === 'dm'
     ? t('chat.onboarding.dmHint', { name: props.characterName })
     : t('chat.onboarding.stageHint', { name: props.characterName })
 ))

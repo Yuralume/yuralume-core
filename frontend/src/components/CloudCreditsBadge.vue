@@ -17,7 +17,7 @@ import { useI18n } from 'vue-i18n'
 
 import { useAuth } from '@/composables/useAuth'
 import { useCloudCredits } from '@/composables/useCloudCredits'
-import { formatCreditAmount, portalCreditsUrl } from '@/utils/creditsFormat'
+import { creditAmountText, portalCreditsUrl } from '@/utils/creditsFormat'
 
 const { t } = useI18n()
 const { cloudMode, portalUrl } = useAuth()
@@ -29,12 +29,7 @@ const visible = computed(() => cloudMode.value && credits.hasBalance.value)
 const topUpHref = computed(() => portalCreditsUrl(portalUrl.value))
 
 function amountText(value: number): string {
-  return t('credits.amount', {
-    amount: formatCreditAmount(value),
-    // Plural count for en-US (Lume / Lumes); zh-TW and ja-JP resolve to the
-    // same word either way.
-    unit: t('credits.unit', Math.round(Math.abs(value))),
-  })
+  return creditAmountText(t, value)
 }
 
 const totalText = computed(() => amountText(credits.total.value))

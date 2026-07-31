@@ -18,6 +18,7 @@ import NsfwModeSetting from './NsfwModeSetting.vue'
 import PlayerPasswordPanel from './PlayerPasswordPanel.vue'
 import PlayerPlaceLocaleSettings from './PlayerPlaceLocaleSettings.vue'
 import PortalAccountLink from './PortalAccountLink.vue'
+import QuotaOverageSettings from './QuotaOverageSettings.vue'
 import SimpleImageProfilePicker from './SimpleImageProfilePicker.vue'
 import TtsPregenSetting from './TtsPregenSetting.vue'
 import VisualGenerationStyleSetting from './VisualGenerationStyleSetting.vue'
@@ -317,7 +318,13 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <section class="voice-pregen-section">
       <ChatAssistSetting />
     </section>
-    <section class="voice-pregen-section">
+    <!--
+      Cloud mode never wires a TTS pregeneration service (billing point is
+      the player's play button, not a background synthesize call), so the
+      preference has nothing to control there. Hide it the same way
+      NsfwModeSetting below hides a self-host-only toggle.
+    -->
+    <section v-if="!cloudMode" class="voice-pregen-section">
       <TtsPregenSetting />
     </section>
     <section class="voice-pregen-section">
@@ -332,6 +339,11 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <section v-if="isAdmin" class="provider-section">
       <SimpleImageProfilePicker />
     </section>
+    <!-- Hosted overage switches. Deliberately not wrapped in a
+         `.provider-section`: the component renders no nodes outside cloud
+         mode, and an empty wrapper would still draw its divider — the
+         self-host preferences group must stay byte-identical (plan AP4). -->
+    <QuotaOverageSettings class="overage-section" />
   </section>
 
   <RouterLink
@@ -523,6 +535,13 @@ defineExpose({ flashWebNotification, flashAdminEntry })
 
 .admin-settings-entry__hint {
   line-height: 1.45;
+}
+
+/* Matches the divider the sibling preference blocks draw, without an empty
+   wrapper that would render on self-host where the component is silent. */
+.overage-section {
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border);
 }
 
 .portal-account-entry {

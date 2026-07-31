@@ -7,6 +7,7 @@ from kokoro_link.infrastructure.prompt.default import LATEST_USER_MESSAGE_MARKER
 
 class FakeChatModel(ChatModelPort):
     supports_vision: bool = False
+    prefers_public_image_urls: bool = False
 
     def __init__(self, provider_id: str) -> None:
         self.provider_id = provider_id

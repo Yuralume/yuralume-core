@@ -23,15 +23,18 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from kokoro_link.api.dependencies import get_container, get_current_user_id
 from kokoro_link.api.routes._cloud_errors import (
     INSUFFICIENT_CREDITS_CODE,
+    PRICE_CHANGED_CODE,
     insufficient_credits_detail,
     insufficient_credits_guard,
+    price_changed_detail,
 )
+from kokoro_link.contracts.cloud_action_billing import ActionPriceChanged
 from kokoro_link.application.services.character_image_service import (
     GenerationFailedError,
 )
@@ -524,3 +527,45 @@ def test_self_host_chat_failures_are_unchanged() -> None:
 
     with pytest.raises(httpx.ConnectError):
         client.post("/api/v1/chat/messages", json=_chat_payload())
+
+
+# -- the sibling refusal: the quoted price moved (C1) ------------------
+
+
+def test_a_moved_price_becomes_a_409_carrying_the_new_number() -> None:
+    """Same structured-detail mechanism, a different player instruction.
+
+    Out of credits ⇒ top up (402). Price changed ⇒ send again (409), with the
+    current price so the SPA can state it rather than sending the player off to
+    look it up.
+    """
+    with pytest.raises(HTTPException) as excinfo:
+        with insufficient_credits_guard():
+            raise ActionPriceChanged(
+                action_key="chat", expected_price_cr=3.0, current_price_cr=4.0,
+            )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail["code"] == PRICE_CHANGED_CODE
+    assert excinfo.value.detail["current_price_cr"] == 4.0
+    assert excinfo.value.detail["message"]
+
+
+def test_a_moved_price_is_found_through_a_rewrapped_error() -> None:
+    """Media routes re-wrap upstream failures into their own error type."""
+    try:
+        raise ActionPriceChanged(action_key="image_portrait")
+    except ActionPriceChanged as cause:
+        wrapped = GenerationFailedError("portrait failed")
+        wrapped.__cause__ = cause
+
+    detail = price_changed_detail(wrapped)
+    assert detail is not None
+    assert detail["code"] == PRICE_CHANGED_CODE
+    assert "current_price_cr" not in detail  # unknown, so not invented
+
+
+def test_an_ordinary_error_still_passes_through_the_guard() -> None:
+    with pytest.raises(ValueError):
+        with insufficient_credits_guard():
+            raise ValueError("unrelated")

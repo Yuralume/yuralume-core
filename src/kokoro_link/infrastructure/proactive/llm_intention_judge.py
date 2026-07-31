@@ -24,7 +24,10 @@ from kokoro_link.contracts.proactive_intention import (
     ProactiveIntentionJudgePort,
 )
 from kokoro_link.domain.entities.character import Character
-from kokoro_link.domain.entities.schedule import ScheduleActivity
+from kokoro_link.domain.entities.schedule import (
+    ScheduleActivity,
+    without_expired_operator_commitments,
+)
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
 from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.infrastructure.prompt.character_identity import (
@@ -46,6 +49,9 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
     format_local_current_time,
     render_subjective_time_topical_hint,
+)
+from kokoro_link.infrastructure.prompt.weather_freshness import (
+    render_weather_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
 
@@ -267,12 +273,16 @@ def _optional_calendar_block(context: ProactiveContext) -> str:
 
 
 def _optional_weather_block(context: ProactiveContext) -> str:
-    weather = context.weather_context.strip()
-    if not weather:
-        return ""
     # Weather block ships with its own header inline, so emit a bare
-    # blank-line separator without a synthetic title.
-    return "\n\n" + weather[:600]
+    # blank-line separator without a synthetic title. The shared helper
+    # appends the freshness-authority directive chat and the decider use,
+    # so the judge doesn't green-light a push built on stale rain.
+    lines = render_weather_fact_lines(
+        context.weather_context, max_fact_chars=600,
+    )
+    if not lines:
+        return ""
+    return "\n\n" + "\n".join(lines)
 
 
 def _optional_world_event_block(context: ProactiveContext) -> str:
@@ -533,7 +543,13 @@ def _schedule_lines(context: ProactiveContext) -> list[str]:
         ]
         lines.append("- 接下來：" + "；".join(snippets))
     if context.upcoming_day_schedules:
-        for schedule in context.upcoming_day_schedules[:2]:
+        for raw_schedule in context.upcoming_day_schedules[:2]:
+            # Same P1c filter as the chat renderer and the decider: a
+            # commitment the sweep retired is history, and the judge weighs
+            # these days as reasons to spend a slot ("明天要一起去…，先問問
+            # 幾點集合"). Applied before the slice so a retired block can't
+            # push a live one out of the three shown.
+            schedule = without_expired_operator_commitments(raw_schedule)
             snippets = [
                 f"{to_timezone(act.start_at, context.local_tz).strftime('%H:%M')} {act.description}"
                 for act in schedule.activities[:3]

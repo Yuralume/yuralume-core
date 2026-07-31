@@ -100,7 +100,7 @@ def _install_background_loop_fakes(container):
     return coordinator, worker
 
 
-def test_role_coordinator_starts_only_coordinator_loop() -> None:
+def test_role_coordinator_starts_coordinator_and_world_event_loops() -> None:
     app = _app_for_role("coordinator")
     proactive, world, telegram, studio = _install_fakes(app.state.container)
     coordinator, worker = _install_background_loop_fakes(app.state.container)
@@ -112,11 +112,11 @@ def test_role_coordinator_starts_only_coordinator_loop() -> None:
 
     assert coordinator.started is True
     assert coordinator.stopped is True
-    # Everything else stays off: no worker, no embedded scheduler, no connectors,
-    # no Studio recovery.
+    # The coordinator also owns the lease-gated global world-event loop.
     assert worker.started is False
     assert proactive.started is False
-    assert world.started is False
+    assert world.started is True
+    assert world.stopped is True
     assert telegram.started is False
     assert studio.called is False
 

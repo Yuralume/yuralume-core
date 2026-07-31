@@ -1,12 +1,22 @@
-"""Transport-classification lock for HostedChannelProactiveClient (LH4).
+"""Transport-classification lock for HostedChannelProactiveClient (LH4/LH7-D).
 
-Each Channel status code maps to exactly one ledger-facing outcome: 200/404 for
-eligibility, 2xx/404/409 for accept, and 429/5xx/network for the retryable
-transient error. Service-auth headers (caller=core, audience=yuralume-channel)
-ride every request.
+Each Channel status code maps to exactly one ledger-facing outcome: 2xx/404/409
+for accept, and 429/5xx/network for the retryable transient error.
+
+Eligibility is the one route where the status code is NOT the whole answer: the
+Channel answers ``200`` for both verdicts and puts the verdict in the body's
+``eligible`` field (LH7-D). So the eligibility cases below pin the BODY
+semantics — declined ⇒ ``False`` with the ``reason`` logged, an unreadable body
+⇒ the pre-LH7-D status-only semantics (``True``) plus a loud warning so a new
+Core against an old Channel keeps pushing instead of going silent.
+
+Service-auth headers (caller=core, audience=yuralume-channel) ride every
+request.
 """
 
 from __future__ import annotations
+
+import logging
 
 import httpx
 import pytest
@@ -66,7 +76,7 @@ def _envelope_payload() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_eligibility_200_true_with_path_and_auth_headers(
+async def test_eligibility_200_eligible_true_with_path_and_auth_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, object] = {}
@@ -75,7 +85,10 @@ async def test_eligibility_200_true_with_path_and_auth_headers(
         seen["url"] = str(request.url)
         seen["caller"] = request.headers.get("X-Yuralume-Service-Caller")
         seen["audience"] = request.headers.get("X-Yuralume-Service-Audience")
-        return httpx.Response(200)
+        return httpx.Response(
+            200,
+            json={"eligible": True, "ttl_seconds": 60, "reason": None},
+        )
 
     _install(monkeypatch, handler)
     eligible = await _client().get_eligibility(
@@ -87,6 +100,212 @@ async def test_eligibility_200_true_with_path_and_auth_headers(
     )
     assert seen["caller"] == "core"
     assert seen["audience"] == "yuralume-channel"
+
+
+@pytest.mark.asyncio
+async def test_eligibility_200_eligible_false_is_false_and_logs_reason(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 200 that says "no" must not be read as "yes" (LH7-D).
+
+    This is the whole point of the ticket: the character is simply not opted in,
+    and Core must skip it BEFORE spending decider/generation budget. The reason
+    reaches the log so an operator can see *why* nothing was pushed.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "eligible": False,
+                "ttl_seconds": 30,
+                "reason": "not_opted_in",
+            },
+        )
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.INFO):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is False
+    assert "not_opted_in" in caplog.text
+    # Module logging discipline: identifiers never reach this module's log —
+    # correlation lives server-side in the channel's delivery ledger. (Scoped
+    # to our records: httpx's own request log legitimately carries the URL.)
+    own = " ".join(
+        record.getMessage() for record in caplog.records
+        if record.name.endswith("hosted_channel_proactive_client")
+    )
+    assert own
+    assert "t1" not in own
+    assert "a1" not in own
+    assert "c1" not in own
+
+
+@pytest.mark.asyncio
+async def test_eligibility_200_declined_without_reason_still_false(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"eligible": False})
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.INFO):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is False
+    assert "unspecified" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_eligibility_200_missing_field_keeps_legacy_true_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mixed-version window: new Core, old Channel that omits ``eligible``.
+
+    A contract gap must not escalate into a push outage — keep the pre-LH7-D
+    status-only semantics and make the mismatch loud instead.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ttl_seconds": 30})
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is True
+    assert any(
+        record.levelno == logging.WARNING for record in caplog.records
+    )
+    assert "eligible" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    ["", "not json at all", "[]", '{"eligible": "false"}'],
+    ids=["empty", "malformed", "not-an-object", "non-boolean"],
+)
+async def test_eligibility_200_unreadable_body_keeps_legacy_true_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    body: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body.encode(), headers={
+                "Content-Type": "application/json",
+            },
+        )
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is True
+    assert any(
+        record.levelno == logging.WARNING for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"eligible": NaN}',
+        b'{"eligible": Infinity}',
+        b"[" * 6000 + b"]" * 6000,
+    ],
+    ids=["nan-constant", "infinity-constant", "deeply-nested"],
+)
+async def test_eligibility_200_hostile_body_degrades_to_legacy_true(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    content: bytes,
+) -> None:
+    """Non-standard JSON constants, decoder-depth attacks and broken encodings
+    are all "unusable body": the documented degraded path (True + warning),
+    never a crash out of the decoder and never a verdict read off a body the
+    contract does not allow."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=content, headers={"Content-Type": "application/json"},
+        )
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is True
+    assert any(
+        record.levelno == logging.WARNING for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_eligibility_200_invalid_utf8_reason_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Broken encodings never crash the tick. httpx's tolerant charset
+    fallback decodes the bytes, so the unambiguous ``eligible: false`` verdict
+    still lands — the mojibake only ever reaches the log through the collapsed
+    and clamped reason path."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"eligible": false, "reason": "\xff\xfe broken"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.INFO):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is False
+    declines = [
+        record.getMessage() for record in caplog.records
+        if "eligibility declined" in record.getMessage()
+    ]
+    assert len(declines) == 1
+    assert "\n" not in declines[0]
+
+
+@pytest.mark.asyncio
+async def test_eligibility_declined_reason_is_collapsed_to_one_log_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A channel-supplied string never gets to forge extra log lines."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"eligible": False, "reason": "not\n opted\r\nin " + "x" * 400},
+        )
+
+    _install(monkeypatch, handler)
+    with caplog.at_level(logging.INFO):
+        eligible = await _client().get_eligibility(
+            tenant_id="t1", account_id="a1", character_id="c1",
+        )
+    assert eligible is False
+    declines = [
+        record for record in caplog.records
+        if "eligibility declined" in record.getMessage()
+    ]
+    assert len(declines) == 1
+    message = declines[0].getMessage()
+    assert "\n" not in message
+    assert "\r" not in message
+    # Pin the exact normalization rule: whitespace collapsed to single spaces,
+    # then clamped to 120 characters — not merely "no CR/LF, not 400 x's".
+    expected = ("not opted in " + "x" * 400)[:120]
+    reason = message.split("reason=", 1)[1].split(" — ", 1)[0]
+    assert reason == expected
+    assert len(reason) <= 120
 
 
 @pytest.mark.asyncio

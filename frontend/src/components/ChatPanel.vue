@@ -4,9 +4,9 @@ import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { BulbOutlined, CloseOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import type { Character } from '@/types/character'
-import type { ChatMessage, StageAccessVerdict } from '@/types/chat'
+import type { ChatMessage } from '@/types/chat'
 import type { ChatAssistSuggestion } from '@/types/chatAssist'
-import { canUseStageAccess, webDmPresenceFrame, webStagePresenceFrame } from '@/types/chat'
+import { webDmPresenceFrame, webStagePresenceFrame } from '@/types/chat'
 import type { ScheduleActivity } from '@/types/schedule'
 import {
   ChatRuntimeLimitError,
@@ -16,20 +16,30 @@ import {
   undoLastTurn,
 } from '@/utils/api/chat'
 import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
+import { isPriceChangedError } from '@/utils/api/priceChanged'
+import { creditAmountText } from '@/utils/creditsFormat'
 import { suggestChatAssistMessages } from '@/utils/api/chatAssist'
-import { getCharacter, getStageAccess } from '@/utils/api/characters'
-import { updateOperatorProfile } from '@/utils/api/operatorProfile'
+import { getCharacter } from '@/utils/api/characters'
 import { notification } from 'ant-design-vue'
 import { getCurrentActivity } from '@/utils/api/schedule'
 import ChatBubble from '@/components/ChatBubble.vue'
 import ChatAssistDiscoveryHint from '@/components/ChatAssistDiscoveryHint.vue'
 import ChatFirstTurnGuide from '@/components/ChatFirstTurnGuide.vue'
+import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
 import { UiButton } from '@/components/ui'
 import { useChatAssistPreference } from '@/composables/useChatAssistPreference'
 import { useAuth } from '@/composables/useAuth'
-import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
+import {
+  refreshCloudCreditsAfterAction,
+  useCloudCredits,
+} from '@/composables/useCloudCredits'
+import {
+  ACTION_CHAT,
+  ACTION_IMAGE_CHAT_TOOL,
+  useActionPricing,
+} from '@/composables/useActionPricing'
 import { useNsfwMode } from '@/composables/useNsfwMode'
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
@@ -38,10 +48,6 @@ import { characterDisplayRef } from '@/utils/characterDisplay'
 import { splitAssistantBubbles } from '@/utils/chatSegments'
 import { shouldSendChatInputOnKeydown } from '@/utils/chatInputKeys'
 import { resolveTTSAvailability } from '@/utils/ttsAvailability'
-import {
-  resolveStageAccessNotice,
-  shouldOpenStageAccessNotice,
-} from '@/utils/stageAccessNotice'
 import {
   isChatAssistDiscovered,
   isChatAssistHintDismissed,
@@ -56,9 +62,34 @@ const confirmDialog = useConfirmDialog()
 const { chatAssistEnabled, loadChatAssistPreference } = useChatAssistPreference()
 const { cloudMode, portalUrl } = useAuth()
 const { pt } = usePlayerCopy()
+const cloudCredits = useCloudCredits()
+const actionPricing = useActionPricing()
 // A turn that was refused for lack of credits shows the shared notice card in
 // the message stream instead of a generic "chat failed" bubble.
 const creditsExhausted = ref(false)
+/**
+ * Price of the turn we refused to send, when the refusal came from the local
+ * pre-check rather than from the server's 402 (plan AP2). Null keeps the
+ * notice card exactly as the server-refusal path has always rendered it.
+ */
+const creditsRequiredCr = ref<number | null>(null)
+/**
+ * "…and a picture is extra." The chat price covers everything it takes to
+ * answer one message *except* a picture drawn along the way, which is charged
+ * as its own action — so the composer discloses both numbers rather than
+ * letting the second one turn up in the ledger unannounced.
+ *
+ * Fail-soft like every other price surface: no cloud mode, no published image
+ * price, or tiers that disagree, and the line simply is not there.
+ */
+const chatImageExtraText = computed(() => {
+  if (!cloudMode.value) return null
+  const price = actionPricing.priceOf(ACTION_IMAGE_CHAT_TOOL)
+  if (!price) return null
+  return pt('credits.price.chatImageExtra', {
+    amount: creditAmountText(t, price.price_cr),
+  })
+})
 /**
  * Hosted trial chat hit its message cap. On self-host this state is
  * unreachable (there is no trial), so the existing error bubble is left
@@ -107,14 +138,6 @@ const ttsAvailable = ref(false)
 const revealingMessageIndex = ref<number | null>(null)
 const currentActivity = ref<ScheduleActivity | null>(null)
 const currentActivityLoading = ref(false)
-const stageAccessVerdict = ref<StageAccessVerdict | null>(null)
-const stageAccessLoading = ref(false)
-const stageAccessNoticeOpen = ref(false)
-const stageAccessNoticeExpanded = ref(false)
-const stageAccessContextFormOpen = ref(false)
-const stageAccessStatusDraft = ref('')
-const stageAccessStatusSaving = ref(false)
-const stageAccessStatusError = ref<string | null>(null)
 const chatAssistOpen = ref(false)
 const chatAssistLoading = ref(false)
 const chatAssistError = ref<string | null>(null)
@@ -143,9 +166,10 @@ function releaseSendingLock(lockId: number) {
 }
 
 type ChatInteractionMode = 'stage' | 'dm'
-// Stage Access invokes an LLM judge, so the passive/default mode is DM.
-// The player explicitly selecting Stage is the only automatic evaluation
-// trigger; opening the chat and activity polling stay provider-free.
+// Both surfaces are the player's to pick, with no gate in between (plan
+// SA, D1): switching is local state only — no request, no wait, no charge.
+// DM stays the opening default because a first message is the gentler
+// entry, not because same-space has to be earned.
 const interactionMode = ref<ChatInteractionMode>('dm')
 
 const panelClass = computed(() => [
@@ -171,9 +195,7 @@ const chatAssistHintVisible = computed(() => shouldShowChatAssistHint({
 const modeStatusLabel = computed(() => (
   interactionMode.value === 'dm'
     ? t('chat.mode.dmStatus')
-    : stageAccessVerdict.value?.decision === 'warn'
-      ? t('chat.mode.stageWarnStatus')
-      : t('chat.mode.stageStatus')
+    : t('chat.mode.stageStatus')
 ))
 
 // 桌面 landscape 版面偏好 toggle 文案：依「目前狀態」描述「點下去會
@@ -192,11 +214,7 @@ const stageLayoutToggleAria = computed(() => (
 
 const emptyMessage = computed(() => (
   interactionMode.value === 'dm'
-    ? stageAccessVerdict.value?.decision === 'block'
-      ? t('chat.history.emptyDmStageBlocked', { name: characterDisplayName.value })
-      : t('chat.history.emptyDm')
-    : stageAccessVerdict.value?.decision === 'warn'
-      ? t('chat.history.emptyStageWarn', { name: characterDisplayName.value })
+    ? t('chat.history.emptyDm')
     : t('chat.history.empty')
 ))
 
@@ -219,133 +237,27 @@ async function useChatAssistSuggestion(message: string) {
   chatAssistOpen.value = false
 }
 
-const stageAccessNoticeTitle = computed(() => {
-  if (stageAccessVerdict.value?.decision === 'block') return t('chat.stageAccess.blockTitle')
-  if (stageAccessVerdict.value?.decision === 'warn') {
-    return t('chat.stageAccess.warnTitle', { name: characterDisplayName.value })
-  }
-  return t('chat.stageAccess.allowTitle', { name: characterDisplayName.value })
-})
-
 const stageTabSubtitle = computed(() => {
   if (currentActivityLoading.value && !currentActivity.value) {
     return t('chat.mode.stagePreparing', { name: characterDisplayName.value })
   }
-  if (stageAccessLoading.value) return t('chat.mode.stageChecking')
   return t('chat.mode.stageHint')
 })
 
-// Single source of truth for the notice's visible/collapsed/details
-// booleans. Stage attempts and retries are explicit player actions, so
-// refusals always open the notice and keep phone/meet/retry/add-context
-// affordances reachable. The notice opens collapsed; expansion is the
-// player's per-notice toggle.
-const stageAccessNoticeState = computed(() => resolveStageAccessNotice({
-  noticeOpen: stageAccessNoticeOpen.value,
-  decision: stageAccessVerdict.value?.decision ?? null,
-  expanded: stageAccessNoticeExpanded.value,
-}))
-
-const shouldShowStageAccessNotice = computed(() => stageAccessNoticeState.value.visible)
-
-const isStageAccessNoticeCollapsed = computed(() => stageAccessNoticeState.value.collapsed)
-
-const shouldShowStageAccessNoticeDetails = computed(() => stageAccessNoticeState.value.showDetails)
-
-const shouldShowStageAccessContextForm = computed(() => (
-  shouldShowStageAccessNoticeDetails.value && stageAccessContextFormOpen.value
-))
-
-async function selectInteractionMode(mode: ChatInteractionMode) {
-  if (mode === 'stage') {
-    await refreshStageAccess()
-  }
-  if (mode === 'stage' && !canUseStageAccess(stageAccessVerdict.value)) {
-    // Explicit player action — the notice always opens so the refusal is
-    // explained and the phone/meet/retry affordances stay reachable.
-    interactionMode.value = 'dm'
-    stageAccessNoticeOpen.value = stageAccessVerdict.value !== null
-      && shouldOpenStageAccessNotice('explicit', true)
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
-    focusInput()
-    return
-  }
+// Switching surface is a local state change and nothing else (plan SA,
+// D1). With no gate to consult there is no in-between "checking..." state
+// to render and no refusal to explain: same-space is the player declaring
+// where they are, and whether that fits the character's day is answered
+// inside the reply, by the character.
+function selectInteractionMode(mode: ChatInteractionMode) {
   interactionMode.value = mode
-  stageAccessNoticeOpen.value = mode === 'stage' && stageAccessVerdict.value?.decision === 'warn'
-  stageAccessNoticeExpanded.value = false
-  stageAccessContextFormOpen.value = false
   focusInput()
 }
 
 function currentPresenceFrame(hasAttachments: boolean) {
-  return interactionMode.value === 'stage' && canUseStageAccess(stageAccessVerdict.value)
-    ? webStagePresenceFrame(hasAttachments, stageAccessVerdict.value)
+  return interactionMode.value === 'stage'
+    ? webStagePresenceFrame(hasAttachments)
     : webDmPresenceFrame(hasAttachments)
-}
-
-function switchToPhoneFromNotice() {
-  interactionMode.value = 'dm'
-  stageAccessNoticeOpen.value = false
-  stageAccessNoticeExpanded.value = false
-  stageAccessContextFormOpen.value = false
-  focusInput()
-}
-
-function fillMeetingOpener() {
-  if (!props.character) return
-  inputText.value = stageAccessVerdict.value?.suggested_opener
-    || t('chat.stageAccess.defaultMeetingOpener', { name: props.character.name })
-  interactionMode.value = 'dm'
-  stageAccessNoticeOpen.value = false
-  stageAccessNoticeExpanded.value = false
-  stageAccessContextFormOpen.value = false
-  focusInput()
-}
-
-async function retryStageAccess() {
-  stageAccessNoticeOpen.value = false
-  stageAccessNoticeExpanded.value = false
-  stageAccessContextFormOpen.value = false
-  await refreshStageAccess()
-  if (stageAccessVerdict.value && !canUseStageAccess(stageAccessVerdict.value)) {
-    // Retry is an explicit player action — always explain the outcome.
-    stageAccessNoticeOpen.value = shouldOpenStageAccessNotice(
-      'explicit',
-      true,
-    )
-    stageAccessNoticeExpanded.value = false
-  }
-}
-
-function toggleStageAccessContextForm() {
-  stageAccessNoticeExpanded.value = true
-  stageAccessContextFormOpen.value = !stageAccessContextFormOpen.value
-}
-
-async function submitStageAccessStatus() {
-  const status = stageAccessStatusDraft.value.trim()
-  if (!status || stageAccessStatusSaving.value) {
-    stageAccessStatusError.value = t('chat.stageAccess.contextRequired')
-    return
-  }
-  stageAccessStatusSaving.value = true
-  stageAccessStatusError.value = null
-  try {
-    const profile = await updateOperatorProfile({ current_status: status })
-    window.dispatchEvent(new CustomEvent('kokoro:operator-profile-updated', {
-      detail: profile,
-    }))
-    stageAccessStatusDraft.value = ''
-    stageAccessContextFormOpen.value = false
-    await retryStageAccess()
-  } catch (error) {
-    stageAccessStatusError.value = error instanceof Error
-      ? t('common.errorWithDetail', { message: t('chat.stageAccess.contextSaveFailed'), detail: error.message })
-      : t('chat.stageAccess.contextSaveFailed')
-  } finally {
-    stageAccessStatusSaving.value = false
-  }
 }
 
 // Files the user has picked but not yet sent. Each entry = one image
@@ -600,7 +512,6 @@ let activityTimer: ReturnType<typeof setInterval> | null = null
 async function refreshCurrentActivity() {
   if (!props.character) {
     currentActivity.value = null
-    stageAccessVerdict.value = null
     return
   }
   currentActivityLoading.value = true
@@ -611,22 +522,6 @@ async function refreshCurrentActivity() {
     currentActivity.value = null
   } finally {
     currentActivityLoading.value = false
-  }
-}
-
-async function refreshStageAccess() {
-  if (!props.character) {
-    stageAccessVerdict.value = null
-    return
-  }
-  stageAccessLoading.value = true
-  try {
-    const verdict = await getStageAccess(props.character.id)
-    stageAccessVerdict.value = verdict
-  } catch {
-    stageAccessVerdict.value = null
-  } finally {
-    stageAccessLoading.value = false
   }
 }
 
@@ -658,20 +553,12 @@ watch(() => props.character?.id ?? null, (characterId) => {
   }
   if (characterId) {
     interactionMode.value = 'dm'
-    stageAccessVerdict.value = null
-    stageAccessNoticeOpen.value = false
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
     refreshCurrentActivity()
     activityTimer = setInterval(() => {
       refreshCurrentActivity()
     }, 60_000)
   } else {
     currentActivity.value = null
-    stageAccessVerdict.value = null
-    stageAccessNoticeOpen.value = false
-    stageAccessNoticeExpanded.value = false
-    stageAccessContextFormOpen.value = false
   }
 }, { immediate: true })
 
@@ -720,17 +607,43 @@ function handleBubbleRevealProgress(index: number) {
   void scrollToBottom()
 }
 
+/**
+ * The wallet as the pre-check sees it. Reads the shared badge snapshot — no
+ * extra request on the send path — and stays deliberately timid: an unknown
+ * or stale balance never refuses a turn (see `shortfallFor`).
+ */
+function currentBalanceView() {
+  return {
+    total: cloudCredits.total.value,
+    known: cloudCredits.hasBalance.value,
+    stale: cloudCredits.stale.value,
+  }
+}
+
 async function handleSend() {
   if (!props.character || sending.value) return
   const hasText = inputText.value.trim().length > 0
   const hasImages = stagedAttachments.value.length > 0
   if (!hasText && !hasImages) return
 
+  // AP2 pre-check: with a fixed, published price we can tell the player the
+  // turn will not go through *before* their sentence disappears into a send
+  // that ends in a 402. Runs before anything is cleared, so the text they
+  // wrote is still in the box when they come back from topping up.
+  const shortfall = actionPricing.shortfallFor(ACTION_CHAT, currentBalanceView())
+  if (shortfall !== null) {
+    creditsRequiredCr.value = shortfall
+    creditsExhausted.value = true
+    await scrollToBottom()
+    return
+  }
+
   const userText = inputText.value.trim() || t('chat.input.attachWithImage')
   const toUpload = stagedAttachments.value.slice()
   inputText.value = ''
   uploadError.value = null
   creditsExhausted.value = false
+  creditsRequiredCr.value = null
   demoLimitReached.value = false
   const sendingLockId = beginSendingLock()
 
@@ -821,8 +734,7 @@ async function handleSend() {
     }
     emit('conversationUpdate', reply.conversation_id, [...localMessages.value], updatedChar)
     // The post-turn processor may have nudged the character forward in
-    // their schedule; refresh the cheap activity badge without invoking the
-    // Stage Access LLM judge.
+    // their schedule; refresh the cheap activity badge.
     refreshCurrentActivity()
     // The turn just spent credits — settle the badge on the post-charge
     // number rather than leaving the player to guess.
@@ -843,6 +755,15 @@ async function handleSend() {
       // The notice card carries that promise plus the top-up CTA, so a
       // generic error bubble here would only muddy it.
       creditsExhausted.value = true
+    } else if (isPriceChangedError(err)) {
+      // The quoted Lume price moved mid-session; nothing was charged. Pull
+      // the refreshed list so the composer hint shows the number the next
+      // send will actually bind to.
+      actionPricing.refresh()
+      localMessages.value.push({
+        role: 'assistant',
+        content: t('chat.priceChanged'),
+      })
     } else if (cloudMode.value && isDemoMessageCapError(err)) {
       demoLimitReached.value = true
     } else {
@@ -1070,104 +991,11 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <div
-        v-if="shouldShowStageAccessNotice && stageAccessVerdict"
-        class="stage-access-notice"
-        :class="[
-          `stage-access-notice--${stageAccessVerdict.decision}`,
-          { 'is-collapsed': isStageAccessNoticeCollapsed },
-        ]"
-      >
-        <div class="stage-access-main">
-          <div class="stage-access-copy">
-            <span class="stage-access-title">{{ stageAccessNoticeTitle }}</span>
-            <span class="stage-access-reason">{{ stageAccessVerdict.reason_for_user }}</span>
-          </div>
-          <button
-            type="button"
-            class="ui-btn ui-btn--ghost stage-access-toggle"
-            :aria-expanded="!isStageAccessNoticeCollapsed"
-            :aria-label="isStageAccessNoticeCollapsed
-              ? t('chat.stageAccess.expandDetails')
-              : t('chat.stageAccess.collapseDetails')"
-            @click="stageAccessNoticeExpanded = !stageAccessNoticeExpanded"
-          >
-            <span v-if="isStageAccessNoticeCollapsed" class="stage-access-toggle-label">
-              {{ t('chat.stageAccess.expandDetails') }}
-            </span>
-            <span aria-hidden="true">{{ isStageAccessNoticeCollapsed ? '▾' : '▴' }}</span>
-          </button>
-          <div v-if="shouldShowStageAccessNoticeDetails" class="stage-access-actions">
-            <button
-              type="button"
-              class="ui-btn ui-btn--ghost stage-access-action"
-              @click="switchToPhoneFromNotice"
-            >
-              {{ t('chat.stageAccess.usePhone') }}
-            </button>
-            <button
-              type="button"
-              class="ui-btn ui-btn--ghost stage-access-action"
-              @click="fillMeetingOpener"
-            >
-              {{ t('chat.stageAccess.askToMeet', { name: characterDisplayName }) }}
-            </button>
-            <button
-              type="button"
-              class="ui-btn ui-btn--ghost stage-access-action"
-              @click="retryStageAccess"
-            >
-              {{ t('chat.stageAccess.retry') }}
-            </button>
-            <button
-              type="button"
-              class="ui-btn ui-btn--ghost stage-access-action"
-              @click="toggleStageAccessContextForm"
-            >
-              {{ stageAccessContextFormOpen ? t('chat.stageAccess.contextClose') : t('chat.stageAccess.contextOpen') }}
-            </button>
-          </div>
-        </div>
-        <form
-          v-if="shouldShowStageAccessContextForm"
-          class="stage-access-context"
-          @submit.prevent="submitStageAccessStatus"
-        >
-          <label class="field-label" for="stage-access-current-status">
-            {{ t('chat.stageAccess.contextLabel') }}
-          </label>
-          <div class="stage-access-context-row">
-            <input
-              id="stage-access-current-status"
-              v-model="stageAccessStatusDraft"
-              type="text"
-              class="field-input stage-access-context-input"
-              :placeholder="t('chat.stageAccess.contextPlaceholder', { name: characterDisplayName })"
-              :disabled="stageAccessStatusSaving"
-            />
-            <button
-              type="submit"
-              class="ui-btn ui-btn--primary stage-access-context-submit"
-              :disabled="stageAccessStatusSaving || !stageAccessStatusDraft.trim()"
-            >
-              {{ stageAccessStatusSaving ? t('chat.stageAccess.contextSaving') : t('chat.stageAccess.contextSubmit') }}
-            </button>
-          </div>
-          <span
-            class="stage-access-context-hint"
-            :class="{ 'stage-access-context-hint--error': stageAccessStatusError }"
-          >
-            {{ stageAccessStatusError || t('chat.stageAccess.contextHint', { name: characterDisplayName }) }}
-          </span>
-        </form>
-      </div>
-
       <div ref="messagesContainer" class="messages-container">
         <ChatFirstTurnGuide
           v-if="localMessages.length === 0 && !sending && !loadingHistory"
           :character-name="character.name"
           :mode="interactionMode"
-          :stage-blocked="stageAccessVerdict?.decision === 'block'"
           :context="emptyMessage"
           @select-starter="useStarterMessage"
         />
@@ -1207,6 +1035,7 @@ onUnmounted(() => {
         <InsufficientCreditsNotice
           v-if="creditsExhausted"
           class="chat-credits-notice"
+          :required-cr="creditsRequiredCr"
         />
 
         <!-- 試玩上限：雲端專用卡片，把玩家帶回帳號中心註冊正式方案。 -->
@@ -1386,6 +1215,19 @@ onUnmounted(() => {
             {{ sending ? t('chat.input.sending') : t('chat.input.send') }}
           </button>
         </div>
+        <!-- 明碼標價：送出前就看得到這則對話的價格。查不到價格（自架站、按用量
+             計費的方案、價目表讀不到）時完全不輸出節點。 -->
+        <div class="chat-price-row">
+          <!-- 一則訊息的價格不含圖：他在對話中畫圖是另一筆，所以在同一行一併
+               揭露，不讓玩家事後才發現多扣。查不到圖片價格就整段不出現。 -->
+          <span v-if="chatImageExtraText" class="chat-price-extra">
+            {{ chatImageExtraText }}
+          </span>
+          <ActionPriceHint
+            :action-key="ACTION_CHAT"
+            tooltip-key="credits.price.chatTooltip"
+          />
+        </div>
       </div>
     </template>
   </div>
@@ -1467,138 +1309,6 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
-.stage-access-notice {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--color-border);
-  background: rgba(255, 255, 255, 0.035);
-  flex-shrink: 0;
-}
-
-.stage-access-notice.is-collapsed {
-  gap: 0;
-  padding-top: 6px;
-  padding-bottom: 6px;
-}
-
-.stage-access-main {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.stage-access-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.stage-access-notice.is-collapsed .stage-access-copy {
-  flex-direction: row;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.stage-access-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--color-text-primary);
-  flex: 0 0 auto;
-}
-
-.stage-access-notice.is-collapsed .stage-access-title {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.stage-access-reason {
-  font-size: 12px;
-  line-height: 1.35;
-  color: var(--color-text-secondary);
-}
-
-.stage-access-notice.is-collapsed .stage-access-reason {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.stage-access-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  flex-shrink: 1;
-}
-
-.stage-access-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex: 0 0 auto;
-  min-width: 30px;
-  min-height: 28px;
-  padding: 4px 8px;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.stage-access-toggle-label {
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.stage-access-action {
-  min-height: 32px;
-  padding: 6px 9px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.stage-access-context {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.stage-access-context-row {
-  display: flex;
-  gap: 8px;
-  align-items: stretch;
-}
-
-.stage-access-context-input {
-  flex: 1;
-  min-width: 0;
-}
-
-.stage-access-context-submit {
-  flex: 0 0 auto;
-  min-height: 34px;
-  padding: 6px 11px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.stage-access-context-hint {
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  line-height: 1.35;
-}
-
-.stage-access-context-hint--error {
-  color: #ff8a75;
-}
 
 .mode-tab {
   gap: 8px;
@@ -1673,37 +1383,6 @@ onUnmounted(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
     padding: 6px 10px;
-  }
-
-  .stage-access-notice {
-    align-items: stretch;
-    padding: 8px 10px;
-  }
-
-  .stage-access-main,
-  .stage-access-actions {
-    align-items: stretch;
-  }
-
-  .stage-access-main {
-    flex-direction: column;
-  }
-
-  .stage-access-notice.is-collapsed .stage-access-main {
-    flex-direction: row;
-  }
-
-  .stage-access-notice.is-collapsed .stage-access-copy {
-    min-width: 0;
-  }
-
-  .stage-access-actions {
-    justify-content: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .stage-access-context-row {
-    flex-direction: column;
   }
 
   .mode-tab {
@@ -2043,6 +1722,23 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   align-items: stretch;
+}
+
+/* Sits under the composer, right-aligned against the send button. Both parts
+   render nothing when there is no price to quote, so the row costs nothing. */
+.chat-price-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: -4px;
+}
+
+.chat-price-extra {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .staged-attachments {

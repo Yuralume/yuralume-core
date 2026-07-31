@@ -8,6 +8,9 @@ read as two separate index-served queries (never one ``OR ... LIMIT`` that would
 let a saturated overlap window starve the forward frontier), leaning on the
 ``(created_at, id)`` composite index for the overlap-window range scan and the
 primary key for the frontier keyset scan.
+
+Payload serialization is fail-loud: invalid mappings raise before a row is
+added. They must never degrade to durable ``{}`` events reported as success.
 """
 
 from __future__ import annotations
@@ -182,9 +185,10 @@ def _to_event(row: RealtimeEventRow) -> StoredRealtimeEvent:
 def _dump(payload: Mapping[str, Any]) -> str:
     try:
         return json.dumps(dict(payload), ensure_ascii=False)
-    except (TypeError, ValueError):
-        _LOGGER.exception("realtime outbox payload not serializable")
-        return "{}"
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "realtime outbox payload must be JSON-serializable",
+        ) from exc
 
 
 def _load(raw: str | None) -> dict[str, Any]:

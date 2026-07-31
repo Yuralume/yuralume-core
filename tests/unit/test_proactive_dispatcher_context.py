@@ -20,6 +20,7 @@ from kokoro_link.contracts.proactive import (
     ProactiveDeciderPort,
 )
 from kokoro_link.domain.entities.channel_binding import ChannelBinding
+from kokoro_link.domain.entities.character_goal import CharacterGoal
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.entities.operator_persona import OperatorPersona
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
@@ -320,3 +321,78 @@ async def test_dispatcher_adds_persona_curiosity_plan_to_proactive_context() -> 
     assert len(curiosity_context.planned_calls) == 1
     assert curiosity_context.planned_calls[0]["plan"] == plan
     assert curiosity_context.planned_calls[0]["now"] == now
+
+
+@pytest.mark.asyncio
+async def test_active_goals_carry_how_long_ago_they_were_set() -> None:
+    """A goal frozen with a relative word ("陪使用者明早去吃刨冰") reads as
+    forever-tomorrow days after it was written. Injecting the goal's age
+    gives the decider the one fact it needs to notice the promise is
+    stale (COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P2d)."""
+    now = datetime(2026, 7, 29, 6, 0, tzinfo=timezone.utc)
+    harness = build_messaging_harness()
+    dto = await create_character(harness)
+    character = await harness.character_repository.get(dto.id)
+    assert character is not None
+    enabled = character.update(
+        name=None, summary=None, personality=None, interests=None,
+        speaking_style=None, boundaries=None, aspirations=None, appearance=None,
+        state=CharacterState(
+            emotion="平靜", affection=50, fatigue=0, trust=60, energy=80,
+            last_active_at=now - timedelta(hours=2),
+        ),
+        proactive_enabled=True,
+    )
+    await harness.character_repository.save(enabled)
+
+    goal_repo = InMemoryGoalRepository()
+    await goal_repo.add(
+        CharacterGoal.create(
+            character_id=character.id,
+            content="陪使用者明早一起出門吃刨冰",
+            priority=4,
+            created_at=now - timedelta(days=3),
+        ),
+    )
+    await goal_repo.add(
+        CharacterGoal.create(
+            character_id=character.id,
+            content="把新學的和弦練熟",
+            priority=3,
+            created_at=now - timedelta(hours=4),
+        ),
+    )
+
+    account = await create_telegram_account(harness, character_id=character.id)
+    await harness.binding_repository.save(
+        ChannelBinding.create(
+            account_id=account.id, chat_ref="c1", accepts_proactive=True,
+        ),
+    )
+
+    decider = _CapturingDecider()
+    dispatcher = ProactiveDispatcher(
+        character_repository=harness.character_repository,
+        conversation_repository=harness.conversation_repository,
+        account_repository=harness.account_repository,
+        binding_repository=harness.binding_repository,
+        attempt_repository=InMemoryProactiveAttemptRepository(),
+        gate=HeuristicProactiveGate(
+            local_tz=timezone.utc, quiet_hour_start=0, quiet_hour_end=0,
+        ),
+        decider=decider,
+        adapters={
+            Platform.TELEGRAM: harness.telegram_adapter,
+            Platform.LINE: harness.line_adapter,
+        },
+        goal_repository=goal_repo,
+    )
+
+    await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert decider.last_context is not None
+    goals_text = decider.last_context.active_goals_text
+    assert "陪使用者明早一起出門吃刨冰（優先 4）（3 天前立下）" in goals_text
+    assert "把新學的和弦練熟（優先 3）（今天立下）" in goals_text

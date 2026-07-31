@@ -355,7 +355,14 @@ async def test_operator_pending_or_wish_activity_does_not_write_shared_memory() 
 
 
 @pytest.mark.asyncio
-async def test_operator_confirmed_shared_activity_can_be_memorialized() -> None:
+async def test_operator_confirmed_shared_needs_participation_evidence() -> None:
+    """CF4 tightening of the pre-existing "confirmed → just memorialise it"
+    path. An agreement is not attendance: with no aftermath port wired
+    (and therefore no LLM account of what actually happened) and no
+    reachable interaction history, the planner's "一起看電影" text is an
+    unproven plan, so nothing is written. The positive path — evidence
+    present, or the model supplying a factual line — lives in
+    ``test_schedule_memorializer_shared_activity.py``."""
     schedule_repo = InMemoryScheduleRepository()
     memory_repo = InMemoryMemoryRepository()
     memorializer = ScheduleMemorializer(
@@ -387,13 +394,12 @@ async def test_operator_confirmed_shared_activity_can_be_memorialized() -> None:
         now=datetime(2026, 4, 18, 13, 0, tzinfo=UTC),
     )
 
-    assert count == 1
-    memories = await memory_repo.query("c1", limit=10)
-    assert len(memories) == 1
-    assert memories[0].participants[0].role == OPERATOR_CONFIRMED_SHARED_ROLE
+    assert count == 0
+    assert await memory_repo.query("c1", limit=10) == []
     reloaded = await schedule_repo.get("c1", today)
     assert reloaded is not None
-    assert reloaded.activities[0].has_memory is True
+    assert reloaded.activities[0].memorialized is True
+    assert reloaded.activities[0].has_memory is False
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,16 @@ _DEFAULT_HOLD_SECONDS = 0.05
 # to an effective concurrency of 1 regardless of the spec. Dry-run stays sequential
 # (fast, read-only; its 1:1 work-set mirror for the §14 compare must not reorder).
 _DEFAULT_EXECUTION_CONCURRENCY = 2
+# GD0 graceful stop: how long ``stop()`` lets the in-flight batch finish before
+# it falls back to cancellation. An execution-mode job holds a 120s lease
+# (``_DEFAULT_EXECUTION_LEASE_SECONDS``) while its provider call runs, so a job
+# that started an instant before SIGTERM can legitimately need the whole lease
+# width plus a moment for its terminal complete/fail write — hence lease + 30s
+# headroom. The deployment ``stop_grace_period`` is set wider still so the
+# container is not SIGKILLed mid-wait. Past this ceiling we cancel anyway: the
+# crash-safe heartbeat / lease-expiry path stays the backstop, not the primary
+# mechanism.
+_STOP_WAIT_SECONDS = _DEFAULT_EXECUTION_LEASE_SECONDS + 30
 _BACKOFF_BASE_SECONDS = 5
 _BACKOFF_CAP_SECONDS = 300
 _SKIP_MISSING = "missing_character"
@@ -156,8 +166,13 @@ class ShadowDryRunWorker:
             return
         self._stop_event.set()
         try:
-            await asyncio.wait_for(self._task, timeout=5.0)
+            await asyncio.wait_for(self._task, timeout=_STOP_WAIT_SECONDS)
         except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "shadow worker: in-flight batch still running after %ss — "
+                "cancelling worker=%s (lease expiry is the backstop)",
+                _STOP_WAIT_SECONDS, self._worker_id,
+            )
             self._task.cancel()
         finally:
             self._task = None
@@ -231,6 +246,11 @@ class ShadowDryRunWorker:
         else:
             for job in claimed:
                 self._counters.claimed += 1
+                # GD0: shutdown boundary sits immediately BEFORE the job runs,
+                # so a job already mid-validation is never interrupted.
+                if self._stop_requested():
+                    await self._release_unstarted(job, resolved, refresh=refresh)
+                    continue
                 await self._process(job, resolved, refresh=refresh)
         return len(claimed)
 
@@ -244,6 +264,15 @@ class ShadowDryRunWorker:
         async def _run_one(job: ClaimedJob) -> None:
             self._counters.claimed += 1
             async with semaphore:
+                # GD0 shutdown boundary. Checked here — after the semaphore, so
+                # it catches every job still queued behind the in-flight cohort,
+                # and before any effect runs — so a stopping worker hands its
+                # untouched claims straight back instead of parking them for a
+                # lease TTL. Jobs already inside ``_process_execute`` are left
+                # alone; ``stop()``'s widened wait is what protects them.
+                if self._stop_requested():
+                    await self._release_unstarted(job, resolved, refresh=refresh)
+                    return
                 # Re-check ownership per job just before running it (a batch can
                 # span a mode flip); each keeps its own heartbeat inside the runner.
                 if not await self._execution_permitted():
@@ -254,6 +283,43 @@ class ShadowDryRunWorker:
                 )
 
         await asyncio.gather(*(_run_one(job) for job in claimed))
+
+    def _stop_requested(self) -> bool:
+        """Whether shutdown has been signalled (GD0).
+
+        ``None`` before ``start()`` / after ``stop()`` completes — a worker
+        driven directly by ``run_once`` (tests, the soak harness) never sees a
+        stop event and behaves exactly as before."""
+        return self._stop_event is not None and self._stop_event.is_set()
+
+    async def _release_unstarted(
+        self, job: ClaimedJob, claim_now: datetime, *, refresh: bool,
+    ) -> None:
+        """Give a claim back because shutdown pre-empted the job before it ran.
+
+        A surviving worker can pick it up on its very next claim pass rather
+        than waiting out the lease. Best-effort by design: any failure — a dead
+        DB connection mid-shutdown, a lease another worker already took, an
+        adapter without the method — is logged and swallowed. Shutdown must
+        never block on the queue, and an unreleased claim still frees itself
+        when its lease expires."""
+        try:
+            released = await self._queue.release_claim(
+                job.id, self._worker_id,
+                now=self._finish_now(claim_now, refresh),
+            )
+        except Exception:
+            _LOGGER.warning(
+                "shadow worker: un-claim failed during shutdown job=%s kind=%s "
+                "— falling back to lease expiry", job.id, job.kind,
+                exc_info=True,
+            )
+            return
+        if not released:
+            _LOGGER.info(
+                "shadow worker: un-claim skipped (lease no longer ours) "
+                "job=%s kind=%s", job.id, job.kind,
+            )
 
     async def _execution_permitted(self) -> bool:
         """Whether the worker should EXECUTE (vs dry-run) this batch.

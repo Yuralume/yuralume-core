@@ -24,6 +24,7 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_PERSONA_PROJECTION,
     FEATURE_PROMPT_MATERIAL_DIGEST,
     FEATURE_REGISTER_PROFILE,
+    FEATURE_SCHEDULE_WEATHER_DRIFT,
     FEATURE_GROUP_LIGHT_OBSERVERS,
     FEATURE_GROUP_MULTIMODAL_PERCEPTION,
     FEATURE_TO_GROUP,
@@ -105,6 +106,18 @@ def test_feature_groups_have_complete_catalogue_metadata() -> None:
 def test_prompt_material_digest_and_register_profile_use_light_observer_group() -> None:
     assert FEATURE_TO_GROUP[FEATURE_PROMPT_MATERIAL_DIGEST] == FEATURE_GROUP_LIGHT_OBSERVERS
     assert FEATURE_TO_GROUP[FEATURE_REGISTER_PROFILE] == FEATURE_GROUP_LIGHT_OBSERVERS
+
+
+def test_schedule_weather_drift_is_routable_as_a_light_observer() -> None:
+    # Short context (a handful of blocks + the weather facts), low risk, and
+    # it must be cheap enough to run on the tick — same shape as the other
+    # per-activity judges it sits next to.
+    assert FEATURE_SCHEDULE_WEATHER_DRIFT in GLOBAL_FEATURE_KEYS
+    assert FEATURE_LABELS[FEATURE_SCHEDULE_WEATHER_DRIFT]
+    assert (
+        FEATURE_TO_GROUP[FEATURE_SCHEDULE_WEATHER_DRIFT]
+        == FEATURE_GROUP_LIGHT_OBSERVERS
+    )
 
 
 def test_reply_quality_gate_uses_critic_review_group() -> None:

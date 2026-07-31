@@ -115,7 +115,12 @@ class SaRssSourceRepository:
             await session.commit()
 
     async def mark_error(
-        self, source_id: str, *, at: datetime, error: str,
+        self,
+        source_id: str,
+        *,
+        at: datetime,
+        error: str,
+        fetched_count: int = 0,
     ) -> None:
         async with self._session_factory() as session:
             await session.execute(
@@ -124,6 +129,10 @@ class SaRssSourceRepository:
                 .values(
                     last_attempt_at=at,
                     last_error=(error or "unknown error")[:500],
+                    fetched_count_total=(
+                        RssSourceRow.fetched_count_total
+                        + max(0, int(fetched_count))
+                    ),
                 )
             )
             await session.commit()

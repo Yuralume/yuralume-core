@@ -70,10 +70,12 @@ class _CapturingModel(ChatModelPort):
         *,
         provider_id: str = "fake",
         supports_vision: bool,
+        prefers_public_image_urls: bool = False,
         reply: str = "收到了",
     ) -> None:
         self.provider_id = provider_id
         self.supports_vision = supports_vision
+        self.prefers_public_image_urls = prefers_public_image_urls
         self.reply = reply
         self.last_prompt: str | None = None
         self.last_image_urls: tuple[str, ...] | None = None
@@ -406,6 +408,91 @@ async def test_vision_model_gets_base64_data_url_for_storage_uploads(tmp_path) -
     assert url.startswith("data:image/png;base64,")
     # Prompt unchanged — vision path doesn't need the text placeholder.
     assert "模型不支援視覺" not in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_model_gets_public_url_without_reading_object_bytes(
+    tmp_path,
+) -> None:
+    """Hosted Cloud keeps storage bytes out of the Core-to-Gateway JSON."""
+
+    class _NoReadStorage(InMemoryObjectStorage):
+        async def get_bytes(self, *, object_key: str) -> bytes:
+            raise AssertionError(f"must not inline hosted object {object_key}")
+
+    storage = _NoReadStorage(public_base_url="/uploads")
+    await storage.put_bytes(
+        object_key="chat-uploads/incident.png",
+        content=b"x" * 2_424_969,
+        content_type="image/png",
+    )
+    model = _CapturingModel(
+        supports_vision=True,
+        prefers_public_image_urls=True,
+    )
+    chat, chars, _ = _build(
+        supports_vision=True,
+        public_base_url="https://core.example",
+        object_storage=storage,
+        model=model,
+    )
+    created = await chars.create_character(CreateCharacterRequest(name="Yuki"))
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=created.id,
+        message="看看這張",
+        attachment_urls=["/uploads/chat-uploads/incident.png"],
+    ))
+
+    assert model.last_image_urls == (
+        "https://core.example/uploads/chat-uploads/incident.png",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_image_recognition_route_also_uses_public_object_url() -> None:
+    """A text-only main model must not reintroduce base64 in its preflight."""
+
+    class _NoReadStorage(InMemoryObjectStorage):
+        async def get_bytes(self, *, object_key: str) -> bytes:
+            raise AssertionError(f"must not inline hosted object {object_key}")
+
+    storage = _NoReadStorage(public_base_url="/uploads")
+    await storage.put_bytes(
+        object_key="chat-uploads/recognize.png",
+        content=b"x" * 1_000_000,
+        content_type="image/png",
+    )
+    main = _CapturingModel(supports_vision=False, reply="主回覆")
+    recognition = _CapturingModel(
+        supports_vision=True,
+        prefers_public_image_urls=True,
+        reply="[圖 1] 一隻貓",
+    )
+    provider = _RoutingActiveProvider(
+        chat_model=main,
+        image_model=recognition,
+    )
+    chat, chars, _ = _build(
+        supports_vision=False,
+        public_base_url="https://core.example",
+        object_storage=storage,
+        active_llm_provider=provider,
+        model=main,
+    )
+    created = await chars.create_character(CreateCharacterRequest(name="Yuki"))
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=created.id,
+        message="這是什麼？",
+        attachment_urls=["/uploads/chat-uploads/recognize.png"],
+    ))
+
+    assert recognition.last_image_urls == (
+        "https://core.example/uploads/chat-uploads/recognize.png",
+    )
+    assert main.last_image_urls == ()
+    assert "[圖 1] 一隻貓" in (main.last_prompt or "")
 
 
 @pytest.mark.asyncio

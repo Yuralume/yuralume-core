@@ -24,6 +24,8 @@ def schedule_to_row(schedule: DailySchedule) -> DailyScheduleRow:
         date=schedule.date.isoformat(),
         generated_at=schedule.generated_at,
         is_planned=bool(schedule.is_planned),
+        weather_vet_activity_id=schedule.weather_vet_activity_id,
+        weather_vet_condition=schedule.weather_vet_condition,
     )
     row.activities = [
         _activity_to_row(activity, schedule_id=schedule.id, position=index)
@@ -37,6 +39,8 @@ def apply_schedule_to_row(schedule: DailySchedule, row: DailyScheduleRow) -> Non
     row.date = schedule.date.isoformat()
     row.generated_at = schedule.generated_at
     row.is_planned = bool(schedule.is_planned)
+    row.weather_vet_activity_id = schedule.weather_vet_activity_id
+    row.weather_vet_condition = schedule.weather_vet_condition
     # Fully replace the activity collection; cascade delete-orphan cleans rows.
     row.activities = [
         _activity_to_row(activity, schedule_id=schedule.id, position=index)
@@ -91,6 +95,10 @@ def row_to_schedule(row: DailyScheduleRow) -> DailySchedule:
         # 2026-05-17 migration (column default fills True for them).
         # Treat the absence as "planned" to match historical behaviour.
         is_planned=bool(getattr(row, "is_planned", True)),
+        # Same tolerance for rows predating the weather-vet migration: an
+        # absent marker simply means the drift gate is open for that day.
+        weather_vet_activity_id=getattr(row, "weather_vet_activity_id", None),
+        weather_vet_condition=getattr(row, "weather_vet_condition", None),
     )
 
 

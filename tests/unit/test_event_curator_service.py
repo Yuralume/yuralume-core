@@ -127,6 +127,21 @@ class _FakeEmbedder(EmbedderPort):
         return [await self.embed(t) for t in texts]
 
 
+class _RaceLosingInbox(InMemoryCharacterEventInboxRepository):
+    """Simulate another curator inserting after this pass's pre-check."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trim_calls = 0
+
+    async def add_many(self, items) -> int:  # noqa: ANN001
+        return 0
+
+    async def trim_oldest(self, character_id: str, *, keep: int) -> int:
+        self.trim_calls += 1
+        return 0
+
+
 async def _seed_event(
     events: InMemoryWorldEventRepository,
     *,
@@ -235,6 +250,25 @@ async def test_dedupe_existing_inbox_rows() -> None:
     second = await curator.curate(char)
     assert first == 1
     assert second == 0, "rerunning the curator must not duplicate inbox rows"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_does_not_report_false_success() -> None:
+    events = InMemoryWorldEventRepository()
+    inbox = _RaceLosingInbox()
+    matched_vec = (1.0, 0.0)
+    embedder = _FakeEmbedder({"遊戲": matched_vec})
+    char = _make_character(interests=["遊戲"])
+    await _seed_event(events, title="遊戲新聞", embedding=matched_vec)
+    curator = EventCuratorService(
+        world_event_repository=events,
+        inbox_repository=inbox,
+        embedder=embedder,
+        match_threshold=0.5,
+    )
+
+    assert await curator.curate(char) == 0
+    assert inbox.trim_calls == 0
 
 
 @pytest.mark.asyncio

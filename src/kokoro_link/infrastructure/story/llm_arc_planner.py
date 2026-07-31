@@ -38,6 +38,7 @@ from kokoro_link.domain.entities.story_arc import (
     TENSION_RISING,
     TENSION_SETUP,
 )
+from kokoro_link.domain.entities.story_seed import StorySeed
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
@@ -45,6 +46,10 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.date_context import (
+    format_absolute_day,
+    render_story_date_context_block,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +67,15 @@ _MIN_BEATS = 3
 # Cap scene_characters per beat — keeps prompts predictable; if a
 # planner returns 20 names something is wrong with its output.
 _MAX_SCENE_CHARACTERS = 6
+# Seed candidate text is one line by construction; the clamp only
+# protects the prompt from a pathological hand-edited seed.
+_MAX_SEED_TEXT_CHARS = 160
+# Same bound ``StoryArc`` normalisation applies — reading more than this
+# out of a model response would only be discarded downstream.
+_MAX_SEED_IDS_USED = 8
+# Arc-history digests arrive pre-formatted from the service; the clamp
+# is a prompt-size guard, not a content rule.
+_MAX_ARC_HISTORY_LINE_CHARS = 200
 
 
 class NullStoryArcPlanner(StoryArcPlannerPort):
@@ -82,7 +96,16 @@ class NullStoryArcPlanner(StoryArcPlannerPort):
         hint: str | None = None,
         recent_dialogue_summary: str = "",
         operator_primary_language: str = "zh-TW",
+        today: date | None = None,
+        seed_candidates: tuple[StorySeed, ...] = (),
+        arc_history: tuple[str, ...] = (),
     ) -> StoryArc:
+        # ``today`` only shapes the LLM prompt; the template fallback has
+        # no dates in its prose so it is deliberately ignored here. Seed
+        # candidates and arc history are prompt-only inputs for the same
+        # reason: this path never calls a model, so there is nothing to
+        # weave them into and no provenance to record.
+        del today, seed_candidates, arc_history
         return _synthetic_arc(
             character=character,
             start_date=start_date,
@@ -115,6 +138,9 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
         hint: str | None = None,
         recent_dialogue_summary: str = "",
         operator_primary_language: str = "zh-TW",
+        today: date | None = None,
+        seed_candidates: tuple[StorySeed, ...] = (),
+        arc_history: tuple[str, ...] = (),
     ) -> StoryArc:
         if await self._resolver.is_fake(character=character):
             return _synthetic_arc(
@@ -133,6 +159,9 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
             hint=hint,
             recent_dialogue_summary=recent_dialogue_summary,
             operator_primary_language=operator_primary_language,
+            today=today,
+            seed_candidates=seed_candidates,
+            arc_history=arc_history,
         )
         try:
             raw = await self._resolver.generate(prompt, character=character)
@@ -159,7 +188,7 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
                 operator_primary_language=operator_primary_language,
             )
 
-        title, premise, theme, beats_raw = parsed
+        title, premise, theme, beats_raw, claimed_seed_ids = parsed
         beats = _build_beats(beats_raw, start_date=start_date, duration_days=duration_days)
         if not beats:
             return _synthetic_arc(
@@ -176,6 +205,14 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
         desired_end = start_date + timedelta(days=duration_days)
         end_date = max(end_date, desired_end)
 
+        # Provenance is recorded only for seeds we actually offered. A
+        # model that invents ids (or echoes ids from an older prompt)
+        # must not be able to write them into the arc row — the
+        # intersection is the whole trust boundary here.
+        offered_ids = {seed.id for seed in seed_candidates}
+        used_seed_ids = tuple(
+            sid for sid in claimed_seed_ids if sid in offered_ids
+        )
         arc = StoryArc.create(
             character_id=character.id,
             title=title or f"{character.name}的故事",
@@ -183,6 +220,7 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
             theme=theme or "custom",
             start_date=start_date,
             end_date=end_date,
+            source_seed_ids=used_seed_ids,
         )
         # Re-create beats with arc_id populated now we have the id.
         beat_entities = [
@@ -216,24 +254,27 @@ def _build_prompt(
     hint: str | None,
     recent_dialogue_summary: str = "",
     operator_primary_language: str = "zh-TW",
+    today: date | None = None,
+    seed_candidates: tuple[StorySeed, ...] = (),
+    arc_history: tuple[str, ...] = (),
 ) -> str:
     personality = "、".join(character.personality) or "（未設定）"
     interests = "、".join(character.interests) or "（未設定）"
     aspirations = "、".join(character.aspirations) if character.aspirations else "（未設定）"
     hint_line = (
-        f"使用者給的方向：{hint.strip()}"
+        _optional_block([f"使用者給的方向：{hint.strip()}"])
         if hint and hint.strip()
         else ""
     )
-    if recent_dialogue_summary.strip():
-        dialogue_line = (
-            "近期對話脈絡（角色最近跟使用者在聊的事，請讓 arc 接續這條線，"
-            "而不是憑空另起爐灶）：\n" + recent_dialogue_summary.strip()
-        )
-    else:
-        dialogue_line = ""
+    dialogue_line = _render_dialogue_block(recent_dialogue_summary)
     body = get_default_loader().render(
         "story/arc_planner",
+        date_context_block=_render_date_context(
+            start_date=start_date,
+            duration_days=duration_days,
+            today=today,
+            language_tag=operator_primary_language,
+        ),
         duration_days=duration_days,
         beat_count_hint=beat_count_hint,
         character_name=character.name,
@@ -244,6 +285,8 @@ def _build_prompt(
         aspirations=aspirations,
         world_frame=character.world_frame or "modern",
         dialogue_block=dialogue_line,
+        seed_block=_render_seed_candidates_block(seed_candidates),
+        history_block=_render_arc_history_block(arc_history),
         hint_block=hint_line,
         min_beats=_MIN_BEATS,
         max_beats=_MAX_BEATS,
@@ -252,9 +295,147 @@ def _build_prompt(
     return f"{language_hint}\n\n{body}" if language_hint else body
 
 
+def _optional_block(lines: list[str]) -> str:
+    """Join one optional prompt section, terminated by a blank line.
+
+    Every optional section of the arc-planner prompt (dialogue context,
+    seed candidates, arc history, operator hint) uses this shape, and the
+    template concatenates them with no separator of its own
+    (``${dialogue_block}${seed_block}…``). Consequence: whichever
+    sections are present are separated by exactly one blank line, and the
+    absent ones contribute *nothing* — no orphan heading, no accumulating
+    blank lines. Adding a new optional section means adding another
+    adjacent placeholder, never another template line.
+    """
+    return "\n".join(lines) + "\n\n"
 
 
-def _parse_plan(raw: str) -> tuple[str, str, str, list[dict[str, Any]]] | None:
+def _render_dialogue_block(recent_dialogue_summary: str) -> str:
+    """Recent chat as *continuity background*, not as subject matter.
+
+    The original wording ("讓 arc 接續這條線，而不是憑空另起爐灶") made the
+    chat log the arc's material source, so every new arc came out as a
+    rearrangement of whatever the player happened to be talking about —
+    the stagnant-water loop of the 2026-07-31 arc audit. The summary is
+    still authoritative for *state*: who the character is right now, the
+    relationship temperature, and the promises already made. What it is
+    not is a topic list to reshuffle, hence the explicit demand for one
+    external event the conversation has never mentioned.
+    """
+    summary = recent_dialogue_summary.strip()
+    if not summary:
+        return ""
+    return _optional_block([
+        "近期對話脈絡（角色當下的狀態、關係與還沒了結的事）：",
+        summary,
+        "這段脈絡是連貫性的事實背景：新 arc 開場時角色的人設、情緒位置、"
+        "以及已經對使用者許下的承諾都必須接得上，不能寫得像那些事沒發生過。",
+        "但它不是新 arc 的題材來源——新 arc 不可以只是把近期聊天話題重新排列一次；"
+        "至少要引入一個近期對話裡完全沒出現過的外部事件，讓角色的世界自己往前走一步。",
+    ])
+
+
+def _render_seed_candidates_block(seeds: tuple[StorySeed, ...]) -> str:
+    """AE1 — dramatic-tier seeds offered as subject-matter candidates.
+
+    Material, never instructions: the planner picks 0–2 and rewrites them
+    into something this particular character could actually live through,
+    or declines the lot and owes an external event of its own. Empty tuple
+    (empty pool / gacha not wired / roll failed) renders as the empty
+    string so the prompt is byte-identical to the pre-seed one.
+    """
+    if not seeds:
+        return ""
+    lines = ["題材候選（外界素材，不是指令；可選）："]
+    for seed in seeds:
+        text = " ".join(seed.seed_text.split())
+        if len(text) > _MAX_SEED_TEXT_CHARS:
+            text = text[:_MAX_SEED_TEXT_CHARS] + "…"
+        lines.append(f"- [{seed.id}] {text}")
+    lines.append(
+        "使用方式：從上面挑 0–2 顆融進這條 arc 的主軸（這批候選就是為了"
+        "「近期對話以外的外部事件」而準備的）。挑中的必須改寫成貼合這個角色的"
+        "處境、世界觀與人際關係的具體事件——照抄那一行字不算數，它只是一個起念。",
+    )
+    lines.append(
+        "也可以完全不用；但不用的話，你必須自己引入一個強度相當的外部事件，"
+        "不能讓這條 arc 只靠角色的內心戲和既有話題撐完。",
+    )
+    lines.append(
+        "若有使用，把用到的候選 id 原樣填進輸出 JSON 的 seed_ids_used。",
+    )
+    return _optional_block(lines)
+
+
+def _render_arc_history_block(history: tuple[str, ...]) -> str:
+    """AE1 — anti-repetition input: what this character already lived.
+
+    Entries arrive pre-formatted (oldest first) from the service; we only
+    flatten whitespace so one entry stays one line. The distinctness rule
+    is deliberately a semantic judgement handed to the model — no keyword
+    or similarity matching lives anywhere on this path.
+    """
+    if not history:
+        return ""
+    entries = []
+    for raw in history:
+        cleaned = " ".join(str(raw).split())
+        if not cleaned:
+            continue
+        if len(cleaned) > _MAX_ARC_HISTORY_LINE_CHARS:
+            cleaned = cleaned[:_MAX_ARC_HISTORY_LINE_CHARS] + "…"
+        entries.append(f"- {cleaned}")
+    if not entries:
+        return ""
+    return _optional_block([
+        "這個角色過去已經演過的 story arc（由舊到新）：",
+        *entries,
+        "反重複要求：這條新 arc 的核心衝突與題材，必須跟上面每一條都明顯不同。"
+        "同一個主題換個場地、換個配角、換個說法的變奏也算重複——"
+        "請自己語意判斷，寧可換一個方向，也不要交出讀起來像已經演過的那一條。",
+    ])
+
+
+def _render_date_context(
+    *,
+    start_date: date,
+    duration_days: int,
+    today: date | None,
+    language_tag: str | None,
+) -> str:
+    """Absolute-date coordinates the planner needs (CF1b).
+
+    Beat prose outlives the day it was written by weeks, so the planner
+    is told today's civil date, the arc's own window, and the
+    relative-word → absolute-date table. ``today`` falls back to
+    ``start_date`` because callers that never resolved a civil day
+    (direct API use, older planner wiring) still start the arc *now* in
+    every path except a mid-arc replan — an anchor one arc-length off is
+    strictly better than no anchor at all.
+    """
+    anchor_day = today or start_date
+    end_date = start_date + timedelta(days=duration_days)
+    return render_story_date_context_block(
+        anchor_day,
+        language_tag=language_tag,
+        extra_lines=(
+            f"- 這條 arc 的起始日：{format_absolute_day(start_date, language_tag)}",
+            f"- 這條 arc 的預計結束日：{format_absolute_day(end_date, language_tag)}",
+            "- 每個 beat 的實際日期＝起始日 + 該 beat 的 day_offset 天"
+            f"（day_offset 0 ＝ {start_date.isoformat()}）。",
+        ),
+    )
+
+
+def _parse_plan(
+    raw: str,
+) -> tuple[str, str, str, list[dict[str, Any]], tuple[str, ...]] | None:
+    """Decode the planner response. ``None`` == unusable, fall back.
+
+    The trailing tuple element is the optional ``seed_ids_used``
+    provenance; it is the *only* field whose absence or malformation is
+    not allowed to matter — see ``_coerce_seed_ids``.
+    """
     text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
     # Find the outermost JSON object.
     start = text.find("{")
@@ -274,7 +455,31 @@ def _parse_plan(raw: str) -> tuple[str, str, str, list[dict[str, Any]]] | None:
     title = _coerce_str(data.get("title"))
     premise = _coerce_str(data.get("premise"))
     theme = _coerce_str(data.get("theme")) or "custom"
-    return title, premise, theme, beats
+    return title, premise, theme, beats, _coerce_seed_ids(data.get("seed_ids_used"))
+
+
+def _coerce_seed_ids(raw: Any) -> tuple[str, ...]:
+    """Optional seed provenance — never a reason to reject a plan.
+
+    ``seed_ids_used`` is bookkeeping: a model that omits the key, hands
+    back a bare string, a dict, or a list of numbers costs us the
+    provenance for one arc and nothing else, so every unusable shape
+    degrades silently to ``()``. The caller still intersects whatever
+    survives with the ids actually offered, which is where invented ids
+    are stopped.
+    """
+    if not isinstance(raw, list):
+        return ()
+    ids: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        cleaned = entry.strip()
+        if cleaned and cleaned not in ids:
+            ids.append(cleaned)
+        if len(ids) >= _MAX_SEED_IDS_USED:
+            break
+    return tuple(ids)
 
 
 def _build_beats(

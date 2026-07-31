@@ -55,6 +55,29 @@ class CountingPlanner:
         )
 
 
+class EmptyPlannedSchedulePlanner:
+    """A successful structured planner response that contains no activities."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def plan_day(
+        self,
+        *,
+        character: Character,
+        date_: date,
+        local_tz: tzinfo,
+        **_: object,
+    ) -> DailySchedule:
+        self.calls += 1
+        return DailySchedule.create(
+            character_id=character.id,
+            date_=date_,
+            activities=[],
+            is_planned=True,
+        )
+
+
 def _character(*, user_id: str = DEFAULT_OPERATOR_ID) -> Character:
     return Character.create(
         name="Mio",
@@ -80,6 +103,23 @@ async def test_ensure_schedule_generates_once_per_day() -> None:
 
     assert planner.calls == 1
     assert first.id == second.id
+
+
+@pytest.mark.asyncio
+async def test_empty_successful_schedule_is_terminal_for_the_day() -> None:
+    """A valid empty result must not become an every-tick paid retry loop."""
+    repo = InMemoryScheduleRepository()
+    planner = EmptyPlannedSchedulePlanner()
+    service = ScheduleService(repository=repo, planner=planner, local_tz=UTC)
+    character = _character()
+
+    first = await service.ensure_schedule(character, date_=date(2026, 4, 18))
+    second = await service.ensure_schedule(character, date_=date(2026, 4, 18))
+
+    assert first.activities == ()
+    assert first.is_planned is True
+    assert second.id == first.id
+    assert planner.calls == 1
 
 
 @pytest.mark.asyncio
@@ -183,15 +223,24 @@ async def test_ensure_schedule_loads_relationship_for_character_owner() -> None:
 @pytest.mark.asyncio
 async def test_ensure_schedule_swallows_planner_errors() -> None:
     class BrokenPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def plan_day(self, **kwargs):  # noqa: ANN003, ANN201
+            self.calls += 1
             raise RuntimeError("planner exploded")
 
     repo = InMemoryScheduleRepository()
-    service = ScheduleService(repository=repo, planner=BrokenPlanner(), local_tz=UTC)
+    planner = BrokenPlanner()
+    service = ScheduleService(repository=repo, planner=planner, local_tz=UTC)
     character = _character()
 
     schedule = await service.ensure_schedule(character, date_=date(2026, 4, 18))
+    repeated = await service.ensure_schedule(character, date_=date(2026, 4, 18))
     assert schedule.activities == ()
+    assert schedule.is_planned is True
+    assert repeated.id == schedule.id
+    assert planner.calls == 1
 
 
 @pytest.mark.asyncio

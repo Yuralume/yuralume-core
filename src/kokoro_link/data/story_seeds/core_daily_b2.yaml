@@ -1,0 +1,444 @@
+# Core daily seeds — batch 2 (cdb2).
+#
+# Universal across every ``world_frame`` — inner life, emotions, senses,
+# body states, small discoveries, small wins, and gentle social ripples.
+# No modern-only props (phones, transit, electricity-as-word); phrasing
+# stays setting-agnostic so the expander can adapt to any world.
+#
+# Tier: daily only. Low stakes, no conflict escalation, resolvable in a
+# 2-3 sentence beat. Emotion range covers mild positives and negatives.
+#
+# Format per entry:
+#   external_id  : cdb2:<category>:<nnn> — unique across all packs.
+#   seed_text    : one-line zh-TW semantic prompt for the expander.
+#   tags         : free-vocabulary labels.
+#   world_frames : [any] for this pack.
+#   tier         : daily for this pack.
+#   regions      : [global] for this pack.
+#   weight       : 0.5-0.8 (daily band).
+#   cooldown_days: >= 60 (two-month no-repeat invariant).
+pack_id: core_daily_b2
+language: zh-TW
+
+seeds:
+  # --- 微酸吃醋 ------------------------------------------------------
+  - external_id: cdb2:sour:001
+    seed_text: 看到在意的人跟別人聊得很開心，嘴上說沒事，語氣卻不太誠實
+    tags: [jealousy, social, sulky]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: cdb2:sour:002
+    seed_text: 對方隨口稱讚了別人一句，自己竟然默默記到現在
+    tags: [jealousy, introspective, petty]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- 損友日常 ------------------------------------------------------
+  - external_id: cdb2:banter:001
+    seed_text: 被損友毫不留情地吐槽了一整天，偏偏對方說的都對
+    tags: [friendship, banter, exasperated]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:banter:002
+    seed_text: 平常互相拆台的朋友，今天突然認真道了一次謝，反而不知道怎麼接
+    tags: [friendship, warm, awkward]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- 深夜時分 ------------------------------------------------------
+  - external_id: cdb2:night:001
+    seed_text: 睡不著的深夜，和同樣醒著的人聊起了平常不會說出口的事
+    tags: [night, heart-to-heart, intimate]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:night:002
+    seed_text: 深夜趕工的幾個人湊在一起吃宵夜互吐苦水，累歸累卻有點熱鬧
+    tags: [night, work, camaraderie]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 同一個屋簷下 --------------------------------------------------
+  - external_id: cdb2:home:001
+    seed_text: 為了誰該做哪件家事小小爭執了一下，最後邊嘀咕邊一起做完
+    tags: [home, chores, bickering]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:home:002
+    seed_text: 深夜想吃宵夜，發現同住的人也偷偷溜出來覓食，兩人相視而笑
+    tags: [home, night, food, warm]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 偶遇 ----------------------------------------------------------
+  - external_id: cdb2:meet:001
+    seed_text: 和陌生人同時伸手拿了同一樣東西，尷尬又好笑的短暫交會
+    tags: [meet-cute, stranger, awkward]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 90
+
+  - external_id: cdb2:meet:002
+    seed_text: 不小心撞翻了別人的東西，慌張道歉之後反而聊了起來
+    tags: [meet-cute, accident, social]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 料理翻車 ------------------------------------------------------
+  - external_id: cdb2:cook:001
+    seed_text: 想做點心送人，成品歪七扭八，猶豫著要不要拿得出手
+    tags: [cooking, gift, embarrassed, sweet]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 漆黑之夜 ------------------------------------------------------
+  - external_id: cdb2:dark:001
+    seed_text: 夜裡照明突然全滅，反而和身邊的人聊了些平常不會聊的話
+    tags: [night, darkness, heart-to-heart]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 撿到毛孩 ------------------------------------------------------
+  - external_id: cdb2:stray:001
+    seed_text: 被一隻小動物一路跟著回家，嘴上說不收留，心裡已經在想名字
+    tags: [animal, soft-hearted, home]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: cdb2:stray:002
+    seed_text: 餵了幾天的小動物今天沒出現，忍不住多繞了一圈找牠
+    tags: [animal, worry, gentle]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 小店常客 ------------------------------------------------------
+  - external_id: cdb2:shop:001
+    seed_text: 常去的那間小店今天沒開，站在門口悵然了一會
+    tags: [routine, disappointment, gentle]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:shop:002
+    seed_text: 常去的店家記住了自己的習慣，被這件小事暖到
+    tags: [routine, warm, belonging]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 幫忙連鎖 ------------------------------------------------------
+  - external_id: cdb2:favor:001
+    seed_text: 答應幫鄰居一個小忙，結果一件接著一件，一個下午就這樣沒了
+    tags: [neighbor, favor, busy, wry]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 內心小劇場 ----------------------------------------------------
+  - external_id: cdb2:thought:001
+    seed_text: 發現自己最近常常提起某個人，被指出來後有點不好意思
+    tags: [introspective, crush-adjacent, embarrassed]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: cdb2:thought:002
+    seed_text: 突然意識到某個習慣是跟身邊的人學來的，覺得又好氣又好笑
+    tags: [introspective, influence, fond]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:thought:003
+    seed_text: 整理東西時翻出以前的小物件，捨不得丟又不知道留著做什麼
+    tags: [nostalgia, clutter, indecision]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:thought:004
+    seed_text: 想到一件很久以前的糗事，一個人突然笑出聲來
+    tags: [memory, funny, solitary]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- 情緒微光 ------------------------------------------------------
+  - external_id: cdb2:emotion:001
+    seed_text: 被人隨口記得一件自己提過的小事，開心了大半天
+    tags: [warm, seen, happy]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: cdb2:emotion:002
+    seed_text: 明明是替別人高興的事，心裡卻有一絲說不上來的失落
+    tags: [bittersweet, introspective, complex]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: cdb2:emotion:003
+    seed_text: 今天特別想聽人說話，自己不太想開口
+    tags: [quiet, listening, mellow]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: cdb2:emotion:004
+    seed_text: 一件小事不順利，煩躁了一下之後決定先去吃點好的
+    tags: [frustration, self-care, food]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- 感官時刻 ------------------------------------------------------
+  - external_id: cdb2:sense:001
+    seed_text: 半夜下起雨，聽著雨聲反而睡得特別安穩
+    tags: [rain, night, cozy]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:sense:002
+    seed_text: 傍晚的天色美得不像話，站在原地看了好久
+    tags: [sky, beauty, pause]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: cdb2:sense:003
+    seed_text: 路過某處聞到食物香味，一整天都惦記著那個味道
+    tags: [smell, food, craving]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:sense:004
+    seed_text: 起了大霧，熟悉的路變得像另一個地方
+    tags: [fog, atmosphere, wonder]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 身體狀態 ------------------------------------------------------
+  - external_id: cdb2:body:001
+    seed_text: 難得睡了一場飽覺，醒來覺得整個世界都清晰了
+    tags: [sleep, refreshed, physical]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:body:002
+    seed_text: 換了個新姿勢或新習慣，這幾天渾身不對勁
+    tags: [habit, physical, adjusting]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:body:003
+    seed_text: 打了個大大的哈欠被人看到，結果互相傳染打哈欠笑成一團
+    tags: [yawn, funny, physical, social]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- 小發現 --------------------------------------------------------
+  - external_id: cdb2:discovery:001
+    seed_text: 偶然發現兩個各自認識的人竟然彼此熟識，忍不住驚呼世界真小
+    tags: [discovery, social, small-world]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: cdb2:discovery:002
+    seed_text: 發現身邊某個人有個意想不到的隱藏才能
+    tags: [discovery, social, surprise]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:discovery:003
+    seed_text: 無意間聽到別人對自己的正面評價，假裝沒聽到卻偷偷開心
+    tags: [overheard, praise, shy-happy]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:discovery:004
+    seed_text: 找到一個做事的小訣竅，突然覺得以前都白費力氣了
+    tags: [discovery, trick, rueful]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- 小成就 --------------------------------------------------------
+  - external_id: cdb2:achievement:001
+    seed_text: 終於修好了一個壞很久的小東西，成就感意外地大
+    tags: [repair, satisfied, achievement]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:achievement:002
+    seed_text: 練習很久的一件小事今天終於順利做成了一次
+    tags: [practice, milestone, proud]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:achievement:003
+    seed_text: 忍住沒說出口的一句氣話，事後覺得自己成熟了一點
+    tags: [restraint, growth, introspective]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- 社交漣漪 ------------------------------------------------------
+  - external_id: cdb2:social:001
+    seed_text: 順口的一句玩笑話好像讓對方在意了，想著要不要解釋
+    tags: [social, worry, second-guessing]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: cdb2:social:002
+    seed_text: 收到一份不成敬意的小禮物，卻剛好是需要的東西
+    tags: [gift, warm, serendipity]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:social:003
+    seed_text: 跟人約好了一件小事，兩邊都差點忘記，笑著互相責怪
+    tags: [promise, forgetful, funny]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: cdb2:social:004
+    seed_text: 被人問了一句「你還好嗎」，才發現自己今天臉色不太對
+    tags: [concern, self-awareness, gentle]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: cdb2:social:005
+    seed_text: 幫別人保守了一個無傷大雅的小祕密，有種奇妙的默契感
+    tags: [secret, trust, bond]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: cdb2:social:006
+    seed_text: 認錯了人還熱情地打了招呼，尷尬到想找洞鑽
+    tags: [mistake, embarrassed, funny]
+    world_frames: [any]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90

@@ -14,6 +14,9 @@ from uuid import uuid4
 
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
+from kokoro_link.application.services.messaging_media_owner import (
+    resolve_messaging_media_owner,
+)
 from kokoro_link.contracts.messaging import (
     InboundMessage,
     MessagingAccountRepositoryPort,
@@ -341,14 +344,11 @@ class TelegramPollingService:
         )
 
     async def _account_owner_id(self, account: MessagingAccount) -> str:
-        try:
-            character = await self._characters.get(account.character_id)
-        except Exception:
-            _LOGGER.exception(
-                "could not resolve owner for messaging account %s", account.id,
-            )
-            return "default"
-        return str(getattr(character, "user_id", "default") or "default")
+        return await resolve_messaging_media_owner(
+            characters=self._characters,
+            account=account,
+            logger=_LOGGER,
+        )
 
     async def _record_error(
         self,

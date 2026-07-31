@@ -391,6 +391,15 @@ class StoryArc:
     request. The service uses this as bookkeeping to prevent a completed
     template from automatically respawning forever.
     """
+    source_seed_ids: tuple[str, ...] = ()
+    """``StorySeed.id`` provenance for seeds the planner folded into this
+    arc's premise/beats. Purely bookkeeping (AE2 slice of the arc-planner
+    seed-injection plan) — nothing here reads or writes it yet; a later
+    ticket has the LLM planner populate it and the service read it back
+    to exclude already-used seeds from future rolls. Normalised on every
+    construction (see ``_normalise_source_seed_ids``) so a misbehaving
+    planner response cannot balloon the row or store garbage entries.
+    """
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
 
@@ -414,6 +423,11 @@ class StoryArc:
             raise ValueError("StoryArc.tone must be non-empty")
         cleaned_source = _normalise_source_template_id(self.source_template_id)
         object.__setattr__(self, "source_template_id", cleaned_source)
+        object.__setattr__(
+            self,
+            "source_seed_ids",
+            _normalise_source_seed_ids(self.source_seed_ids),
+        )
 
     @classmethod
     def create(
@@ -430,6 +444,7 @@ class StoryArc:
         id: str | None = None,
         tone: str = DEFAULT_ARC_TONE,
         source_template_id: str | None = None,
+        source_seed_ids: Iterable[str] = (),
     ) -> StoryArc:
         now = _utcnow()
         return cls(
@@ -444,6 +459,7 @@ class StoryArc:
             beats=tuple(sorted(beats, key=lambda b: (b.scheduled_date, b.sequence))),
             tone=(tone or "").strip() or DEFAULT_ARC_TONE,
             source_template_id=_normalise_source_template_id(source_template_id),
+            source_seed_ids=_normalise_source_seed_ids(source_seed_ids),
             created_at=now,
             updated_at=now,
         )
@@ -532,6 +548,54 @@ def _normalise_source_template_id(value: object) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+MAX_SOURCE_SEED_ID_LENGTH = 128
+"""Defensive per-id clamp — story seed ids are uuid4 hex (32 chars) or
+short pack slugs today; 128 gives headroom without letting a malformed
+LLM response turn one entry into an unbounded string."""
+
+MAX_SOURCE_SEED_IDS = 8
+"""Cap on how many seed ids a single arc can carry provenance for. An
+arc only has a handful of beats, so a planner returning far more than
+this is misbehaving, not legitimately thorough."""
+
+
+def _normalise_source_seed_ids(value: object) -> tuple[str, ...]:
+    """Best-effort coercion of arc→seed provenance ids.
+
+    Defensive against LLM planner garbage rather than validating and
+    rejecting (mirrors ``_normalise_source_template_id``'s coerce-not-
+    raise stance): non-iterable input becomes ``()``, non-string entries
+    are dropped, each id is stripped and clamped to
+    ``MAX_SOURCE_SEED_ID_LENGTH`` chars, duplicates are removed while
+    preserving first-seen order, and the result is capped at
+    ``MAX_SOURCE_SEED_IDS`` entries.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        # A bare string is a caller mistake (meant a single id), not an
+        # intentional request to iterate it character by character.
+        candidates: Iterable[object] = (value,)
+    else:
+        try:
+            candidates = list(value)
+        except TypeError:
+            return ()
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()[:MAX_SOURCE_SEED_ID_LENGTH]
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+        if len(result) >= MAX_SOURCE_SEED_IDS:
+            break
+    return tuple(result)
 
 
 def _normalise_optional_label(value: object) -> str | None:

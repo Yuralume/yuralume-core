@@ -11,10 +11,21 @@ import {
   type PortraitAspect,
 } from '@/utils/api/characters'
 import { transferStageToAlbum } from '@/utils/api/album'
-import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
+import {
+  billingRefusalKind,
+  refreshQuotedPrices,
+} from '@/utils/api/billingRefusal'
 import { UiButton } from '@/components/ui'
+import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
-import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
+import {
+  refreshCloudCreditsAfterAction,
+  useCloudCredits,
+} from '@/composables/useCloudCredits'
+import {
+  ACTION_IMAGE_PORTRAIT,
+  useActionPricing,
+} from '@/composables/useActionPricing'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
 const props = withDefaults(defineProps<{
@@ -52,6 +63,12 @@ const errorMsg = ref<string | null>(null)
 // rather than in the generic error line, so the "nothing was charged" promise
 // and the top-up CTA travel with it.
 const creditsExhausted = ref(false)
+// Price of a refusal that came from the local pre-check (plan AP2); null for
+// the server's 402, which is worded without a number.
+const creditsRequiredCr = ref<number | null>(null)
+
+const cloudCredits = useCloudCredits()
+const actionPricing = useActionPricing()
 
 const generating = ref(false)
 const committing = ref(false)
@@ -143,9 +160,23 @@ async function handleGenerate() {
       : t('characterImagesPanel.errors.promptRequiredCloud')
     return
   }
+  // AP2 pre-check: the price is published and the balance is already on
+  // screen, so an unaffordable press is answered instantly instead of after
+  // a round trip that ends in a 402.
+  const shortfall = actionPricing.shortfallFor(ACTION_IMAGE_PORTRAIT, {
+    total: cloudCredits.total.value,
+    known: cloudCredits.hasBalance.value,
+    stale: cloudCredits.stale.value,
+  })
+  if (shortfall !== null) {
+    creditsRequiredCr.value = shortfall
+    creditsExhausted.value = true
+    return
+  }
   generating.value = true
   errorMsg.value = null
   creditsExhausted.value = false
+  creditsRequiredCr.value = null
   try {
     const res = await generatePortraitCandidates(
       props.character.id, positive, generateAspect.value, generateCount.value,
@@ -160,10 +191,21 @@ async function handleGenerate() {
     for (const url of res.candidates) fresh.set(url, 'stage')
     candidateTargets.value = fresh
   } catch (err) {
-    if (isInsufficientCreditsError(err)) {
-      creditsExhausted.value = true
-    } else {
-      errorMsg.value = extractError(err) ?? t('characterImagesPanel.errors.generateFailed')
+    switch (billingRefusalKind(err)) {
+      case 'insufficient_credits':
+        creditsExhausted.value = true
+        break
+      case 'price_changed':
+        // The batch is action-priced now, so this refusal is reachable here:
+        // the published price moved between the hint on screen and the press.
+        // Nothing was charged, so the only useful reply is the new number plus
+        // "send it again" — refreshing first is what makes the hint above the
+        // button agree with the retry.
+        await refreshQuotedPrices()
+        errorMsg.value = t('credits.price.changed')
+        break
+      default:
+        errorMsg.value = extractError(err) ?? t('characterImagesPanel.errors.generateFailed')
     }
   } finally {
     generating.value = false
@@ -398,11 +440,23 @@ if (typeof window !== 'undefined') {
           @click="handleGenerate"
         >{{ generating ? t('characterImagesPanel.generate.generating') : t('characterImagesPanel.generate.action') }}</UiButton>
       </div>
+      <!-- 明碼標價：按下去要花多少，按之前就看得到。放在生成列外面是因為
+           那一列是三欄 grid；查不到價格時本元件不輸出任何節點。 -->
+      <ActionPriceHint
+        class="generate-price-hint"
+        :action-key="ACTION_IMAGE_PORTRAIT"
+        tooltip-key="credits.price.imageTooltip"
+        variant="chip"
+      />
 
     </div>
 
     <div v-if="errorMsg" class="images-error">{{ errorMsg }}</div>
-    <InsufficientCreditsNotice v-if="creditsExhausted" class="images-credits-notice" />
+    <InsufficientCreditsNotice
+      v-if="creditsExhausted"
+      class="images-credits-notice"
+      :required-cr="creditsRequiredCr"
+    />
 
     <!-- 候選 modal：Teleport 到 body 才不會被側邊欄的窄版型擠到。
          背景點擊刻意不關閉（會搞丟剛生成的圖）；關閉動作走明確按鈕或 ESC。 -->
@@ -651,6 +705,10 @@ if (typeof window !== 'undefined') {
   grid-template-columns: 1fr auto auto;
   gap: 6px;
   align-items: center;
+}
+
+.generate-price-hint {
+  align-self: flex-end;
 }
 
 .count-select {

@@ -16,9 +16,11 @@ The guard inspects the whole ``raise ... from`` chain, so it fires just as well
 when the refusal has been re-wrapped into a medium-specific error
 (``ImageGenerationError`` → ``GenerationFailedError``, ``TTSError``, …).
 
-**Only** ``insufficient_credits`` is remapped. Every other refusal
-(``entitlement_denied`` and friends) is a deployment/entitlement fault the
-player cannot act on, so it keeps its existing loud behaviour untouched.
+Two refusals are remapped, and only two — both are things the *player* can act
+on: ``insufficient_credits`` (top up) and ``price_changed`` (send again at the
+new price, C1's quote binding). Every other refusal (``entitlement_denied`` and
+friends) is a deployment/entitlement fault the player cannot act on, so it
+keeps its existing loud behaviour untouched.
 
 Self-host deployments never talk to a cloud gateway, so no code path here can
 fire — the guard is a transparent pass-through.
@@ -31,18 +33,26 @@ from contextlib import contextmanager
 
 from fastapi import HTTPException, status
 
+from kokoro_link.contracts.cloud_action_billing import (
+    PRICE_CHANGED_CODE,
+    PRICE_CHANGED_MESSAGE,
+    ActionPriceChanged,
+)
 from kokoro_link.infrastructure.llm.cloud_refusal import (
     INSUFFICIENT_CREDITS_CODE,
     expected_refusal,
 )
 
 _FALLBACK_MESSAGE = "insufficient credits for this request"
+_MAX_CAUSE_DEPTH = 10
 
 __all__ = [
     "INSUFFICIENT_CREDITS_CODE",
+    "PRICE_CHANGED_CODE",
     "insufficient_credits_detail",
     "insufficient_credits_guard",
     "insufficient_credits_http_error",
+    "price_changed_detail",
 ]
 
 
@@ -80,19 +90,58 @@ def insufficient_credits_http_error(
     )
 
 
+def price_changed_detail(exc: BaseException | None) -> dict[str, object] | None:
+    """Structured error body when the quoted price moved, else ``None``.
+
+    Carries ``current_price_cr`` so the SPA can show the new number alongside
+    its localized "the price was updated, please send again" copy instead of
+    making the player go and look it up.
+    """
+    changed = _find_price_changed(exc)
+    if changed is None:
+        return None
+    detail: dict[str, object] = {
+        "code": PRICE_CHANGED_CODE,
+        "message": changed.reason or PRICE_CHANGED_MESSAGE,
+    }
+    if changed.current_price_cr is not None:
+        detail["current_price_cr"] = changed.current_price_cr
+    return detail
+
+
+def _price_changed_http_error(exc: BaseException | None) -> HTTPException | None:
+    """``409 Conflict``: the request is valid, the quote it carried is not."""
+    detail = price_changed_detail(exc)
+    if detail is None:
+        return None
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _find_price_changed(exc: BaseException | None) -> ActionPriceChanged | None:
+    """The price-change refusal ``exc`` is, or wraps via ``raise ... from``."""
+    seen = 0
+    while exc is not None and seen < _MAX_CAUSE_DEPTH:
+        if isinstance(exc, ActionPriceChanged):
+            return exc
+        exc = exc.__cause__
+        seen += 1
+    return None
+
+
 @contextmanager
 def insufficient_credits_guard() -> Iterator[None]:
-    """Re-raise an out-of-credits refusal as HTTP 402; pass everything else on.
+    """Re-raise a player-actionable billing refusal as HTTP; pass the rest on.
 
-    Wrap only the generating call, inside any existing ``try`` — the
-    ``HTTPException`` this raises is not one of the domain error types those
-    handlers catch, so it travels straight to the client while their mappings
-    stay exactly as they were.
+    ``402`` for out-of-credits, ``409`` for a moved price. Wrap only the
+    generating call, inside any existing ``try`` — the ``HTTPException`` this
+    raises is not one of the domain error types those handlers catch, so it
+    travels straight to the client while their mappings stay exactly as they
+    were.
     """
     try:
         yield
     except Exception as exc:
-        error = insufficient_credits_http_error(exc)
+        error = insufficient_credits_http_error(exc) or _price_changed_http_error(exc)
         if error is None:
             raise
         raise error from exc

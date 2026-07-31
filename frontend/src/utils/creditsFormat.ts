@@ -23,6 +23,33 @@ export function formatCreditAmount(amount: number): string {
   return fraction ? `${sign}${grouped}.${fraction}` : `${sign}${grouped}`
 }
 
+/**
+ * The i18n calls needed to render an amount, narrowed to what this helper
+ * uses so `t` can be handed in from any component without importing vue-i18n
+ * here (the unit *word* and its en-US plural stay in the catalog).
+ */
+export interface CreditTranslate {
+  (key: string, plural: number): string
+  (key: string, named: Record<string, unknown>): string
+}
+
+/**
+ * "5,340 螢火" / "5,340 Lumes" — the one place the number and the unit word
+ * are joined, shared by the balance badge and every price hint so a future
+ * wording change lands on all of them at once.
+ */
+export function creditAmountText(
+  translate: CreditTranslate,
+  value: number,
+): string {
+  return translate('credits.amount', {
+    amount: formatCreditAmount(value),
+    // Plural count for en-US (Lume / Lumes); zh-TW and ja-JP resolve to the
+    // same word either way.
+    unit: translate('credits.unit', Math.round(Math.abs(value))),
+  })
+}
+
 function round2(value: number): number {
   const rounded = Math.round(value * 100) / 100
   // Guard -0 so a zero balance never renders with a stray minus sign.

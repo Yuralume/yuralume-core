@@ -11,6 +11,29 @@ from datetime import datetime
 from typing import Protocol
 
 
+class RssFetchError(RuntimeError):
+    """Secret-safe, operator-actionable failure for one RSS source.
+
+    ``feed_url`` deliberately never appears in this exception. Admin-defined
+    feed URLs may contain query credentials, and the ingestion service persists
+    ``str(exc)`` into source health and returns it from the manual-ingest API.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+    ) -> None:
+        self.code = code
+        self.detail = detail
+        self.retryable = retryable
+        self.status_code = status_code
+        super().__init__(f"{code}: {detail}")
+
+
 @dataclass(frozen=True, slots=True)
 class RawWorldEvent:
     """Pre-persistence shape produced by an RSS adapter.

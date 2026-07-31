@@ -379,7 +379,7 @@ async def test_runner_routes_post_turn_even_when_would_run_false() -> None:
     assert spy.jobs == ["job-1"]
 
 
-async def test_runner_post_turn_handler_unwired_completes_noop() -> None:
+async def test_runner_post_turn_handler_unwired_fails_retry() -> None:
     queue = InMemoryBackgroundJobQueue()
     runner = _runner(queue, None)
 
@@ -389,9 +389,9 @@ async def test_runner_post_turn_handler_unwired_completes_noop() -> None:
         now=NOW, worker_id="w1", lease_seconds=120,
     )
 
-    assert disposition.action == "complete"
-    assert disposition.outcome["executed"] is False
-    assert disposition.outcome["reason"] == "handler_unwired"
+    assert disposition.action == "fail_retry"
+    assert isinstance(disposition.error, RuntimeError)
+    assert "handler_unwired" in str(disposition.error)
 
 
 async def test_runner_enqueue_claim_execute_end_to_end() -> None:

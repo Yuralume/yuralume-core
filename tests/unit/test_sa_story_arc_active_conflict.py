@@ -13,6 +13,7 @@ and pgvector-bearing tables would not create here at all.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
@@ -140,3 +141,45 @@ async def test_completing_then_starting_again_is_allowed(repo) -> None:  # noqa:
     await repo.add(second)
 
     assert (await repo.get_active_for_character(CHARACTER)).id == second.id
+
+
+async def test_source_seed_ids_round_trips_through_add(repo) -> None:  # noqa: ANN001
+    """AE2: seed provenance survives insert + read back unchanged."""
+    arc = StoryArc.create(
+        character_id=CHARACTER,
+        title="主線",
+        premise="premise",
+        theme="custom",
+        start_date=TODAY,
+        end_date=TODAY + timedelta(days=21),
+        source_seed_ids=["seed-a", "seed-b"],
+    )
+    await repo.add(arc)
+
+    fetched = await repo.get(arc.id)
+
+    assert fetched is not None
+    assert fetched.source_seed_ids == ("seed-a", "seed-b")
+
+
+async def test_source_seed_ids_round_trips_through_save(repo) -> None:  # noqa: ANN001
+    """save() (the update path) persists source_seed_ids the same way add() does."""
+    arc = StoryArc.create(
+        character_id=CHARACTER,
+        title="主線",
+        premise="premise",
+        theme="custom",
+        start_date=TODAY,
+        end_date=TODAY + timedelta(days=21),
+    )
+    await repo.add(arc)
+    fetched_before = await repo.get(arc.id)
+    assert fetched_before is not None
+    assert fetched_before.source_seed_ids == ()
+
+    updated = replace(arc, source_seed_ids=("seed-a",))
+    await repo.save(updated)
+
+    fetched = await repo.get(arc.id)
+    assert fetched is not None
+    assert fetched.source_seed_ids == ("seed-a",)

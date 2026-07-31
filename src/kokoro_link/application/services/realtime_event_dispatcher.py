@@ -20,8 +20,9 @@ Flow per replica:
   bounded seen-id set (evicted by ``created_at`` once past the overlap window,
   plus a hard-count cap so a dense in-window burst can't grow it without bound),
   rehydrates every genuinely-new row to a full bus event, and publishes it.
-* A row whose backing domain record was deleted rehydrates to ``None`` → skip +
-  log; a single miss must never wedge the loop.
+* A deleted/malformed backing record is terminal: rehydrate returns ``None``
+  and the row is marked seen. A transient domain read or local-bus publish
+  remains unseen, stops the batch before later ids, and retries on the next poll.
 * A slow ``prune`` sweep (default 7d TTL, aligned with the background-jobs
   retention convention) keeps the table bounded. It lives here rather than in a
   separate maintenance job because the dispatcher already holds the outbox port
@@ -59,6 +60,15 @@ from kokoro_link.domain.entities.conversation import MessageRole
 _LOGGER = logging.getLogger(__name__)
 
 RehydratedEvent = ProactiveEvent | FeedPostEvent | FeedCommentReplyEvent
+
+
+class RealtimeRehydrateTransientError(RuntimeError):
+    """A domain-row read failed transiently and the outbox row must be retried."""
+
+
+class RealtimePublishTransientError(RuntimeError):
+    """A local-bus publish failed and the outbox row must be retried."""
+
 
 # Fallback poll cadence + drain page size. The poll is only a safety net behind
 # LISTEN; a large page keeps a burst from taking many round-trips.
@@ -98,7 +108,9 @@ class RealtimeEventRehydrator:
 
     The outbox row carries ids/counts ONLY (red line); the message / post /
     reply text lives in its own durable table, so we re-read it here. A missing
-    row (deleted between append and read) yields ``None`` — the caller skips it.
+    row or malformed payload yields ``None`` — the caller terminally skips it.
+    A reader failure raises :class:`RealtimeRehydrateTransientError` so the
+    dispatcher retries instead of silently losing it.
     Shared by the dispatcher loop and SSE ``Last-Event-ID`` replay.
     """
 
@@ -122,12 +134,20 @@ class RealtimeEventRehydrator:
                 return await self._rehydrate_feed_post(stored)
             if stored.event_kind == EVENT_KIND_FEED_COMMENT_REPLY:
                 return await self._rehydrate_feed_comment_reply(stored)
-        except Exception:  # a bad read must never wedge the drain loop
-            _LOGGER.exception(
-                "realtime rehydrate crashed (id=%s kind=%s)",
-                stored.id, stored.event_kind,
+        except RealtimeRehydrateTransientError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError):
+            _LOGGER.warning(
+                "realtime rehydrate skipped malformed row id=%s kind=%s",
+                stored.id,
+                stored.event_kind,
+                exc_info=True,
             )
             return None
+        except Exception as exc:
+            raise RealtimeRehydrateTransientError(
+                f"unexpected rehydrate failure for event {stored.id}",
+            ) from exc
         _LOGGER.warning(
             "realtime rehydrate skipped unknown kind=%s (id=%s)",
             stored.event_kind, stored.id,
@@ -140,8 +160,11 @@ class RealtimeEventRehydrator:
         payload = stored.payload
         conversation_id = str(payload.get("conversation_id", ""))
         if not conversation_id:
+            self._log_malformed_payload(stored, "conversation_id")
             return None
-        conversation = await self._conversations.get(conversation_id)
+        conversation = await self._read_domain_row(
+            self._conversations, conversation_id, stored,
+        )
         if conversation is None:
             _LOGGER.info(
                 "realtime rehydrate: conversation %s gone (event id=%s)",
@@ -172,8 +195,9 @@ class RealtimeEventRehydrator:
         payload = stored.payload
         post_id = str(payload.get("post_id", ""))
         if not post_id:
+            self._log_malformed_payload(stored, "post_id")
             return None
-        post = await self._feed_posts.get(post_id)
+        post = await self._read_domain_row(self._feed_posts, post_id, stored)
         if post is None:
             _LOGGER.info(
                 "realtime rehydrate: feed post %s gone (event id=%s)",
@@ -196,8 +220,11 @@ class RealtimeEventRehydrator:
         payload = stored.payload
         comment_id = str(payload.get("comment_id", ""))
         if not comment_id:
+            self._log_malformed_payload(stored, "comment_id")
             return None
-        comment = await self._feed_comments.get(comment_id)
+        comment = await self._read_domain_row(
+            self._feed_comments, comment_id, stored,
+        )
         if comment is None:
             _LOGGER.info(
                 "realtime rehydrate: feed comment %s gone (event id=%s)",
@@ -212,6 +239,30 @@ class RealtimeEventRehydrator:
             unread_count=int(payload.get("unread_count", 0) or 0),
             created_at=comment.created_at,
             event_id=stored.id,
+        )
+
+    async def _read_domain_row(
+        self, reader: object, key: str, stored: StoredRealtimeEvent,
+    ) -> object | None:
+        try:
+            return await reader.get(key)  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RealtimeRehydrateTransientError(
+                f"domain read failed for realtime event {stored.id}",
+            ) from exc
+
+    @staticmethod
+    def _log_malformed_payload(
+        stored: StoredRealtimeEvent, field: str,
+    ) -> None:
+        _LOGGER.warning(
+            "realtime rehydrate skipped malformed payload id=%s kind=%s "
+            "missing=%s",
+            stored.id,
+            stored.event_kind,
+            field,
         )
 
 
@@ -299,6 +350,18 @@ class RealtimeEventDispatcher:
         self._wake = asyncio.Event()
         self._running = False
         self._tasks: list[asyncio.Task[None]] = []
+        self._rehydrate_transient_failures = 0
+        self._publish_transient_failures = 0
+
+    @property
+    def rehydrate_transient_failures(self) -> int:
+        """Process-local count of retryable rehydrate failures."""
+        return self._rehydrate_transient_failures
+
+    @property
+    def publish_transient_failures(self) -> int:
+        """Process-local count of retryable local-bus publish failures."""
+        return self._publish_transient_failures
 
     async def start(self) -> None:
         """Prime the cursor at the current tail and spin the loops.
@@ -352,20 +415,52 @@ class RealtimeEventDispatcher:
             if not batch:
                 break
             max_id = self._cursor
+            blocked_on_transient = False
             for stored in batch:
-                max_id = max(max_id, stored.id)
                 if stored.id in self._seen:
+                    max_id = max(max_id, stored.id)
                     continue
-                self._seen[stored.id] = stored.created_at
-                event = await self._rehydrator.rehydrate(stored)
+                try:
+                    event = await self._rehydrator.rehydrate(stored)
+                except RealtimeRehydrateTransientError:
+                    self._rehydrate_transient_failures += 1
+                    blocked_on_transient = True
+                    _LOGGER.warning(
+                        "realtime dispatcher rehydrate transient failure "
+                        "id=%s kind=%s cursor=%s; leaving row unseen for retry",
+                        stored.id,
+                        stored.event_kind,
+                        self._cursor,
+                        exc_info=True,
+                    )
+                    break
                 if event is not None:
-                    await self._publish(event)
+                    try:
+                        await self._publish(event)
+                    except RealtimePublishTransientError:
+                        self._publish_transient_failures += 1
+                        blocked_on_transient = True
+                        _LOGGER.warning(
+                            "realtime dispatcher publish transient failure "
+                            "id=%s kind=%s cursor=%s; leaving row unseen for retry",
+                            stored.id,
+                            stored.event_kind,
+                            self._cursor,
+                            exc_info=True,
+                        )
+                        break
                     published += 1
+                self._seen[stored.id] = stored.created_at
+                max_id = max(max_id, stored.id)
             self._evict_seen()
-            if max_id <= self._cursor:
+            made_forward_progress = max_id > self._cursor
+            if made_forward_progress:
+                self._cursor = max_id
+            if blocked_on_transient:
+                break
+            if not made_forward_progress:
                 # No forward progress (only the overlap tail was re-read) → done.
                 break
-            self._cursor = max_id
             if len(batch) < self._batch_limit:
                 break
         return published
@@ -397,11 +492,12 @@ class RealtimeEventDispatcher:
                     await self._proactive_bus.publish(event)
             elif self._feed_bus is not None:
                 await self._feed_bus.publish(event)
-        except Exception:
-            _LOGGER.exception(
-                "realtime dispatcher failed to publish event id=%s",
-                event.event_id,
-            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RealtimePublishTransientError(
+                f"local bus publish failed for realtime event {event.event_id}",
+            ) from exc
 
     # --- loops ------------------------------------------------------------
 

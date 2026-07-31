@@ -45,9 +45,11 @@ from kokoro_link.contracts.due_jobs import (
     CHARACTER_UPKEEP_KIND,
     FEED_COMMENT_REPLY_KIND,
     FEED_COMPOSE_KIND,
+    GOAL_REVIEW_KIND,
     MEMORIALIZE_KIND,
     PROACTIVE_EVALUATE_KIND,
     SCHEDULE_MAINTENANCE_KIND,
+    SCHEDULE_WEATHER_VET_KIND,
     kind_spec,
 )
 from kokoro_link.contracts.operator_profile import OperatorProfileRepositoryPort
@@ -136,8 +138,12 @@ class CharacterKindHandler:
             )
         elif kind == SCHEDULE_MAINTENANCE_KIND:
             await self._executor.step_schedule_maintenance(character)
+        elif kind == SCHEDULE_WEATHER_VET_KIND:
+            await self._executor.step_schedule_weather_vet(character, now=now)
         elif kind == MEMORIALIZE_KIND:
             await self._executor.step_memorialize(character, now=now)
+        elif kind == GOAL_REVIEW_KIND:
+            await self._executor.step_goal_review(character, now=now)
         elif kind == FEED_COMPOSE_KIND:
             await self._executor.step_feed_compose(character)
         elif kind == FEED_COMMENT_REPLY_KIND:

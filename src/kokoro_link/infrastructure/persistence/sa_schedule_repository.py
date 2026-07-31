@@ -148,6 +148,33 @@ class SAScheduleRepository(ScheduleRepositoryPort):
             await session.commit()
             return len(ids)
 
+    async def set_weather_vet(
+        self,
+        character_id: str,
+        date_: date,
+        *,
+        activity_id: str | None,
+        condition: str | None,
+    ) -> None:
+        # Two columns, one statement — the activity rows are never touched, so
+        # a memorialize claim / encounter block / chat commitment that landed
+        # while the drift judge was thinking survives untouched. Blank halves
+        # normalise the same way ``DailySchedule.with_weather_vet`` does so the
+        # gate reads identically whichever path wrote it.
+        async with self._session_factory() as session:
+            await session.execute(
+                update(DailyScheduleRow)
+                .where(
+                    DailyScheduleRow.character_id == character_id,
+                    DailyScheduleRow.date == date_.isoformat(),
+                )
+                .values(
+                    weather_vet_activity_id=(activity_id or "").strip() or None,
+                    weather_vet_condition=(condition or "").strip() or None,
+                ),
+            )
+            await session.commit()
+
     async def claim_memorialize(self, activity_ids: list[str]) -> set[str]:
         if not activity_ids:
             return set()

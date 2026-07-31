@@ -28,6 +28,7 @@ from kokoro_link.application.services.proactive_event_bus import (
 )
 from kokoro_link.application.services.realtime_event_dispatcher import (
     RealtimeEventRehydrator,
+    RealtimeRehydrateTransientError,
 )
 from kokoro_link.contracts.realtime_events import (
     EVENT_KIND_FEED_POST,
@@ -158,6 +159,27 @@ async def test_replay_frames_skips_missing_row() -> None:
     ]
     assert frames == []
     assert replayed == {1}  # id recorded even though rehydrate missed
+
+
+@pytest.mark.asyncio
+async def test_replay_transient_failure_does_not_mark_event_replayed() -> None:
+    outbox = InMemoryRealtimeOutbox()
+    stored = await _seed(outbox, "post-9", 0)
+
+    class _TransientRehydrator:
+        async def rehydrate(self, _stored):
+            raise RealtimeRehydrateTransientError("temporary read failure")
+
+    replayed: set[int] = set()
+    frames = [
+        frame async for frame in events_route.replay_frames(
+            outbox, _TransientRehydrator(), resume_from=stored.id,
+            is_owned=_always_owned, replayed_ids=replayed,
+        )
+    ]
+
+    assert frames == []
+    assert replayed == set()
 
 
 @pytest.mark.asyncio

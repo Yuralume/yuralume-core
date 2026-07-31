@@ -20,6 +20,7 @@ from kokoro_link.infrastructure.usage.recorder import BackgroundUsageEventRecord
 class _Model:
     provider_id = "fake"
     supports_vision = False
+    prefers_public_image_urls = True
 
     def __init__(self, reply: str = "assistant reply") -> None:
         self.reply = reply
@@ -134,6 +135,7 @@ async def test_metered_active_llm_provider_records_auxiliary_generation_usage() 
     character = _character()
 
     model = await provider.resolve(FEATURE_SCHEDULE_PLAN, character=character)
+    assert model.prefers_public_image_urls is True
     result = await model.generate(
         "plan the day",
         image_urls=("https://example.test/a.png",),

@@ -39,6 +39,11 @@ from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.schedule_repository import ScheduleRepositoryPort
 from kokoro_link.contracts.story_arc import StoryArcRepositoryPort
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.services.shared_activity_evidence import (
+    SharedActivityEvidence,
+    SharedClaimPolicy,
+    derive_shared_activity_evidence,
+)
 from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
 from kokoro_link.domain.value_objects.feed_source import FeedSource
@@ -104,6 +109,54 @@ _NON_BROADCAST_MEMORY_KINDS: frozenset[MemoryKind] = frozenset({
 A kind-level policy (not per-case string matching) so every current and
 future writer of these kinds is covered at the single broadcast chokepoint;
 ``audience`` still governs the per-item judgement for ordinary kinds."""
+
+
+_SHARED_CLAIM_SNIPPETS: dict[SharedClaimPolicy, str] = {
+    SharedClaimPolicy.SOLO_ONLY: (
+        "使用者參與狀態：這只是角色單方面的邀請／想法，使用者從沒答應，"
+        "也沒有任何證據顯示他真的到場——這是角色自己一個人的行程"
+    ),
+    SharedClaimPolicy.UNVERIFIED: (
+        "使用者參與狀態：使用者當初答應過，但沒有任何證據顯示他真的參與了這段活動"
+    ),
+    SharedClaimPolicy.VERIFIED: (
+        "使用者參與狀態：使用者答應過，且活動期間確實有互動紀錄"
+    ),
+}
+"""Structured involvement fact for the composer's context snippets.
+
+Projected from the participant role + the interaction anchor, never from
+reading the activity text — same discipline as the planner's expired
+commitment labels."""
+
+_SHARED_CLAIM_HINT_CLAUSES: dict[SharedClaimPolicy, str] = {
+    SharedClaimPolicy.SOLO_ONLY: (
+        "注意：這件事使用者並沒有參與（他從沒答應，也沒出現）。"
+        "貼文**不可以**寫成「和他一起完成了」，"
+        "只能寫成自己一個人的經歷，或本來想約他的心情。"
+    ),
+    SharedClaimPolicy.UNVERIFIED: (
+        "注意：沒有證據能證明使用者真的參與了這件事。"
+        "貼文**不可以**對外宣稱兩人一起完成，也不要反過來公開指責他失約。"
+    ),
+}
+"""Only the two restrictive policies add a clause — ``VERIFIED`` and
+``NOT_APPLICABLE`` leave the hint exactly as it was."""
+
+
+def _shared_activity_snippets(
+    evidence: SharedActivityEvidence,
+) -> tuple[str, ...]:
+    if not evidence.involves_operator:
+        return ()
+    snippet = _SHARED_CLAIM_SNIPPETS.get(evidence.policy)
+    return (snippet,) if snippet else ()
+
+
+def _shared_activity_hint_clause(evidence: SharedActivityEvidence) -> str:
+    if not evidence.involves_operator:
+        return ""
+    return _SHARED_CLAIM_HINT_CLAUSES.get(evidence.policy, "")
 
 
 class FeedCandidateCollector:
@@ -209,10 +262,22 @@ class FeedCandidateCollector:
                 continue
             location = (activity.location or "").strip()
             location_clause = f"在{location}" if location else ""
+            # CF4: the wall is public and permanent, so an unproven
+            # "we finally went together!" post is the worst copy of this
+            # bug — the 7/27 post claimed a shared outing for an invite
+            # the user never accepted. The activity description is the
+            # *plan*; whether it happened with the operator is a separate
+            # structured question, answered here and handed to the
+            # composer as facts + a rule.
+            evidence = derive_shared_activity_evidence(
+                activity,
+                last_active_at=character.state.last_active_at,
+            )
             hint = (
                 f"角色剛結束「{description}」這項活動（{location_clause}），"
                 "用第一人稱發一篇短動態，分享當下的感受、累或滿足、"
                 "想到什麼就寫什麼。語氣可以隨興一點。"
+                f"{_shared_activity_hint_clause(evidence)}"
             )
             score = 0.6 + min(0.3, activity.busy_score)
             out.append(FeedCandidate(
@@ -224,6 +289,7 @@ class FeedCandidateCollector:
                     f"活動：{description}",
                     f"地點：{location or '未指定'}",
                     f"忙碌度：{activity.busy_score:.2f}",
+                    *_shared_activity_snippets(evidence),
                 ),
             ))
         return out

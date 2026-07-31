@@ -1,0 +1,206 @@
+# Japan-flavored daily seeds (batch 1).
+#
+# Low-stakes everyday micro-events with Japanese cultural texture
+# (school life, vending machines, summer festivals, convenience
+# stores, trains). Seed text stays zh-TW — the expander LLM adapts
+# details to the character's voice + world.
+#
+# Format per entry:
+#   external_id  : stable id for idempotent re-import (must be unique
+#                  across all packs). Convention: ``<pack>:<category>:<n>``.
+#   seed_text    : one-line zh-TW prompt.
+#   tags         : descriptive labels (no vocabulary enforced).
+#   world_frames : which frames this seed fits.
+#   tier         : daily (micro-event, resolvable in 2-3 sentences).
+#   regions      : locale gating for the draw pool.
+#   weight       : relative draw weight.
+#   cooldown_days: minimum days between the same seed for one character.
+pack_id: jp_daily_b1
+language: zh-TW
+
+seeds:
+  # --- School: classroom rhythms -----------------------------------
+  - external_id: jpd1:school:001
+    seed_text: 教室換座位抽籤的日子，抽到的新位置讓人心情有點微妙
+    tags: [school, lottery, mundane, social]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.7
+    cooldown_days: 75
+
+  - external_id: jpd1:school:002
+    seed_text: 上課偷偷傳紙條，一邊寫一邊提防著老師的視線
+    tags: [school, classroom, thrill, social]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: jpd1:school:003
+    seed_text: 忘了帶課本只好跟鄰座共用一本，整節課距離近得不太自在
+    tags: [school, classroom, awkward, closeness]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.6
+    cooldown_days: 90
+
+  - external_id: jpd1:school:004
+    seed_text: 值日打掃被分到跟不太熟的同學一組，掃著掃著竟然聊開了
+    tags: [school, chores, social, gentle]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: jpd1:school:005
+    seed_text: 體育課自由分組遲遲沒被選走，最後被一個意外的人招了手
+    tags: [school, sports, awkward, relief]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- School: lunch & hideouts ------------------------------------
+  - external_id: jpd1:school:006
+    seed_text: 午休偷偷溜到頂樓吃便當吹風，覺得那裡像個秘密基地
+    tags: [school, lunch, rooftop, peaceful]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: jpd1:school:007
+    seed_text: 藉口不舒服躲進保健室睡午覺，卻發現裡面已經有人同樣在偷閒
+    tags: [school, skipping, encounter, lazy]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: jpd1:school:008
+    seed_text: 社團活動日什麼正事都沒做，一群人窩在社辦泡茶閒聊到天黑
+    tags: [school, club, idle, cozy]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: jpd1:school:009
+    seed_text: 考試前臨時湊了讀書會，一半時間唸書一半被零食和閒聊拖走
+    tags: [school, exam, study-group, chaotic]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- School: after class -----------------------------------------
+  - external_id: jpd1:school:010
+    seed_text: 放學突然下起雨只剩一把傘，跟人共撐時反而不知道該說什麼
+    tags: [school, rain, shared-umbrella, closeness]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: jpd1:school:011
+    seed_text: 放學後坐在河堤看夕陽，話說到一半突然不知道怎麼接下去
+    tags: [school, riverbank, sunset, introspective]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: jpd1:school:012
+    seed_text: 發現想借的書借閱紀錄上總是同一個名字，開始好奇那是個什麼樣的人
+    tags: [school, library, curiosity, mystery]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 120
+
+  - external_id: jpd1:school:013
+    seed_text: 開學日走在飄滿櫻花的坡道上，對新的班級既期待又有點緊張
+    tags: [school, spring, sakura, new-term]
+    world_frames: [school]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 180
+
+  # --- Modern: street & convenience --------------------------------
+  - external_id: jpd1:modern:001
+    seed_text: 在自動販賣機前被請了一罐飲料，小小的人情一直記著想找機會還
+    tags: [vending-machine, favor, social, gentle]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: jpd1:modern:002
+    seed_text: 便利商店貨架上出現期間限定的新品，猶豫了半天還是拿去結帳了
+    tags: [convenience-store, limited-edition, small-joy]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: jpd1:modern:003
+    seed_text: 電車上靠著車窗打瞌睡，在差點坐過站的瞬間驚醒
+    tags: [train, commute, drowsy, mishap]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- Modern: seasonal --------------------------------------------
+  - external_id: jpd1:modern:004
+    seed_text: 傍晚聽見遠處傳來祭典的太鼓聲，臨時起意想去逛逛攤位
+    tags: [summer-festival, evening, impulse, festive]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 150
+
+  - external_id: jpd1:modern:005
+    seed_text: 新年參拜抽了支籤，看到結果之後一整天都有點在意
+    tags: [shrine, new-year, fortune, superstition]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 180
+
+  - external_id: jpd1:modern:006
+    seed_text: 颱風逼近突然多出一天不用出門的假，反而不知道拿這份自由怎麼辦
+    tags: [typhoon, day-off, windfall, idle]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.5
+    cooldown_days: 120
+
+  # --- Modern: night -----------------------------------------------
+  - external_id: jpd1:modern:007
+    seed_text: 下班繞去錢湯泡了個澡，熱水一沖，一整天的疲憊都跟著水流走了
+    tags: [sento, night, relief, refreshed]
+    world_frames: [modern]
+    tier: daily
+    regions: [jp]
+    weight: 0.6
+    cooldown_days: 75

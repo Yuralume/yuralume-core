@@ -292,7 +292,11 @@ sources:
     feed_url: https://www.animatetimes.com/rss/
     category: anime
     locale: ja-JP
-    enabled: true
+    # Official endpoint returns HTTP 404 and no replacement feed is
+    # advertised. Keep the id as a retirement tombstone so upgrades disable
+    # rows still using this URL while preserving operator replacement URLs.
+    enabled: false
+    retired: true
 
   - id: nature-news
     name: Nature News
@@ -306,7 +310,9 @@ sources:
     feed_url: https://www.oricon.co.jp/rss/news/total.xml
     category: entertainment
     locale: ja-JP
-    enabled: true
+    # Official endpoint returns HTTP 410; see retirement semantics above.
+    enabled: false
+    retired: true
 
   - id: udn-life
     name: UDN 生活

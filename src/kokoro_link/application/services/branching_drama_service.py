@@ -14,6 +14,17 @@ layers:
 
 Deeper outline layers and images are generated lazily as the player
 advances, prefetching 2 layers ahead in the background.
+
+**Deliberately not action-priced.** The AP2 second wave gave the fusion
+pipeline a fixed per-action price (``fusion_story`` /
+``fusion_story_iterate``); the branching-drama family stays
+``charging_mode=legacy`` in ``contracts/action-catalog.json`` and keeps
+billing per Gateway call, per the CREATOR_STUDIO_VALUE_LINE_PLAN §2.6 ruling.
+The reason is structural, not scheduling: a drama's cost is driven by how deep
+the *player* walks the tree and how many images the lazy prefetch decides to
+draw, so there is no bounded unit of work a single up-front price could honour.
+Adding a charge here without first pricing that unit would either overcharge a
+two-node session or hand out an unbounded one for a flat fee.
 """
 
 from __future__ import annotations

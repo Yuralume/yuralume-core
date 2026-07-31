@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS frontend-builder
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS frontend-builder
 
 WORKDIR /app
 
@@ -37,7 +37,7 @@ COPY docs/CUSTOM_TTS_SERVER_SPEC.md ./docs/CUSTOM_TTS_SERVER_SPEC.md
 RUN cd frontend && npm run build
 
 
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS app
+FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim@sha256:fb576a1ff0c6b967e8b466695af934e34161c4a99c2fbfb859261d4a24d4a8d3 AS app
 
 WORKDIR /app
 
@@ -61,6 +61,7 @@ COPY src ./src
 COPY --from=frontend-builder /app/src/kokoro_link/frontend/dist ./src/kokoro_link/frontend/dist
 
 RUN uv sync --frozen --no-dev \
+    && uv cache clean \
     && mkdir -p /tmp/yuralume-uploads \
     && useradd --create-home --uid 10001 yuralume \
     && chown -R yuralume:yuralume /app /tmp/yuralume-uploads

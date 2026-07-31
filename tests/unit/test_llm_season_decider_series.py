@@ -78,3 +78,55 @@ def test_non_series_prompt_keeps_llm_planner_contract() -> None:
 
     assert "非 series-bound" in prompt
     assert "LLM planner 規劃內容" in prompt
+
+
+# ---- AE0: arc history + anti-echo instructions ------------------------
+
+
+def _context(**overrides: object) -> StoryArcSeasonContext:
+    base: dict[str, object] = dict(
+        character=_character(),
+        today=date(2026, 6, 9),
+        completed_arc=_completed_arc(),
+        days_since_completed=2,
+        continuation_summary="上一段已收束。",
+        recent_dialogue_summary="最近她提到想繼續。",
+    )
+    base.update(overrides)
+    return StoryArcSeasonContext(**base)  # type: ignore[arg-type]
+
+
+def test_arc_history_block_lists_every_entry_in_order() -> None:
+    prompt = _build_prompt(
+        _context(
+            arc_history=(
+                "第一季｜growth｜她第一次站上舞台。",
+                "第二季｜conflict｜她和搭檔拆夥。",
+            ),
+        ),
+    )
+
+    assert "歷史 story arc（由舊到新）：" in prompt
+    assert "- 第一季｜growth｜她第一次站上舞台。" in prompt
+    assert "- 第二季｜conflict｜她和搭檔拆夥。" in prompt
+    assert prompt.index("第一季") < prompt.index("第二季")
+
+
+def test_empty_arc_history_omits_the_block() -> None:
+    prompt = _build_prompt(_context())
+
+    # The instruction line still mentions the list; only the data block
+    # (its heading and bullets) disappears.
+    assert "歷史 story arc（由舊到新）：" not in prompt
+    # The placeholder collapses back to the blank separator line the
+    # template always had — no orphan heading, no double blank line.
+    assert "source_template_id: book-one\n\nSeries / 下一本資訊：" in prompt
+
+
+def test_prompt_forbids_echoing_chat_and_replaying_history() -> None:
+    prompt = _build_prompt(_context(arc_history=("第一季｜growth｜舊題材",)))
+
+    assert "hint 不得只複述近期聊天話題" in prompt
+    assert "不得重跑「歷史 story arc」清單中任何一條的核心題材" in prompt
+    # The continuity instruction survives, re-scoped to consequences.
+    assert "承接的是「後果與狀態」，不是重跑同一個題材" in prompt

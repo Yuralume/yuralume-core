@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -21,8 +22,13 @@ class _FakeSidecarClient:
         self.release = asyncio.Event()
         self.connections: list[tuple[str, str, str | None]] = []
 
-    async def connect(self, *, sidecar_url, session_id, api_token, on_event):  # noqa: ANN001
+    async def connect(
+        self, *, sidecar_url, session_id, api_token, on_event,
+        on_connected=None,
+    ):  # noqa: ANN001
         self.connections.append((sidecar_url, session_id, api_token))
+        if on_connected is not None:
+            await on_connected()
         await on_event(self.event)
         self.connected.set()
         await self.release.wait()
@@ -74,3 +80,44 @@ async def test_gateway_event_dispatches_through_messaging_pipeline() -> None:
 
     sidecar.release.set()
     await service.stop()
+
+
+class _SidecarFailsBeforeConnected:
+    async def connect(
+        self, *, sidecar_url, session_id, api_token, on_event,
+        on_connected=None,
+    ):  # noqa: ANN001
+        _ = (sidecar_url, session_id, api_token, on_event, on_connected)
+        raise RuntimeError("SSE handshake failed")
+
+
+@pytest.mark.asyncio
+async def test_gateway_health_is_not_refreshed_before_sse_connected() -> None:
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_whatsapp_account(
+        harness,
+        character_id=character.id,
+        sidecar_url="http://127.0.0.1:32190/",
+        session_id="mio",
+    )
+    locked = await harness.account_repository.try_acquire_gateway_lock(
+        account.id,
+        owner_id="worker-1",
+        now=datetime.now(timezone.utc),
+        ttl=timedelta(seconds=90),
+    )
+    assert locked is not None
+    service = WhatsAppGatewayService(
+        account_repository=harness.account_repository,
+        dispatcher=harness.dispatcher,
+        sidecar_client=_SidecarFailsBeforeConnected(),
+        event_parser=parse_whatsapp_event,
+        owner_id="worker-1",
+    )
+
+    with pytest.raises(RuntimeError, match="SSE handshake failed"):
+        await service._connect_locked_account(locked)
+
+    stored = await harness.account_repository.get(account.id)
+    assert stored.polling_last_update_at is None

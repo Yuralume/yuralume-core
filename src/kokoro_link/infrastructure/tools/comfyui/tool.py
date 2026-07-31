@@ -23,6 +23,10 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from kokoro_link.application.services.album_service import AlbumService
+from kokoro_link.application.services.cloud_action_billing_service import (
+    CloudActionBillingService,
+    NullActionBillingService,
+)
 from kokoro_link.application.services.feature_keys import (
     FEATURE_IMAGE_CHAT_TOOL,
 )
@@ -31,6 +35,15 @@ from kokoro_link.application.services.visual_generation_style import (
     VisualGenerationStyleService,
 )
 from kokoro_link.contracts.active_image import ActiveImageProviderPort
+from kokoro_link.contracts.cloud_action_billing import (
+    ACTION_IMAGE_CHAT_TOOL,
+    client_quoted_price,
+    prepaid_action,
+)
+from kokoro_link.contracts.interaction_context import (
+    confirm_deferred_deliveries,
+    interaction_scope,
+)
 from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
@@ -42,6 +55,10 @@ from kokoro_link.contracts.image_provider import (
 )
 from kokoro_link.contracts.object_storage import ObjectStoragePort
 from kokoro_link.contracts.tool import ToolContext, ToolPort
+from kokoro_link.infrastructure.llm.cloud_refusal import (
+    INSUFFICIENT_CREDITS_CODE,
+    ExpectedCloudRefusal,
+)
 from kokoro_link.domain.entities.generation_usage import (
     CAPABILITY_IMAGE,
     STATUS_FAILED,
@@ -97,10 +114,19 @@ class ComfyImageTool(ToolPort):
         object_storage: ObjectStoragePort | None = None,
         visual_style_service: VisualGenerationStyleService | None = None,
         usage_recorder: UsageEventRecorderPort | None = None,
+        action_billing: (
+            CloudActionBillingService | NullActionBillingService | None
+        ) = None,
     ) -> None:
         self._image_provider = image_provider
         _ = uploads_dir, url_prefix
         self._object_storage = object_storage
+        # AP2: ``image_chat_tool`` is its own action, charged separately from
+        # the chat turn that triggered it and scoped so its Gateway call is
+        # attributed to that charge rather than the turn's.
+        self._action_billing: (
+            CloudActionBillingService | NullActionBillingService
+        ) = action_billing or NullActionBillingService()
         # Optional: container wires this in so every tool generation
         # ends up browsable in the album UI. Left optional so unit tests
         # of the tool can ignore album behaviour and focus on generation.
@@ -112,6 +138,52 @@ class ComfyImageTool(ToolPort):
         self._usage_recorder = recorder
 
     async def invoke(self, ctx: ToolContext) -> ToolResult:
+        """Charge, generate, then settle only if an image actually came back.
+
+        The generation body reports failure as ``ToolResult(ok=False)`` rather
+        than by raising — the chat loop needs the character to apologise, not
+        the turn to die — so the charge has to be closed on the *result*, not
+        on control flow. An out-of-credits refusal is likewise turned into a
+        failed tool result: the turn it belongs to has already been paid for
+        and delivered, and killing it over a failed side-image would take the
+        player's reply away from them.
+        """
+        prepaid = prepaid_action(ACTION_IMAGE_CHAT_TOOL)
+        if prepaid is not None:
+            # An over-quota picture was already bought at the overage price by
+            # the caller, who also owns closing that charge. Charging
+            # ``image_chat_tool`` on top would bill one picture twice and put
+            # two rows in /credits for one action.
+            with interaction_scope(prepaid):
+                return await self._generate(ctx)
+        try:
+            charge = await self._action_billing.begin(
+                ACTION_IMAGE_CHAT_TOOL,
+                operator_id=getattr(ctx.character, "user_id", "") or "",
+                # R9: the picture is billed at the number the player's own
+                # screen quoted for it, carried on the turn that spawned this
+                # tool call — the model decides to draw mid-turn, so there is
+                # no second chance to ask the client.
+                quoted_price_cr=client_quoted_price(ACTION_IMAGE_CHAT_TOOL),
+            )
+        except ExpectedCloudRefusal as exc:
+            if exc.code != INSUFFICIENT_CREDITS_CODE:
+                raise
+            _LOGGER.info("generate_image refused: %s", exc.code)
+            return ToolResult.failure(exc.reason or "螢火不足，這次畫不出來")
+        try:
+            with interaction_scope(charge.context if charge else None):
+                result = await self._generate(ctx)
+        except BaseException:
+            await self._action_billing.release(charge)
+            raise
+        if result.ok:
+            await self._action_billing.settle(charge)
+        else:
+            await self._action_billing.release(charge)
+        return result
+
+    async def _generate(self, ctx: ToolContext) -> ToolResult:
         args = dict(ctx.arguments)
         positive = str(args.get("positive") or "")
         aspect = str(args.get("aspect") or "portrait")
@@ -258,6 +330,12 @@ class ComfyImageTool(ToolPort):
                 billable_quantity=len(returned_images),
             )
             return ToolResult.failure(f"產圖存檔失敗：{exc}")
+
+        if attachments:
+            # The picture is in object storage and about to travel back with
+            # the tool result, so the covered Gateway call has delivered. Until
+            # this point a storage failure must still refund the charge.
+            confirm_deferred_deliveries()
 
         await self._record_usage_safely(
             ctx=ctx,

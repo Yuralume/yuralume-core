@@ -48,6 +48,7 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
+    render_date_anchor_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
 
@@ -211,6 +212,18 @@ def _build_prompt(
         ),
         *_render_operator_context(operator, resolved_player_address),
         *render_current_time_fact_lines(ref_now, local_tz),
+        # Absolute-date discipline (COMMITMENT_LIFECYCLE_AND_FRESHNESS
+        # P3): everything this processor writes lands in long-term state
+        # and is re-read days later, so the template forbids bare
+        # relative time words. The model can only obey that if it can do
+        # the conversion — this table is the arithmetic it needs.
+        *render_date_anchor_lines(
+            ref_now,
+            local_tz,
+            language_tag=(
+                operator.primary_language if operator is not None else None
+            ),
+        ),
         *_render_content_mode_context(content_mode),
         *(peer_context_lines or []),
     ]

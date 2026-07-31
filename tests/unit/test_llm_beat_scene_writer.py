@@ -198,3 +198,34 @@ async def test_null_writer_inner_monologue_localized_for_en_operator() -> None:
     assert draft.cast_strategy == "inner_monologue"
     assert "Solo Rehearsal" in draft.narrative
     assert "獨自面對" not in draft.narrative
+
+
+@pytest.mark.asyncio
+async def test_scene_prompt_carries_absolute_date_discipline() -> None:
+    # CF1b: the scene narrative is persisted as a StoryEvent and
+    # memorialized, so relative time words inside it go stale the same
+    # way a frozen beat summary does.
+    model = _ScriptedModel(
+        '{"narrative": "我站在門口。", "cast_strategy": "npc_dialogue"}',
+    )
+    writer = LLMStoryBeatSceneWriter(model=model)
+
+    await writer.write_scene(_context())
+
+    prompt = model.prompts[0]
+    assert "日期換算錨點" in prompt
+    assert "- 今天＝2026-06-01（星期一）" in prompt
+    assert "- 明天＝2026-06-02（星期二）" in prompt
+    assert "時間紀律" in prompt
+
+
+@pytest.mark.asyncio
+async def test_scene_prompt_date_anchor_localizes_weekday() -> None:
+    model = _ScriptedModel(
+        '{"narrative": "I stood there.", "cast_strategy": "npc_dialogue"}',
+    )
+    writer = LLMStoryBeatSceneWriter(model=model)
+
+    await writer.write_scene(_context(operator_primary_language="en-US"))
+
+    assert "- 今天＝2026-06-01（Monday）" in model.prompts[0]

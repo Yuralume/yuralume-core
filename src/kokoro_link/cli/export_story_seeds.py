@@ -31,7 +31,11 @@ import yaml
 
 from kokoro_link.bootstrap.container import build_container
 from kokoro_link.bootstrap.settings import AppSettings
-from kokoro_link.domain.entities.story_seed import StorySeed
+from kokoro_link.domain.entities.story_seed import (
+    SEED_REGION_GLOBAL,
+    SEED_TIER_DAILY,
+    StorySeed,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -126,6 +130,10 @@ def _seed_to_yaml(seed: StorySeed, *, with_local: bool) -> dict:
         payload["tags"] = list(seed.tags)
     if seed.world_frames and seed.world_frames != ("any",):
         payload["world_frames"] = list(seed.world_frames)
+    if seed.tier != SEED_TIER_DAILY:
+        payload["tier"] = seed.tier
+    if seed.regions and seed.regions != (SEED_REGION_GLOBAL,):
+        payload["regions"] = list(seed.regions)
     if seed.weight != 1.0:
         payload["weight"] = seed.weight
     if seed.cooldown_days != 7:

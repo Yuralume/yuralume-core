@@ -114,6 +114,7 @@ from kokoro_link.application.services.persona_curiosity_observability import (
     persona_curiosity_plan_summary,
 )
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.character_goal import CharacterGoal
 from kokoro_link.domain.entities.character_operator_relationship_seed import (
     CharacterOperatorRelationshipSeed,
 )
@@ -151,6 +152,7 @@ from kokoro_link.infrastructure.prompt.initial_relationship import (
     render_initial_relationship_seed_lines,
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
+    format_civil_days_ago_label,
     format_relative_past_label,
 )
 
@@ -531,7 +533,9 @@ class ProactiveDispatcher:
         recent_memories_text = await self._load_recent_memories_text(
             character_id, when,
         )
-        active_goals_text = await self._load_active_goals_text(character_id)
+        active_goals_text = await self._load_active_goals_text(
+            character_id, when, operator_tz,
+        )
         available_tools = self._describe_tools(character)
         story_events = await self._load_story_events(character, when)
         recent_sent_attempts = await self._load_recent_sent_attempts(character_id)
@@ -760,7 +764,7 @@ class ProactiveDispatcher:
                 if acceptance.delivered:
                     delivered += 1
                     external_delivered = True
-                    binding_id_for_log = acceptance.delivery_id or binding.id
+                    binding_id_for_log = binding.id
                 else:
                     _LOGGER.warning(
                         "proactive external delivery not accepted "
@@ -783,7 +787,9 @@ class ProactiveDispatcher:
                 if acceptance.delivered:
                     delivered += 1
                     external_delivered = True
-                    binding_id_for_log = acceptance.delivery_id
+                    # The Hosted delivery id is an opaque Channel receipt,
+                    # not a Core channel_bindings.id foreign key.
+                    # binding_id_for_log intentionally remains None.
                 else:
                     _LOGGER.warning(
                         "proactive hosted delivery not accepted "
@@ -831,6 +837,13 @@ class ProactiveDispatcher:
                 "persona_curiosity": persona_curiosity_metadata,
                 **quality_metadata,
             },
+            # Only the send path carries the prompt into the turn record:
+            # skip / gate-blocked ticks fire every few minutes and would
+            # otherwise flood the table with prompts for messages that
+            # never existed (see COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN
+            # §2 P0). ``None`` from a decider that doesn't assemble a
+            # prompt degrades to the previous empty-string behaviour.
+            prompt_assembled=decision.prompt_assembled or "",
             now=when,
         )
 
@@ -1974,7 +1987,12 @@ class ProactiveDispatcher:
             return ()
         return tuple(sent)
 
-    async def _load_active_goals_text(self, character_id: str) -> str:
+    async def _load_active_goals_text(
+        self,
+        character_id: str,
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
+    ) -> str:
         if self._goals is None:
             return ""
         try:
@@ -1986,8 +2004,9 @@ class ProactiveDispatcher:
             return ""
         if not goals:
             return ""
+        tz = local_tz or self._local_tz
         lines = [
-            f"- {g.content}（優先 {g.priority}）"
+            f"- {g.content}（優先 {g.priority}）{_goal_age_tag(g, now, tz)}"
             for g in goals[:5]
         ]
         return "\n".join(lines)
@@ -2101,7 +2120,7 @@ class ProactiveDispatcher:
                 if acceptance.delivered:
                     delivered += 1
                     external_delivered = True
-                    binding_id_for_log = acceptance.delivery_id or binding.id
+                    binding_id_for_log = binding.id
                 else:
                     _LOGGER.warning(
                         "pre-composed external delivery not accepted "
@@ -2127,7 +2146,9 @@ class ProactiveDispatcher:
                 if acceptance.delivered:
                     delivered += 1
                     external_delivered = True
-                    binding_id_for_log = acceptance.delivery_id
+                    # The Hosted delivery id is an opaque Channel receipt,
+                    # not a Core channel_bindings.id foreign key.
+                    # binding_id_for_log intentionally remains None.
                 else:
                     _LOGGER.warning(
                         "pre-composed hosted delivery not accepted "
@@ -2201,6 +2222,7 @@ class ProactiveDispatcher:
         binding_id: str | None = None,
         message: str | None = None,
         metadata: dict | None = None,
+        prompt_assembled: str = "",
     ) -> ProactiveAttempt:
         attempt = ProactiveAttempt.record(
             character_id=character_id,
@@ -2228,6 +2250,7 @@ class ProactiveDispatcher:
                         self._prompt_pack_hash_provider()
                         if self._prompt_pack_hash_provider is not None else ""
                     ),
+                    prompt_assembled=prompt_assembled,
                     response_text=message or "",
                     post_turn_refs={
                         "proactive_attempt_id": attempt.id,
@@ -2373,6 +2396,25 @@ def _memory_recall_time_tag(item: MemoryItem, now: datetime | None) -> str:
     if elapsed_min < 0:
         return ""
     return f"（{format_relative_past_label(elapsed_min)}）"
+
+
+def _goal_age_tag(
+    goal: CharacterGoal, now: datetime | None, local_tz: tzinfo,
+) -> str:
+    """Append 「（3 天前立下）」 so a goal reads as a dated statement.
+
+    Goals are written in the moment ("陪使用者**明早**一起出門吃刨冰") and
+    then live for weeks; without an age the decider has no way to tell a
+    promise made this morning from one whose 「明早」 passed three days ago.
+    Sibling of :func:`_memory_recall_time_tag`, but counted in civil days
+    rather than elapsed hours — commitments expire on calendar boundaries.
+    Empty when the reference clock or the stamp is missing, leaving the
+    line exactly as before.
+    """
+    label = format_civil_days_ago_label(
+        getattr(goal, "created_at", None), now, local_tz=local_tz,
+    )
+    return f"（{label}立下）" if label else ""
 
 
 def _format_intention_skip_reason(

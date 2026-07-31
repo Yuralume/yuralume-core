@@ -11,6 +11,24 @@ class CloudIdentityUnavailable(RuntimeError):
     """Raised when a cloud resource call cannot be scoped to a tenant."""
 
 
+class CloudGatewayRequestTooLargeError(RuntimeError):
+    """A deterministic local refusal before an oversized request is sent.
+
+    The retryable field is intentionally a plain contract field so external
+    turns can reject instead of treating this as a transient Gateway outage.
+    """
+
+    retryable = False
+
+    def __init__(self, *, actual_bytes: int, max_bytes: int) -> None:
+        self.actual_bytes = actual_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            "cloud gateway request exceeds the configured wire budget "
+            f"({actual_bytes} bytes > {max_bytes} bytes)",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CloudGatewayIdentity:
     operator_id: str

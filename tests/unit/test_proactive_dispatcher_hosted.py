@@ -220,8 +220,9 @@ async def test_hosted_path_full_chain_records_line_conversation() -> None:
     assert (envelope.tenant_id, envelope.account_id) == _HOSTED_IDENTITY
     assert envelope.character_id == character.id
     assert envelope.text == "在忙嗎？"
-    # The channel's delivery id flows onto the audit row.
-    assert attempt.binding_id == "chan-del-1"
+    # Hosted returns an opaque Channel delivery receipt, not a Core
+    # channel_bindings.id.  It must never be persisted through that FK.
+    assert attempt.binding_id is None
     # Pre-send ledger closed out on acceptance.
     stored = await ledger.get(envelope.event_id)
     assert stored is not None
@@ -329,6 +330,7 @@ async def test_deliver_pre_composed_routes_hosted() -> None:
         port.accepted[0].account_id,
     ) == _HOSTED_IDENTITY
     assert port.accepted[0].text == "約好的晚安訊息"
+    assert attempt.binding_id is None
     conversation = await harness.conversation_repository.latest_for_character(
         character.id, source="line",
     )

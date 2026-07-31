@@ -63,7 +63,10 @@ class _Recorder:
     order: list[str] = field(default_factory=list)
 
 
-def _executor_with_recorder(rec: _Recorder, *, crash_step: str | None = None):
+def _executor_with_recorder(
+    rec: _Recorder, *, crash_step: str | None = None, drift=None,  # noqa: ANN001
+    goal_review=None,  # noqa: ANN001
+):
     """Build an executor whose every dependency records its call into ``rec``."""
 
     def _stub(step: str):
@@ -106,6 +109,8 @@ def _executor_with_recorder(rec: _Recorder, *, crash_step: str | None = None):
         beat_due_checker=_stub("beat_due"),
         schedule_service=_stub("ensure_schedule"),
         schedule_memorializer=_stub("memorialize"),
+        schedule_weather_drift=drift,
+        goal_review_service=goal_review,
         feed_composer=_stub("feed_compose"),
         feed_comment_reply=_stub("feed_comment_reply"),
         dispatcher=_stub("proactive_dispatch"),
@@ -323,6 +328,175 @@ async def test_subscription_allows_wrapper_fail_soft() -> None:
     assert await executor.subscription_allows(_Character()) is False
 
 
+class _DriftRecorder:
+    """Weather-drift service double: records the characters/instants it vetted."""
+
+    def __init__(self, *, crash: bool = False) -> None:
+        self.calls: list[tuple[str, datetime | None]] = []
+        self._crash = crash
+
+    async def vet(self, character, *, now=None):  # noqa: ANN001
+        self.calls.append((character.id, now))
+        if self._crash:
+            raise RuntimeError("drift down")
+        return None
+
+
+def _ensure_only_executor(rec: _Recorder, drift: _DriftRecorder, **kwargs):
+    """Executor whose only wired collaborators are schedule-ensure + drift."""
+
+    class _Schedules:
+        async def ensure_window(self, character, **_):  # noqa: ANN001
+            rec.order.append("ensure_window")
+            if kwargs.get("ensure_crashes"):
+                raise RuntimeError("ensure down")
+
+    return CharacterTickExecutor(
+        schedule_service=_Schedules(),
+        schedule_weather_drift=drift,
+        dispatcher=object(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_weather_drift_vet_runs_after_ensure_window() -> None:
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift)
+    await executor.run(
+        _Character(proactive_enabled=False),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    # The vet reads the day the ensure just materialised, so ordering matters.
+    assert rec.order == ["ensure_window"]
+    assert drift.calls == [("char-1", NOW)]
+
+
+@pytest.mark.asyncio
+async def test_weather_drift_vet_crash_does_not_break_the_tick() -> None:
+    rec = _Recorder()
+    executor = _executor_with_recorder(rec, drift=_DriftRecorder(crash=True))
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    assert len(rec.order) == 7
+
+
+@pytest.mark.asyncio
+async def test_weather_drift_vet_still_runs_when_ensure_window_crashes() -> None:
+    # The day may already be planned from an earlier tick — a failed ensure
+    # must not cost today's correction.
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift, ensure_crashes=True)
+    await executor.run(
+        _Character(proactive_enabled=False),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    assert drift.calls == [("char-1", NOW)]
+
+
+@pytest.mark.asyncio
+async def test_schedule_maintenance_step_does_not_carry_the_vet() -> None:
+    # ``schedule_maintenance`` is a DAILY chain. Piggybacking the intra-day vet
+    # on it would give the distributed topology exactly the once-a-midnight
+    # cadence the drift correction exists to replace, so the two are separate
+    # steps behind separate kinds.
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift)
+    await executor.step_schedule_maintenance(_Character())
+    assert rec.order == ["ensure_window"]
+    assert drift.calls == []
+
+
+@pytest.mark.asyncio
+async def test_weather_vet_step_runs_the_vet_without_replanning() -> None:
+    # The ``schedule_weather_vet`` kind fires on its own sub-daily cadence; it
+    # only re-reads today against the current sky, never re-runs the planner.
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift)
+    await executor.step_schedule_weather_vet(_Character(), now=NOW)
+    assert rec.order == []
+    assert drift.calls == [("char-1", NOW)]
+
+
+@pytest.mark.asyncio
+async def test_weather_vet_step_survives_a_crashing_vet() -> None:
+    rec = _Recorder()
+    executor = _ensure_only_executor(rec, _DriftRecorder(crash=True))
+    await executor.step_schedule_weather_vet(_Character(), now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_warmup_skips_the_weather_vet() -> None:
+    # A brand-new character's day was planned against this exact sky
+    # milliseconds ago — paying for a drift verdict on it is pure waste.
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift)
+    await executor.run_warmup(_Character(), now=NOW)
+    assert rec.order == ["ensure_window"]
+    assert drift.calls == []
+
+
+@pytest.mark.asyncio
+async def test_abort_between_ensure_and_vet_stops_before_the_write() -> None:
+    # A reclaimed job's original runner must not land a schedule write after
+    # its lease is gone; the vet is the one step in (d) that persists.
+    rec = _Recorder()
+    drift = _DriftRecorder()
+    executor = _ensure_only_executor(rec, drift)
+    def abort_check() -> bool:
+        # The lease is lost mid-step: every pre-step check passed, the ensure
+        # ran, and only then does the runner discover it no longer owns the job.
+        return "ensure_window" in rec.order
+
+    await executor.run(
+        _Character(proactive_enabled=False),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+        abort_check=abort_check,
+    )
+    assert rec.order == ["ensure_window"]
+    assert drift.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unwired_weather_drift_leaves_the_tick_untouched() -> None:
+    rec = _Recorder()
+    executor = _executor_with_recorder(rec)
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    assert rec.order == [
+        "rest_recovery",
+        "beat_due",
+        "ensure_schedule",
+        "memorialize",
+        "feed_compose",
+        "feed_comment_reply",
+        "proactive_dispatch",
+    ]
+
+
 def test_runtime_activity_tick_gate_conforms_to_character_gate_view() -> None:
     gate = RuntimeActivityTickGate(
         policies={},
@@ -336,3 +510,102 @@ def test_runtime_activity_tick_gate_conforms_to_character_gate_view() -> None:
     assert hasattr(gate, "allows_proactive")
     view: CharacterGateView = gate  # type-checks structurally
     assert view is gate
+
+
+class _GoalReviewRecorder:
+    """Daily goal-review service double (CF2)."""
+
+    def __init__(self, *, crash: bool = False) -> None:
+        self.calls: list[tuple[str, datetime | None]] = []
+        self._crash = crash
+
+    async def review_if_due(self, character, *, now=None) -> bool:  # noqa: ANN001
+        self.calls.append((character.id, now))
+        if self._crash:
+            raise RuntimeError("review down")
+        return True
+
+
+@pytest.mark.asyncio
+async def test_goal_review_runs_in_the_embedded_tick() -> None:
+    # CF2: a self-host character must converge its goal list too, so the daily
+    # review is part of the embedded tick body — not only the distributed
+    # ``goal_review`` chain. The service's own per-day claim decides whether
+    # this call costs an LLM round trip.
+    rec = _Recorder()
+    review = _GoalReviewRecorder()
+    executor = _executor_with_recorder(rec, goal_review=review)
+    steps: list[str] = []
+
+    async def step_timer(name, coro):  # noqa: ANN001
+        steps.append(name)
+        return await coro
+
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+        step_timer=step_timer,
+    )
+    assert review.calls == [("char-1", NOW)]
+    # Placed after memorialization, before the gated feed pass.
+    assert steps.index("goal_review") == steps.index("memorialize") + 1
+    assert steps.index("goal_review") < steps.index("feed_compose")
+
+
+@pytest.mark.asyncio
+async def test_goal_review_crash_does_not_stop_the_tick() -> None:
+    rec = _Recorder()
+    executor = _executor_with_recorder(
+        rec, goal_review=_GoalReviewRecorder(crash=True),
+    )
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    assert "proactive_dispatch" in rec.order
+
+
+@pytest.mark.asyncio
+async def test_unwired_goal_review_leaves_the_tick_untouched() -> None:
+    # No service → no step, no metric name. Deployments that predate CF2 keep
+    # the exact tick body they had.
+    rec = _Recorder()
+    steps: list[str] = []
+
+    async def step_timer(name, coro):  # noqa: ANN001
+        steps.append(name)
+        return await coro
+
+    await _executor_with_recorder(rec).run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+        step_timer=step_timer,
+    )
+    assert "goal_review" not in steps
+
+
+@pytest.mark.asyncio
+async def test_step_goal_review_is_the_distributed_entry_point() -> None:
+    review = _GoalReviewRecorder()
+    executor = CharacterTickExecutor(
+        goal_review_service=review, dispatcher=object(),
+    )
+    await executor.step_goal_review(_Character(), now=NOW)
+    assert review.calls == [("char-1", NOW)]
+
+
+@pytest.mark.asyncio
+async def test_step_goal_review_is_fail_soft() -> None:
+    executor = CharacterTickExecutor(
+        goal_review_service=_GoalReviewRecorder(crash=True), dispatcher=object(),
+    )
+    await executor.step_goal_review(_Character(), now=NOW)  # must not raise

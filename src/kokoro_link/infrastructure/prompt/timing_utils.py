@@ -14,15 +14,36 @@ actually changes its opening or topic remains the model's call.
 
 from __future__ import annotations
 
-from datetime import datetime, tzinfo
+from datetime import date, datetime, timedelta, tzinfo
 
 from kokoro_link.domain.value_objects.timezone import to_timezone
+from kokoro_link.infrastructure.localization.fallback_texts import (
+    localized_weekday_label,
+)
 
 # 6h ≈ the point where "still in the same session" stops being a
 # sensible default. Below this we don't surface the catch-up hint —
 # the natural-language idle descriptor already gives the model enough
 # context.
 _SUBJECTIVE_TIME_CATCHUP_THRESHOLD_HOURS = 6.0
+
+# Which civil days the date-anchor table spells out, and the relative
+# word each one has to replace. Two days back covers "昨天 / 前天"
+# retrospection; three days forward covers the "明天 / 後天 / 大後天"
+# range that conversation-extracted commitments actually land on
+# (anything further out is normally spoken as an explicit date already).
+_DATE_ANCHOR_OFFSETS: tuple[tuple[int, str], ...] = (
+    (-2, "前天"),
+    (-1, "昨天"),
+    (0, "今天"),
+    (1, "明天"),
+    (2, "後天"),
+    (3, "大後天"),
+)
+
+_DATE_ANCHOR_HEADING = (
+    "日期換算錨點（角色所在時區的民曆日）："
+)
 
 
 def time_of_day_hint(local_now: datetime) -> str:
@@ -65,6 +86,63 @@ def render_current_time_fact_lines(
     if heading is None:
         return [line]
     return [heading, line]
+
+
+def render_date_anchor_lines(
+    now: datetime | None,
+    local_tz: tzinfo,
+    *,
+    language_tag: str | None = None,
+    heading: str | None = _DATE_ANCHOR_HEADING,
+) -> list[str]:
+    """Render the relative-word → absolute-date conversion table.
+
+    Writers that persist natural language into long-term state (post-turn
+    memories, goal proposals, story-arc beats, schedule descriptions) get
+    read back days later with no "what day is today" context attached —
+    a frozen 「明天」 then reads as forever-tomorrow. Rather than rewriting
+    the model's prose afterwards (which would be keyword surgery on
+    user-visible text, banned by the LLM-first rule), we hand the model
+    the arithmetic it needs and state the discipline in the template.
+
+    Deliberately deterministic: calendar arithmetic is schema data, not
+    a semantic judgement. ``language_tag`` only localises the weekday
+    annotation so the model can copy it straight into content written in
+    the operator's language.
+    """
+    if now is None:
+        return []
+    return render_date_anchor_lines_for_day(
+        to_timezone(now, local_tz).date(),
+        language_tag=language_tag,
+        heading=heading,
+    )
+
+
+def render_date_anchor_lines_for_day(
+    today: date | None,
+    *,
+    language_tag: str | None = None,
+    heading: str | None = _DATE_ANCHOR_HEADING,
+) -> list[str]:
+    """Same anchor table as :func:`render_date_anchor_lines`, keyed on a date.
+
+    Some writers never see an instant — the story-arc planner, beat scene
+    writer and beat rechecker are all handed the operator-local *civil
+    day* their caller already resolved (``context.today`` /
+    ``start_date``) rather than a UTC ``datetime`` plus a timezone. They
+    need the identical relative-word → absolute-date table, so the offsets
+    and formatting live here once and the instant-based entry point above
+    just converts and delegates.
+    """
+    if today is None:
+        return []
+    lines = [heading] if heading is not None else []
+    for offset, relative_word in _DATE_ANCHOR_OFFSETS:
+        day = today + timedelta(days=offset)
+        weekday = localized_weekday_label(day.weekday(), language_tag)
+        lines.append(f"- {relative_word}＝{day.isoformat()}（{weekday}）")
+    return lines
 
 
 def format_current_time_fact(
@@ -130,6 +208,37 @@ def format_relative_past_label(minutes: float) -> str:
     if minutes < 2:
         return "剛剛"
     return f"{format_gap_duration_label(minutes)}前"
+
+
+def format_civil_days_ago_label(
+    past: datetime | None,
+    now: datetime | None,
+    *,
+    local_tz: tzinfo,
+) -> str:
+    """Render how many *civil days* ago something was written: 今天 / N 天前.
+
+    Sibling to :func:`format_relative_past_label`, which measures elapsed
+    duration ("約 8 小時前"). For material the character may speak about as
+    a dated commitment — goals, invitations — the calendar boundary is the
+    thing that matters: a goal set at 23:50 last night is 「1 天前」, and its
+    frozen 「明早」 is already spent. Duration buckets blur exactly that line.
+
+    Returns ``""`` when either instant is missing or the stored stamp is in
+    the future (clock skew), so callers can append it unconditionally and
+    simply get no tag rather than a nonsense one. Naive stamps are read as
+    UTC, matching the persistence convention.
+    """
+    if past is None or now is None:
+        return ""
+    past_day = to_timezone(past, local_tz).date()
+    today = to_timezone(now, local_tz).date()
+    days = (today - past_day).days
+    if days < 0:
+        return ""
+    if days == 0:
+        return "今天"
+    return f"{days} 天前"
 
 
 def describe_idle_natural(minutes: float) -> str:

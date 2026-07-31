@@ -8,6 +8,8 @@ prompt. Empty / ``None`` scene context falls back to the legacy
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from kokoro_link.contracts.story import SceneContext
@@ -322,3 +324,56 @@ async def test_unknown_tone_falls_back_to_daily() -> None:
     assert "進入時刻" in prompt
     assert "不要迴避" not in prompt
     assert "心理層次" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_scene_prompt_carries_absolute_date_discipline() -> None:
+    # CF1b: the scene expander writes the player-visible beat narrative
+    # that gets persisted as a StoryEvent, so it needs today's date, the
+    # relative-word → absolute-date table, and the discipline rule.
+    model = _CapturingModel()
+    expander = LLMStoryEventExpander(model=model)
+    await expander.expand(
+        seed=_DuckSeed("她踏進教室時，老師已經在等。"),
+        character_name="Aki",
+        character_summary="插畫家",
+        speaking_style="溫柔",
+        world_frame="modern",
+        scene=SceneContext(
+            scene_type="conflict",
+            location="音樂教室",
+            scene_characters=("指導老師",),
+            dramatic_question="她要承認嗎？",
+            today=date(2026, 6, 1),
+        ),
+    )
+    prompt = model.last_prompt
+    assert prompt is not None
+    assert "今天：2026-06-01（星期一）" in prompt
+    assert "日期換算錨點" in prompt
+    assert "- 明天＝2026-06-02（星期二）" in prompt
+    assert "時間紀律" in prompt
+
+
+@pytest.mark.asyncio
+async def test_scene_prompt_without_today_still_states_discipline() -> None:
+    model = _CapturingModel()
+    expander = LLMStoryEventExpander(model=model)
+    await expander.expand(
+        seed=_DuckSeed("她踏進教室時，老師已經在等。"),
+        character_name="Aki",
+        character_summary="插畫家",
+        speaking_style="溫柔",
+        world_frame="modern",
+        scene=SceneContext(scene_type="conflict", location="音樂教室"),
+    )
+    prompt = model.last_prompt
+    assert prompt is not None
+    assert "時間紀律" in prompt
+    assert "沒有可靠的今天日期" in prompt
+
+
+def test_scene_context_today_alone_is_not_meaningful() -> None:
+    # ``today`` is calendar plumbing, not scene structure — it must not
+    # flip an otherwise-empty context into scene-prompt mode.
+    assert SceneContext(today=date(2026, 6, 1)).is_meaningful() is False

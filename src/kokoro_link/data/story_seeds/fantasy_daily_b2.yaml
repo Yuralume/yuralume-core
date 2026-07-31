@@ -1,0 +1,296 @@
+# Fantasy daily seeds — batch b2.
+#
+# Generic high-fantasy slice-of-life: potion mishaps, market stalls,
+# familiars, guild boards, seasonal chores. Same temperature as
+# frame_fantasy.yaml — low stakes, gentle ups and downs, resolvable
+# in 2-3 narrated sentences. The expander adapts details to the
+# character's world via their summary + speaking style.
+#
+# external_id convention: fdb2:<category>:<nnn> (unique across packs).
+pack_id: fantasy_daily_b2
+language: zh-TW
+
+seeds:
+  # --- Herbs / potions ---------------------------------------------
+  - external_id: fdb2:herb:001
+    seed_text: 進森林採當季藥草，在老樹根旁發現一株沒見過的稀有品種
+    tags: [outdoor, discovery, magical]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:potion:001
+    seed_text: 熬魔藥失手冒出一屋子粉紅色的煙，邊開窗邊翻配方找哪一步錯了
+    tags: [indoor, mistake, magical]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- Familiar ----------------------------------------------------
+  - external_id: fdb2:familiar:001
+    seed_text: 慣用的羽毛筆又不見了，最後在使魔的窩裡找到一整堆贓物
+    tags: [indoor, animal, funny]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:familiar:002
+    seed_text: 使魔最近不肯吃飯，換了好幾種餌食才發現牠只是想吃烤過的
+    tags: [animal, gentle, discovery]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- Market / shop -----------------------------------------------
+  - external_id: fdb2:market:001
+    seed_text: 帶自製藥水去週末市集擺攤，被老練的主婦殺價殺得毫無招架之力
+    tags: [outdoor, social, funny]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:market:002
+    seed_text: 常去的雜貨攤換了新招牌，老闆一臉期待地問好不好看
+    tags: [outdoor, social, mundane]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: fdb2:shop:001
+    seed_text: 店裡的老熟客今天欲言又止，攪著茶好一會才說出他的小煩惱
+    tags: [indoor, social, gentle]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Guild -------------------------------------------------------
+  - external_id: fdb2:guild:001
+    seed_text: 公會布告板上有張找貓的委託，報酬只有一籃蘋果，卻莫名想接
+    tags: [social, gentle, mundane]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:guild:002
+    seed_text: 公會裡遇到緊張兮兮的新人問東問西，想起自己剛起步的樣子
+    tags: [social, nostalgia, gentle]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Everyday magic ----------------------------------------------
+  - external_id: fdb2:magic:001
+    seed_text: 洗碗的咒語出了點岔子，盤子在水槽裡排成一列跳起舞來
+    tags: [indoor, magical, funny]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:magic:002
+    seed_text: 保存食物的冰咒難得一次成功，連鄰居都跑來問訣竅
+    tags: [magical, satisfied, social]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Home / cozy -------------------------------------------------
+  - external_id: fdb2:home:001
+    seed_text: 雨下了一整天出不了門，窩在屋裡整理藥材、烤點心聽雨聲
+    tags: [indoor, cozy, rain]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.8
+    cooldown_days: 60
+
+  - external_id: fdb2:home:002
+    seed_text: 用清潔魔法大掃除，從床底掃出一件早就忘了的舊東西
+    tags: [indoor, nostalgia, magical]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- Food / cooking ----------------------------------------------
+  - external_id: fdb2:food:001
+    seed_text: 市場買到一種切開會微微發光的異界蔬菜，猶豫該怎麼下鍋
+    tags: [food, discovery, magical]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:food:002
+    seed_text: 向借宿的旅人學了一道異鄉燉菜，陌生香料的味道讓廚房像換了一個國度
+    tags: [food, discovery, travel]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:harvest:001
+    seed_text: 果樹大豐收，熬了一整天果醬，櫃子裡多出一排亮晶晶的瓶子
+    tags: [food, satisfied, seasonal]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- Errands / travel --------------------------------------------
+  - external_id: fdb2:travel:001
+    seed_text: 替村民送藥到鄰村，回程搭上乾草車的便車，晃晃悠悠看了一路風景
+    tags: [outdoor, gentle, travel]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:rest:001
+    seed_text: 泡了據說含微量魔力的溫泉，指尖到現在還暖暖地發麻
+    tags: [rest, magical, refreshed]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- Study / night -----------------------------------------------
+  - external_id: fdb2:study:001
+    seed_text: 書庫翻到一本滿是古文的舊書，抄了一下午只解出開頭一句
+    tags: [indoor, study, curiosity]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: fdb2:night:001
+    seed_text: 爬上屋頂等流星，順手替明天的天氣占了一卦，結果模稜兩可
+    tags: [night, magical, gentle]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: fdb2:night:002
+    seed_text: 深夜爐火毫無預兆地轉成淡綠色，翻遍手邊的書也查不出緣由，索性搬了張椅子守著它看
+    tags: [night, magical, curious]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- Village life ------------------------------------------------
+  - external_id: fdb2:village:001
+    seed_text: 村民帶著小病痛上門看診，配完藥收到幾顆還溫熱的雞蛋當診金
+    tags: [social, gentle, mundane]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: fdb2:village:002
+    seed_text: 村裡的南瓜比賽兩家爭得面紅耳赤，自己莫名被拱出來當裁判，左右為難
+    tags: [social, funny, dilemma]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- Practice / mishaps ------------------------------------------
+  - external_id: fdb2:train:001
+    seed_text: 掃帚飛行練習又栽進乾草堆，圍觀的村童拍手拍得比誰都響
+    tags: [outdoor, mistake, funny]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Small wonders -----------------------------------------------
+  - external_id: fdb2:gift:001
+    seed_text: 清晨門口多了顆用葉子包好的小果實，猜不出是哪位小精靈留下的
+    tags: [gentle, mystery, magical]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: fdb2:creature:001
+    seed_text: 市集攤位上那隻會學舌的鳥偏偏學會了自己的口頭禪，引來一圈人笑成一片
+    tags: [animal, funny, embarrassed]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- Relationships (kept daily-mild) -----------------------------
+  - external_id: fdb2:social:001
+    seed_text: 發現在意的人身上多了個別人送的小護符，狀似隨意地問了句「哪來的」
+    tags: [social, jealousy, subtle]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: fdb2:social:002
+    seed_text: 和老搭檔分頭辦完事會合，發現兩人不約而同都替對方多帶了一份小點心
+    tags: [social, warm, partnership]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: fdb2:festival:001
+    seed_text: 祭典散場後提著燈籠並肩走夜路，有句話到了嘴邊又收回去
+    tags: [night, social, introspective]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- Seasons -----------------------------------------------------
+  - external_id: fdb2:season:001
+    seed_text: 一早推開門發現落了今年第一場雪，趕著替藥草園蓋上稻草
+    tags: [outdoor, seasonal, mundane]
+    world_frames: [fantasy]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 90

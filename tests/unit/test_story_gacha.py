@@ -182,3 +182,124 @@ async def test_character_specific_seed_preferred_over_global() -> None:
         character=character, today=date_type(2026, 4, 20), count=2,
     )
     assert {s.seed_text for s in result.picked} == {"global", "private"}
+
+
+# ---- tier filtering --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dramatic_seed_never_enters_default_daily_roll() -> None:
+    seeds = InMemoryStorySeedRepository()
+    events = InMemoryStoryEventRepository()
+    await _seed(seeds, [
+        StorySeed.create(
+            seed_text="劇情種子", world_frames=["modern"], tier="dramatic",
+        ),
+    ])
+    gacha = StoryGachaService(
+        seed_repository=seeds, event_repository=events,
+        rng=random.Random(0),
+    )
+
+    result = await gacha.roll(
+        character=_character(), today=date_type(2026, 4, 20), count=1,
+    )
+    assert result.picked == ()
+    assert result.eligible_count == 0
+
+
+@pytest.mark.asyncio
+async def test_dramatic_roll_excludes_daily_seeds() -> None:
+    seeds = InMemoryStorySeedRepository()
+    events = InMemoryStoryEventRepository()
+    await _seed(seeds, [
+        StorySeed.create(seed_text="日常種子", world_frames=["modern"]),
+        StorySeed.create(
+            seed_text="劇情種子", world_frames=["modern"], tier="dramatic",
+        ),
+    ])
+    gacha = StoryGachaService(
+        seed_repository=seeds, event_repository=events,
+        rng=random.Random(0),
+    )
+
+    result = await gacha.roll(
+        character=_character(), today=date_type(2026, 4, 20), count=2,
+        tier="dramatic",
+    )
+    assert [s.seed_text for s in result.picked] == ["劇情種子"]
+    assert result.eligible_count == 1
+
+
+# ---- region filtering ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_region_roll_draws_global_and_matching_region() -> None:
+    seeds = InMemoryStorySeedRepository()
+    events = InMemoryStoryEventRepository()
+    await _seed(seeds, [
+        StorySeed.create(seed_text="全球", world_frames=["modern"]),
+        StorySeed.create(
+            seed_text="台味", world_frames=["modern"], regions=["tw"],
+        ),
+        StorySeed.create(
+            seed_text="日味", world_frames=["modern"], regions=["jp"],
+        ),
+    ])
+    gacha = StoryGachaService(
+        seed_repository=seeds, event_repository=events,
+        rng=random.Random(0),
+    )
+
+    result = await gacha.roll(
+        character=_character(), today=date_type(2026, 4, 20), count=3,
+        region="tw",
+    )
+    assert {s.seed_text for s in result.picked} == {"全球", "台味"}
+    assert result.eligible_count == 2
+
+
+@pytest.mark.asyncio
+async def test_none_region_draws_only_global_seeds() -> None:
+    seeds = InMemoryStorySeedRepository()
+    events = InMemoryStoryEventRepository()
+    await _seed(seeds, [
+        StorySeed.create(seed_text="全球", world_frames=["modern"]),
+        StorySeed.create(
+            seed_text="台味", world_frames=["modern"], regions=["tw"],
+        ),
+    ])
+    gacha = StoryGachaService(
+        seed_repository=seeds, event_repository=events,
+        rng=random.Random(0),
+    )
+
+    result = await gacha.roll(
+        character=_character(), today=date_type(2026, 4, 20), count=2,
+        region=None,
+    )
+    assert {s.seed_text for s in result.picked} == {"全球"}
+    assert result.eligible_count == 1
+
+
+@pytest.mark.asyncio
+async def test_region_mismatch_reports_empty_reason() -> None:
+    seeds = InMemoryStorySeedRepository()
+    events = InMemoryStoryEventRepository()
+    await _seed(seeds, [
+        StorySeed.create(
+            seed_text="日味", world_frames=["modern"], regions=["jp"],
+        ),
+    ])
+    gacha = StoryGachaService(
+        seed_repository=seeds, event_repository=events,
+        rng=random.Random(0),
+    )
+
+    result = await gacha.roll(
+        character=_character(), today=date_type(2026, 4, 20), count=1,
+        region="tw",
+    )
+    assert result.picked == ()
+    assert result.reason_if_empty is not None

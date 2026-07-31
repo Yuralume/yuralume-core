@@ -165,3 +165,36 @@ async def test_completion_writer_falls_back_localized_on_bad_json() -> None:
 
     assert "we finished" in draft.content.lower()
     assert "我們一起走完了" not in draft.content
+
+
+@pytest.mark.asyncio
+async def test_completion_prompt_carries_absolute_date_discipline() -> None:
+    # CF1b: the milestone is a long-term memory re-read for months, so a
+    # relative time word inside it never resolves.
+    from dataclasses import replace
+
+    model = _ScriptedModel('{"content":"我們記得那一天。"}')
+    writer = LLMArcCompletionMemoryWriter(model=model)
+
+    await writer.write_memory(replace(_context(), today=date(2026, 6, 1)))
+
+    prompt = model.prompts[0]
+    assert "今天：2026-06-01（星期一）" in prompt
+    assert "日期換算錨點" in prompt
+    assert "- 昨天＝2026-05-31（星期日）" in prompt
+    assert "時間紀律" in prompt
+
+
+@pytest.mark.asyncio
+async def test_completion_prompt_without_today_still_states_discipline() -> None:
+    # Legacy callers that never resolved a civil day must not silently
+    # lose the rule — the block degrades to "no date, so no relative
+    # time words at all".
+    model = _ScriptedModel('{"content":"我們記得那一天。"}')
+    writer = LLMArcCompletionMemoryWriter(model=model)
+
+    await writer.write_memory(_context())
+
+    prompt = model.prompts[0]
+    assert "時間紀律" in prompt
+    assert "沒有可靠的今天日期" in prompt

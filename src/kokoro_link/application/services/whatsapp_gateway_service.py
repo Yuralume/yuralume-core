@@ -39,6 +39,7 @@ class WhatsAppSidecarClientPort(Protocol):
         session_id: str,
         api_token: str | None,
         on_event: Callable[[dict[str, Any]], Awaitable[None]],
+        on_connected: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -183,11 +184,12 @@ class WhatsAppGatewayService:
             await self._record_error(account, "Missing sidecar_url/session_id")
             return
 
-        await self._accounts.mark_gateway_success(
-            account.id,
-            owner_id=self._owner_id,
-            at=_utcnow(),
-        )
+        async def handle_connected() -> None:
+            await self._accounts.mark_gateway_success(
+                account.id,
+                owner_id=self._owner_id,
+                at=_utcnow(),
+            )
 
         async def handle_event(raw: dict[str, Any]) -> None:
             parsed = self._event_parser(raw)
@@ -223,6 +225,7 @@ class WhatsAppGatewayService:
             session_id=session_id,
             api_token=api_token,
             on_event=handle_event,
+            on_connected=handle_connected,
         )
 
     async def _refresh_lock_until_cancelled(

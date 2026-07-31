@@ -33,6 +33,15 @@ and in-process debounce) and re-raises, leaving the transport free to
 re-deliver. Every other failure keeps the historical semantics — swallowed,
 stamps retained — because a turn that crashed mid-flight may already have
 appended the user message and charged for it.
+
+**Drain rollback (GD1-A).** A replica told to drain refuses new turns on the
+first line of ``ChatService._begin_turn``, which puts a drained delivery in
+exactly the conversation-busy shape: the claim was taken in step 1, nothing was
+written, and the refusal is about *this replica*, not about the message. So it
+is handed back the same way. Letting the generic ``except`` below swallow it
+would be the worst possible outcome — the receipt stays stamped, the webhook
+answers 200, the platform never retries, and the player's message is gone for
+good with no error anywhere.
 """
 
 import asyncio
@@ -43,6 +52,7 @@ from enum import Enum
 from kokoro_link.application.dto.chat import PresenceFramePayload, SendChatMessageRequest
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
+from kokoro_link.application.services.drain_state import ServerDrainingError
 from kokoro_link.application.services.outbound_message_segments import (
     send_segmented_outbound,
 )
@@ -218,6 +228,23 @@ class MessagingDispatcher:
             await self._rollback_delivery(message, claim)
             _LOGGER.warning(
                 "inbound handed back to the transport — conversation busy "
+                "binding=%s conversation=%s %s/%s id=%s",
+                binding.id,
+                conversation_id,
+                message.platform.value,
+                message.chat_ref,
+                message.platform_message_id,
+            )
+            raise
+        except ServerDrainingError:
+            # Same shape as busy, different cause: this replica is going away
+            # and refused the turn before it wrote anything. Hand the delivery
+            # back so the platform re-delivers it to a live replica. Must sit
+            # above the generic clause — swallowing a drain would keep the
+            # receipt, answer the webhook 200, and lose the message silently.
+            await self._rollback_delivery(message, claim)
+            _LOGGER.warning(
+                "inbound handed back to the transport — replica draining "
                 "binding=%s conversation=%s %s/%s id=%s",
                 binding.id,
                 conversation_id,

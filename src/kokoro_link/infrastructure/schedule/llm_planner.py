@@ -33,13 +33,19 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import (
     DailySchedule,
     MeetingAffordance,
+    OPERATOR_CONFIRMED_LAPSED_ROLE,
+    OPERATOR_INVITE_EXPIRED_ROLE,
     OPERATOR_INVITE_PENDING_ROLE,
     OPERATOR_WISH_ROLE,
     ScenePrivacy,
     ScheduleActivity,
 )
+from kokoro_link.domain.services.recent_activity_digest import (
+    RecentDayActivities,
+)
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.entities.story_arc import StoryArcBeat
+from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
@@ -61,6 +67,14 @@ _MAX_CATEGORY_CHARS = 40
 _MAX_LOCATION_CHARS = 80
 _MAX_COMPANION_NAMES_PER_ACTIVITY = 3
 _MAX_COMPANION_NAME_CHARS = 40
+
+# SE1 — bounds on the story-event inspiration block. Narratives are 2–3
+# sentences by contract but the expander is an LLM, so both axes are
+# clamped: at most this many events (most recent win) and at most this
+# many characters per narrative. Together they cap the block near the
+# weight of the recent-activity digest it sits beside.
+_MAX_STORY_EVENTS = 8
+_MAX_STORY_EVENT_NARRATIVE_CHARS = 160
 
 _WEEKDAY_LABELS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -93,6 +107,9 @@ class LLMSchedulePlanner(SchedulePlannerPort):
         operator_persona_lines: tuple[str, ...] = (),
         schedule_involvement_policy: str = "none",
         pre_committed_activities: tuple[ScheduleActivity, ...] = (),
+        expired_operator_commitments: tuple[ScheduleActivity, ...] = (),
+        recent_activity_digest: tuple[RecentDayActivities, ...] = (),
+        recent_story_events: tuple[StoryEvent, ...] = (),
         recurring_patterns: tuple[BehavioralPattern, ...] = (),
         operator_primary_language: str = "zh-TW",
     ) -> DailySchedule:
@@ -119,6 +136,9 @@ class LLMSchedulePlanner(SchedulePlannerPort):
             operator_persona_lines=operator_persona_lines,
             schedule_involvement_policy=schedule_involvement_policy,
             pre_committed_activities=pre_committed_activities,
+            expired_operator_commitments=expired_operator_commitments,
+            recent_activity_digest=recent_activity_digest,
+            recent_story_events=recent_story_events,
             recurring_patterns=recurring_patterns,
             local_tz=local_tz,
             operator_primary_language=operator_primary_language,
@@ -129,14 +149,15 @@ class LLMSchedulePlanner(SchedulePlannerPort):
             log_auxiliary_llm_failure(
                 _LOGGER, exc, "Schedule planner LLM call failed",
             )
-            # On failure preserve the pre-commitments so we don't
-            # silently lose user agreements made in chat — they'll be
-            # re-fed to the next plan_day attempt via ensure_schedule.
+            # Preserve pre-commitments, but make the attempt terminal for this
+            # civil day. Automatic every-tick retries can multiply one upstream
+            # outage into unbounded paid traffic; the explicit regenerate path
+            # is the controlled retry surface.
             return DailySchedule.create(
                 character_id=character.id,
                 date_=date_,
                 activities=list(pre_committed_activities),
-                is_planned=False,
+                is_planned=True,
             )
 
         entries = parse_memory_payload(raw)
@@ -172,6 +193,9 @@ def _build_prompt(
     operator_persona_lines: tuple[str, ...] = (),
     schedule_involvement_policy: str = "none",
     pre_committed_activities: tuple[ScheduleActivity, ...] = (),
+    expired_operator_commitments: tuple[ScheduleActivity, ...] = (),
+    recent_activity_digest: tuple[RecentDayActivities, ...] = (),
+    recent_story_events: tuple[StoryEvent, ...] = (),
     recurring_patterns: tuple[BehavioralPattern, ...] = (),
     local_tz: tzinfo | None = None,
     operator_primary_language: str = "zh-TW",
@@ -191,8 +215,13 @@ def _build_prompt(
         if calendar_context.strip()
         else ""
     )
+    # The caveat rides with the facts rather than sitting in the template's
+    # principles, so it only ever appears when there *are* facts to qualify
+    # (future-day pre-plans pass an empty context on purpose).
     weather_block = (
-        "\n此刻真實世界天氣：\n" + weather_context.strip() + "\n"
+        "\n此刻真實世界天氣（此為規劃當下的即時事實，當天天氣可能變化）：\n"
+        + weather_context.strip()
+        + "\n"
         if weather_context.strip()
         else ""
     )
@@ -207,7 +236,12 @@ def _build_prompt(
     commitments_block = _render_commitments_block(
         pre_committed_activities, local_tz=local_tz,
     )
+    expired_commitments_block = _render_expired_commitments_block(
+        expired_operator_commitments, local_tz=local_tz,
+    )
     patterns_block = _render_recurring_patterns_block(recurring_patterns)
+    recent_activity_block = _render_recent_activity_block(recent_activity_digest)
+    story_events_block = _render_story_events_block(recent_story_events)
     dialogue_block = (
         "\n近期對話脈絡（這位角色最近跟使用者在聊的事，行程請盡量呼應、"
         "避免與剛達成的共識或約定相衝突）：\n"
@@ -268,10 +302,13 @@ def _build_prompt(
         weather_block=weather_block,
         operator_context_block=operator_context_block,
         commitments_block=commitments_block,
+        expired_commitments_block=expired_commitments_block,
         dialogue_block=dialogue_block,
         world_block=world_block,
         arc_block=arc_block,
         patterns_block=patterns_block,
+        recent_activity_block=recent_activity_block,
+        story_events_block=story_events_block,
     )
     language_hint = render_operator_language_hint(operator_primary_language)
     if language_hint:
@@ -395,6 +432,70 @@ def _render_commitments_block(
     return "\n".join(lines)
 
 
+_EXPIRED_ROLE_LABELS: dict[str, str] = {
+    OPERATOR_INVITE_EXPIRED_ROLE: "當時只是邀請，使用者始終沒有答應",
+    OPERATOR_CONFIRMED_LAPSED_ROLE: "當時說好了，但沒有留下真的一起完成的紀錄",
+}
+
+
+def _expired_status_label(activity: ScheduleActivity) -> str:
+    """Describe *why* a commitment is dead, from its structured role.
+
+    Derived from the participant role the expiry sweep stamped — never
+    from reading the description — so this stays a fact projection rather
+    than an interpretation of user-visible prose.
+    """
+    for ref in activity.participant_refs:
+        label = _EXPIRED_ROLE_LABELS.get(ref.role or "")
+        if label is not None:
+            return label
+    return "已經過去、沒有成行"
+
+
+def _render_expired_commitments_block(
+    commitments: tuple[ScheduleActivity, ...],
+    *,
+    local_tz: tzinfo | None,
+) -> str:
+    """Render dead invitations as a "know this, never use this" fact list.
+
+    The counterpart to :func:`_render_commitments_block`. That block says
+    "keep these exactly"; this one says "these are over". Both are needed:
+    filtering the expired ones out of the input silently would leave the
+    model free to re-invent them from a dialogue summary that still talks
+    about the appointment — which is precisely how the same invitation kept
+    reappearing on day after day after it had already failed to happen.
+    """
+    if not commitments:
+        return ""
+    lines = [
+        "",
+        "**已經過期、沒有成行的邀請／共同約定（事實清單，僅供你知悉，不是可用素材）**：",
+    ]
+    for act in commitments:
+        start = act.start_at
+        end = act.end_at
+        if local_tz is not None:
+            start = start.astimezone(local_tz)
+            end = end.astimezone(local_tz)
+        weekday = _WEEKDAY_LABELS[start.weekday()]
+        loc = f"（{act.location}）" if act.location else ""
+        lines.append(
+            f"- {start.date().isoformat()}（{weekday}）"
+            f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')} "
+            f"{act.description}{loc}｜{_expired_status_label(act)}",
+        )
+    lines.append(
+        "以上都已成為過去式。**不得**把其中任何一項重新排進今天的行程，也不得換個說法、"
+        "換個時段、換個地點後再排一次。就算近期對話脈絡、劇情骨架或生活節奏裡又提到它們，"
+        "那也只是舊話題的回音，不代表這個約定重新成立。角色心裡若仍惦記，"
+        "只能安排成與使用者無關的獨自行動，operator_involvement 不得因此標成邀請或共同狀態；"
+        "要重新約，必須等使用者在對話裡再次開口。",
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_recurring_patterns_block(
     patterns: tuple[BehavioralPattern, ...],
 ) -> str:
@@ -418,6 +519,108 @@ def _render_recurring_patterns_block(
     ]
     for pattern in patterns[:8]:
         lines.append(f"- {pattern.description}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_recent_activity_block(
+    days: tuple[RecentDayActivities, ...],
+) -> str:
+    """CF5 P5a — the days just gone, as a fact list the planner reads
+    before inventing today.
+
+    The counterpart to :func:`_render_recurring_patterns_block`: that one
+    says "this is your rhythm, feel free to keep it", this one says "this
+    is what you already did, don't just do it again". Both are facts; the
+    template's 生活素材新鮮度紀律 rules own the judgement of which
+    activities the no-repeat rule covers, so nothing here inspects,
+    classifies or compares descriptions — they are passed through
+    verbatim, routine entries included. Hiding the routine ones would be
+    the code quietly deciding what counts as routine, which is precisely
+    the call the model is asked to make.
+
+    Absolute dates (never 昨天/前天) for the same reason CF3 stamped them
+    on expired commitments: a relative label read days later is how a
+    stale item gets re-read as a live one.
+    """
+    if not days:
+        return ""
+    lines = [
+        "",
+        "最近幾天已經排過／做過的活動（事實清單；用來判斷什麼題材剛用過，"
+        "不是今天要照抄的內容）：",
+    ]
+    for day in days:
+        weekday = _WEEKDAY_LABELS[day.date.weekday()]
+        joined = "、".join(day.descriptions)
+        lines.append(f"- {day.date.isoformat()}（{weekday}）：{joined}")
+    lines.append(
+        "今天請給出新的一天：上面出現過的特色／一次性活動不要再排一次，"
+        "同一個主題要再登場必須帶明確的新進展或變化並寫進 description；"
+        "日常慣例（睡眠、三餐、通勤、既有習慣）不在此限，照常安排即可。",
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _story_event_date_label(raw: str) -> str:
+    """Absolute-date label for one story event, weekday attached.
+
+    ``StoryEvent.date`` is a stored ISO string, not a ``date`` — a row
+    that somehow holds junk falls back to the raw text rather than
+    killing the whole prompt build."""
+    text = raw.strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        return text
+    return f"{parsed.isoformat()}（{_WEEKDAY_LABELS[parsed.weekday()]}）"
+
+
+def _render_story_events_block(
+    events: tuple[StoryEvent, ...],
+) -> str:
+    """SE1 — the character's recent story events, as inspiration facts.
+
+    The third leg of the freshness inputs: the recurring-patterns block
+    says "this is your rhythm", the recent-activity block says "this is
+    what you already did", and this one says "this is what recently
+    *happened to you*". Story events were previously visible to chat and
+    the proactive decider but never to the planner — the "planner 盲區"
+    item of the stale-appointment diagnosis — so the day being planned
+    could not pick up, respond to or close out anything the character
+    had just lived through.
+
+    Facts only, judgement stays with the model: narratives are passed
+    through verbatim apart from whitespace-flattening and a length clamp
+    (they are persisted prose re-read for days; nothing here inspects or
+    classifies their content). Callers supply events oldest-first; the
+    count cap keeps the most recent ones. Absolute dates for the same
+    reason CF3/CF5 use them — a relative label read later is how a stale
+    item gets re-read as a live one.
+    """
+    if not events:
+        return ""
+    lines = [
+        "",
+        "角色近日發生的小事（角色近日的親身經歷，由舊到新；靈感素材，不是指令）：",
+    ]
+    for event in events[-_MAX_STORY_EVENTS:]:
+        narrative = " ".join(event.narrative.split())
+        if len(narrative) > _MAX_STORY_EVENT_NARRATIVE_CHARS:
+            narrative = narrative[:_MAX_STORY_EVENT_NARRATIVE_CHARS] + "…"
+        tone = (
+            f"｜當時心情：{event.emotional_tone}"
+            if event.emotional_tone else ""
+        )
+        lines.append(
+            f"- {_story_event_date_label(event.date)}：{narrative}{tone}",
+        )
+    lines.append(
+        "今天的行程可以自然延續、回應或收尾其中的片段，也可以完全不提；"
+        "要延續時請帶出新的進展或變化（見生活素材新鮮度紀律），"
+        "不要把同一件事原樣重演。",
+    )
     lines.append("")
     return "\n".join(lines)
 

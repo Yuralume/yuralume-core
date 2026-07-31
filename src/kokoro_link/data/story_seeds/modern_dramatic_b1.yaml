@@ -1,0 +1,149 @@
+# Modern dramatic story seeds — batch 1 (seed-harvest-b1).
+#
+# Assumes contemporary earth — phones, messaging, workplaces, city life.
+# Tension hooks that open a scene without deciding the player's reaction
+# or playing out the resolution. No named people, no IP.
+#
+# tier: dramatic — lower weight, longer cooldown than daily seeds.
+pack_id: modern_dramatic_b1
+language: zh-TW
+
+seeds:
+  # --- Messages / phones -------------------------------------------
+  - external_id: mdr1:missend:001
+    seed_text: 一則不該被那個人看到的訊息，發現時已經出現在對方的對話框裡
+    tags: [mistake, panic, tech, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 60
+
+  - external_id: mdr1:draft:001
+    seed_text: 換手機轉移備份時，跳出一段早該被刪掉的舊語音訊息，播放鍵遲遲按不下去
+    tags: [nostalgia, dilemma, tech, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 45
+
+  - external_id: mdr1:silence:001
+    seed_text: 平常總是秒回的那個人已讀不回一整天，翻遍對話也找不出哪裡不對
+    tags: [anxiety, silence, relationship, tech]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 45
+
+  - external_id: mdr1:call:001
+    seed_text: 半夜手機突然響起，那頭沉默了幾秒才開口問「現在方便說話嗎」
+    tags: [night, suspense, tension, tech]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 60
+
+  - external_id: mdr1:found:001
+    seed_text: 撿到一支響個不停的手機，螢幕上跳著「拜託接電話」的訊息
+    tags: [stranger, dilemma, urgency, tech]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  # --- Relationships / reunions ------------------------------------
+  - external_id: mdr1:ex:001
+    seed_text: 前任突然傳來一句「最近好嗎」，偏偏挑在心情最複雜的時候
+    tags: [ex, conflicted, relationship, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  - external_id: mdr1:pretend:001
+    seed_text: 為了應付一場躲不掉的聚會，臨時跟人講好要假扮成一對
+    tags: [fake-dating, awkward, comedy, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 90
+
+  - external_id: mdr1:stranded:001
+    seed_text: 突如其來的暴雨把兩個正在尷尬期的人困在同一個屋簷下
+    tags: [forced-proximity, weather, awkward, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  - external_id: mdr1:reunion:001
+    seed_text: 同學會的邀請突然出現，名單上有個以為這輩子不會再見的名字
+    tags: [reunion, nostalgia, conflicted]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 90
+
+  # --- Public eye / reputation -------------------------------------
+  - external_id: mdr1:rumor:001
+    seed_text: 網路上開始流傳一則和身邊人有關的貼文，內容跟自己知道的完全對不上
+    tags: [rumor, loyalty, dilemma, social-media]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 45
+
+  - external_id: mdr1:past:001
+    seed_text: 學生時代的舊帳號被人挖了出來，截圖正在小圈子裡悄悄流傳
+    tags: [exposure, embarrassed, past, social-media]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 90
+
+  - external_id: mdr1:prove:001
+    seed_text: 總是被看輕的場合突然被點名上場，全場的目光一下子集中過來
+    tags: [underdog, pressure, stage, tension]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  - external_id: mdr1:impostor:001
+    seed_text: 第一次在所有人面前搞砸了最拿手的事，開始懷疑過去的稱讚都是客套
+    tags: [failure, self-doubt, vulnerability]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  # --- Life turning points -----------------------------------------
+  - external_id: mdr1:family:001
+    seed_text: 家裡擅自安排好了一條路，消息傳來的時候一切都已經談妥了
+    tags: [family, autonomy, conflict, dilemma]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 90
+
+  - external_id: mdr1:dare:001
+    seed_text: 一群人起鬨約好半夜去傳聞鬧鬼的老地方試膽，話說出口就收不回了
+    tags: [dare, spooky, group, night]
+    world_frames: [modern]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 90

@@ -31,7 +31,10 @@ from kokoro_link.application.services.proactive_delivery.line_conversation_recor
 )
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
 from kokoro_link.contracts.external_proactive import (
+    DeliveryAcceptance,
+    ExternalProactiveConfigurationError,
     ExternalProactiveDeliveryPort,
+    ExternalProactiveTransientError,
     envelope_from_payload,
 )
 from kokoro_link.contracts.external_proactive_ledger import (
@@ -142,18 +145,61 @@ class ProactiveDeliveryRetryWorker:
             envelope = envelope_from_payload(json.loads(event.envelope_json))
         except Exception:
             _LOGGER.exception(
-                "proactive delivery retry: envelope rehydrate failed event=%s",
+                "proactive delivery retry: malformed envelope event=%s",
                 event.event_id,
+            )
+            await self._safe_mark_terminal(
+                event.event_id,
+                reason="malformed_envelope",
+                now=now,
             )
             return
         try:
             acceptance = await self._external_delivery.accept(envelope)
-        except Exception:
-            # Transient (429 / 5xx / network) — leave the row pending for the
-            # next tick; the same event_id is re-sent, never re-decided.
-            _LOGGER.info(
-                "proactive delivery retry: event=%s still pending",
+        except ExternalProactiveTransientError as exc:
+            # Only an explicitly typed transport failure may remain pending.
+            _LOGGER.warning(
+                "proactive delivery retry: transient failure event=%s "
+                "error_type=%s; still pending",
                 event.event_id,
+                type(exc).__name__,
+            )
+            return
+        except ExternalProactiveConfigurationError as exc:
+            _LOGGER.error(
+                "proactive delivery retry: configuration failure event=%s "
+                "error_type=%s",
+                event.event_id,
+                type(exc).__name__,
+            )
+            await self._safe_mark_terminal(
+                event.event_id,
+                reason=f"delivery_configuration_error:{type(exc).__name__}",
+                now=now,
+            )
+            return
+        except Exception as exc:
+            _LOGGER.exception(
+                "proactive delivery retry: unexpected delivery failure event=%s",
+                event.event_id,
+            )
+            await self._safe_mark_terminal(
+                event.event_id,
+                reason=f"unexpected_delivery_error:{type(exc).__name__}",
+                now=now,
+            )
+            return
+        if not isinstance(acceptance, DeliveryAcceptance):
+            _LOGGER.error(
+                "proactive delivery retry: malformed acceptance event=%s "
+                "result_type=%s",
+                event.event_id,
+                type(acceptance).__name__,
+            )
+            await self._safe_mark_terminal(
+                event.event_id,
+                reason=f"malformed_delivery_acceptance:{type(acceptance).__name__}",
+                now=now,
             )
             return
         if acceptance.delivered:

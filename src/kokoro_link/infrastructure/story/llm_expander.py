@@ -25,6 +25,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.date_context import (
+    render_story_date_context_block,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -295,6 +298,13 @@ def _build_scene_prompt(
     constraint_block = "\n".join(base_constraints + tone_extras)
     body = get_default_loader().render(
         "story/expander_scene",
+        # CF1b: this narrative is persisted as a StoryEvent and read back
+        # for days, so the template forbids bare relative time words —
+        # this block is the arithmetic the model needs to comply.
+        date_context_block=render_story_date_context_block(
+            scene.today,
+            language_tag=operator_primary_language,
+        ),
         character_name=character_name,
         character_summary=character_summary or "（未設定）",
         identity_block=_identity_block(character),

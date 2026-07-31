@@ -27,11 +27,20 @@ from kokoro_link.api.dependencies import get_container
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.contracts.background_jobs import COORDINATOR_LEASE_NAME
 from kokoro_link.contracts.clock import ensure_utc
+from kokoro_link.infrastructure.observability.action_billing_metrics import (
+    render_action_billing_metrics,
+)
 from kokoro_link.infrastructure.observability.background_queue_metrics import (
     render_queue_metrics,
 )
+from kokoro_link.infrastructure.observability.drain_metrics import (
+    render_drain_metrics,
+)
 from kokoro_link.infrastructure.observability.execution_mode_metrics import (
     render_execution_mode_metrics,
+)
+from kokoro_link.infrastructure.observability.prompt_pack_metrics import (
+    render_prompt_pack_metrics,
 )
 from kokoro_link.infrastructure.observability.scheduler_metrics import (
     SchedulerMetrics,
@@ -102,7 +111,94 @@ async def scrape_metrics(
     mode_body = await _render_execution_mode_metrics(container)
     if mode_body:
         body = body + mode_body
+    billing_body = _render_action_billing_metrics(container)
+    if billing_body:
+        body = body + billing_body
+    pack_body = _render_prompt_pack_metrics(container)
+    if pack_body:
+        body = body + pack_body
+    drain_body = _render_drain_metrics(container)
+    if drain_body:
+        body = body + drain_body
     return PlainTextResponse(body, media_type=_PROMETHEUS_CONTENT_TYPE)
+
+
+def _render_drain_metrics(container: ServiceContainer) -> str:
+    """Append this replica's drain switch and in-flight turn count (GD1-A).
+
+    Unconditional and synchronous — two in-process integers, no port to await.
+    ``yuralume_core_active_turns`` is the gauge ``deploy.sh`` polls to zero
+    before it recreates a drained replica, so it is the one series here whose
+    absence would silently turn a graceful roll back into the SIGKILL roll it
+    replaced. Absent only on a container built without the field, and a read
+    failure is swallowed like every sibling: the scrape must not be the thing
+    that breaks.
+    """
+    state = getattr(container, "drain_state", None)
+    if state is None:
+        return ""
+    try:
+        return render_drain_metrics(
+            draining=state.draining, active_turns=state.active_turns,
+        )
+    except Exception:  # never let a drain read break the scrape
+        _LOGGER.exception("internal metrics: drain render failed")
+        return ""
+
+
+def _render_prompt_pack_metrics(container: ServiceContainer) -> str:
+    """Append this process's prompt pack identity (PD3).
+
+    Unconditional — hosted and self-host alike. The scrape is token-gated and
+    loopback-only, which is exactly why the hash lives here and **not** on the
+    public ``/health`` payload: a public build fingerprint helps only someone
+    probing the deployment.
+
+    Rendered once per process and cached by the exporter (the loader owns the
+    pack for the process lifetime; there is no hot reload). Any failure to read
+    the pack is swallowed and logged, same as the sibling helpers — a metrics
+    scrape must not be the thing that breaks.
+    """
+    settings = getattr(container, "app_settings", None)
+    try:
+        return render_prompt_pack_metrics(
+            humanization=getattr(settings, "humanization", None),
+            prompt_quality=getattr(settings, "prompt_quality", None),
+        )
+    except Exception:  # never let a pack read break the scrape
+        _LOGGER.exception("internal metrics: prompt pack render failed")
+        return ""
+
+
+def _render_action_billing_metrics(container: ServiceContainer) -> str:
+    """Append the AP2/AP4 action-billing counters (AP5 residual R-2).
+
+    Synchronous — these are in-process integers, not a port read, so unlike the
+    queue and ownership series there is nothing to await. Absent on self-host,
+    where the null billing service owns no counters.
+
+    Two of the emitted series are **alert lines, not statistics**:
+    ``yuralume_action_billing_released_uncovered`` (the Gateway is not
+    honouring Core's interaction header, so a fixed-price tier is silently
+    running on per-call billing) and
+    ``yuralume_action_billing_close_abandoned`` (money left reserved on a
+    player's wallet for the upstream sweeper). Both should sit at zero; see
+    ``infrastructure/observability/action_billing_metrics``.
+    """
+    try:
+        return render_action_billing_metrics(
+            billing=getattr(
+                getattr(container, "action_billing_service", None),
+                "counters", None,
+            ),
+            overage=getattr(
+                getattr(container, "quota_overage_service", None),
+                "counters", None,
+            ),
+        )
+    except Exception:  # never let a counter read break the scrape
+        _LOGGER.exception("internal metrics: action billing render failed")
+        return ""
 
 
 async def _render_queue_metrics(container: ServiceContainer) -> str:

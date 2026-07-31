@@ -28,6 +28,9 @@ from kokoro_link.contracts.activity_aftermath import (
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
+from kokoro_link.domain.services.shared_activity_evidence import (
+    SharedActivityEvidence,
+)
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.memory.in_memory import InMemoryMemoryRepository
 from kokoro_link.infrastructure.repositories.in_memory_characters import (
@@ -87,6 +90,7 @@ class _StubAftermathPort:
         character: Character,
         activity: ScheduleActivity,
         operator_primary_language: str = "zh-TW",
+        evidence: SharedActivityEvidence | None = None,
     ) -> ActivityAftermath:
         _ = operator_primary_language
         self.calls.append(activity.description)
@@ -102,6 +106,7 @@ class _RaisingAftermathPort:
         character: Character,
         activity: ScheduleActivity,
         operator_primary_language: str = "zh-TW",
+        evidence: SharedActivityEvidence | None = None,
     ) -> ActivityAftermath:
         raise RuntimeError("aftermath LLM exploded")
 

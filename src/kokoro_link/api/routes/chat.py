@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from kokoro_link.api.dependencies import (
+    ensure_not_draining,
     ensure_owned_character_id,
     get_container,
     get_current_user_id,
@@ -38,6 +39,9 @@ from kokoro_link.application.services.turn_undo_service import (
     NoJournalError, UndoResult,
 )
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.contracts.cloud_gateway import (
+    CloudGatewayRequestTooLargeError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +49,11 @@ _CHAT_UPLOAD_SUBDIR = "chat-uploads"
 _CHAT_UPLOAD_MAX_BYTES = 8 * 1024 * 1024  # 8 MB — matches character images
 _CHAT_UPLOAD_ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _CHAT_UPLOAD_MAX_PER_REQUEST = 4
+_PAYLOAD_TOO_LARGE_DETAIL = {
+    "code": "payload_too_large",
+    "message": "LLM request exceeds the size limit",
+    "retryable": False,
+}
 
 
 class ChatUploadsResponse(BaseModel):
@@ -334,6 +343,10 @@ async def send_chat_message(
     payload: SendChatMessageRequest,
     container: ServiceContainer = Depends(get_container),
     current_user_id: str = Depends(get_current_user_id),
+    # Runs before the handler body — which is the point: the ownership lookup
+    # below persists rest-recovery state, so a drain refused only inside the
+    # service would still have written on the way to its 503.
+    _drain_gate: None = Depends(ensure_not_draining),
 ) -> ChatReplyResponse:
     character = await _safe_get_character_entity(
         container, payload.character_id, current_user_id,
@@ -360,6 +373,11 @@ async def send_chat_message(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(error),
         ) from error
+    except CloudGatewayRequestTooLargeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=_PAYLOAD_TOO_LARGE_DETAIL,
+        ) from error
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -369,6 +387,8 @@ async def send_chat_message_stream(
     payload: SendChatMessageRequest,
     container: ServiceContainer = Depends(get_container),
     current_user_id: str = Depends(get_current_user_id),
+    # Same gate, same reason as the sync route above.
+    _drain_gate: None = Depends(ensure_not_draining),
 ) -> StreamingResponse:
     character = await _safe_get_character_entity(
         container, payload.character_id, current_user_id,
@@ -397,6 +417,11 @@ async def send_chat_message_stream(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(error),
         ) from error
+    except CloudGatewayRequestTooLargeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=_PAYLOAD_TOO_LARGE_DETAIL,
+        ) from error
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -408,10 +433,22 @@ async def send_chat_message_stream(
         # until the assistant message lands.
         finalize_started = False
 
-        # Send conversation_id immediately so frontend can track it
-        yield f"data: {json.dumps({'conversation_id': finalizer.conversation_id})}\n\n"
-
         try:
+            # Send conversation_id immediately so frontend can track it.
+            #
+            # Inside the ``try`` on purpose. A client that goes away while this
+            # very first frame is in flight closes the generator *at this yield
+            # point*, and a yield sitting above the ``try`` means the close
+            # unwinds without ever reaching the ``finally`` below: the turn
+            # lease strands until its 180s TTL, the action charge stays
+            # reserved until a sweeper finds it, and the in-memory
+            # ``active_turns`` slot is stuck for the life of the process — so
+            # every later drain burns its whole 180s budget waiting for a turn
+            # that ended long ago. The window is small (one frame) but it is a
+            # disconnect at exactly the moment disconnects cluster: the user
+            # hitting send and immediately navigating away.
+            yield f"data: {json.dumps({'conversation_id': finalizer.conversation_id})}\n\n"
+
             async for token in token_stream:
                 collected.append(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"

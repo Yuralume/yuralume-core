@@ -212,6 +212,8 @@ async def trigger_ingest(
         "events_persisted": report.events_persisted,
         "events_skipped_dedup": report.events_skipped_dedup,
         "events_skipped_embed": report.events_skipped_embed,
+        "events_failed_persist": report.events_failed_persist,
+        "embed_batches_failed": report.embed_batches_failed,
         "events_region_corrected": report.events_region_corrected,
         "errors": list(report.errors),
     }

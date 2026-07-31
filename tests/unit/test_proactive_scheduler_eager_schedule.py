@@ -126,6 +126,45 @@ async def test_tick_continues_when_schedule_service_crashes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tick_vets_intra_day_weather_drift_for_every_character() -> None:
+    """The drift vet is world advancement too — a character the user hasn't
+    opened must still stop narrating a sky that has since cleared."""
+    harness = build_messaging_harness()
+    proactive_dto = await create_character(
+        harness, name="Proactive", proactive_enabled=True,
+    )
+    silent_dto = await create_character(
+        harness, name="Silent", proactive_enabled=False,
+    )
+
+    class _RecordingDrift:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def vet(self, character, *, now=None):  # noqa: ANN001, ARG002
+            self.calls.append(character.id)
+            return None
+
+    drift = _RecordingDrift()
+    scheduler = ProactiveScheduler(
+        dispatcher=_RecordingDispatcher(),  # type: ignore[arg-type]
+        character_repository=harness.character_repository,
+        tick_seconds=0.05,
+        startup_grace_seconds=0.0,
+        schedule_service=_RecordingScheduleService(),  # type: ignore[arg-type]
+        schedule_weather_drift=drift,  # type: ignore[arg-type]
+    )
+    await scheduler.start()
+    try:
+        await asyncio.sleep(0.12)
+    finally:
+        await scheduler.stop()
+
+    assert proactive_dto.id in set(drift.calls)
+    assert silent_dto.id in set(drift.calls)
+
+
+@pytest.mark.asyncio
 async def test_no_schedule_service_keeps_legacy_behavior() -> None:
     """``schedule_service=None`` is the pre-eager default — the
     scheduler must still tick and dispatch."""

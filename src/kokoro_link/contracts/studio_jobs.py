@@ -134,6 +134,30 @@ class StudioJobRepositoryPort(Protocol):
 
     async def save(self, job: StudioGenerationJob) -> None: ...
 
+    async def save_terminal_if_running(
+        self, job: StudioGenerationJob,
+    ) -> bool:
+        """Compare-and-swap a ``running`` row to its terminal status.
+
+        Returns whether *this* caller performed the transition. ``False``
+        means the row was already finished (or is gone) — somebody else got
+        there first.
+
+        Load-bearing for money, not just for tidy rows (R4). A job row is
+        finalizable from several independent places at once: the in-process
+        runner that owns it, a startup recovery pass that found it still
+        ``running``, and the supersede path for a duplicate row. Each of them
+        holds its own ``ActionChargeHandle`` rebuilt from the same params, so
+        the handles' local "already closed" flags cannot see each other and an
+        unconditional ``save`` would let two of them close one reservation
+        twice. Making the row transition the CAS token means exactly one
+        finalizer wins, and only the winner is allowed to close the charge.
+
+        ``job`` must already carry a terminal status; passing a ``running``
+        job is a programming error.
+        """
+        ...
+
     async def get(self, job_id: str) -> StudioGenerationJob | None: ...
 
     async def list_running(self) -> list[StudioGenerationJob]: ...

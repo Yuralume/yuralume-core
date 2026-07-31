@@ -21,13 +21,13 @@ def test_channel_env_keys_land_on_cloud_settings(
     monkeypatch.setenv("KOKORO_CHANNEL_BASE_URL", "https://channel.example/")
     monkeypatch.setenv(
         "KOKORO_CHANNEL_SERVICE_CREDENTIAL",
-        "kid|core|yuralume-channel|delivery:create|secret",
+        "kid|core|yuralume-channel|delivery:eligibility-read,delivery:create|secret",
     )
     settings = _load_cloud_settings(role="all")
     assert settings.channel_base_url == "https://channel.example"
     assert (
         settings.channel_service_credential
-        == "kid|core|yuralume-channel|delivery:create|secret"
+        == "kid|core|yuralume-channel|delivery:eligibility-read,delivery:create|secret"
     )
 
 
@@ -36,9 +36,61 @@ def test_channel_env_keys_default_blank(
 ) -> None:
     monkeypatch.delenv("KOKORO_CHANNEL_BASE_URL", raising=False)
     monkeypatch.delenv("KOKORO_CHANNEL_SERVICE_CREDENTIAL", raising=False)
+    monkeypatch.delenv("YURALUME_CLOUD_CHANNEL_REQUIRED", raising=False)
     settings = _load_cloud_settings(role="all")
+    assert settings.channel_required is False
     assert settings.channel_base_url == ""
     assert settings.channel_service_credential == ""
+
+
+def test_inactive_self_host_ignores_stale_partial_channel_env(monkeypatch) -> None:
+    monkeypatch.setenv("YURALUME_CLOUD_ENABLED", "false")
+    monkeypatch.setenv("YURALUME_CLOUD_CHANNEL_REQUIRED", "false")
+    monkeypatch.setenv("KOKORO_CHANNEL_BASE_URL", "http://retired-channel:8080")
+    monkeypatch.delenv("KOKORO_CHANNEL_SERVICE_CREDENTIAL", raising=False)
+
+    settings = _load_cloud_settings(role="all")
+
+    assert settings.active is False
+    assert settings.channel_base_url == "http://retired-channel:8080"
+
+
+def test_required_channel_accepts_bound_versioned_credential(monkeypatch) -> None:
+    monkeypatch.setenv("YURALUME_CLOUD_CHANNEL_REQUIRED", "true")
+    monkeypatch.setenv("KOKORO_CHANNEL_BASE_URL", "http://channel-api:8080/")
+    monkeypatch.setenv(
+        "KOKORO_CHANNEL_SERVICE_CREDENTIAL",
+        "kid|core|yuralume-channel|delivery:eligibility-read,delivery:create|secret",
+    )
+
+    settings = _load_cloud_settings(role="worker")
+
+    assert settings.channel_required is True
+    assert settings.channel_base_url == "http://channel-api:8080"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "credential", "message"),
+    [
+        ("", "", "requires KOKORO_CHANNEL_BASE_URL"),
+        ("http://channel-api:8080", "", "all-or-none"),
+        ("", "kid|core|yuralume-channel|delivery:create|secret", "all-or-none"),
+        ("channel-api:8080", "kid|core|yuralume-channel|delivery:eligibility-read,delivery:create|secret", "http"),
+        ("http://channel-api:8080", "malformed", "service credentials"),
+        ("http://channel-api:8080", "kid|wrong|yuralume-channel|delivery:eligibility-read,delivery:create|secret", "caller=core"),
+        ("http://channel-api:8080", "kid|core|wrong|delivery:eligibility-read,delivery:create|secret", "audience=yuralume-channel"),
+        ("http://channel-api:8080", "kid|core|yuralume-channel|delivery:create|secret", "delivery:eligibility-read"),
+    ],
+)
+def test_required_channel_rejects_missing_or_misbound_configuration(
+    monkeypatch, base_url: str, credential: str, message: str,
+) -> None:
+    monkeypatch.setenv("YURALUME_CLOUD_CHANNEL_REQUIRED", "true")
+    monkeypatch.setenv("KOKORO_CHANNEL_BASE_URL", base_url)
+    monkeypatch.setenv("KOKORO_CHANNEL_SERVICE_CREDENTIAL", credential)
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        _load_cloud_settings(role="worker")
 
 
 class _FakeCharRepo:

@@ -227,6 +227,7 @@ async def test_normal_path_hook_order_and_stable_turn_id() -> None:
     )
 
     assert port.calls == [
+        "stable_turn_id",
         "persist_user",
         "heartbeat",
         "heartbeat",
@@ -306,7 +307,11 @@ async def test_busy_defer_uses_commit_deferred_not_save() -> None:
     assert reply.assistant_message.content == "先回，等會議結束再好好回你"
     # Busy-defer branch: user persisted before the decision, brief finalised
     # via commit_deferred_reply — never the normal assistant commit, never save.
-    assert port.calls == ["persist_user", "commit_deferred"]
+    assert port.calls == [
+        "stable_turn_id",
+        "persist_user",
+        "commit_deferred",
+    ]
     assert "commit_assistant" not in port.calls
     assert save_repo.save_calls == baseline_saves
 

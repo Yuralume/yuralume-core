@@ -21,6 +21,17 @@ from typing import Protocol, runtime_checkable
 
 SLOT_KIND_PROACTIVE = "proactive"
 SLOT_KIND_FEED_REPLY = "feed_reply_pass"
+#: One at-most-once claim per (character, civil day) daily goal review (CF2 /
+#: COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P2a). ``slot`` is the operator's
+#: local ISO date, so the same character is reviewed at most once a day no
+#: matter how many embedded ticks, distributed due-jobs and chat turns race for
+#: it — the dedup is a DB unique index, never a per-process flag. Goals are
+#: player-visible (PlayerGoalsPanel), so this is a visible-output claim in the
+#: same sense as ``proactive``: it fences a paid LLM pass whose result the
+#: player reads. NOT released on failure — a review that crashed waits for the
+#: next civil day rather than re-firing on every 300s tick.
+SLOT_KIND_GOAL_REVIEW = "goal_review"
+
 #: One at-most-once claim per pending-follow-up release, keyed by the row id. The
 #: distributed release path claims it just before the visible send so a reclaimed
 #: job (worker crashed after sending, before marking the row resolved) finds the

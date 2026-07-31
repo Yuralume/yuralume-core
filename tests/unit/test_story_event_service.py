@@ -140,6 +140,91 @@ async def test_ensure_today_handles_empty_seed_pool_gracefully() -> None:
     assert expander.call_count == 0
 
 
+class _LanguageOperatorProfileService:
+    def __init__(self, primary_language: str) -> None:
+        self._language = primary_language
+
+    async def get_for_user(self, user_id: str) -> OperatorProfile:
+        return OperatorProfile(
+            id=user_id,
+            display_name=user_id,
+            primary_language=self._language,
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_today_filters_seeds_by_operator_region() -> None:
+    """A ja operator's daily roll sees jp + global seeds, never tw seeds."""
+    expander = _ScriptedExpander("日常的一幕。")
+    seeds_repo = InMemoryStorySeedRepository()
+    events_repo = InMemoryStoryEventRepository()
+    memory_repo = InMemoryMemoryRepository()
+    tw_seed = StorySeed.create(
+        seed_text="放學買手搖飲", world_frames=["modern"], regions=["tw"],
+    )
+    jp_seed = StorySeed.create(
+        seed_text="部活後的自販機", world_frames=["modern"], regions=["jp"],
+    )
+    await seeds_repo.add(tw_seed)
+    await seeds_repo.add(jp_seed)
+    gacha = StoryGachaService(
+        seed_repository=seeds_repo, event_repository=events_repo,
+        rng=random.Random(0),
+    )
+    service = StoryEventService(
+        gacha=gacha,
+        expander=expander,
+        event_repository=events_repo,
+        memory_repository=memory_repo,
+        embedder=None,
+        local_tz=timezone.utc,
+        operator_profile_service=_LanguageOperatorProfileService("ja-JP"),
+    )
+
+    character = replace(_character(), user_id="owner-ja")
+    report = await service.ensure_today(
+        character, now=datetime(2026, 4, 20, 10, tzinfo=timezone.utc),
+    )
+
+    assert report.newly_rolled == 1
+    assert report.events[0].seed_id == jp_seed.id
+
+
+@pytest.mark.asyncio
+async def test_ensure_today_never_rolls_dramatic_seeds() -> None:
+    expander = _ScriptedExpander("不該出現的劇情。")
+    seeds_repo = InMemoryStorySeedRepository()
+    events_repo = InMemoryStoryEventRepository()
+    memory_repo = InMemoryMemoryRepository()
+    await seeds_repo.add(
+        StorySeed.create(
+            seed_text="一句能開一場戲的種子",
+            world_frames=["modern"],
+            tier="dramatic",
+        ),
+    )
+    gacha = StoryGachaService(
+        seed_repository=seeds_repo, event_repository=events_repo,
+        rng=random.Random(0),
+    )
+    service = StoryEventService(
+        gacha=gacha,
+        expander=expander,
+        event_repository=events_repo,
+        memory_repository=memory_repo,
+        embedder=None,
+        local_tz=timezone.utc,
+    )
+
+    report = await service.ensure_today(
+        _character(), now=datetime(2026, 4, 20, 10, tzinfo=timezone.utc),
+    )
+
+    assert report.newly_rolled == 0
+    assert report.events == ()
+    assert expander.call_count == 0
+
+
 @pytest.mark.asyncio
 async def test_ensure_today_uses_owner_timezone_for_civil_day() -> None:
     expander = _ScriptedExpander("午夜後的故事。")

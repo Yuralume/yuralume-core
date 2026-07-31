@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kokoro_link.domain.entities.character_event_inbox import (
@@ -43,29 +44,32 @@ class SaCharacterEventInboxRepository:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self._session_factory = session_factory
 
-    async def add_many(self, items: list[CharacterEventInboxItem]) -> None:
+    async def add_many(self, items: list[CharacterEventInboxItem]) -> int:
         if not items:
-            return
+            return 0
         async with self._session_factory() as session:
-            session.add_all(
-                CharacterEventInboxRow(
-                    id=i.id,
-                    character_id=i.character_id,
-                    world_event_id=i.world_event_id,
-                    similarity=i.similarity,
-                    created_at=i.created_at,
-                    claimed_by_surface=i.claimed_by_surface,
-                    claimed_at=i.claimed_at,
-                )
-                for i in items
+            stmt = pg_insert(CharacterEventInboxRow).values(
+                [
+                    {
+                        "id": item.id,
+                        "character_id": item.character_id,
+                        "world_event_id": item.world_event_id,
+                        "similarity": item.similarity,
+                        "created_at": item.created_at,
+                        "claimed_by_surface": item.claimed_by_surface,
+                        "claimed_at": item.claimed_at,
+                    }
+                    for item in items
+                ]
+            ).on_conflict_do_nothing(
+                index_elements=[
+                    CharacterEventInboxRow.character_id,
+                    CharacterEventInboxRow.world_event_id,
+                ],
             )
-            try:
-                await session.commit()
-            except Exception:
-                # Unique constraint on (character_id, world_event_id) —
-                # caller should pre-check via has_event, but fail-soft
-                # here to keep curator batch operations from aborting.
-                await session.rollback()
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(result.rowcount or 0)
 
     async def list_for_character(
         self,

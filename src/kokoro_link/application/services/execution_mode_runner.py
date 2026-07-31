@@ -235,39 +235,25 @@ class ExecutionModeRunner:
                 outcome={"executed": False, "kind": kind, "reason": "unknown_kind"},
             )
         if is_character_kind and self._kind_handler is None:
-            # Registry kind claimed but no handler wired: complete as a no-op
-            # rather than retry forever (a mis-provisioned worker).
             _LOGGER.warning(
                 "execution runner: per-kind job=%s but handler unwired", kind,
             )
-            return ExecutionDisposition(
-                _ACTION_COMPLETE,
-                outcome={"executed": False, "kind": kind, "reason": "handler_unwired"},
-            )
+            return self._handler_unwired(kind)
         if is_social_kind and self._social_kind_handler is None:
             _LOGGER.warning(
                 "execution runner: social job=%s but handler unwired", kind,
             )
-            return ExecutionDisposition(
-                _ACTION_COMPLETE,
-                outcome={"executed": False, "kind": kind, "reason": "handler_unwired"},
-            )
+            return self._handler_unwired(kind)
         if is_release_kind and self._release_handler is None:
             _LOGGER.warning(
                 "execution runner: release job=%s but handler unwired", kind,
             )
-            return ExecutionDisposition(
-                _ACTION_COMPLETE,
-                outcome={"executed": False, "kind": kind, "reason": "handler_unwired"},
-            )
+            return self._handler_unwired(kind)
         if is_post_turn_kind and self._post_turn_handler is None:
             _LOGGER.warning(
                 "execution runner: post-turn job=%s but handler unwired", kind,
             )
-            return ExecutionDisposition(
-                _ACTION_COMPLETE,
-                outcome={"executed": False, "kind": kind, "reason": "handler_unwired"},
-            )
+            return self._handler_unwired(kind)
         # social_tick + the social per-kind chains are cross-character / pair work
         # (an ``encounter_tick`` job's character_id slot is a canonical pair id, not
         # a character, so the worker's single-character ``would_run`` never applies);
@@ -762,6 +748,16 @@ class ExecutionModeRunner:
             "execution runner: job kind=%s failed, retrying", kind,
         )
         return ExecutionDisposition(_ACTION_FAIL_RETRY, error=exc)
+
+    @staticmethod
+    def _handler_unwired(kind: str) -> ExecutionDisposition:
+        # A known durable kind without its production handler is a deployment
+        # defect, not successful work. Route through queue.fail so it retries
+        # with backoff and reaches the normal dead-letter state at max attempts.
+        return ExecutionDisposition(
+            _ACTION_FAIL_RETRY,
+            error=RuntimeError(f"handler_unwired for known job kind={kind}"),
+        )
 
     async def _resolve_freeze_threshold(self) -> int | None:
         if self._freeze_idle_days_threshold is None:

@@ -16,6 +16,10 @@ from kokoro_link.contracts.generation_trigger import (
     TRIGGER_HEADER_NAME,
     generation_trigger_header_value,
 )
+from kokoro_link.contracts.interaction_context import (
+    covered_call_receipt,
+    interaction_headers,
+)
 from kokoro_link.contracts.image_provider import (
     ImageGenerationError,
     ImageNoOutputError,
@@ -120,12 +124,24 @@ class CloudGatewayImageProvider:
                     json=payload,
                 )
                 data = _json_or_raise(response, "image")
+                # Only a call the Gateway actually waived is paid for by the
+                # covering action charge, and only once the bytes are in hand:
+                # a job the Gateway billed itself, or an answer whose artifact
+                # never downloads, has bought the player nothing and must stay
+                # refundable (see ``CoveredCallReceipt``).
+                receipt = covered_call_receipt(response.headers)
                 self._capture_usage_metadata(data)
-                return await _image_bytes_from_response(
+                images = await _image_bytes_from_response(
                     data,
                     client=client,
                     base_url=self._base_url,
                 )
+                # Bytes in memory are not yet what the player bought — the
+                # picture only exists once it is in object storage. The caller
+                # that persists them confirms this receipt; a storage failure
+                # therefore refunds instead of billing for an invisible image.
+                receipt.defer_delivery()
+                return images
         except httpx.TimeoutException as exc:
             raise ImageTimeoutError("cloud image gateway timed out") from exc
         except ImageGenerationError:
@@ -169,6 +185,10 @@ class CloudGatewayImageProvider:
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
+            # ``image_portrait`` / ``image_chat_tool`` are action-priced
+            # entries, so their Gateway call must name the charge that already
+            # covers it or the player pays twice. Empty outside a scope.
+            **interaction_headers(),
         }
 
 

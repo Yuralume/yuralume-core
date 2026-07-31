@@ -1,0 +1,151 @@
+# Core dramatic story seeds — batch 1 (seed-harvest-b1).
+#
+# Frame-agnostic tension hooks: each seed opens a scene without deciding
+# the player's reaction or playing out the resolution. The expander LLM
+# adapts details to the character's voice + world. No modern tech, no
+# named people, no IP.
+#
+# tier: dramatic — lower weight, longer cooldown than daily seeds.
+pack_id: core_dramatic_b1
+language: zh-TW
+
+seeds:
+  # --- Rifts / reconciliation hooks --------------------------------
+  - external_id: cdr1:rift:001
+    seed_text: 和最要好的人為了一句沒說清楚的話鬧僵，兩邊都在等對方先低頭
+    tags: [conflict, friendship, regret, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 45
+
+  - external_id: cdr1:misheard:001
+    seed_text: 無意間只聽見一段對話的後半，越回想越覺得說的是自己
+    tags: [misunderstanding, anxiety, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 45
+
+  - external_id: cdr1:rumor:001
+    seed_text: 流傳了很久的一個傳聞，今天終於當著本人的面被說了出來
+    tags: [rumor, confrontation, social]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  # --- Arrivals / encounters ---------------------------------------
+  - external_id: cdr1:visitor:001
+    seed_text: 風雨正大的深夜，門外站著一個渾身濕透、欲言又止的熟面孔
+    tags: [visitor, night, mystery, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  - external_id: cdr1:trace:001
+    seed_text: 在陌生的地方認出一樣舊物，只有多年沒消息的那個人才會留下
+    tags: [reunion, clue, nostalgia, mystery]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  - external_id: cdr1:rival:001
+    seed_text: 立場相對的兩個人狹路相逢，到了該出手的時候卻誰也下不了手
+    tags: [rivalry, conflicted, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  - external_id: cdr1:request:001
+    seed_text: 一位即將遠行的陌生人，鄭重其事把一樁未了的心願託付過來
+    tags: [stranger, burden, farewell, duty]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  # --- Words unsaid / interrupted ----------------------------------
+  - external_id: cdr1:confess:001
+    seed_text: 醞釀了很久的一句話才剛起頭，就被突如其來的騷動硬生生打斷
+    tags: [confession, interrupted, regret, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 60
+
+  - external_id: cdr1:unsaid:001
+    seed_text: 有人鄭重開口說「有件事想告訴你」，話到一半卻突然改口說沒事
+    tags: [suspense, withholding, social, tension]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 45
+
+  - external_id: cdr1:unsent:001
+    seed_text: 整理舊物時翻出一件當年備好卻始終沒送出去的禮物
+    tags: [regret, nostalgia, unfinished]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 60
+
+  # --- Secrets / dilemmas ------------------------------------------
+  - external_id: cdr1:note:001
+    seed_text: 收到一張沒有署名的字條，寫的事原本不該有任何人知道
+    tags: [secret, anonymous, unease, mystery]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  - external_id: cdr1:dilemma:001
+    seed_text: 撞見一直敬重的人私下做著說不出口的事，說破還是裝作沒看見
+    tags: [dilemma, conscience, secret, trust]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  - external_id: cdr1:crossroad:001
+    seed_text: 夢寐以求的機會終於到來，但點頭就意味著離開現在珍惜的一切
+    tags: [crossroad, dream, parting, dilemma]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 90
+
+  # --- Masks slipping ----------------------------------------------
+  - external_id: cdr1:reveal:001
+    seed_text: 平日最不起眼的那個人，在關鍵時刻露了一手誰都想不到的本事
+    tags: [hidden-talent, surprise, awe]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 60
+
+  - external_id: cdr1:pedestal:001
+    seed_text: 被眾人仰望的那個人私下低聲問，能不能有人只把他當普通人
+    tags: [loneliness, vulnerability, empathy]
+    world_frames: [any]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60

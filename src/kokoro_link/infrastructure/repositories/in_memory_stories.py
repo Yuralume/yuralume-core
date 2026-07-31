@@ -35,6 +35,8 @@ class InMemoryStorySeedRepository(StorySeedRepositoryPort):
                 seed_text=seed.seed_text,
                 tags=seed.tags,
                 world_frames=seed.world_frames,
+                tier=seed.tier,
+                regions=seed.regions,
                 weight=seed.weight,
                 cooldown_days=seed.cooldown_days,
                 enabled=seed.enabled,

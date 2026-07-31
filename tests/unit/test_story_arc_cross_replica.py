@@ -73,7 +73,16 @@ class _SlowPlanner(StoryArcPlannerPort):
         hint: str | None = None,
         recent_dialogue_summary: str = "",
         operator_primary_language: str = "zh-TW",
+        today: date | None = None,
+        seed_candidates: tuple[object, ...] = (),
+        arc_history: tuple[str, ...] = (),
     ) -> StoryArc:
+        # ``today`` (CF1b absolute-date anchors) and the AE0 pair
+        # ``seed_candidates`` / ``arc_history`` are prompt-only context;
+        # this stub ignores them but must accept them, because the racing
+        # test wraps ``plan_arc`` in a ``**kwargs`` passthrough that
+        # defeats the service's signature-based kwarg filtering.
+        del today, seed_candidates, arc_history
         self.calls += 1
         await asyncio.sleep(0.05)
         arc = StoryArc.create(

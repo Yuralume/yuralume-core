@@ -27,12 +27,17 @@ exposes the operations the chat / REST / post-turn pipelines need:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass, replace
 from datetime import date as date_type, datetime, timedelta, timezone, tzinfo
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 from kokoro_link.application.services.beat_retry_policy import BeatRetryPolicy
+from kokoro_link.application.services.story_gacha import StoryGachaService
+from kokoro_link.application.services.story_seed_region import (
+    resolve_seed_region,
+)
 from kokoro_link.application.services.studio_execution_lease import (
     StudioExecutionLease,
     StudioLeaseSession,
@@ -77,11 +82,34 @@ from kokoro_link.domain.entities.story_arc import (
     StoryArcBeat,
     TENSION_RISING,
 )
+from kokoro_link.domain.entities.story_seed import (
+    SEED_TIER_DRAMATIC,
+    StorySeed,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_DURATION_DAYS = 21
 _DEFAULT_BEAT_COUNT = 5
 _DEFAULT_RECHECK_ATTEMPT_THRESHOLD = 2
+
+_SEED_CANDIDATE_COUNT = 5
+"""How many ``dramatic`` seeds are offered to the planner per new arc.
+
+Candidates, not instructions — the planner picks 0–2 and rewrites them.
+Five leaves real choice without turning the prompt into a menu."""
+
+_SEED_EXCLUSION_ARC_LIMIT = 3
+"""How far back ``source_seed_ids`` are honoured when filtering the roll.
+
+Purely a short-term anti-rng-repeat guard on top of the semantic defence:
+a seed the last three arcs already consumed does not come round again."""
+
+_ARC_HISTORY_LIMIT = 6
+"""Upper bound on the arc digests handed to planner / season decider."""
+
+_ARC_HISTORY_PREMISE_CHARS = 80
+"""Premise budget per history line — enough to identify the subject
+matter, short enough that six of them stay a glanceable list."""
 
 _ARC_INSERT_MAX_ATTEMPTS = 2
 """``start_new_arc`` re-abandon retries. Two writers need one extra pass; the
@@ -145,6 +173,7 @@ class StoryArcService:
         beat_rechecker: StoryBeatRecheckerPort | None = None,
         recheck_attempt_threshold: int = _DEFAULT_RECHECK_ATTEMPT_THRESHOLD,
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
+        gacha_service: StoryGachaService | None = None,
         template_translator: "ArcTemplateTranslatorPort | None" = None,
         execution_lease: StudioExecutionLease | None = None,
         lease_heartbeat_interval_seconds: float | None = None,
@@ -161,6 +190,13 @@ class StoryArcService:
         self._beat_rechecker = beat_rechecker
         self._recheck_attempt_threshold = max(1, recheck_attempt_threshold)
         self._operator_profile_service = operator_profile_service
+        # Optional — when wired, the LLM planning path is handed a
+        # handful of ``dramatic``-tier story seeds as subject-matter
+        # candidates so a new arc has somewhere to come from other than
+        # the last few chat turns (AE0). ``None`` = no candidates ever,
+        # i.e. exactly the pre-AE0 behaviour; every failure mode inside
+        # the roll degrades to the same empty tuple.
+        self._gacha_service = gacha_service
         # Optional — when wired, ``start_new_arc`` materialises the
         # character's bound template (Phase 2 of SCENE_BEAT_PLAN)
         # instead of asking the LLM planner. ``None`` keeps pre-Phase-2
@@ -552,9 +588,100 @@ class StoryArcService:
                 recent_dialogue_summary=_merge_planner_context(
                     summary, continuation,
                 ),
+                seed_candidates=await self._load_seed_candidates(
+                    character, start,
+                ),
+                arc_history=await self._load_arc_history(character.id),
             )
         await self._add_as_only_active(arc)
         return arc
+
+    async def _load_seed_candidates(
+        self, character: Character, start: date_type,
+    ) -> tuple[StorySeed, ...]:
+        """Roll ``dramatic`` story seeds as subject-matter candidates.
+
+        The planner is the second ratified consumer of the dramatic tier
+        (STORY_SEED_ENRICHMENT_PLAN §1): the everyday gacha never draws
+        these, so rolling them here costs the daily rotation nothing. The
+        roll itself applies frame / region / cooldown filtering; on top of
+        it we drop seeds the last few arcs already consumed, so a small
+        pool cannot hand the planner the same opener twice in a row.
+        That id-level set difference is the *only* mechanical step in this
+        path — the real anti-repetition defence is semantic, in the
+        prompt.
+
+        Fail-soft by construction: no gacha wired, an empty pool, a repo
+        that raises — every one of them yields ``()``, and an empty tuple
+        renders the prompt exactly as it did before seeds existed. A seed
+        problem must never be the reason a character has no arc.
+        """
+        gacha = self._gacha_service
+        if gacha is None:
+            return ()
+        try:
+            region = resolve_seed_region(
+                await self._resolve_operator_language(character),
+            )
+            result = await gacha.roll(
+                character=character,
+                today=start,
+                count=_SEED_CANDIDATE_COUNT,
+                tier=SEED_TIER_DRAMATIC,
+                region=region,
+            )
+            consumed = await self._recently_consumed_seed_ids(character.id)
+            return tuple(
+                seed for seed in result.picked if seed.id not in consumed
+            )
+        except Exception:
+            _LOGGER.exception(
+                "arc seed candidate roll failed character=%s; "
+                "planning without seed candidates", character.id,
+            )
+            return ()
+
+    async def _recently_consumed_seed_ids(self, character_id: str) -> set[str]:
+        """Union of ``source_seed_ids`` across the last few arcs."""
+        arcs = await self._repository.list_for_character(character_id)
+        recent = sorted(
+            arcs, key=lambda arc: arc.updated_at, reverse=True,
+        )[:_SEED_EXCLUSION_ARC_LIMIT]
+        return {
+            seed_id for arc in recent for seed_id in arc.source_seed_ids
+        }
+
+    async def _load_arc_history(
+        self, character_id: str, *, exclude_arc_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Return one-line digests of earlier arcs, oldest first.
+
+        The planner and the season decider both need to know what this
+        character has already lived through, or every season converges on
+        the same handful of themes. Status is deliberately ignored —
+        an abandoned arc's subject matter is just as spent as a completed
+        one's. ``exclude_arc_id`` drops the arc the caller is already
+        describing in full (the current arc on a replan, the just-finished
+        arc in the season context) so it is not narrated twice.
+
+        Fail-soft: a repository problem returns ``()`` and the prompt
+        simply omits the block.
+        """
+        try:
+            arcs = await self._repository.list_for_character(character_id)
+            candidates = [
+                arc for arc in arcs
+                if exclude_arc_id is None or arc.id != exclude_arc_id
+            ]
+            candidates.sort(key=lambda arc: arc.updated_at, reverse=True)
+            recent = candidates[:_ARC_HISTORY_LIMIT]
+            recent.reverse()
+            return tuple(_format_arc_history_entry(arc) for arc in recent)
+        except Exception:
+            _LOGGER.exception(
+                "arc history digest load failed character=%s", character_id,
+            )
+            return ()
 
     async def _abandon_active_arc(self, character_id: str) -> None:
         existing = await self._repository.get_active_for_character(character_id)
@@ -659,6 +786,11 @@ class StoryArcService:
         Memorialized (realized) beats are preserved — we only replace
         pending / active / skipped beats so a mid-arc replan doesn't
         rewrite history the character already remembers.
+
+        Gets the arc-history digest but deliberately **no** seed
+        candidates: the premise is already fixed, and dangling fresh
+        subject matter in front of the planner mid-arc pulls the
+        remaining beats off the story they belong to.
         """
         arc = await self._repository.get(arc_id)
         if arc is None:
@@ -678,6 +810,9 @@ class StoryArcService:
             beat_count_hint=max(1, len(arc.beats) - len(realized)) or self._default_beat_count,
             hint=hint,
             recent_dialogue_summary=summary,
+            arc_history=await self._load_arc_history(
+                character.id, exclude_arc_id=arc.id,
+            ),
         )
         # Keep arc identity; only swap beats.
         merged_beats: list[StoryArcBeat] = list(realized)
@@ -708,29 +843,38 @@ class StoryArcService:
         beat_count_hint: int,
         hint: str | None,
         recent_dialogue_summary: str,
+        seed_candidates: tuple[StorySeed, ...] = (),
+        arc_history: tuple[str, ...] = (),
     ) -> StoryArc:
-        language = await self._resolve_operator_language(character)
-        try:
-            return await self._planner.plan_arc(
-                character=character,
-                start_date=start_date,
-                duration_days=duration_days,
-                beat_count_hint=beat_count_hint,
-                hint=hint,
-                recent_dialogue_summary=recent_dialogue_summary,
-                operator_primary_language=language,
-            )
-        except TypeError as exc:
-            if "operator_primary_language" not in str(exc):
-                raise
-            return await self._planner.plan_arc(
-                character=character,
-                start_date=start_date,
-                duration_days=duration_days,
-                beat_count_hint=beat_count_hint,
-                hint=hint,
-                recent_dialogue_summary=recent_dialogue_summary,
-            )
+        """Call the planner, omitting optional kwargs it cannot accept.
+
+        ``StoryArcPlannerPort`` has grown optional context kwargs over
+        time (``operator_primary_language``, then ``today`` for the
+        absolute-date anchors in the planner prompt, then ``seed_candidates``
+        / ``arc_history`` for AE0's material and anti-repetition inputs).
+        Implementations pinned to an older signature must not break arc
+        creation, so unsupported kwargs are filtered out *before* the call
+        — not retried after a ``TypeError``. Planners are allowed to have
+        side effects (they persist nothing themselves, but wrappers around
+        them do), and a retry would run those twice.
+        """
+        optional: dict[str, object] = {
+            "operator_primary_language": (
+                await self._resolve_operator_language(character)
+            ),
+            "today": self._today(),
+            "seed_candidates": seed_candidates,
+            "arc_history": arc_history,
+        }
+        return await self._planner.plan_arc(
+            character=character,
+            start_date=start_date,
+            duration_days=duration_days,
+            beat_count_hint=beat_count_hint,
+            hint=hint,
+            recent_dialogue_summary=recent_dialogue_summary,
+            **_supported_planner_kwargs(self._planner.plan_arc, optional),
+        )
 
     async def _localize_template(
         self, template: ArcTemplate, *, character: Character,
@@ -883,6 +1027,13 @@ class StoryArcService:
             ),
             recent_dialogue_summary=recent_dialogue_summary,
             continuation_summary=continuation_summary,
+            # ``completed_arc`` is already passed whole, so the digest
+            # list covers everything *before* it — the decider needs the
+            # longer view to avoid greenlighting a season that re-runs a
+            # theme from three arcs ago.
+            arc_history=await self._load_arc_history(
+                character.id, exclude_arc_id=completed_arc.id,
+            ),
         )
 
     async def _summarize_completed_arc(
@@ -1377,6 +1528,16 @@ def _merge_planner_context(
     return "\n\n".join(parts)
 
 
+def _format_arc_history_entry(arc: StoryArc) -> str:
+    """One glanceable line per past arc: title｜theme｜truncated premise.
+
+    Full-width bars separate the fields because the prose around them is
+    CJK; an ASCII pipe reads as part of the sentence at this density.
+    """
+    premise = (arc.premise or "").strip()[:_ARC_HISTORY_PREMISE_CHARS]
+    return f"{arc.title}｜{arc.theme}｜{premise}"
+
+
 def _series_member_index(
     member_template_ids: tuple[str, ...],
     template_id: str | None,
@@ -1463,6 +1624,32 @@ def _skip_beat(
         else:
             out.append(beat)
     return out, changed
+
+
+def _supported_planner_kwargs(
+    plan_arc: Callable[..., Any],
+    candidates: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep only the optional kwargs ``plan_arc`` actually declares.
+
+    A callable that takes ``**kwargs`` — or whose signature cannot be
+    introspected at all — is assumed to forward everything, so it gets
+    the full set.
+    """
+    try:
+        parameters = inspect.signature(plan_arc).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return dict(candidates)
+    if any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    ):
+        return dict(candidates)
+    return {
+        name: value
+        for name, value in candidates.items()
+        if name in parameters
+    }
 
 
 def _recheck_decision_to_adjustment(

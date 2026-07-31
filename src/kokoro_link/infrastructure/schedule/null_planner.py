@@ -14,6 +14,10 @@ from kokoro_link.domain.entities.behavioral_pattern import BehavioralPattern
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
 from kokoro_link.domain.entities.story_arc import StoryArcBeat
+from kokoro_link.domain.entities.story_event import StoryEvent
+from kokoro_link.domain.services.recent_activity_digest import (
+    RecentDayActivities,
+)
 
 
 class NullSchedulePlanner(SchedulePlannerPort):
@@ -33,6 +37,9 @@ class NullSchedulePlanner(SchedulePlannerPort):
         operator_persona_lines: tuple[str, ...] = (),
         schedule_involvement_policy: str = "none",
         pre_committed_activities: tuple[ScheduleActivity, ...] = (),
+        expired_operator_commitments: tuple[ScheduleActivity, ...] = (),
+        recent_activity_digest: tuple[RecentDayActivities, ...] = (),
+        recent_story_events: tuple[StoryEvent, ...] = (),
         recurring_patterns: tuple[BehavioralPattern, ...] = (),
         operator_primary_language: str = "zh-TW",
     ) -> DailySchedule:

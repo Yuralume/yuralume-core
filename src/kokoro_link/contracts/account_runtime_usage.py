@@ -11,6 +11,23 @@ ACCOUNT_RUNTIME_EVENT_CHARACTER_CREATE = "character_create"
 ACCOUNT_RUNTIME_EVENT_CHAT_IMAGE = "chat_image"
 ACCOUNT_RUNTIME_EVENT_FEED_POST = "feed_post"
 
+#: AP4 quota-overage purchases. Counted separately from the quota events
+#: above because they answer a different question: not "how much of the tier
+#: allowance is spent" but "how many extra slots has this player *bought*
+#: today", which is what ``daily_overage_limit`` bounds. Sharing the base
+#: event type would make the ceiling unenforceable — the base counter is
+#: already at its own limit by the time an overage is even considered.
+ACCOUNT_RUNTIME_EVENT_CHAT_IMAGE_OVERAGE = "chat_image_overage"
+ACCOUNT_RUNTIME_EVENT_FEED_POST_OVERAGE = "feed_post_overage"
+
+#: AP4 consent trail. Every move of an overage switch — by the player at the
+#: settings surface, or by the service revoking a stale agreement after a price
+#: rise — appends one of these, carrying the action key, the direction and the
+#: price in ``resource_id``. Not a limit counter: nothing counts these, they
+#: exist so "who agreed to spend what, and when" is answerable from the same
+#: append-only ledger that already survives character deletion.
+ACCOUNT_RUNTIME_EVENT_OVERAGE_CONSENT = "overage_consent"
+
 
 @dataclass(frozen=True, slots=True)
 class AccountRuntimeUsageEvent:
@@ -40,6 +57,34 @@ class AccountRuntimeUsageRepositoryPort(Protocol):
         since: datetime,
         until: datetime | None = None,
     ) -> int: ...
+
+    async def claim_event_slot(
+        self,
+        *,
+        operator_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        since: datetime,
+        limit: int,
+    ) -> str | None:
+        """Take one of at most ``limit`` slots in the window, atomically.
+
+        Returns the recorded event's id, or ``None`` when the window is full.
+
+        Counting first and recording afterwards cannot enforce a ceiling: two
+        concurrent ticks (several characters of one operator, several hosted
+        replicas) both read the same "one slot left" and both spend. Claiming
+        the slot *by writing it* and only then counting makes every racer
+        visible to every other racer, so the window can never exceed ``limit``.
+        A tie may cost both racers a free slot; over-denial is the safe
+        direction here. Callers must :meth:`discard_event` a claim they end up
+        not using.
+        """
+        ...
+
+    async def discard_event(self, *, event_id: str) -> None:
+        """Undo a claim whose work never happened."""
+        ...
 
     async def list_events(
         self,

@@ -152,8 +152,8 @@ async def test_pre_send_is_durable_before_accept_then_marked_accepted() -> None:
     # Save happened BEFORE accept: the ledger already held a pending row when
     # the port's accept ran.
     assert port.ledger_state_at_accept == [ExternalProactiveEventState.PENDING]
-    # The channel's delivery_id flowed onto the audit row.
-    assert attempt.binding_id == "chan-1"
+    # The Channel receipt is opaque and is not a Core channel binding FK.
+    assert attempt.binding_id is None
     # Successful acceptance closed the ledger row out.
     event_id = port.accepted_event_ids[0]
     stored = await ledger.get(event_id)

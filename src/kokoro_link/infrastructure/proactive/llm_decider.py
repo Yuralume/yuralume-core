@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, tzinfo
 
 from kokoro_link.application.services.feature_keys import (
@@ -30,7 +31,10 @@ from kokoro_link.contracts.proactive import (
     ProactiveDeciderPort,
 )
 from kokoro_link.domain.entities.character import Character
-from kokoro_link.domain.entities.schedule import ScheduleActivity
+from kokoro_link.domain.entities.schedule import (
+    ScheduleActivity,
+    without_expired_operator_commitments,
+)
 from kokoro_link.domain.value_objects.tool_call import ToolCall
 from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.infrastructure.prompt.character_identity import (
@@ -52,6 +56,9 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
     render_current_time_fact_lines,
     render_subjective_time_topical_hint,
+)
+from kokoro_link.infrastructure.prompt.weather_freshness import (
+    render_weather_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
 
@@ -83,6 +90,17 @@ class LLMProactiveDecider(ProactiveDeciderPort):
                 message=None,
             )
         prompt = _build_prompt(context)
+        decision = await self._decide_with_prompt(context, prompt)
+        # Every exit below this point came out of ``prompt``; stamping it
+        # once here beats threading it through a dozen early returns and
+        # guarantees the audit trail can never drift from the text the
+        # model actually saw (including the quality-gate retry, which
+        # re-enters ``decide`` with a mutated context).
+        return replace(decision, prompt_assembled=prompt)
+
+    async def _decide_with_prompt(
+        self, context: ProactiveContext, prompt: str,
+    ) -> ProactiveDecision:
         try:
             raw = await self._resolver.generate(prompt, character=context.character)
         except Exception as exc:
@@ -236,9 +254,16 @@ def _build_prompt(context: ProactiveContext) -> str:
             for a in context.upcoming_activities[:3]
         ]
         time_lines.append("- 接下來：" + "；".join(upcoming_strs))
+    # The authority claim is deliberately scoped to *place and activity*.
+    # The schedule text was written when the day was planned, so any
+    # weather baked into a description is a forecast-time narrative, not a
+    # fact — letting it outrank the live weather layer is what produced
+    # "還在下雨吧？" hours after the sky cleared.
     sections.append(
         "行程（此為你此刻身處地點與正在做的事的**唯一真實來源**；"
-        "其他段落如故事、劇情線只是話題素材，若與此段衝突一律以此段為準）：\n"
+        "其他段落如故事、劇情線只是話題素材，若與此段衝突一律以此段為準。"
+        "但行程是事前排定的：描述裡若隱含天氣（下雨、放晴、帶傘…），"
+        "那只是預排當下的敘述，實際天氣一律以天氣事實層為準）：\n"
         + "\n".join(time_lines)
     )
 
@@ -317,9 +342,11 @@ def _build_prompt(context: ProactiveContext) -> str:
         )
 
     # 天氣事實層 —— 跟 chat / planner / feed 共用同一筆事實，避免主動
-    # 訊息聲稱「外面好天氣」但 feed 同時貼出去下雨的場景。
-    if context.weather_context.strip():
-        sections.append(context.weather_context.strip())
+    # 訊息聲稱「外面好天氣」但 feed 同時貼出去下雨的場景。事實與
+    # freshness 優先權指示走 chat 同一個 helper，兩個出口不會各自漂移。
+    weather_lines = render_weather_fact_lines(context.weather_context)
+    if weather_lines:
+        sections.append("\n".join(weather_lines))
 
     upcoming_block = _render_upcoming_days_for_decider(context)
     if upcoming_block:
@@ -533,15 +560,31 @@ def _render_upcoming_days_for_decider(context: ProactiveContext) -> str:
     commitment-fidelity contract as the chat-side renderer: surface
     what was already pre-planned, instruct the model to keep further
     horizons vague.
+
+    The guidance text is deliberately phrased as a *lookup duty* rather
+    than a worked example. The previous wording demonstrated the shape of
+    the sentence ("明天有約 X…") without saying where X may come from, and
+    the model duly filled X from a goal written three days earlier —
+    reporting a dead appointment as tomorrow's plan. Naming this list as
+    the sole date authority is what makes the other material sections
+    (goals, arcs, memories) checkable instead of quotable.
+
+    Blocks whose operator commitment the sweep already retired are dropped
+    first, same filter as the chat renderer (plan §2 P1c): declaring this
+    list the only date authority is worthless if the list itself still
+    carries the lapsed 刨冰 invite. Filtering happens before the
+    「另外還有 N 段」 count so a dropped block can't leak back in as an
+    arithmetic remainder.
     """
-    upcoming = context.upcoming_day_schedules
+    upcoming = [
+        without_expired_operator_commitments(sched)
+        for sched in context.upcoming_day_schedules
+    ]
     if not upcoming:
         return ""
     today_local = to_timezone(context.now, context.local_tz).date()
     lines = [
-        "接下來幾天的行程（已預先排定；可作為主動開口的鉤子，例如"
-        "「明天有約 X 想到就期待」「後天那個會議好麻煩」。"
-        "**不要憑空編造**這份清單以外的時段／承諾）：",
+        "接下來幾天的行程（已預先排定；**這份清單是你講任何未來約定時唯一的日期權威**）：",
     ]
     for sched in upcoming[:2]:
         day_diff = (sched.date - today_local).days
@@ -566,6 +609,14 @@ def _render_upcoming_days_for_decider(context: ProactiveContext) -> str:
             if len(sched.activities) > 4 else ""
         )
         lines.append(f"- {label}：{ '；'.join(snippets) }{more}")
+    lines.append(
+        "用法：要說「明天／後天有約 X」之前，先在上面那幾天把 X 找出來 —— "
+        "只有清單上那天真的排著 X，才可以拿它當開口的鉤子。"
+        "清單以外的時段與承諾**不要憑空編造**；"
+        "目標、故事線、回憶裡的「明天要一起…」若在這裡找不到對應，"
+        "那是寫下當時的舊說法、早就過期了，不要再講成還沒發生的未來計畫"
+        "（想提就用過去式如實說）。"
+    )
     return "\n".join(lines)
 
 

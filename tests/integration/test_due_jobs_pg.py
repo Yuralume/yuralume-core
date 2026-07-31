@@ -94,8 +94,14 @@ class _RecordingExecutor:
     async def step_schedule_maintenance(self, character):  # noqa: ANN001
         self.calls.append(("schedule_maintenance", character.id))
 
+    async def step_schedule_weather_vet(self, character, *, now=None):  # noqa: ANN001
+        self.calls.append(("schedule_weather_vet", character.id))
+
     async def step_memorialize(self, character, *, now):  # noqa: ANN001
         self.calls.append(("memorialize", character.id))
+
+    async def step_goal_review(self, character, *, now=None):  # noqa: ANN001
+        self.calls.append(("goal_review", character.id))
 
     async def step_feed_compose(self, character):  # noqa: ANN001
         self.calls.append(("feed_compose", character.id))

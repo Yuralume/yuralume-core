@@ -26,6 +26,7 @@ from kokoro_link.application.services.external_chat.turn_support import (
 from kokoro_link.application.services.external_chat_roster_service import (
     RosterCharacterView,
 )
+from kokoro_link.contracts.cloud_gateway import CloudGatewayRequestTooLargeError
 from kokoro_link.application.services.external_chat_turn_service import (
     _AUTHENTICATED_CALLER,
     _build_canonical_payload,
@@ -255,6 +256,33 @@ async def test_runtime_limit_maps_to_429_failed_retryable() -> None:
     receipt_id = next(iter(harness.receipt_repo._records))
     receipt = await harness.receipt_repo.get(receipt_id)
     assert receipt.state is ExternalChatTurnState.FAILED_RETRYABLE
+
+
+async def test_cloud_payload_limit_maps_to_terminal_413_and_replays() -> None:
+    harness = await build_harness(
+        chat_service_override=_RaisingChatService(
+            CloudGatewayRequestTooLargeError(
+                actual_bytes=300_000,
+                max_bytes=229_376,
+            ),
+        ),
+    )
+    command = make_command()
+
+    first = await harness.turn_service.execute(command)
+    second = await harness.turn_service.execute(command)
+
+    assert first.status_code == second.status_code == 413
+    assert second.body_json == first.body_json
+    body = json.loads(first.body_json)
+    assert body["error"] == {
+        "code": "payload_too_large",
+        "message": "LLM request exceeds the size limit",
+        "retryable": False,
+    }
+    receipt_id = next(iter(harness.receipt_repo._records))
+    receipt = await harness.receipt_repo.get(receipt_id)
+    assert receipt.state is ExternalChatTurnState.FAILED_TERMINAL
 
 
 async def test_generic_exception_maps_to_503_failed_retryable() -> None:

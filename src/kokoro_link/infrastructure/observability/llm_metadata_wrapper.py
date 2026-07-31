@@ -111,6 +111,9 @@ class MetadataCapturingChatModel(ChatModelPort):
         self._inner = inner
         self.provider_id = inner.provider_id
         self.supports_vision = inner.supports_vision
+        self.prefers_public_image_urls = bool(
+            getattr(inner, "prefers_public_image_urls", False),
+        )
 
     async def generate(
         self,

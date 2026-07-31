@@ -204,6 +204,18 @@ memory's content so the next chat naturally surfaces the feeling, and
 tagged ``aftermath`` so the prompt builder can promote fresh ones to a
 dedicated 情緒尾韻 block. Cheap, short context — fits a small/fast model."""
 
+FEATURE_SCHEDULE_WEATHER_DRIFT = "schedule_weather_drift"
+"""Intra-day schedule-vs-weather drift judge. Runs on the tick over the
+activity happening now plus the next couple, reading the planned prose
+against the weather facts true *at this instant* and returning partial
+rewrites for the blocks that plainly contradict them ("河堤散步" under a
+fresh downpour). Blocks the weather doesn't touch (看電影) come back
+untouched — the model decides, there is no weather-category rule table.
+Short context (a few blocks + the fact block), but the output is the
+schedule prose every downstream surface quotes, so it wants a model that
+writes a clean sentence. Gated by a per-day marker so an unchanged sky
+costs nothing."""
+
 FEATURE_IDLE_DRIFT = "idle_drift"
 """Long-absence mood drift judge. Runs at chat pre-turn time when the
 user has been idle past a threshold (default 2h) — reads persona axes
@@ -220,11 +232,6 @@ character "I'll get back to you" with the actual reply deferred. LLM
 reads persona + activity + message and writes its own call; no busy-
 score thresholds or category lists are enumerated. Cheap, short
 context — fits a small/fast model."""
-
-FEATURE_SCENE_ACCESS = "scene_access"
-"""Scene Access judge. Decides whether same-space stage interaction is
-plausible in the current semantic context, or whether the UI should
-prefer phone, asking to meet, or waiting for a more open scene."""
 
 FEATURE_BUSY_FOLLOW_UP = "busy_follow_up"
 """Deferred-reply composer — runs at proactive-tick time once the
@@ -513,9 +520,9 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_FEED_COMPOSE,
     FEATURE_FEED_COMMENT_REPLY,
     FEATURE_ACTIVITY_AFTERMATH,
+    FEATURE_SCHEDULE_WEATHER_DRIFT,
     FEATURE_IDLE_DRIFT,
     FEATURE_BUSY_REPLY_DECIDE,
-    FEATURE_SCENE_ACCESS,
     FEATURE_BUSY_FOLLOW_UP,
     FEATURE_SCHEDULED_PROMISE,
     FEATURE_PROACTIVE_INTENTION,
@@ -616,9 +623,9 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_FEED_COMPOSE: "動態貼文撰寫",
     FEATURE_FEED_COMMENT_REPLY: "動態留言回覆",
     FEATURE_ACTIVITY_AFTERMATH: "行程情緒尾韻",
+    FEATURE_SCHEDULE_WEATHER_DRIFT: "行程天氣脫節矯正",
     FEATURE_IDLE_DRIFT: "久未互動的情緒漂移",
     FEATURE_BUSY_REPLY_DECIDE: "忙碌延遲：是否延後判斷",
-    FEATURE_SCENE_ACCESS: "同場可抵達性判斷",
     FEATURE_BUSY_FOLLOW_UP: "忙碌延遲：補回完整回覆",
     FEATURE_SCHEDULED_PROMISE: "排程承諾：依約定時間主動發訊息",
     FEATURE_PROACTIVE_INTENTION: "主動訊息：內心動機審核",
@@ -696,7 +703,7 @@ FEATURE_GROUP_DESCRIPTIONS: dict[str, str] = {
         "把使用者上傳圖片轉成詳細文字脈絡，讓純文字聊天與創角草稿模型仍能理解圖片。"
     ),
     FEATURE_GROUP_HIGH_REASONING_GATES: (
-        "錯誤會破壞節奏、同場邏輯、長期規劃或安全邊界的判斷型任務。"
+        "錯誤會破壞節奏、長期規劃或安全邊界的判斷型任務。"
     ),
     FEATURE_GROUP_CORE_STRUCTURED_MEMORY: (
         "高頻且影響長期狀態的結構化背景任務，重點是穩定 JSON 與保守抽取。"
@@ -763,7 +770,6 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_IMAGE_RECOGNITION,
     ),
     FEATURE_GROUP_HIGH_REASONING_GATES: (
-        FEATURE_SCENE_ACCESS,
         FEATURE_PROACTIVE_INTENTION,
         FEATURE_SCHEDULE_PLAN,
         FEATURE_ARC_PLAN,
@@ -792,6 +798,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
     ),
     FEATURE_GROUP_LIGHT_OBSERVERS: (
         FEATURE_ACTIVITY_AFTERMATH,
+        FEATURE_SCHEDULE_WEATHER_DRIFT,
         FEATURE_IDLE_DRIFT,
         FEATURE_BUSY_REPLY_DECIDE,
         FEATURE_CHAT_REPETITION_CHECK,

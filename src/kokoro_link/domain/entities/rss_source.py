@@ -86,9 +86,14 @@ class RssSource:
             fetched_count_total=self.fetched_count_total + max(0, fetched_count),
         )
 
-    def with_error(self, *, at: datetime, error: str) -> "RssSource":
+    def with_error(
+        self, *, at: datetime, error: str, fetched_count: int = 0,
+    ) -> "RssSource":
         return replace(
             self,
             last_attempt_at=at,
             last_error=(error or "unknown error")[:500],
+            fetched_count_total=(
+                self.fetched_count_total + max(0, fetched_count)
+            ),
         )

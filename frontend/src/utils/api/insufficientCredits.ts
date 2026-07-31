@@ -18,6 +18,7 @@
  */
 
 import { formatErrorBody, readErrorBody } from '@/utils/api/httpError'
+import { priceChangedFromBody } from '@/utils/api/priceChanged'
 
 export const INSUFFICIENT_CREDITS_CODE = 'insufficient_credits'
 export const INSUFFICIENT_CREDITS_STATUS = 402
@@ -133,6 +134,7 @@ export async function apiErrorFromResponse(res: Response): Promise<Error> {
   const body = await readErrorBody(res)
   return (
     insufficientCreditsFromBody(body, res.status)
+    ?? priceChangedFromBody(body, res.status)
     ?? new Error(formatErrorBody(body, res))
   )
 }

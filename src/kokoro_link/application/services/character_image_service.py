@@ -24,6 +24,10 @@ from uuid import uuid4
 from kokoro_link.application.services.account_runtime_profile import (
     PermissiveAccountRuntimeProfileResolver,
 )
+from kokoro_link.application.services.cloud_action_billing_service import (
+    CloudActionBillingService,
+    NullActionBillingService,
+)
 from kokoro_link.application.services.feature_keys import (
     FEATURE_IMAGE_PORTRAIT,
 )
@@ -32,12 +36,16 @@ from kokoro_link.application.services.subscription_access_guard import (
 )
 from kokoro_link.application.services.image_usage import image_usage_parts_from_provider
 from kokoro_link.contracts.active_image import ActiveImageProviderPort
+from kokoro_link.contracts.cloud_action_billing import ACTION_IMAGE_PORTRAIT
 from kokoro_link.contracts.account_runtime_profile import (
     AccountRuntimeProfileResolverPort,
 )
 from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
+)
+from kokoro_link.contracts.interaction_context import (
+    confirm_deferred_deliveries,
 )
 from kokoro_link.contracts.object_storage import (
     ObjectStoragePort,
@@ -148,6 +156,9 @@ class CharacterImageService:
         candidate_batch_repository: (
             CharacterImageCandidateBatchRepositoryPort | None
         ) = None,
+        action_billing: (
+            CloudActionBillingService | NullActionBillingService | None
+        ) = None,
     ) -> None:
         self._character_repository = character_repository
         _ = uploads_dir, url_prefix
@@ -169,6 +180,11 @@ class CharacterImageService:
             candidate_batch_repository
             or InMemoryCharacterImageCandidateBatchRepository()
         )
+        # AP2: ``image_portrait`` is an action-priced entry. The null object
+        # keeps self-host and token-billed tiers on the original path.
+        self._action_billing: (
+            CloudActionBillingService | NullActionBillingService
+        ) = action_billing or NullActionBillingService()
 
     def set_usage_recorder(self, recorder: UsageEventRecorderPort | None) -> None:
         self._usage_recorder = recorder
@@ -255,6 +271,7 @@ class CharacterImageService:
         positive: str,
         aspect: str = "portrait",
         is_primary_init: bool = False,
+        quoted_price_cr: float | None = None,
     ) -> Character:
         """Generate a portrait via the wired image provider and append it
         to ``image_urls``.
@@ -280,6 +297,47 @@ class CharacterImageService:
             )
         character = await self._load_character(character_id)
         await self._ensure_subscription_access(character)
+        # AP2: charged before any generation happens, so an out-of-credits
+        # player is refused up-front rather than after the GPU work. Every
+        # failure below leaves the ``async with`` by exception, which releases.
+        #
+        # R9: ``quoted_price_cr`` is the number this player's own screen showed
+        # (the SPA sends it with the request). It binds the charge to what was
+        # displayed rather than to Core's process-local cache, which under
+        # several replicas — or straight after a back-office edit — can hold a
+        # price this player never saw. ``None`` (an older client, or the
+        # one-time primary-portrait path, which has no screen to quote from)
+        # falls back to the cache exactly as before.
+        #
+        # Known residual: the ``is_primary_init=True`` call from
+        # ``CharacterPrimaryImageInitializer`` runs inline on the character-
+        # create request, i.e. under a ``user_action`` trigger, so it *is*
+        # charged — at a price the create modal never displayed. Whether that
+        # first portrait is bundled into character creation or priced on its
+        # own is an owner pricing call, not something to decide here.
+        async with self._action_billing.action(
+            ACTION_IMAGE_PORTRAIT,
+            operator_id=getattr(character, "user_id", "") or "",
+            quoted_price_cr=quoted_price_cr,
+        ):
+            return await self._generate_portrait(
+                character,
+                positive=positive,
+                aspect=aspect,
+                is_primary_init=is_primary_init,
+            )
+
+    async def _generate_portrait(
+        self,
+        character: Character,
+        *,
+        positive: str,
+        aspect: str,
+        is_primary_init: bool,
+    ) -> Character:
+        """Portrait generation proper, with the character already loaded and
+        its access + action charge already settled by :meth:`generate_portrait`."""
+        character_id = character.id
         if not is_primary_init:
             await self._ensure_image_generation_enabled(character)
         if len(character.image_urls) >= MAX_IMAGES_PER_CHARACTER:
@@ -414,6 +472,12 @@ class CharacterImageService:
                 billable_quantity=len(images),
             )
             raise CharacterImageError(str(exc)) from exc
+        if stored_count:
+            # The portrait now exists where the player can see it, so the
+            # covered Gateway call has finally delivered. Confirming here (and
+            # not in the provider, which only ever held bytes in memory) is
+            # what keeps a storage failure refundable.
+            confirm_deferred_deliveries()
         await self._record_image_usage_safely(
             character=character,
             feature_key="character_portrait",
@@ -435,6 +499,7 @@ class CharacterImageService:
         positive: str,
         aspect: str = "portrait",
         count: int = MAX_CANDIDATES_PER_BATCH,
+        quoted_price_cr: float | None = None,
     ) -> tuple[Character, list[str]]:
         """Gacha flow: render N candidate images but don't commit yet.
 
@@ -447,6 +512,26 @@ class CharacterImageService:
 
         Returns ``(character, candidate_urls)`` — the character comes
         back unchanged but lets the route echo a consistent shape.
+
+        **This is where ``image_portrait`` is actually charged.** The player's
+        picture button (``CharacterImagesPanel``) posts one batch per press, so
+        one batch is one action: the charge wraps the whole batch, its
+        interaction scope covers every upstream call the batch makes (the
+        prompt styler and the single N-image render alike), and it settles or
+        refunds once for the press rather than once per returned candidate.
+        Charging per image instead would bill a number the price hint never
+        showed. ``commit_candidates`` is free by construction — picking which
+        of the pictures you already paid for to keep is not a second action.
+
+        The charge is raised after **every** cheap refusal — no album access,
+        no headroom, and no usable image provider — precisely so those never
+        take the player's money and hand it straight back. Resolving the
+        provider is part of that list rather than an implementation detail of
+        the batch: "no image profile is currently active" is a configuration
+        answer, reachable on every press, and raising a reservation the very
+        next line refunds turns a stable misconfiguration into a stream of
+        charge/refund pairs across the player's ledger for pictures that were
+        never even attempted.
         """
         if self._image_provider is None:
             raise GenerationDisabledError(
@@ -466,14 +551,41 @@ class CharacterImageService:
         provider = await self._image_provider.resolve(
             FEATURE_IMAGE_PORTRAIT, character=character,
         )
-        profile_id = await self._image_provider.resolve_profile_id(
-            FEATURE_IMAGE_PORTRAIT, character=character,
-        )
         if provider is None:
             raise GenerationDisabledError(
                 "No image profile is currently active for portrait "
                 "generation — check KOKORO_IMAGE_PROFILES / preferences.",
             )
+        profile_id = await self._image_provider.resolve_profile_id(
+            FEATURE_IMAGE_PORTRAIT, character=character,
+        )
+        # R9: bound to the number this player's own screen quoted, exactly as
+        # the single-portrait path does; ``None`` falls back to Core's cache.
+        async with self._action_billing.action(
+            ACTION_IMAGE_PORTRAIT,
+            operator_id=getattr(character, "user_id", "") or "",
+            quoted_price_cr=quoted_price_cr,
+        ):
+            return await self._generate_candidates(
+                character, positive=positive, aspect=aspect,
+                clamped_count=clamped_count,
+                provider=provider, profile_id=profile_id,
+            )
+
+    async def _generate_candidates(
+        self,
+        character: Character,
+        *,
+        positive: str,
+        aspect: str,
+        clamped_count: int,
+        provider,
+        profile_id: str | None,
+    ) -> tuple[Character, list[str]]:
+        """Batch generation proper — character loaded, provider resolved, and
+        access + charge held by :meth:`generate_candidates`. Every exception
+        leaves that ``async with`` by raising, which refunds."""
+        character_id = character.id
         # Still render the full requested batch even if headroom is
         # smaller; commit handles the cap. This lets the operator
         # pick their favourite N out of a larger pool.
@@ -648,7 +760,74 @@ class CharacterImageService:
                 billable_quantity=len(images),
             )
             raise CharacterImageError(str(exc)) from exc
-        await self._candidate_batches.replace(character_id, object_keys)
+        # The batch registration is the last thing that has to land before the
+        # candidates are *reachable*: object storage has no list-by-prefix, so
+        # a batch nobody recorded is a set of orphan keys the picker can never
+        # commit from — the player paid and got a dead gallery. It therefore
+        # sits ahead of the delivery confirmation, not after it: an unconfirmed
+        # covered call is a refundable one, and a confirmation issued a line
+        # too early would charge for pictures the next request cannot find.
+        try:
+            registered = await self._candidate_batches.replace(
+                character_id, object_keys,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception(
+                "generate_candidates: recording the candidate batch failed "
+                "(character=%s)",
+                character_id,
+            )
+            await self._record_image_usage_safely(
+                character=character,
+                feature_key="character_album_candidate",
+                provider=provider,
+                profile_id=profile_id or "",
+                aspect=aspect,
+                requested=clamped_count,
+                returned=len(images),
+                artifact_count=len(urls),
+                status=STATUS_FAILED,
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+                started_at=started_at,
+                billable_quantity=len(images),
+            )
+            raise CharacterImageError(str(exc)) from exc
+        if urls and not registered:
+            # A conditional write is the only way to get here (an unconditional
+            # replace always applies), but "the keys are not the live batch"
+            # has the same consequence as a failed write, so it gets the same
+            # refundable answer rather than a silent success.
+            _LOGGER.warning(
+                "generate_candidates: candidate batch was superseded before "
+                "it could be recorded (character=%s)", character_id,
+            )
+            await self._record_image_usage_safely(
+                character=character,
+                feature_key="character_album_candidate",
+                provider=provider,
+                profile_id=profile_id or "",
+                aspect=aspect,
+                requested=clamped_count,
+                returned=len(images),
+                artifact_count=len(urls),
+                status=STATUS_FAILED,
+                error_code=CharacterImageError.__name__,
+                error_message="candidate batch superseded before it landed",
+                started_at=started_at,
+                billable_quantity=len(images),
+            )
+            raise CharacterImageError(
+                "Candidate batch could not be recorded — please try again.",
+            )
+        if urls:
+            # The candidates now exist at URLs the player's picker can load
+            # *and* the batch that makes them commit-able is stored, so the
+            # covered Gateway call has finally delivered. Same rule as the
+            # single-portrait path: confirming here rather than in the provider
+            # (which only ever held bytes) is what keeps a storage failure
+            # refundable instead of charging for pictures nobody can see.
+            confirm_deferred_deliveries()
         await self._record_image_usage_safely(
             character=character,
             feature_key="character_album_candidate",

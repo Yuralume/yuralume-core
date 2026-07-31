@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kokoro_link.application.services import background_shadow_worker as worker_module
 from kokoro_link.application.services.background_shadow_worker import (
     ShadowDryRunWorker,
 )
@@ -452,6 +453,160 @@ async def test_execution_concurrency_knob_of_one_is_sequential() -> None:
     await worker.run_once(now=BASE)
 
     assert probe.max_in_flight == 1
+
+
+# --------------------------------------------------------------------------- #
+# GD0-A graceful stop: SIGTERM lets the in-flight job finish inside the widened
+# wait, and every claimed-but-unstarted job goes straight back to the queue so a
+# surviving worker takes it now instead of after the lease TTL.
+# --------------------------------------------------------------------------- #
+
+class _GatedRunner:
+    """Blocks inside ``execute`` until the test opens the gate."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+        self.finished: list[str] = []
+        self.cancelled = False
+
+    async def execute(self, job, *, would_run, skip_reason, now, worker_id, lease_seconds):  # noqa: ANN001,E501
+        self.started.set()
+        try:
+            await self.gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.finished.append(job.id)
+        return ExecutionDisposition("complete", outcome={"executed": True})
+
+
+async def _started_worker(queue, runner, *, concurrency: int = 1):
+    """Start a worker and wait until its first job is actually in flight."""
+    worker = ShadowDryRunWorker(
+        queue=queue,
+        character_repository=_FakeCharacterRepo([]),
+        worker_id="w1",
+        dry_run_hold_seconds=0.0,
+        runtime_ownership=_FakeOwnership(),
+        execution_runner=runner,
+        execution_concurrency=concurrency,
+        claim_limit=8,
+        loop_seconds=0.01,
+    )
+    await worker.start()
+    await asyncio.wait_for(runner.started.wait(), timeout=5)
+    return worker
+
+
+async def test_stop_wait_ceiling_covers_the_execution_lease() -> None:
+    # The ceiling must outlast a job holding a full execution lease, otherwise
+    # the graceful path degrades back into "cancel a live provider call".
+    assert worker_module._STOP_WAIT_SECONDS == 150
+    assert (
+        worker_module._STOP_WAIT_SECONDS
+        > worker_module._DEFAULT_EXECUTION_LEASE_SECONDS
+    )
+
+
+async def test_stop_waits_for_the_in_flight_job() -> None:
+    queue, ids = await _queue_with(lambda e: [_social_spec(0, epoch=e)])
+    runner = _GatedRunner()
+    worker = await _started_worker(queue, runner)
+
+    stopping = asyncio.create_task(worker.stop())
+    await asyncio.sleep(0.01)
+    # Still blocked on the running job — stop does not cut it short.
+    assert not stopping.done()
+
+    runner.gate.set()
+    await asyncio.wait_for(stopping, timeout=5)
+
+    assert runner.finished == [ids[0]] and not runner.cancelled
+    job = await queue.get(ids[0])
+    assert job is not None and job.status == JobStatus.DONE
+    assert not worker.started
+
+
+async def test_stop_releases_claimed_jobs_that_never_started() -> None:
+    queue, ids = await _queue_with(
+        lambda e: [_social_spec(i, epoch=e) for i in range(3)],
+    )
+    runner = _GatedRunner()
+    worker = await _started_worker(queue, runner, concurrency=1)
+
+    stopping = asyncio.create_task(worker.stop())
+    await asyncio.sleep(0.01)
+    runner.gate.set()
+    await asyncio.wait_for(stopping, timeout=5)
+
+    # Exactly one job ran; the two still queued behind it were un-claimed the
+    # moment they reached the run boundary.
+    assert len(runner.finished) == 1
+    ran = runner.finished[0]
+    for job_id in ids:
+        job = await queue.get(job_id)
+        assert job is not None
+        if job_id == ran:
+            assert job.status == JobStatus.DONE
+            continue
+        assert job.status == JobStatus.QUEUED
+        assert job.lease_owner is None and job.lease_until is None
+        assert job.attempt_count == 0  # never ran → attempt refunded
+
+
+class _ReleaseFailingQueue:
+    """Real queue whose ``release_claim`` always explodes (DB gone at SIGTERM)."""
+
+    def __init__(self, inner) -> None:  # noqa: ANN001
+        self._inner = inner
+        self.release_attempts = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    async def release_claim(self, job_id, worker_id, *, now):  # noqa: ANN001
+        self.release_attempts += 1
+        raise RuntimeError("db down")
+
+
+async def test_stop_is_not_blocked_by_a_failing_unclaim() -> None:
+    inner, ids = await _queue_with(
+        lambda e: [_social_spec(i, epoch=e) for i in range(3)],
+    )
+    queue = _ReleaseFailingQueue(inner)
+    runner = _GatedRunner()
+    worker = await _started_worker(queue, runner, concurrency=1)
+
+    stopping = asyncio.create_task(worker.stop())
+    await asyncio.sleep(0.01)
+    runner.gate.set()
+    await asyncio.wait_for(stopping, timeout=5)
+
+    assert queue.release_attempts == 2  # both unstarted jobs were attempted
+    assert not worker.started           # shutdown still completed cleanly
+    # The un-released jobs simply keep their claim and fall back to lease expiry.
+    stranded = [
+        job for job in [await inner.get(job_id) for job_id in ids]
+        if job is not None and job.status == JobStatus.CLAIMED
+    ]
+    assert len(stranded) == 2
+
+
+async def test_stop_cancels_in_flight_work_past_the_wait_ceiling(monkeypatch) -> None:
+    # The backstop: a job that outlives the ceiling is cancelled anyway, and the
+    # crash-safe lease-expiry path reclaims it.
+    monkeypatch.setattr(worker_module, "_STOP_WAIT_SECONDS", 0.05)
+    queue, ids = await _queue_with(lambda e: [_social_spec(0, epoch=e)])
+    runner = _GatedRunner()
+    worker = await _started_worker(queue, runner)
+
+    await asyncio.wait_for(worker.stop(), timeout=5)  # never opens the gate
+
+    assert runner.cancelled and runner.finished == []
+    assert not worker.started
+    job = await queue.get(ids[0])
+    assert job is not None and job.status == JobStatus.CLAIMED
 
 
 async def test_counters_track_a_mixed_batch() -> None:

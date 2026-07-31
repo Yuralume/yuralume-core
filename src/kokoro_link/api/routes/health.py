@@ -8,7 +8,8 @@ scheduler crashes, a static 200 lets every downstream gate (healthcheck,
 deploy health-wait) treat a process doing zero background work as healthy.
 
 So the probe is loop-liveness-aware: a role that STARTS a core loop it owns
-(the embedded schedulers under ``start_schedulers`` — ``all`` / ``background``;
+(the proactive scheduler under ``start_schedulers`` — ``all`` / ``background``;
+the world-event scheduler under ``start_world_event_scheduler``;
 the durable coordinator/worker under ``run_background_coordinator`` /
 ``run_background_worker`` — ``all`` / ``background`` / the dedicated
 ``coordinator`` / ``worker`` roles) 503s when that loop was started and its task
@@ -33,7 +34,8 @@ def health(request: Request) -> JSONResponse:
     container = getattr(state, "container", None)
     # A role is "unhealthy" when a core loop it OWNS was started and has since
     # died. Each role only owns the loops its matrix flags turn on (§2.1): the
-    # embedded schedulers ride with ``start_schedulers`` (all / background); the
+    # proactive scheduler rides with ``start_schedulers`` (all / background),
+    # world events with ``start_world_event_scheduler``; the
     # durable coordinator/worker ride with ``run_background_coordinator`` /
     # ``run_background_worker`` — so a dedicated coordinator or worker process
     # 503s on ITS loop's death without falsely depending on an embedded scheduler
@@ -42,6 +44,7 @@ def health(request: Request) -> JSONResponse:
         owned: list[object | None] = []
         if matrix.start_schedulers:
             owned.append(getattr(container, "proactive_scheduler", None))
+        if matrix.start_world_event_scheduler:
             owned.append(getattr(container, "world_event_scheduler", None))
         if matrix.run_background_coordinator:
             owned.append(getattr(container, "background_shadow_coordinator", None))

@@ -15,10 +15,30 @@ import type {
   ProactiveRhythm,
   UpdateCharacterRequest,
 } from '@/types/character'
-import type { ChatSurface, StageAccessVerdict } from '@/types/chat'
+import {
+  ACTION_CHARACTER_DRAFT,
+  ACTION_IMAGE_PORTRAIT,
+  useActionPricing,
+} from '@/composables/useActionPricing'
 import { insufficientCreditsFromAxios } from '@/utils/api/insufficientCredits'
+import { priceChangedFromAxios } from '@/utils/api/priceChanged'
 
 const BASE = '/api/v1/characters'
+
+/**
+ * The fixed price this client is quoting for one action, or `null` (plan R9).
+ *
+ * Same contract as the chat and fusion transports: the server binds the charge
+ * to the number that was on the player's screen and answers `409
+ * price_changed` if the published price has moved, rather than silently
+ * charging an amount nobody was shown. `null` — self-host, a token-billed
+ * tier, a price list that has not loaded, tiers that disagree — is sent as
+ * nothing at all, and the server falls back to its own cache exactly as
+ * before.
+ */
+function quotedPriceCr(actionKey: string): number | null {
+  return useActionPricing().priceOf(actionKey)?.price_cr ?? null
+}
 
 export async function listCharacters(): Promise<Character[]> {
   const { data } = await axios.get<Character[]>(BASE)
@@ -27,17 +47,6 @@ export async function listCharacters(): Promise<Character[]> {
 
 export async function getCharacter(id: string): Promise<Character> {
   const { data } = await axios.get<Character>(`${BASE}/${id}`)
-  return data
-}
-
-export async function getStageAccess(
-  id: string,
-  surface: ChatSurface = 'web_stage',
-): Promise<StageAccessVerdict> {
-  const { data } = await axios.get<StageAccessVerdict>(
-    `${BASE}/${id}/stage-access`,
-    { params: { surface } },
-  )
   return data
 }
 
@@ -181,10 +190,19 @@ async function postImageGeneration<T>(
     const { data } = await axios.post<T>(path, body)
     return data
   } catch (err) {
-    const creditsError = insufficientCreditsFromAxios(err)
-    if (creditsError) throw creditsError
-    throw err
+    throw billingErrorFromAxios(err) ?? err
   }
+}
+
+/**
+ * The typed billing refusal behind an axios rejection, or `null`.
+ *
+ * Both refusals are things the player can act on and neither is a failure of
+ * the generator: 402 "top up", 409 "the price moved, send again — nothing was
+ * spent". Anything else is left untouched for the caller's normal handling.
+ */
+function billingErrorFromAxios(err: unknown): Error | null {
+  return insufficientCreditsFromAxios(err) ?? priceChangedFromAxios(err)
 }
 
 export async function generateCharacterPortrait(
@@ -192,9 +210,12 @@ export async function generateCharacterPortrait(
   positive: string,
   aspect: PortraitAspect = 'portrait',
 ): Promise<Character> {
+  const quoted = quotedPriceCr(ACTION_IMAGE_PORTRAIT)
   return postImageGeneration<Character>(
     `${BASE}/${characterId}/images/generate`,
-    { positive, aspect },
+    quoted === null
+      ? { positive, aspect }
+      : { positive, aspect, quoted_price_cr: quoted },
   )
 }
 
@@ -209,9 +230,16 @@ export async function generatePortraitCandidates(
   aspect: PortraitAspect = 'portrait',
   count: number = 4,
 ): Promise<GenerateCandidatesResponse> {
+  // This — not `generateCharacterPortrait` — is the button players press, so
+  // it is the call that has to carry the quote. One batch is one charge at one
+  // price, so the number sent is the batch price the hint displayed, never
+  // `count` times it.
+  const quoted = quotedPriceCr(ACTION_IMAGE_PORTRAIT)
   return postImageGeneration<GenerateCandidatesResponse>(
     `${BASE}/${characterId}/images/candidates`,
-    { positive, aspect, count },
+    quoted === null
+      ? { positive, aspect, count }
+      : { positive, aspect, count, quoted_price_cr: quoted },
   )
 }
 
@@ -361,12 +389,24 @@ export async function generateCharacterDraft(options: {
   if (options.image) {
     form.append('image', options.image)
   }
-  const { data } = await axios.post<CharacterDraft>(
-    `${BASE}/draft`,
-    form,
-    { headers: { 'Content-Type': 'multipart/form-data' } },
-  )
-  return data
+  // R9 quote binding, as a form field because this endpoint is multipart.
+  const quoted = quotedPriceCr(ACTION_CHARACTER_DRAFT)
+  if (quoted !== null) {
+    form.append('quoted_price_cr', String(quoted))
+  }
+  try {
+    const { data } = await axios.post<CharacterDraft>(
+      `${BASE}/draft`,
+      form,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+    return data
+  } catch (err) {
+    // The draft is action-priced, so "out of 螢火" and "the price moved" are
+    // both normal answers here — surface them as the typed errors the modal
+    // renders as localized copy instead of a raw transport message.
+    throw billingErrorFromAxios(err) ?? err
+  }
 }
 
 /**

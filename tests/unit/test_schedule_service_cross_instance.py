@@ -187,8 +187,8 @@ async def test_losing_replica_returns_current_state_without_blocking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claim_is_released_when_planning_fails() -> None:
-    """A crashed plan must not park the day behind a live claim until TTL."""
+async def test_claim_is_released_but_terminal_failure_is_not_replanned() -> None:
+    """A crashed plan releases its claim without causing same-day retries."""
     repo = InMemoryScheduleRepository()
     lease = InMemoryBackgroundCoordinatorLease()
     planner_a = GatedPlanner()
@@ -200,13 +200,20 @@ async def test_claim_is_released_when_planning_fails() -> None:
 
     failed = await service_a.ensure_schedule(character, date_=_TARGET)
     assert failed.activities == ()
+    assert failed.is_planned is True
+
+    probe = RuntimeClaim(lease, prefix="sched", owner_id="replica-b")
+    parts = _plan_claim_parts(character.id, _TARGET)
+    assert await probe.acquire(*parts)
+    await probe.release(*parts)
 
     recovered = await asyncio.wait_for(
         service_b.ensure_schedule(character, date_=_TARGET), timeout=2,
     )
 
-    assert planner_b.calls == 1
-    assert [a.description for a in recovered.activities] == ["call-1"]
+    assert planner_b.calls == 0
+    assert recovered.id == failed.id
+    assert recovered.activities == ()
 
 
 @pytest.mark.asyncio

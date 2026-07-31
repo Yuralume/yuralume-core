@@ -21,6 +21,7 @@ from kokoro_link.application.services.proactive_event_bus import ProactiveEvent
 from kokoro_link.application.services.realtime_event_dispatcher import (
     RealtimeEventDispatcher,
     RealtimeEventRehydrator,
+    RealtimeRehydrateTransientError,
 )
 from kokoro_link.contracts.realtime_events import (
     EVENT_KIND_FEED_COMMENT_REPLY,
@@ -44,12 +45,36 @@ class _CapturingBus:
         self.events.append(event)
 
 
+class _TransientOnceBus(_CapturingBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def publish(self, event: object) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("temporary local bus failure")
+        await super().publish(event)
+
+
 class _DictReader:
     def __init__(self, rows: dict[str, object]) -> None:
         self._rows = rows
 
     async def get(self, key: str) -> object | None:
         return self._rows.get(key)
+
+
+class _TransientOnceReader(_DictReader):
+    def __init__(self, rows: dict[str, object]) -> None:
+        super().__init__(rows)
+        self.attempts = 0
+
+    async def get(self, key: str) -> object | None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("temporary database read failure")
+        return await super().get(key)
 
 
 def _conversation(text: str, *, created_at: datetime = BASE):
@@ -220,6 +245,22 @@ async def test_rehydrate_unknown_kind_returns_none() -> None:
     assert await reh.rehydrate(stored) is None
 
 
+@pytest.mark.asyncio
+async def test_rehydrate_propagates_transient_reader_failure() -> None:
+    outbox = InMemoryRealtimeOutbox()
+    stored = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=0,
+        character_id="char-1", post_id="post-9",
+    )
+    reh = RealtimeEventRehydrator(
+        _DictReader({}), _TransientOnceReader({"post-9": _post_row()}),
+        _DictReader({}),
+    )
+
+    with pytest.raises(RealtimeRehydrateTransientError):
+        await reh.rehydrate(stored)
+
+
 # --- dispatcher drain -----------------------------------------------------
 
 @pytest.mark.asyncio
@@ -321,6 +362,85 @@ async def test_drain_skips_rehydrate_miss_without_crashing() -> None:
     published = await disp.drain_once()
     assert published == 1  # the miss is skipped, the live row delivered
     assert len(feed.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_rehydrate_stops_at_row_without_seen_or_cursor_skip() -> None:
+    outbox = InMemoryRealtimeOutbox()
+    first = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=0,
+        character_id="char-1", post_id="post-9",
+    )
+    second = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=1,
+        character_id="char-1", post_id="post-9",
+    )
+    reader = _TransientOnceReader({"post-9": _post_row()})
+    reh = RealtimeEventRehydrator(
+        _DictReader({}), reader, _DictReader({}),
+    )
+    feed = _CapturingBus()
+    disp = RealtimeEventDispatcher(outbox, reh, None, feed)
+
+    assert await disp.drain_once() == 0
+    assert disp._cursor == 0
+    assert first.id not in disp._seen
+    assert second.id not in disp._seen
+    assert disp.rehydrate_transient_failures == 1
+    assert feed.events == []
+
+    assert await disp.drain_once() == 2
+    assert disp._cursor == second.id
+    assert [event.event_id for event in feed.events] == [first.id, second.id]
+
+
+@pytest.mark.asyncio
+async def test_malformed_payload_is_terminal_and_does_not_block_next_row() -> None:
+    outbox = InMemoryRealtimeOutbox()
+    malformed = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=0,
+        character_id="char-1",
+    )
+    live = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=1,
+        character_id="char-1", post_id="post-9",
+    )
+    feed = _CapturingBus()
+    disp = RealtimeEventDispatcher(
+        outbox, _build(posts={"post-9": _post_row()}), None, feed,
+    )
+
+    assert await disp.drain_once() == 1
+    assert disp._cursor == live.id
+    assert malformed.id in disp._seen
+    assert [event.event_id for event in feed.events] == [live.id]
+
+
+@pytest.mark.asyncio
+async def test_transient_publish_stops_without_seen_or_cursor_skip() -> None:
+    outbox = InMemoryRealtimeOutbox()
+    first = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=0,
+        character_id="char-1", post_id="post-9",
+    )
+    second = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=1,
+        character_id="char-1", post_id="post-9",
+    )
+    feed = _TransientOnceBus()
+    disp = RealtimeEventDispatcher(
+        outbox, _build(posts={"post-9": _post_row()}), None, feed,
+    )
+
+    assert await disp.drain_once() == 0
+    assert disp._cursor == 0
+    assert first.id not in disp._seen
+    assert second.id not in disp._seen
+    assert disp.publish_transient_failures == 1
+
+    assert await disp.drain_once() == 2
+    assert disp._cursor == second.id
+    assert [event.event_id for event in feed.events] == [first.id, second.id]
 
 
 @pytest.mark.asyncio

@@ -208,7 +208,21 @@ class FusionStorySummaryResponse(BaseModel):
         )
 
 
-class CreateFusionStoryRequest(BaseModel):
+class QuotedActionPriceMixin(BaseModel):
+    """The fixed price this client had on screen when it sent the request.
+
+    R9 quote binding: the server refuses (``409 price_changed``) when the
+    published price no longer matches, and reading "what we quoted" from its
+    own process-local cache is only a proxy — across replicas, or right after a
+    back-office edit, that number may be one this player never saw. Optional
+    everywhere, because self-host and token-billed tiers have nothing to quote;
+    omitted falls back to the cache exactly as before.
+    """
+
+    quoted_price_cr: float | None = Field(default=None, ge=0)
+
+
+class CreateFusionStoryRequest(QuotedActionPriceMixin):
     # 1–5 characters (C1-5): solo casts are allowed; the second+ member is
     # optional. ``min_length=1`` rejects an empty cast at the schema edge
     # (422) while the service enforces the same floor for non-HTTP callers.
@@ -216,13 +230,21 @@ class CreateFusionStoryRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=2000)
 
 
-class IterateOutlineRequest(BaseModel):
+class IterateOutlineRequest(QuotedActionPriceMixin):
     hint: str | None = Field(default=None, max_length=2000)
 
 
-class IterateBeatRequest(BaseModel):
+class IterateBeatRequest(QuotedActionPriceMixin):
     beat_index: int = Field(..., ge=0, le=10)
     hint: str | None = Field(default=None, max_length=2000)
+
+
+class PolishFusionStoryRequest(QuotedActionPriceMixin):
+    """Body of the polish endpoint — quote binding only.
+
+    The endpoint took no body before AP2 and still accepts none (the route
+    defaults it), so existing clients keep working unchanged.
+    """
 
 
 class FusionToArcDraftRequest(BaseModel):

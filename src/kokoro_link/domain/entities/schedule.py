@@ -41,6 +41,37 @@ OPERATOR_INVOLVEMENT_ROLES = frozenset(
         OPERATOR_WISH_ROLE,
     },
 )
+"""Roles describing a *live* operator commitment — one that still has a
+future in it. Membership is what makes an activity survive a re-plan."""
+
+OPERATOR_INVITE_EXPIRED_ROLE = "operator_invite_expired"
+OPERATOR_CONFIRMED_LAPSED_ROLE = "operator_confirmed_lapsed"
+OPERATOR_EXPIRED_ROLES = frozenset(
+    {
+        OPERATOR_INVITE_EXPIRED_ROLE,
+        OPERATOR_CONFIRMED_LAPSED_ROLE,
+    },
+)
+"""Terminal states for a commitment whose civil day came and went.
+
+Deliberately encoded as ``participant_refs`` **role values** rather than a
+new column: the whole lifecycle then rides on JSON that already round-trips
+through ``participant_refs_json``, so no alembic migration is needed and a
+row written before this existed is simply an un-expired candidate the sweep
+marks on its next pass.
+"""
+
+OPERATOR_ANY_INVOLVEMENT_ROLES = OPERATOR_INVOLVEMENT_ROLES | OPERATOR_EXPIRED_ROLES
+"""Every role that marks the operator as attached to an activity, live or
+spent. Used when *replacing* an operator ref, so re-confirming a lapsed
+plan overwrites the old ref instead of stacking a second one."""
+
+_EXPIRY_TRANSITIONS: dict[str, str] = {
+    OPERATOR_INVITE_PENDING_ROLE: OPERATOR_INVITE_EXPIRED_ROLE,
+    OPERATOR_CONFIRMED_SHARED_ROLE: OPERATOR_CONFIRMED_LAPSED_ROLE,
+}
+"""Live role → terminal role. ``operator_wish`` has no entry on purpose: a
+wish was never an appointment, so it has nothing to expire out of."""
 
 
 class ScenePrivacy(StrEnum):
@@ -104,14 +135,22 @@ class ScheduleActivity:
     角色真實互動，使用 ``ParticipantRef(actor_kind="character", ...)`` 寫
     入這欄，讓 UI 與記憶流程能分辨「真實角色」與文字同伴。"""
     scene_privacy: ScenePrivacy | None = None
-    """LLM-produced semantic privacy affordance for Scene Access.
+    """Planner-produced semantic privacy reading of the activity's scene.
 
-    ``None`` means legacy / unknown, not "safe" or "private". Python
-    code must not derive this from location keywords; planners or
-    SceneAccessJudge may provide it as a structured semantic result."""
+    ``None`` means legacy / unknown, not "safe" or "private". Python code
+    must not derive this from location keywords — only the schedule
+    planner may fill it, as a structured semantic result.
+
+    Consumed by chat-assist's schedule snapshot (rendered as a scene
+    cue when suggesting player lines); also kept as narrative material
+    the main chat may draw on later (e.g. letting a character set a
+    boundary in-story during a private moment)."""
     meeting_affordance: MeetingAffordance | None = None
-    """LLM-produced indication of whether an activity naturally allows
-    encounter, requires invitation, or is not available for meeting."""
+    """Planner-produced indication of whether an activity naturally allows
+    encounter, requires invitation, or is not available for meeting.
+
+    Same status as ``scene_privacy``: produced by the planner, consumed
+    by chat-assist's schedule snapshot, retained as narrative material."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "busy_score", _clamp_busy(self.busy_score))
@@ -288,6 +327,73 @@ def default_busy_score(category: str) -> float:
     return DEFAULT_UNKNOWN_BUSY_SCORE
 
 
+def has_live_operator_commitment(activity: ScheduleActivity) -> bool:
+    """``True`` when the activity still encodes a promise to / plan with the
+    operator (a pending invite, a wish, or a confirmed shared plan).
+
+    Expired / lapsed roles deliberately answer ``False``: they are the record
+    of a commitment, not a commitment.
+    """
+    return any(
+        ref.role in OPERATOR_INVOLVEMENT_ROLES
+        for ref in activity.participant_refs
+    )
+
+
+def has_expired_operator_commitment(activity: ScheduleActivity) -> bool:
+    """``True`` when the activity carries a spent operator commitment."""
+    return any(
+        ref.role in OPERATOR_EXPIRED_ROLES
+        for ref in activity.participant_refs
+    )
+
+
+def expire_operator_commitment(
+    activity: ScheduleActivity,
+) -> ScheduleActivity | None:
+    """Move any live operator commitment on ``activity`` to its terminal role.
+
+    Purely structural — the caller owns the "has this day passed?" decision
+    and no user-visible text (``description`` / ``location``) is touched.
+    ``None`` means nothing changed, which makes repeated sweeps free and
+    lets callers skip a write.
+
+    An ``operator_confirmed_shared`` block that actually produced a memory
+    is left alone: it is history rather than a lapsed promise. The test is
+    ``memorialized and has_memory``, not ``memorialized`` alone —
+    :mod:`kokoro_link.application.services.schedule_memorializer` marks a
+    completed block memorialised (the idempotency latch) even when it
+    deliberately writes *no* memory, which is exactly what it does for a
+    shared plan with no evidence the operator took part. Keying on the
+    latch alone would pin that block as a live commitment forever, so the
+    unattended appointment this whole state machine exists to retire would
+    never reach the expired-facts list.
+    """
+    if not activity.participant_refs:
+        return None
+    updated: list[ParticipantRef] = []
+    changed = False
+    for ref in activity.participant_refs:
+        target_role = _EXPIRY_TRANSITIONS.get(ref.role or "")
+        blocked_by_history = (
+            ref.role == OPERATOR_CONFIRMED_SHARED_ROLE
+            and activity.memorialized
+            and activity.has_memory
+        )
+        if (
+            target_role is None
+            or ref.actor_kind != "operator"
+            or blocked_by_history
+        ):
+            updated.append(ref)
+            continue
+        updated.append(replace(ref, role=target_role))
+        changed = True
+    if not changed:
+        return None
+    return replace(activity, participant_refs=tuple(updated))
+
+
 def _coerce_scene_privacy(raw: ScenePrivacy | str | None) -> ScenePrivacy | None:
     if raw is None:
         return None
@@ -342,6 +448,20 @@ class DailySchedule:
     activities: tuple[ScheduleActivity, ...] = field(default_factory=tuple)
     generated_at: datetime = field(default_factory=_utcnow)
     is_planned: bool = True
+    weather_vet_activity_id: str | None = None
+    """Which activity was in progress the last time the intra-day weather
+    drift judge looked at this day. ``None`` = never vetted."""
+    weather_vet_condition: str | None = None
+    """The weather condition phrase that was true at that same moment
+    (:func:`kokoro_link.infrastructure.weather.facts.extract_condition_phrase`).
+
+    Together with ``weather_vet_activity_id`` this is purely a **cost
+    gate**: an unchanged pair means "we already asked the LLM about this
+    block under this sky", so the tick skips the call — idempotent across
+    ticks and across instances. Either half changing (the day moved on to
+    the next block, or the weather turned mid-block) re-opens the gate.
+    It is never a semantic input — the judgement itself always compares
+    the full schedule text against the full weather fact block."""
 
     @classmethod
     def create(
@@ -366,6 +486,23 @@ class DailySchedule:
 
     def with_is_planned(self, flag: bool = True) -> "DailySchedule":
         return replace(self, is_planned=flag)
+
+    def with_weather_vet(
+        self, activity_id: str | None, condition: str | None,
+    ) -> "DailySchedule":
+        """Stamp the intra-day weather-drift gate marker.
+
+        Written after *every* judge call — including one that returned no
+        rewrites — so an unchanged sky doesn't pay for the same verdict
+        again on the next tick. Blank halves normalise to ``None`` so
+        "never vetted" has a single representable form (an empty weather
+        block yields no condition phrase).
+        """
+        return replace(
+            self,
+            weather_vet_activity_id=(activity_id or "").strip() or None,
+            weather_vet_condition=(condition or "").strip() or None,
+        )
 
     def activity_at(self, moment: datetime) -> ScheduleActivity | None:
         """Return the activity that covers ``moment``, if any.
@@ -415,3 +552,30 @@ class DailySchedule:
     def with_activities(self, activities: list[ScheduleActivity]) -> "DailySchedule":
         ordered = tuple(sorted(activities, key=lambda a: a.start_at))
         return replace(self, activities=ordered)
+
+
+def without_expired_operator_commitments(
+    schedule: DailySchedule,
+) -> DailySchedule:
+    """Drop blocks whose operator commitment has been retired by the sweep.
+
+    The single filter behind every "接下來幾天" renderer — chat prompt,
+    proactive decider, proactive intention judge. A lapsed 刨冰 invite that
+    survived into a future day's row would otherwise be re-announced as a
+    plan the user never agreed to, and the three renderers each grew their
+    own copy of the day list, so one shared function is what keeps them from
+    drifting apart again (plan §2 P1c).
+
+    Callers must apply it **before** any 「共 N 段」/「另外還有 N 段」
+    arithmetic, or a dropped block leaks back in as a count. Structural role
+    check only (:func:`has_expired_operator_commitment`) — the activity's own
+    text is never inspected. Returns the schedule unchanged (same object)
+    when nothing is filtered, so the common path allocates nothing.
+    """
+    kept = [
+        activity for activity in schedule.activities
+        if not has_expired_operator_commitment(activity)
+    ]
+    if len(kept) == len(schedule.activities):
+        return schedule
+    return schedule.with_activities(kept)

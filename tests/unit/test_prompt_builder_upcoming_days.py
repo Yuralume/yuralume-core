@@ -6,7 +6,13 @@ from datetime import date, datetime, timezone
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import Conversation
-from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
+from kokoro_link.domain.entities.schedule import (
+    OPERATOR_CONFIRMED_LAPSED_ROLE,
+    OPERATOR_INVITE_EXPIRED_ROLE,
+    DailySchedule,
+    ScheduleActivity,
+)
+from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.prompt.default import (
     DefaultPromptContextBuilder,
@@ -77,6 +83,94 @@ def test_day_after_collapses_to_one_liner() -> None:
     assert "2026-05-21" in body
     # Day-after one-liner mentions the activity count, not every line.
     assert "共 2 段" in body
+
+
+def _expired_activity(
+    target: date, description: str, *, role: str, hour: int = 15,
+) -> ScheduleActivity:
+    base = datetime.combine(target, datetime.min.time(), tzinfo=timezone.utc)
+    return ScheduleActivity.create(
+        start_at=base.replace(hour=hour),
+        end_at=base.replace(hour=hour + 1),
+        description=description,
+        category="social",
+        participant_refs=(
+            ParticipantRef(
+                actor_kind="operator",
+                actor_id=None,
+                display_name="使用者",
+                role=role,
+            ),
+        ),
+    )
+
+
+def test_expired_invite_is_dropped_from_tomorrow_listing() -> None:
+    """A carried-over invite the sweep retired must not be re-announced as a
+    future plan (plan §2 P1c — the 刨冰 activity rebooked onto 7/30, 7/31)."""
+    tomorrow = _schedule(date(2026, 5, 20), ["整理稿件"])
+    tomorrow = tomorrow.with_activities([
+        *tomorrow.activities,
+        _expired_activity(
+            date(2026, 5, 20),
+            "和使用者一起去吃刨冰",
+            role=OPERATOR_INVITE_EXPIRED_ROLE,
+        ),
+    ])
+
+    body = "\n".join(
+        _render_upcoming_days_block([tomorrow], today_local=date(2026, 5, 19)),
+    )
+
+    assert "整理稿件" in body
+    assert "刨冰" not in body
+
+
+def test_lapsed_confirmed_plan_is_dropped_and_not_counted_day_after() -> None:
+    """The day-after one-liner reports an activity count plus a headline —
+    both must be computed on the filtered list, or the count leaks the
+    dropped block back into the prompt."""
+    tomorrow = _schedule(date(2026, 5, 20), ["明日工作"])
+    day_after = _schedule(date(2026, 5, 21), ["下午做剪輯"])
+    day_after = day_after.with_activities([
+        *day_after.activities,
+        _expired_activity(
+            date(2026, 5, 21),
+            "和使用者一起去共享工作室",
+            role=OPERATOR_CONFIRMED_LAPSED_ROLE,
+            hour=16,
+        ),
+    ])
+
+    body = "\n".join(
+        _render_upcoming_days_block(
+            [tomorrow, day_after], today_local=date(2026, 5, 19),
+        ),
+    )
+
+    assert "共享工作室" not in body
+    assert "共 1 段" in body
+
+
+def test_day_becomes_empty_when_every_block_expired() -> None:
+    tomorrow = DailySchedule.create(
+        character_id="char-x",
+        date_=date(2026, 5, 20),
+        activities=[
+            _expired_activity(
+                date(2026, 5, 20),
+                "和使用者一起去吃刨冰",
+                role=OPERATOR_INVITE_EXPIRED_ROLE,
+            ),
+        ],
+    )
+
+    body = "\n".join(
+        _render_upcoming_days_block([tomorrow], today_local=date(2026, 5, 19)),
+    )
+
+    assert "刨冰" not in body
+    assert "尚未安排具體時段" in body
 
 
 def test_build_threads_upcoming_into_prompt() -> None:

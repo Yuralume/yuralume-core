@@ -21,6 +21,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.date_context import (
+    render_story_date_context_block,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +99,12 @@ def _build_prompt(context: ArcCompletionMemoryContext) -> str:
         )
     body = get_default_loader().render(
         "story/arc_completion_memory",
+        # CF1b: a relationship milestone is read back for months, so a
+        # relative time word frozen into it never resolves.
+        date_context_block=render_story_date_context_block(
+            context.today,
+            language_tag=context.operator_primary_language,
+        ),
         character_name=context.character.name,
         character_summary=context.character.summary or "（未設定）",
         arc_title=context.arc.title,

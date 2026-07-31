@@ -183,6 +183,7 @@ async def test_empty_on_model_exception() -> None:
         character=_character(), date_=date(2026, 4, 18), local_tz=UTC,
     )
     assert schedule.activities == ()
+    assert schedule.is_planned is True
 
 
 @pytest.mark.asyncio

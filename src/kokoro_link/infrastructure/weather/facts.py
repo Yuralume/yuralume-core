@@ -56,6 +56,12 @@ _WMO_CONDITION: dict[int, str] = {
 }
 
 
+# The "現在" line's shape, shared by the renderer and the extractor below
+# so the two can never drift apart: ``- 現在：{condition}[，氣溫 {temp}]``.
+_NOW_LINE_PREFIX = "- 現在："
+_NOW_LINE_SEPARATOR = "，"
+
+
 def condition_phrase(code: int | None) -> str:
     """Map a WMO weather code into a short Chinese phrase.
 
@@ -147,9 +153,11 @@ class WeatherFacts:
         condition = condition_phrase(self.condition_code)
         now_temp = _fmt_temp(self.temperature_c)
         if now_temp is not None:
-            lines.append(f"- 現在：{condition}，氣溫 {now_temp}")
+            lines.append(
+                f"{_NOW_LINE_PREFIX}{condition}{_NOW_LINE_SEPARATOR}氣溫 {now_temp}"
+            )
         else:
-            lines.append(f"- 現在：{condition}")
+            lines.append(f"{_NOW_LINE_PREFIX}{condition}")
         high = _fmt_temp(self.high_c)
         low = _fmt_temp(self.low_c)
         if high is not None and low is not None:
@@ -169,3 +177,27 @@ class WeatherFacts:
         elif self.is_day is True:
             lines.append("- 此刻為白天時段")
         return "\n".join(lines)
+
+
+def extract_condition_phrase(block: str) -> str:
+    """Read the current-condition phrase back out of a rendered block.
+
+    The schedule weather-drift gate stores this phrase alongside the
+    activity it last vetted, so "same block, sky turned" re-opens the gate
+    while "same block, same sky" stays cheap. It parses the renderer's own
+    output rather than the ``WeatherFacts`` object because callers upstream
+    only ever pass the rendered ``weather_context`` string around.
+
+    Empty string when the block is empty or carries no "現在" line (a
+    forecast-only block, or a provider that gave highs/lows only) — the
+    caller treats that as "no condition to compare" and simply re-judges.
+    """
+    if not block:
+        return ""
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_NOW_LINE_PREFIX):
+            continue
+        rest = stripped[len(_NOW_LINE_PREFIX):]
+        return rest.split(_NOW_LINE_SEPARATOR, 1)[0].strip()
+    return ""

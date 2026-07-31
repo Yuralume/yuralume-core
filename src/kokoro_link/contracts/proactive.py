@@ -211,6 +211,21 @@ class ProactiveDecision:
     message (e.g. a ``generate_image`` call to attach a fresh selfie
     to a "早安" push). The dispatcher runs these before delivering
     and merges their attachments into the outbound message."""
+    prompt_assembled: str | None = None
+    """The exact prompt this decision came out of, for the audit trail.
+
+    The decider owns prompt assembly, so it is the only layer that can
+    hand the real text back; the dispatcher persists it on the turn
+    record when — and only when — the message actually goes out
+    (COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P0). Skip / blocked
+    ticks drop it on the floor: at a ~5-minute cadence they would bury
+    the table in prompts nobody will ever read.
+
+    ``None`` = no prompt was assembled (short-circuit paths such as the
+    fake provider, or a decider implementation that doesn't prompt at
+    all). Implementations are free to leave it unset; the dispatcher
+    then records an empty prompt exactly as it did before this field
+    existed."""
 
 
 class ProactiveGatePort(Protocol):

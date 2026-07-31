@@ -12,6 +12,7 @@ only at deliberate checkpoints.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, tzinfo
 from typing import Protocol
 
 from kokoro_link.domain.entities.character import Character
@@ -52,6 +53,8 @@ class GoalReviewerPort(Protocol):
         active_goals: list[CharacterGoal],
         recent_messages: list[Message],
         operator_primary_language: str = "zh-TW",
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
     ) -> GoalReviewResult:
         """Judge each active goal and optionally propose new ones.
 
@@ -60,4 +63,11 @@ class GoalReviewerPort(Protocol):
         ``GoalStatusChange.notes`` — both render in PlayerGoalsPanel.vue,
         so a non-Chinese player must not see Chinese goals / review notes.
         Defaults to ``zh-TW`` (ship-first) so legacy callers keep working.
+
+        ``now`` / ``local_tz`` give the reviewer the owning operator's civil
+        day. Without them it cannot tell whether a goal that says 「明早一起
+        出門」 refers to a morning that already passed, so a date-bound goal
+        would never close (CF2 / plan §2 P2b rule 2). Both are optional so
+        reviewers predating the calendar context keep working; callers must
+        pass them through a keyword-tolerance check rather than assume.
         """

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -57,6 +57,69 @@ class SAAccountRuntimeUsageRepository:
         async with self._session_factory() as session:
             result = await session.execute(stmt)
             return int(result.scalar_one())
+
+    async def claim_event_slot(
+        self,
+        *,
+        operator_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        since: datetime,
+        limit: int,
+    ) -> str | None:
+        """Write the claim first, then check whether the window still fits.
+
+        A read-then-write ceiling is not a ceiling: two concurrent ticks of the
+        same operator (several characters, several hosted replicas) both read
+        the same last free slot and both spend it. Inserting first makes every
+        racer visible to every other racer's count, so the window can never end
+        up over ``limit``. The cost is that a tie may deny both racers when one
+        slot was free — the deliberate direction for a service whose whole
+        contract is fail-closed: a lost slot is an inconvenience, an unbounded
+        purchase loop is the player's money.
+        """
+        if limit <= 0:
+            return None
+        event_id = str(uuid4())
+        stamp = ensure_utc(occurred_at)
+        since_utc = ensure_utc(since)
+        async with self._session_factory() as session:
+            session.add(
+                AccountRuntimeEventRow(
+                    id=event_id,
+                    operator_id=operator_id,
+                    event_type=event_type,
+                    occurred_at=stamp,
+                ),
+            )
+            await session.commit()
+            used = await session.execute(
+                select(func.count())
+                .select_from(AccountRuntimeEventRow)
+                .where(
+                    AccountRuntimeEventRow.operator_id == operator_id,
+                    AccountRuntimeEventRow.event_type == event_type,
+                    AccountRuntimeEventRow.occurred_at >= since_utc,
+                ),
+            )
+            if int(used.scalar_one()) > limit:
+                await session.execute(
+                    delete(AccountRuntimeEventRow).where(
+                        AccountRuntimeEventRow.id == event_id,
+                    ),
+                )
+                await session.commit()
+                return None
+        return event_id
+
+    async def discard_event(self, *, event_id: str) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(AccountRuntimeEventRow).where(
+                    AccountRuntimeEventRow.id == event_id,
+                ),
+            )
+            await session.commit()
 
     async def list_events(
         self,

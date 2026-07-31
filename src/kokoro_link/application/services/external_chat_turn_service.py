@@ -56,6 +56,7 @@ from kokoro_link.application.services.external_chat_roster_service import (
     RosterView,
     resolve_cloud_operator,
 )
+from kokoro_link.contracts.cloud_gateway import CloudGatewayRequestTooLargeError
 from kokoro_link.contracts.external_chat_turn import (
     Claimed,
     CommittedRecovery,
@@ -237,6 +238,11 @@ class ExternalChatTurnService:
             return await self._fail_retryable(
                 fence, status=429, code="rate_limited",
                 message="runtime limit exceeded",
+            )
+        except CloudGatewayRequestTooLargeError:
+            return await self._fail_terminal(
+                fence, status=413, code="payload_too_large",
+                message="LLM request exceeds the size limit",
             )
         except TurnFencingStale:
             return await self._fail_retryable(

@@ -155,6 +155,9 @@ def test_app_settings_loads_cloud_settings(
     monkeypatch.setenv("STORAGE_PUBLIC_URL", "http://127.0.0.1:9012")
     monkeypatch.setenv("APP_BASE_URL", "https://app.example.test")
     monkeypatch.setenv("YURALUME_CLOUD_ENABLED", "true")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app",
+    )
     monkeypatch.setenv("YURALUME_CLOUD_USER_SERVICE_URL", "https://users.example")
     monkeypatch.setenv("YURALUME_CLOUD_GATEWAY_URL", "https://gateway.example")
     monkeypatch.setenv("YURALUME_CLOUD_DEPLOYMENT_TOKEN", "deploy-secret")
@@ -253,6 +256,59 @@ def _base_cloud_env(monkeypatch, tmp_path: Path) -> None:
         "YURALUME_CLOUD_USER_INTERNAL_CREDENTIAL",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def test_cloud_mode_requires_database_even_for_credential_exempt_coordinator(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _base_cloud_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("YURALUME_PROCESS_ROLE", "coordinator")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KOKORO_DATABASE_URL", raising=False)
+
+    with pytest.raises(ValueError, match=r"YURALUME_CLOUD_ENABLED=true.*DATABASE_URL"):
+        AppSettings.from_env(project_root=tmp_path)
+
+
+@pytest.mark.parametrize("role", ["api", "worker", "background"])
+def test_split_realtime_publisher_roles_reject_memory_backend(
+    tmp_path: Path, monkeypatch, role: str,
+) -> None:
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("YURALUME_CLOUD_ENABLED", "false")
+    monkeypatch.setenv("YURALUME_PROCESS_ROLE", role)
+    monkeypatch.setenv(
+        "YURALUME_BACKGROUND_BACKEND",
+        "postgres" if role == "worker" else "embedded",
+    )
+    monkeypatch.setenv("YURALUME_REALTIME_BACKEND", "memory")
+    if role == "worker":
+        monkeypatch.setenv(
+            "DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app",
+        )
+
+    with pytest.raises(ValueError, match=r"YURALUME_REALTIME_BACKEND=memory.*role"):
+        AppSettings.from_env(project_root=tmp_path)
+
+
+@pytest.mark.parametrize("role", ["connector", "coordinator"])
+def test_non_realtime_publisher_roles_allow_memory_backend(
+    tmp_path: Path, monkeypatch, role: str,
+) -> None:
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("YURALUME_CLOUD_ENABLED", "false")
+    monkeypatch.setenv("YURALUME_PROCESS_ROLE", role)
+    monkeypatch.setenv(
+        "YURALUME_BACKGROUND_BACKEND",
+        "postgres" if role == "coordinator" else "embedded",
+    )
+    monkeypatch.setenv("YURALUME_REALTIME_BACKEND", "memory")
+    if role == "coordinator":
+        monkeypatch.setenv(
+            "DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app",
+        )
+
+    assert AppSettings.from_env(project_root=tmp_path).process.role == role
 
 
 def test_coordinator_role_boots_without_cloud_deployment_token(

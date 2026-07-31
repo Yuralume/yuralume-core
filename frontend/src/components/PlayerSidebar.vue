@@ -17,6 +17,7 @@ import type { MessagingPlatform } from '@/types/messaging'
 import { resolveWebPushNudge } from '@/utils/webPushNudge'
 import SidebarBrand from './SidebarBrand.vue'
 import CloudCreditsBadge from './CloudCreditsBadge.vue'
+import CloudNoticeDot from './CloudNoticeDot.vue'
 import PostCreateChannelGuide from './PostCreateChannelGuide.vue'
 import AlbumPanel from './AlbumPanel.vue'
 import CharacterImagesPanel from './CharacterImagesPanel.vue'
@@ -280,6 +281,10 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
     <!-- 螢火餘額徽章：僅 hosted（cloud）模式且拿得到餘額時渲染，
          self-host 這裡完全不輸出任何節點。 -->
     <CloudCreditsBadge />
+
+    <!-- 未讀公告紅點：同樣僅 hosted（cloud）模式，且只在真的有未讀時出現。
+         公告內文一律留在 Portal，這裡只負責「有新的東西」這一個提示。 -->
+    <CloudNoticeDot />
 
     <!-- 頁籤 -->
     <div class="tabs" role="tablist" :aria-label="t('playerSidebar.tabs.ariaLabel')">

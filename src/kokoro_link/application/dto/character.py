@@ -780,6 +780,19 @@ class GeneratePortraitRequest(BaseModel):
 
     positive: str
     aspect: str = "portrait"
+    quoted_price_cr: float | None = Field(default=None, ge=0)
+    """The price this client had on screen for one portrait (R9).
+
+    Same contract as the chat turn's field: the charge is bound to the number
+    the *player* was shown, not to whatever this replica's price cache holds —
+    under several hosted replicas, or right after a back-office edit, those are
+    not the same number and only the first one was ever agreed to. Omitted (an
+    older client, self-host, or no unambiguous price to quote) falls back to
+    the process cache, so nothing regresses.
+
+    Under-reporting gains nothing: the User service answers ``409
+    price_changed`` when the quote does not match the published price.
+    """
 
 
 class GenerateCandidatesRequest(BaseModel):
@@ -794,6 +807,16 @@ class GenerateCandidatesRequest(BaseModel):
     positive: str
     aspect: str = "portrait"
     count: int = 4
+    quoted_price_cr: float | None = Field(default=None, ge=0)
+    """The price this client had on screen for one batch (R9).
+
+    One press of the picture button is one ``image_portrait`` action whatever
+    ``count`` says, so this is the *batch* price, not a per-image one — the
+    same single number the hint above the button displayed. Semantics are
+    otherwise identical to :class:`GeneratePortraitRequest`: omitted falls back
+    to Core's cache, and a stale quote is answered with ``409 price_changed``
+    rather than a charge nobody agreed to.
+    """
 
 
 class GenerateCandidatesResponse(BaseModel):

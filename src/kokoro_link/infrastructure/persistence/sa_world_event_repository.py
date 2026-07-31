@@ -89,7 +89,12 @@ class SaWorldEventRepository:
         async with self._session_factory() as session:
             stmt = pg_insert(WorldEventRow).values(**payload)
             stmt = stmt.on_conflict_do_update(
-                index_elements=[WorldEventRow.id],
+                # URL is the shared pool's de-duplication identity.  Different
+                # scheduler processes create different UUIDs for the same feed
+                # item, so targeting ``id`` leaves the URL uniqueness race
+                # exposed.  Keep the winning row's stable id (existing inbox
+                # rows may reference it) and refresh only its mutable payload.
+                index_elements=[WorldEventRow.url],
                 set_={
                     "title": stmt.excluded.title,
                     "summary": stmt.excluded.summary,

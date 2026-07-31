@@ -8,7 +8,8 @@ import pytest
 from kokoro_link.application.services.rss_ingestion_service import (
     RssIngestionService,
 )
-from kokoro_link.contracts.rss_feed_fetcher import RawWorldEvent
+from kokoro_link.contracts.embedder import EmbedderError
+from kokoro_link.contracts.rss_feed_fetcher import RawWorldEvent, RssFetchError
 from kokoro_link.domain.entities.rss_source import RssSource
 from kokoro_link.domain.entities.world_event import WorldEvent
 from kokoro_link.infrastructure.repositories.in_memory_rss_sources import (
@@ -236,3 +237,256 @@ async def test_dedup_hit_with_matching_region_corrects_nothing() -> None:
 
     assert report.events_skipped_dedup == 1
     assert report.events_region_corrected == 0
+
+
+class _PerSourceFetcher(_Fetcher):
+    async def fetch(self, **kwargs) -> list[RawWorldEvent]:
+        if kwargs["source_id"] == "broken":
+            raise RssFetchError(
+                "http_status", "upstream returned HTTP 410", status_code=410,
+            )
+        return await super().fetch(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_fetch_failure_is_source_isolated_and_report_is_url_safe() -> None:
+    sources = InMemoryRssSourceRepository()
+    events = InMemoryWorldEventRepository()
+    broken_url = "https://example.test/feed?token=must-not-leak"
+    await sources.upsert(RssSource(
+        id="broken", name="Broken", feed_url=broken_url, category="news",
+    ))
+    await sources.upsert(RssSource(
+        id="healthy", name="Healthy", feed_url="https://healthy.test/rss",
+        category="news",
+    ))
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=events,
+        feed_fetcher=_PerSourceFetcher(),
+        embedder=_Embedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.sources_attempted == 2
+    assert report.sources_succeeded == 1
+    assert report.events_persisted == 1
+    assert report.errors == (
+        "broken: http_status: upstream returned HTTP 410",
+    )
+    assert broken_url not in repr(report.errors)
+    assert "token" not in repr(report.errors)
+    assert (await sources.get("broken")).last_error == (
+        "http_status: upstream returned HTTP 410"
+    )
+    assert (await sources.get("healthy")).last_success_at is not None
+
+
+class _UrlLeakingFetcher(_Fetcher):
+    async def fetch(self, **kwargs) -> list[RawWorldEvent]:
+        raise RuntimeError("failed https://example.test/rss?secret=do-not-leak")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_fetch_error_does_not_persist_exception_message() -> None:
+    sources = InMemoryRssSourceRepository()
+    await sources.upsert(_NCDR)
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=InMemoryWorldEventRepository(),
+        feed_fetcher=_UrlLeakingFetcher(),
+        embedder=_Embedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.errors == ("ncdr: unexpected_fetch_error: RuntimeError",)
+    assert "example.test" not in (await sources.get("ncdr")).last_error
+
+
+class _FailingEventRepository(InMemoryWorldEventRepository):
+    async def upsert(self, event: WorldEvent) -> None:
+        raise RuntimeError("write failed for https://private.test/event?key=secret")
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_is_counted_without_logging_event_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sources = InMemoryRssSourceRepository()
+    await sources.upsert(_NCDR)
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=_FailingEventRepository(),
+        feed_fetcher=_Fetcher(),
+        embedder=_Embedder(),
+    )
+
+    with caplog.at_level("WARNING"):
+        report = await service.ingest_all()
+
+    assert report.events_failed_persist == 1
+    assert report.events_persisted == 0
+    assert report.sources_succeeded == 0
+    assert report.errors == (
+        "ncdr: storage_degraded: persisted=0 failed=1",
+    )
+    source = await sources.get("ncdr")
+    assert source.last_success_at is None
+    assert source.last_error == "storage_degraded: persisted=0 failed=1"
+    assert source.fetched_count_total == 0
+    assert "world_event upsert failed source_id=ncdr" in caplog.text
+    assert "private.test" not in caplog.text
+    assert "example.com/alert" not in caplog.text
+
+
+class _PartiallyFailingEventRepository(InMemoryWorldEventRepository):
+    async def upsert(self, event: WorldEvent) -> None:
+        if event.url.endswith("/failed"):
+            raise RuntimeError("write failed")
+        await super().upsert(event)
+
+
+class _TwoEventFetcher(_Fetcher):
+    async def fetch(self, **kwargs) -> list[RawWorldEvent]:
+        event = (await super().fetch(**kwargs))[0]
+        return [
+            replace(event, url="https://events.test/persisted"),
+            replace(event, url="https://events.test/failed"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_partial_persist_failure_marks_degraded_and_counts_only_writes(
+) -> None:
+    sources = InMemoryRssSourceRepository()
+    await sources.upsert(_NCDR)
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=_PartiallyFailingEventRepository(),
+        feed_fetcher=_TwoEventFetcher(),
+        embedder=_Embedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.events_persisted == 1
+    assert report.events_failed_persist == 1
+    assert report.sources_succeeded == 0
+    assert report.errors == (
+        "ncdr: storage_degraded: persisted=1 failed=1",
+    )
+    source = await sources.get("ncdr")
+    assert source.last_success_at is None
+    assert source.last_error == "storage_degraded: persisted=1 failed=1"
+    assert source.fetched_count_total == 1
+
+
+class _FailingEmbedder(_Embedder):
+    @property
+    def is_operational(self) -> bool:
+        return True
+
+    async def embed_many(self, texts):
+        raise EmbedderError("provider URL or credential must not be logged")
+
+
+@pytest.mark.asyncio
+async def test_embed_batch_failure_is_counted_while_events_persist() -> None:
+    sources = InMemoryRssSourceRepository()
+    events = InMemoryWorldEventRepository()
+    await sources.upsert(_NCDR)
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=events,
+        feed_fetcher=_Fetcher(),
+        embedder=_FailingEmbedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.embed_batches_failed == 1
+    assert report.events_skipped_embed == 1
+    assert report.events_persisted == 1
+
+
+class _ShortEmbedder(_Embedder):
+    @property
+    def is_operational(self) -> bool:
+        return True
+
+    async def embed_many(self, texts):
+        _ = texts
+        return []
+
+
+@pytest.mark.asyncio
+async def test_short_embed_batch_cannot_silently_drop_events() -> None:
+    sources = InMemoryRssSourceRepository()
+    events = InMemoryWorldEventRepository()
+    await sources.upsert(_NCDR)
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=events,
+        feed_fetcher=_Fetcher(),
+        embedder=_ShortEmbedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.embed_batches_failed == 1
+    assert report.events_skipped_embed == 1
+    assert report.events_persisted == 1
+
+
+class _PerSourceProbeFailureRepository(InMemoryWorldEventRepository):
+    async def has_url(self, url: str) -> bool:
+        if "broken-event" in url:
+            raise RuntimeError(
+                "probe failed https://private.test/?credential=must-not-leak"
+            )
+        return await super().has_url(url)
+
+
+class _DistinctPerSourceFetcher(_Fetcher):
+    async def fetch(self, **kwargs) -> list[RawWorldEvent]:
+        event = (await super().fetch(**kwargs))[0]
+        return [replace(
+            event,
+            url=f"https://events.test/{kwargs['source_id']}-event",
+        )]
+
+
+@pytest.mark.asyncio
+async def test_post_fetch_failure_is_source_isolated_and_url_safe() -> None:
+    sources = InMemoryRssSourceRepository()
+    events = _PerSourceProbeFailureRepository()
+    for source_id in ("broken", "healthy"):
+        await sources.upsert(RssSource(
+            id=source_id,
+            name=source_id.title(),
+            feed_url=f"https://feeds.test/{source_id}?token=do-not-leak",
+            category="news",
+        ))
+    service = RssIngestionService(
+        rss_source_repository=sources,
+        world_event_repository=events,
+        feed_fetcher=_DistinctPerSourceFetcher(),
+        embedder=_Embedder(),
+    )
+
+    report = await service.ingest_all()
+
+    assert report.sources_attempted == 2
+    assert report.sources_succeeded == 1
+    assert report.events_persisted == 1
+    assert report.errors == (
+        "broken: source_processing_error: RuntimeError",
+    )
+    assert "private.test" not in repr(report.errors)
+    assert "feeds.test" not in repr(report.errors)
+    assert (await sources.get("broken")).last_error == (
+        "source_processing_error: RuntimeError"
+    )
+    assert (await sources.get("healthy")).last_success_at is not None

@@ -13,6 +13,21 @@ _LOGGER = logging.getLogger(__name__)
 # effective) combination — a config change produces a fresh warning.
 _WARNED_CLAMPS: set[tuple[str, str, int]] = set()
 
+#: ``tier_profile.billing_shape`` — how the tier's foreground calls are priced.
+BILLING_SHAPE_TOKEN_FLOATING = "token_floating"
+"""Today's shape: every Gateway call reserves/settles its own token cost."""
+BILLING_SHAPE_ACTION_FIXED = "action_fixed"
+"""AP2 shape: the player action is the billing unit, at a fixed back-office
+price; the calls it makes are covered by that one charge."""
+
+_BILLING_SHAPES = frozenset({
+    BILLING_SHAPE_TOKEN_FLOATING,
+    BILLING_SHAPE_ACTION_FIXED,
+})
+
+DEFAULT_DAILY_OVERAGE_LIMIT = 5
+"""Per-item daily ceiling on player-authorised quota overage purchases."""
+
 
 @dataclass(frozen=True, slots=True)
 class AccountRuntimeProfile:
@@ -42,6 +57,18 @@ class AccountRuntimeProfile:
     album_generation_enabled: bool = True
     video_generation_enabled: bool = True
     tts_enabled: bool = True
+    billing_shape: str = BILLING_SHAPE_TOKEN_FLOATING
+    overage_enabled: bool = False
+    daily_overage_limit: int = DEFAULT_DAILY_OVERAGE_LIMIT
+
+    @property
+    def uses_action_pricing(self) -> bool:
+        """True when player actions carry a fixed back-office price.
+
+        The default is deliberately ``False`` for every un-migrated tier and
+        for self-host, so the action-charging path is opt-in per tier.
+        """
+        return self.billing_shape == BILLING_SHAPE_ACTION_FIXED
 
     def effective_proactive_multiplier(self, *, idle: bool) -> int:
         return self._effective_multiplier(
@@ -160,6 +187,22 @@ class AccountRuntimeProfile:
                 data, "background_judge_model_pin",
                 default=default.background_judge_model_pin, name=name,
             ),
+            billing_shape=_choice_knob(
+                data, "billing_shape", allowed=_BILLING_SHAPES,
+                default=default.billing_shape, name=name,
+            ),
+            overage_enabled=_bool_knob(
+                data, "overage_enabled",
+                default=default.overage_enabled, name=name,
+            ),
+            # Not nullable: "no limit" is not an option an operator should be
+            # able to configure by omission on a knob whose whole job is to
+            # bound how much a background actor may spend.
+            daily_overage_limit=_int_knob(
+                data, "daily_overage_limit", minimum=0, maximum=1000,
+                default=default.daily_overage_limit, nullable=False,
+                name=name,
+            ),
         )
 
 
@@ -222,6 +265,29 @@ def _bool_knob(
     value = payload[key]
     if isinstance(value, bool):
         return value
+    _warn_invalid(name, key, value)
+    return default
+
+
+def _choice_knob(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    allowed: frozenset[str],
+    default: str,
+    name: str,
+) -> str:
+    """Resolve a closed-vocabulary string knob.
+
+    An unrecognised value falls back to the default rather than being passed
+    through: ``billing_shape`` decides whether the player is charged per action
+    or per token, and an unknown third shape has no defined behaviour at all.
+    """
+    if key not in payload:
+        return default
+    value = payload[key]
+    if isinstance(value, str) and value.strip() in allowed:
+        return value.strip()
     _warn_invalid(name, key, value)
     return default
 

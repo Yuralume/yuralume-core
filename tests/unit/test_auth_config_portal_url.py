@@ -94,6 +94,21 @@ def test_cloud_mode_rejects_non_http_portal_url(monkeypatch) -> None:
         _load_cloud_settings()
 
 
+def test_cloud_session_absolute_ttl_defaults_to_seven_days(monkeypatch) -> None:
+    """Hosted renewal is capped so a session eventually re-runs the tier gate."""
+    monkeypatch.delenv("YURALUME_CLOUD_ENABLED", raising=False)
+    monkeypatch.delenv("YURALUME_CLOUD_SESSION_ABSOLUTE_TTL_SECONDS", raising=False)
+
+    assert _load_cloud_settings().session_absolute_ttl_seconds == 7 * 24 * 60 * 60
+
+
+def test_cloud_session_absolute_ttl_reads_env(monkeypatch) -> None:
+    monkeypatch.delenv("YURALUME_CLOUD_ENABLED", raising=False)
+    monkeypatch.setenv("YURALUME_CLOUD_SESSION_ABSOLUTE_TTL_SECONDS", "86400")
+
+    assert _load_cloud_settings().session_absolute_ttl_seconds == 86400
+
+
 def test_cloud_mode_boots_without_portal_url(monkeypatch) -> None:
     """Core keeps it optional — the hosted preflight (Cloud repo) is the gate.
 

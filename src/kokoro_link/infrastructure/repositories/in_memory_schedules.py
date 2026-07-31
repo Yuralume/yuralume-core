@@ -33,6 +33,21 @@ class InMemoryScheduleRepository(ScheduleRepositoryPort):
         bucket = self._by_character.pop(character_id, None)
         return len(bucket) if bucket else 0
 
+    async def set_weather_vet(
+        self,
+        character_id: str,
+        date_: date,
+        *,
+        activity_id: str | None,
+        condition: str | None,
+    ) -> None:
+        schedule = self._by_character.get(character_id, {}).get(date_)
+        if schedule is None:
+            return
+        self._by_character[character_id][date_] = schedule.with_weather_vet(
+            activity_id, condition,
+        )
+
     async def claim_memorialize(self, activity_ids: list[str]) -> set[str]:
         wanted = set(activity_ids)
         if not wanted:

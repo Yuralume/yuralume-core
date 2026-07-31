@@ -19,7 +19,6 @@ from kokoro_link.contracts.proactive import ProactiveContext
 from kokoro_link.contracts.scheduled_promise_composer import (
     ScheduledPromiseComposeInput,
 )
-from kokoro_link.contracts.scene_access import SceneAccessContext
 from kokoro_link.contracts.self_reflection import ReflectionGeneratorInput
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.branching_drama import DramaNode
@@ -128,9 +127,6 @@ from kokoro_link.application.services.experiment_analysis_service import (
 )
 from kokoro_link.domain.entities.operator_persona import OperatorPersona
 from kokoro_link.domain.entities.schedule import ScheduleActivity
-from kokoro_link.infrastructure.scene_access.llm_judge import (
-    _build_prompt as build_scene_access_prompt,
-)
 from kokoro_link.infrastructure.prompts import get_default_loader
 
 
@@ -316,21 +312,6 @@ def test_scheduled_promise_prompt_pins_visible_message_language() -> None:
     )
 
     _assert_visible_language_rule(prompt)
-
-
-def test_scene_access_prompt_pins_visible_verdict_language() -> None:
-    prompt = build_scene_access_prompt(
-        SceneAccessContext(
-            character_id="char-1",
-            operator_id="user-1",
-            character_name="Mio",
-            operator_primary_language="en-US",
-        ),
-    )
-
-    _assert_visible_language_rule(prompt)
-    assert "reason_for_user" in prompt
-    assert "suggested_opener" in prompt
 
 
 def test_character_draft_prompt_pins_visible_json_text_language() -> None:

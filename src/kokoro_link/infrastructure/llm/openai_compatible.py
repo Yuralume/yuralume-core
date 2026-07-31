@@ -128,6 +128,7 @@ class OpenAICompatibleChatModel(ChatModelPort):
     ) -> None:
         self.provider_id = provider_id
         self.supports_vision = supports_vision
+        self.prefers_public_image_urls = False
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model

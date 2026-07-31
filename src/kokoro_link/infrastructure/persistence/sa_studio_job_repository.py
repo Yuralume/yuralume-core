@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -46,6 +46,42 @@ class SAStudioJobRepository:
                 row.error_message = job.error_message
                 row.updated_at = ensure_utc(job.updated_at)
             await session.commit()
+
+    async def save_terminal_if_running(
+        self, job: StudioGenerationJob,
+    ) -> bool:
+        """One UPDATE guarded on ``status = 'running'`` — see the port doc.
+
+        The guard is in the WHERE clause rather than a read-then-write so it
+        stays atomic across replicas: two processes finalizing the same job
+        issue the same statement and the database hands exactly one of them a
+        non-zero ``rowcount``.
+        """
+        if job.status == JOB_STATUS_RUNNING:
+            raise ValueError(
+                "save_terminal_if_running needs a terminal job status, "
+                f"got {job.status!r}",
+            )
+        stmt = (
+            update(StudioGenerationJobRow)
+            .where(
+                StudioGenerationJobRow.id == job.id,
+                StudioGenerationJobRow.status == JOB_STATUS_RUNNING,
+            )
+            .values(
+                kind=job.kind,
+                target_id=job.target_id,
+                status=job.status,
+                attempts=job.attempts,
+                params_json=_serialize_params(job),
+                error_message=job.error_message,
+                updated_at=ensure_utc(job.updated_at),
+            )
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return bool(result.rowcount)
 
     async def get(self, job_id: str) -> StudioGenerationJob | None:
         async with self._session_factory() as session:

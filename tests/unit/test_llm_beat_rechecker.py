@@ -123,3 +123,22 @@ async def test_null_rechecker_keeps_pending() -> None:
     decision = await NullStoryBeatRechecker().recheck(_context())
 
     assert decision.action == "keep_pending"
+
+
+@pytest.mark.asyncio
+async def test_recheck_prompt_carries_absolute_date_discipline() -> None:
+    # CF1b: ``mark_realized`` narrative becomes the realized beat's
+    # player-visible record, so it needs the same absolute-date rule as
+    # every other story writer.
+    model = _ScriptedModel(
+        '{"action":"keep_pending","reason":"still pending"}',
+    )
+    rechecker = LLMStoryBeatRechecker(model=model)
+
+    await rechecker.recheck(_context())
+
+    prompt = model.prompts[0]
+    assert "日期換算錨點" in prompt
+    assert "- 今天＝2026-06-01（星期一）" in prompt
+    assert "- 明天＝2026-06-02（星期二）" in prompt
+    assert "時間紀律" in prompt

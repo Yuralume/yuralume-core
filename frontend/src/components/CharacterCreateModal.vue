@@ -38,6 +38,13 @@ import {
   shouldBlockCreateForIntake,
 } from '@/utils/characterCreationIntake'
 import { UiButton } from '@/components/ui'
+import ActionPriceHint from '@/components/ActionPriceHint.vue'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
+import { ACTION_CHARACTER_DRAFT } from '@/composables/useActionPricing'
+import {
+  billingRefusalKind,
+  refreshQuotedPrices,
+} from '@/utils/api/billingRefusal'
 import CharacterIdentityFields from './CharacterIdentityFields.vue'
 import {
   buildInitialRelationshipPayload,
@@ -137,6 +144,12 @@ const draftImagePreview = ref<string | null>(null)
 const draftLoading = ref(false)
 const draftIntakeLoading = ref(false)
 const draftError = ref<string | null>(null)
+// An empty wallet is an *answer*, not a fault, so it leaves the red error line
+// and takes the shared top-up card instead — the same surface the images
+// panel, the fusion viewer and the drama page already give it. The card is
+// what carries the "nothing ran, nothing was charged" promise and the CTA that
+// makes the refusal actionable; a plain sentence carried neither.
+const draftCreditsExhausted = ref(false)
 
 const STATUS_ROTATE_MS = 5000
 const STATUS_KEYS = {
@@ -401,6 +414,7 @@ function appendText(current: string, value: string): string {
 function openDraft() {
   draftOpen.value = true
   draftError.value = null
+  draftCreditsExhausted.value = false
 }
 
 function closeDraft() {
@@ -408,6 +422,7 @@ function closeDraft() {
   draftPrompt.value = ''
   clearDraftImage()
   draftError.value = null
+  draftCreditsExhausted.value = false
 }
 
 function onDraftImageChange(event: Event) {
@@ -436,6 +451,7 @@ async function submitDraft() {
   draftLoading.value = true
   draftIntakeLoading.value = false
   draftError.value = null
+  draftCreditsExhausted.value = false
   try {
     const draft = await generateCharacterDraft({ prompt, image: draftImage.value })
     nameCandidates.value = draft.name_candidates ?? []
@@ -485,10 +501,46 @@ async function submitDraft() {
     await runCreationIntake()
     closeDraft()
   } catch (err) {
-    draftError.value = err instanceof Error ? err.message : t('characterCreate.errors.draftFailed')
+    await applyDraftFailure(err)
   } finally {
     draftLoading.value = false
     draftIntakeLoading.value = false
+  }
+}
+
+/**
+ * A draft is an action-priced button (AP2), so two of its failures are
+ * *answers*, not faults: the wallet is empty, or the published price moved
+ * between the quote on screen and the charge. Neither may surface as a raw
+ * transport message, which reads as "the generator broke".
+ *
+ * The empty wallet takes the shared `InsufficientCreditsNotice` rather than a
+ * line of red text, because that is the surface every other priced button in
+ * the app already gives it. The card is not decoration: it states that nothing
+ * ran and nothing was charged, and it carries the top-up link that is the only
+ * thing the player can actually do next. Rendering the same refusal as a red
+ * error line here made this one button look broken while the identical refusal
+ * elsewhere looked like a checkout step.
+ *
+ * The moved price also re-pulls the published list. Without that the hint next
+ * to the button keeps quoting the number that was just refused, so a player
+ * told to "send it again" would be resending the same stale quote and getting
+ * the same 409 forever.
+ */
+async function applyDraftFailure(err: unknown): Promise<void> {
+  switch (billingRefusalKind(err)) {
+    case 'insufficient_credits':
+      draftCreditsExhausted.value = true
+      draftError.value = null
+      return
+    case 'price_changed':
+      await refreshQuotedPrices()
+      draftError.value = t('credits.price.changed')
+      return
+    default:
+      draftError.value = err instanceof Error
+        ? err.message
+        : t('characterCreate.errors.draftFailed')
   }
 }
 
@@ -1267,12 +1319,24 @@ function cancel() {
             </div>
 
             <div v-if="draftError" class="error-msg">{{ draftError }}</div>
+            <InsufficientCreditsNotice
+              v-if="draftCreditsExhausted"
+              class="draft-credits-notice"
+            />
             <div v-if="draftProgressHint" class="draft-progress status-carousel" role="status" aria-live="polite">
               {{ draftProgressHint }}
             </div>
           </div>
 
           <div class="modal-actions">
+            <!-- 明碼標價：按下去要花多少，按之前就看得到。查不到價格時（自架、
+                 按用量計費的方案）本元件不輸出任何節點。 -->
+            <ActionPriceHint
+              class="draft-price-hint"
+              :action-key="ACTION_CHARACTER_DRAFT"
+              tooltip-key="credits.price.draftTooltip"
+              variant="chip"
+            />
             <UiButton :disabled="draftBusy" @click="closeDraft">{{ t('common.actions.cancel') }}</UiButton>
             <UiButton variant="primary" :loading="draftBusy" @click="submitDraft">
               {{ draftSubmitLabel }}
@@ -1401,6 +1465,10 @@ function cancel() {
   color: var(--color-primary-light);
 }
 
+.draft-credits-notice {
+  margin-top: 8px;
+}
+
 .error-msg {
   padding: 8px 10px;
   background: rgba(231, 76, 60, 0.12);
@@ -1417,6 +1485,13 @@ function cancel() {
   padding: 12px 18px;
   border-top: 1px solid var(--color-border);
   justify-content: flex-end;
+}
+
+/* 版面規則而已：讓價格 chip 靠左，兩顆按鈕維持原本的靠右。元件自己不輸出
+   節點時（自架 / 查不到價）這條規則沒有作用對象，版面與改動前相同。 */
+.draft-price-hint {
+  margin-right: auto;
+  align-self: center;
 }
 
 .creation-progress {

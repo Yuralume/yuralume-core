@@ -118,6 +118,8 @@ def _seed_to_row(seed: StorySeed) -> StorySeedRow:
         seed_text=seed.seed_text,
         tags=json.dumps(list(seed.tags), ensure_ascii=False),
         world_frames=json.dumps(list(seed.world_frames), ensure_ascii=False),
+        tier=seed.tier,
+        regions=json.dumps(list(seed.regions), ensure_ascii=False),
         weight=float(seed.weight),
         cooldown_days=int(seed.cooldown_days),
         enabled=bool(seed.enabled),
@@ -135,6 +137,8 @@ def _apply_seed_updates(row: StorySeedRow, seed: StorySeed) -> None:
     row.seed_text = seed.seed_text
     row.tags = json.dumps(list(seed.tags), ensure_ascii=False)
     row.world_frames = json.dumps(list(seed.world_frames), ensure_ascii=False)
+    row.tier = seed.tier
+    row.regions = json.dumps(list(seed.regions), ensure_ascii=False)
     row.weight = float(seed.weight)
     row.cooldown_days = int(seed.cooldown_days)
     row.enabled = bool(seed.enabled)
@@ -154,11 +158,21 @@ def _row_to_seed(row: StorySeedRow) -> StorySeed:
         frames = tuple(frames_raw) if isinstance(frames_raw, list) else ("any",)
     except json.JSONDecodeError:
         frames = ("any",)
+    try:
+        regions_raw = json.loads(getattr(row, "regions", None) or '["global"]')
+        regions = (
+            tuple(regions_raw) if isinstance(regions_raw, list) and regions_raw
+            else ("global",)
+        )
+    except json.JSONDecodeError:
+        regions = ("global",)
     return StorySeed(
         id=row.id,
         seed_text=row.seed_text,
         tags=tags,
         world_frames=frames,
+        tier=getattr(row, "tier", None) or "daily",
+        regions=regions,
         weight=float(row.weight),
         cooldown_days=int(row.cooldown_days),
         enabled=bool(row.enabled),

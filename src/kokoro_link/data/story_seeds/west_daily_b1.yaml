@@ -1,0 +1,148 @@
+# Western daily-life seeds (batch 1).
+#
+# Modern-frame, west-region flavored micro-events — farmers markets,
+# diners, road trips, garage sales, community life. Low stakes, mild
+# emotion, resolvable in 2-3 narrated sentences. One line of zh-TW
+# semantic input for the downstream expander LLM; no names, no IP,
+# no pre-written endings.
+pack_id: west_daily_b1
+language: zh-TW
+
+seeds:
+  # --- Market / food ------------------------------------------------
+  - external_id: wdd1:daily:001
+    seed_text: 週末逛露天農夫市集，攤主多塞了一把當季水果，還順口聊了幾句產地的事
+    tags: [market, food, gentle, social]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:002
+    seed_text: 隔著電話請長輩遠端指導做一道家常菜，那頭的步驟全是「適量」和「憑感覺」
+    tags: [cooking, family, humor, indoor]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:003
+    seed_text: 社區百樂餐每人帶一道菜，端著自己做的那道，有點期待又有點緊張
+    tags: [potluck, food, community, nervous]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: wdd1:daily:004
+    seed_text: 後院烤肉顧火顧得手忙腳亂，香味倒是先把鄰居引了過來
+    tags: [bbq, outdoor, community, humor]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- Out and about ------------------------------------------------
+  - external_id: wdd1:daily:005
+    seed_text: 長途開車途中臨時繞去一個路邊怪景點，計畫外的停留反而最難忘
+    tags: [road-trip, outdoor, discovery]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: wdd1:daily:006
+    seed_text: 深夜窩進24小時餐館，一杯續杯咖啡下肚，話不知不覺變多了
+    tags: [diner, late-night, cozy, social]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:007
+    seed_text: 在鄰居的車庫拍賣挖到一件舊東西，上面還留著前主人的使用痕跡
+    tags: [garage-sale, discovery, nostalgia]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: wdd1:daily:008
+    seed_text: 常去的街角咖啡店裡，熟客之間的小八卦成了今天最有趣的風景
+    tags: [coffee-shop, people-watching, cozy]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:009
+    seed_text: 在公園看長輩們下棋，看著看著被拉去替補一局，輸得心服口服
+    tags: [park, social, humor]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:010
+    seed_text: 路過街角的免費小書箱，用一本讀完的書換走一本沒聽過的，像和陌生人交換了心情
+    tags: [books, community, serendipity]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- Home / community ---------------------------------------------
+  - external_id: wdd1:daily:011
+    seed_text: 一夜大雪把整條街埋了，鄰居們陸續出來鏟雪，鏟著鏟著變成閒話家常大會
+    tags: [snow, community, cozy]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.5
+    cooldown_days: 120
+
+  - external_id: wdd1:daily:012
+    seed_text: 清晨發現垃圾桶被翻得亂七八糟，和鄰居研究了半天到底是浣熊還是別的什麼幹的
+    tags: [animal, mystery, humor]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: wdd1:daily:013
+    seed_text: 路過小孩認真經營的檸檬水攤，被賣力的推銷打動買了一杯，還被找錯了錢
+    tags: [community, kids, warm, humor]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:014
+    seed_text: 看著教學影片想自己修好家裡的小東西，結果越修越不對勁
+    tags: [diy, mishap, indoor, frustration]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: wdd1:daily:015
+    seed_text: 讀書會聊到一半，書裡某段情節戳中了誰的現實心事，話題悄悄變了調
+    tags: [book-club, introspective, social]
+    world_frames: [modern]
+    tier: daily
+    regions: [west]
+    weight: 0.5
+    cooldown_days: 75

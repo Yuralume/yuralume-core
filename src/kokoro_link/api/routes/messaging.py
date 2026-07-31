@@ -37,6 +37,7 @@ from kokoro_link.application.services.chat_turn_lease import ConversationBusyErr
 from kokoro_link.application.services.channel_binding_service import (
     ChannelBindingConflictError,
 )
+from kokoro_link.application.services.drain_state import ServerDrainingError
 from kokoro_link.application.services.messaging_account_service import (
     MessagingAccountConflictError,
 )
@@ -1144,6 +1145,16 @@ async def telegram_webhook(
             account.id,
         )
         raise _conversation_busy_response()
+    except ServerDrainingError:
+        # Above the generic clause on purpose: the dispatcher already gave the
+        # delivery back, so the only thing that can still lose the message is a
+        # 200 here. Re-raised to the app-wide handler, which answers 503 +
+        # Retry-After — and Telegram re-delivers on any non-2xx.
+        _LOGGER.info(
+            "Telegram update handed back — replica draining account=%s",
+            account.id,
+        )
+        raise
     except Exception:
         _LOGGER.exception("dispatcher crashed for Telegram update")
     return {"ok": True, "dispatched": True}
@@ -1220,6 +1231,21 @@ async def line_webhook(
                 "LINE event deferred — conversation busy account=%s",
                 account.id,
             )
+        except ServerDrainingError:
+            # Unlike busy — which is about one conversation — draining is about
+            # the whole replica, so there is nothing to gain from grinding
+            # through the rest of the batch: every remaining event would claim a
+            # receipt only to roll it straight back. Abort instead. The events
+            # already dispatched are protected by their own receipts, this one
+            # was handed back by the dispatcher, and the ones not reached were
+            # never claimed — so LINE's re-delivery of the batch replays exactly
+            # what is missing. Must sit above the generic clause: a swallow here
+            # would answer 200 and end the message's life.
+            _LOGGER.info(
+                "LINE batch handed back — replica draining account=%s",
+                account.id,
+            )
+            raise
         except Exception:
             _LOGGER.exception("dispatcher crashed for LINE event")
     if deferred:

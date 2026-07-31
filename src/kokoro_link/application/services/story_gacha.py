@@ -22,7 +22,7 @@ from kokoro_link.contracts.story import (
     StorySeedRepositoryPort,
 )
 from kokoro_link.domain.entities.character import Character
-from kokoro_link.domain.entities.story_seed import StorySeed
+from kokoro_link.domain.entities.story_seed import SEED_TIER_DAILY, StorySeed
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,8 +56,16 @@ class StoryGachaService:
         character: Character,
         today: date_type,
         count: int = _DEFAULT_DRAW_COUNT,
+        tier: str = SEED_TIER_DAILY,
+        region: str | None = None,
     ) -> GachaResult:
-        """Pick up to ``count`` seeds for the character today."""
+        """Pick up to ``count`` seeds for the character today.
+
+        ``tier`` defaults to ``daily`` — dramatic seeds never enter the
+        everyday rotation unless a caller explicitly rolls for them.
+        ``region`` is the player's resolved region (``None`` = unknown →
+        only ``global`` seeds pass); see ``resolve_seed_region``.
+        """
         if count <= 0:
             return GachaResult(picked=(), eligible_count=0, reason_if_empty="count<=0")
 
@@ -80,6 +88,7 @@ class StoryGachaService:
             s for s in all_seeds
             if _is_eligible(
                 s, frame=frame, today=today,
+                tier=tier, region=region,
                 last_rolls=last_rolls,
                 already_picked=already_picked_seed_ids,
             )
@@ -87,7 +96,9 @@ class StoryGachaService:
         if not eligible:
             return GachaResult(
                 picked=(), eligible_count=0,
-                reason_if_empty="all seeds on cooldown or frame-mismatched",
+                reason_if_empty=(
+                    "all seeds on cooldown or tier/frame/region-mismatched"
+                ),
             )
 
         picked = _weighted_sample_without_replacement(
@@ -101,12 +112,18 @@ def _is_eligible(
     *,
     frame: str,
     today: date_type,
+    tier: str,
+    region: str | None,
     last_rolls: dict[str, str],
     already_picked: set[str],
 ) -> bool:
     if not seed.enabled:
         return False
+    if seed.tier != tier:
+        return False
     if not seed.fits_frame(frame):
+        return False
+    if not seed.fits_region(region):
         return False
     if seed.id in already_picked:
         # Already rolled today — don't duplicate within one day.

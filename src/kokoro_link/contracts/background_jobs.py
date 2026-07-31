@@ -282,6 +282,26 @@ class BackgroundJobQueuePort(Protocol):
         succeeds; a stale caller gets ``False`` and no state change."""
         ...
 
+    async def release_claim(
+        self, job_id: str, worker_id: str, *, now: datetime,
+    ) -> bool:
+        """Hand an **unstarted** claim back to the queue (GD0 graceful stop).
+
+        Undoes the claim exactly: back to ``queued`` at the same ``due_at``,
+        lease cleared, and the attempt *refunded* — nothing ran, so charging it
+        would let a rolling restart walk a job toward ``dead``. A surviving
+        worker can then pick the job up immediately instead of waiting out the
+        lease TTL.
+
+        Only the current lease owner with a still-valid lease succeeds
+        (``False`` otherwise, no state change): an expired lease may already
+        have been re-claimed elsewhere, and requeueing it under that owner
+        would resurrect a running job as ready work.
+
+        Callers MUST only release work they have not begun; once a handler has
+        applied any effect the job goes through ``complete`` / ``fail``."""
+        ...
+
     async def fail(
         self,
         job_id: str,

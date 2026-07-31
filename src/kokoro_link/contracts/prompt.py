@@ -89,6 +89,7 @@ class PromptContextBuilderPort(Protocol):
         world_event_context: tuple[str, ...] | None = None,
         upcoming_day_schedules: list[DailySchedule] | None = None,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
+        include_operator_status: bool = True,
     ) -> str:
         """Build prompt context for model generation.
 
@@ -130,4 +131,12 @@ class PromptContextBuilderPort(Protocol):
         list (or omitted) = no pre-planned upcoming days yet; the
         builder appends a "remote future is vague" guard so the model
         admits it hasn't decided.
+
+        ``include_operator_status`` gates the operator's self-reported
+        "current status" only. ``operator`` itself still drives the
+        identity / language blocks either way. Callers must pass ``False``
+        whenever the turn may have been typed by someone other than the
+        profile's owner — an external channel with an open or multi-entry
+        sender allowlist — otherwise the owner's whereabouts are handed to
+        the model as if they were the current sender's.
         """

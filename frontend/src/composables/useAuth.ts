@@ -24,6 +24,7 @@ import {
   login as apiLogin,
   loginWithCloudSession as apiLoginWithCloudSession,
   loginWithDemoSession as apiLoginWithDemoSession,
+  refreshSession as apiRefreshSession,
   setupInitialAdmin as apiSetup,
 } from '@/utils/api/auth'
 import type { AuthUser, BuildInfo } from '@/utils/api/auth'
@@ -71,13 +72,29 @@ function applyUserRuntimePreferences(user: AuthUser | null): void {
  */
 function persistToken(next: string | null): void {
   const changed = token.value !== next
+  writeToken(next)
+  if (changed) notifyIdentityChanged()
+}
+
+/**
+ * Swap the credential without announcing an identity change.
+ *
+ * Sliding renewal hands back a *new token for the same player*, so routing it
+ * through `persistToken` would fire the identity broadcast and make every
+ * per-identity cache drop and refetch — a visible stutter, several times a
+ * day, for nothing. Only use this where the subject provably did not change.
+ */
+function rotateToken(next: string): void {
+  writeToken(next)
+}
+
+function writeToken(next: string | null): void {
   token.value = next
   if (next) {
     localStorage.setItem(TOKEN_KEY, next)
   } else {
     localStorage.removeItem(TOKEN_KEY)
   }
-  if (changed) notifyIdentityChanged()
 }
 
 /**
@@ -199,6 +216,19 @@ async function refreshMe(): Promise<void> {
   applyUserRuntimePreferences(currentUser.value)
 }
 
+/**
+ * Extend the current session. Same player, fresh credential — the token is
+ * rotated in place so per-identity caches are left intact.
+ *
+ * Throws on failure; callers treat that as "carry on with the token we have"
+ * because the global 401 interceptor already owns the terminal case.
+ */
+async function renewSession(): Promise<void> {
+  const res = await apiRefreshSession()
+  rotateToken(res.token)
+  currentUser.value = res.user
+}
+
 function logout(): void {
   persistToken(null)
   currentUser.value = null
@@ -241,6 +271,7 @@ export function useAuth() {
     // actions
     bootstrapAuth,
     refreshMe,
+    renewSession,
     login,
     loginWithDemoSession,
     loginWithCloudSession,

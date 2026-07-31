@@ -137,6 +137,14 @@ def test_globally_readable_sources_declare_no_region() -> None:
         assert sources[source_id].get("region") is None, source_id
 
 
+def test_dead_bundled_sources_are_retired() -> None:
+    sources = {source["id"]: source for source in _bundled_sources()}
+
+    for source_id in {"animate-times", "oricon-entertainment"}:
+        assert sources[source_id]["retired"] is True
+        assert sources[source_id]["enabled"] is False
+
+
 def test_japan_bound_sources_declare_region_jp() -> None:
     """The hosted JP pack: outlets covering Japanese domestic life. A
     player in Taiwan gets nothing from NHK's headline rundown, so these

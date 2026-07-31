@@ -32,6 +32,13 @@ import type {
   FusionStoryStatus,
 } from '@/types/fusionStory'
 import { UiButton } from '@/components/ui'
+import ActionPriceHint from '@/components/ActionPriceHint.vue'
+import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
+import { ACTION_FUSION_STORY } from '@/composables/useActionPricing'
+import {
+  billingRefusalKind,
+  refreshQuotedPrices,
+} from '@/utils/api/billingRefusal'
 import CharacterMultiSelect from '@/components/fusion-story/CharacterMultiSelect.vue'
 import ArcTemplateIntakeWizard from '@/components/ArcTemplateIntakeWizard.vue'
 import FusionStoryStatusBadge from '@/components/fusion-story/FusionStoryStatusBadge.vue'
@@ -63,6 +70,10 @@ const promptText = ref('')
 // ordering bug against applySeedHandoff.
 const seedSingleCastId = ref<string | null>(null)
 const errorMessage = ref('')
+// A 402 from the create call is not an error line: it gets the shared top-up
+// card, which carries the two promises ("nothing ran, nothing was charged" and
+// "your characters' daily life is unaffected") the generic alert cannot.
+const creditsExhausted = ref(false)
 const creating = ref(false)
 const adaptingToArc = ref(false)
 const adaptedDraft = ref<TemplateDraftPayload | null>(null)
@@ -261,6 +272,7 @@ function clearSelection() {
 async function handleCreate() {
   if (!canCreate.value) return
   errorMessage.value = ''
+  creditsExhausted.value = false
   creating.value = true
   try {
     const created = await createFusionStory({
@@ -272,8 +284,24 @@ async function handleCreate() {
     promptText.value = ''
     await refreshLists()
   } catch (err: unknown) {
-    errorMessage.value =
-      err instanceof Error ? err.message : t('fusionStory.page.errors.createFailed')
+    // A fusion run is action-priced (AP2 second wave), so the charge is raised
+    // *before* the 202 and two of the answers here are decisions rather than
+    // faults. Rendering either as "建立失敗" would tell a player whose wallet
+    // is simply empty that the Studio is broken.
+    switch (billingRefusalKind(err)) {
+      case 'insufficient_credits':
+        creditsExhausted.value = true
+        break
+      case 'price_changed':
+        // Nothing was reserved — re-pull the list so the hint by the button
+        // shows the number the retry will actually be charged.
+        await refreshQuotedPrices()
+        errorMessage.value = t('credits.price.changed')
+        break
+      default:
+        errorMessage.value =
+          err instanceof Error ? err.message : t('fusionStory.page.errors.createFailed')
+    }
   } finally {
     creating.value = false
   }
@@ -488,7 +516,8 @@ onBeforeUnmount(stopPolling)
       </div>
     </header>
 
-    <div v-if="errorMessage" class="fusion-page__alert">
+    <InsufficientCreditsNotice v-if="creditsExhausted" />
+    <div v-else-if="errorMessage" class="fusion-page__alert">
       {{ errorMessage }}
     </div>
 
@@ -627,6 +656,14 @@ onBeforeUnmount(stopPolling)
             >
               {{ creating ? t('fusionStory.page.creating') : t('fusionStory.page.createAction') }}
             </UiButton>
+            <!-- 一口價：大綱、每一段、潤稿全含在這個數字裡，按之前就看得到。
+                 查不到價格（自架、按用量計費的方案）時不輸出任何節點。 -->
+            <ActionPriceHint
+              class="fusion-page__price"
+              :action-key="ACTION_FUSION_STORY"
+              tooltip-key="credits.price.fusionTooltip"
+              variant="chip"
+            />
           </div>
         </StudioCreatorPanel>
       </main>
@@ -923,6 +960,11 @@ onBeforeUnmount(stopPolling)
 .fusion-page__actions {
   display: flex;
   gap: 8px;
+  align-items: center;
+}
+/* 版面規則而已；元件在查不到價格時不輸出節點，此時版面與改動前相同。 */
+.fusion-page__price {
+  flex: 0 0 auto;
 }
 @media (max-width: 768px) {
   .fusion-page {

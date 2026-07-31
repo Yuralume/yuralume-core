@@ -158,6 +158,14 @@ def test_matrix_outbox_writer_only_on_tick_executing_headless_roles() -> None:
         assert matrix_for_role(role).enable_realtime_outbox_writer is False
 
 
+def test_world_event_scheduler_has_one_owner_in_dedicated_topology() -> None:
+    assert matrix_for_role("coordinator").start_world_event_scheduler is True
+    for role in ("api", "worker", "connector"):
+        assert matrix_for_role(role).start_world_event_scheduler is False
+    assert matrix_for_role("all").start_world_event_scheduler is True
+    assert matrix_for_role("background").start_world_event_scheduler is True
+
+
 def test_matrix_unknown_role_raises() -> None:
     with pytest.raises(ValueError, match="component matrix"):
         matrix_for_role("nope")

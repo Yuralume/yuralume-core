@@ -41,10 +41,6 @@ from kokoro_link.application.dto.character import (
     InitialRelationshipSafeUserProfilePayload,
 )
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
-from kokoro_link.application.dto.scene_access import StageAccessVerdictResponse
-from kokoro_link.application.services.scene_access_service import (
-    CharacterNotFoundError as SceneAccessCharacterNotFoundError,
-)
 from kokoro_link.application.services.feature_keys import (
     CHARACTER_FEATURE_KEYS,
     FEATURE_LABELS,
@@ -111,7 +107,6 @@ from kokoro_link.application.services.character_lora_service import (
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.contracts.character_draft import ImageInput
 from kokoro_link.domain.entities.character import Character
-from kokoro_link.domain.value_objects.presence_frame import ChatSurface
 
 router = APIRouter(tags=["characters"])
 
@@ -299,9 +294,18 @@ async def create_character(
 async def draft_character(
     prompt: str | None = Form(default=None),
     image: UploadFile | None = File(default=None),
+    quoted_price_cr: float | None = Form(default=None, ge=0),
     container: ServiceContainer = Depends(get_container),
     current_user_id: str = Depends(get_current_user_id),
 ) -> CharacterDraftResponse:
+    """Draft a character from a prompt and/or a reference picture.
+
+    ``quoted_price_cr`` is R9's quote binding, carried as a form field because
+    this endpoint is multipart (the reference image rides along). It is the
+    price the player's own screen showed; the charge is bound to it so a
+    back-office edit mid-session answers ``409 price_changed`` instead of
+    billing a number nobody agreed to.
+    """
     if (prompt is None or not prompt.strip()) and image is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -319,15 +323,20 @@ async def draft_character(
         mime = image.content_type or "image/png"
         image_input = ImageInput(data=data, mime_type=mime)
 
-    return await container.character_draft_service.generate(
-        prompt=prompt,
-        image=image_input,
-        operator_primary_language=await resolve_operator_primary_language(
-            container,
-            current_user_id,
-        ),
-        operator_id=current_user_id,
-    )
+    # The draft is an action-priced entry point, so both billing refusals are
+    # reachable here: 402 when the wallet is empty, 409 when the quote above no
+    # longer matches. Without the guard either one would surface as a 500.
+    with insufficient_credits_guard():
+        return await container.character_draft_service.generate(
+            prompt=prompt,
+            image=image_input,
+            operator_primary_language=await resolve_operator_primary_language(
+                container,
+                current_user_id,
+            ),
+            operator_id=current_user_id,
+            quoted_price_cr=quoted_price_cr,
+        )
 
 
 @router.post(
@@ -661,38 +670,6 @@ async def get_character(
     return character
 
 
-@router.get(
-    "/characters/{character_id}/stage-access",
-    response_model=StageAccessVerdictResponse,
-)
-async def get_stage_access(
-    character_id: str,
-    surface: ChatSurface = Query(default=ChatSurface.WEB_STAGE),
-    container: ServiceContainer = Depends(get_container),
-    _owned_character_id: str = Depends(ensure_owned_character_id),
-    current_user_id: str = Depends(get_current_user_id),
-) -> StageAccessVerdictResponse:
-    service = getattr(container, "scene_access_service", None)
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Scene access service is not available",
-        )
-    try:
-        verdict = await service.evaluate(
-            character_id,
-            operator_id=current_user_id,
-            requested_surface=surface,
-            current_user_id=current_user_id,
-        )
-    except SceneAccessCharacterNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Character not found",
-        ) from exc
-    return StageAccessVerdictResponse.from_domain(verdict)
-
-
 @router.patch("/characters/{character_id}", response_model=CharacterResponse)
 async def update_character(
     character_id: str,
@@ -928,13 +905,25 @@ async def generate_character_portrait(
     _owned_character_id: str = Depends(ensure_owned_character_id),
 ) -> CharacterResponse:
     """Render a portrait via ComfyUI and append it to the character's
-    permanent image library (same store as manual uploads)."""
+    permanent image library (same store as manual uploads).
+
+    Kept action-priced even though the SPA's picture button posts to
+    ``/images/candidates`` instead: this is an owner-gated player endpoint that
+    writes straight into the album, so an uncharged one would be a free,
+    unmetered generation path on a fixed-price tier for anyone driving the API
+    directly (the client helper ``generateCharacterPortrait`` still calls it).
+    The one caller that must *not* pay — the first portrait drawn during
+    character creation — reaches the service directly, not this route.
+    """
     try:
         with insufficient_credits_guard():
             updated = await container.character_image_service.generate_portrait(
                 character_id,
                 positive=payload.positive,
                 aspect=payload.aspect,
+                # R9: bind the fixed charge to the price this player's screen
+                # actually showed, not to this replica's cached one.
+                quoted_price_cr=payload.quoted_price_cr,
             )
     except GenerationDisabledError as exc:
         raise HTTPException(
@@ -993,6 +982,9 @@ async def generate_candidate_portraits(
                 positive=payload.positive,
                 aspect=payload.aspect,
                 count=payload.count,
+                # R9: one batch is one charge, bound to the price this
+                # player's screen showed for the button they pressed.
+                quoted_price_cr=payload.quoted_price_cr,
             )
     except GenerationDisabledError as exc:
         raise HTTPException(

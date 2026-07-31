@@ -14,6 +14,10 @@ from uuid import uuid4
 
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
+from kokoro_link.application.services.messaging_media_owner import (
+    MessagingMediaOwnerUnavailable,
+    resolve_messaging_media_owner,
+)
 from kokoro_link.contracts.messaging import (
     InboundMessage,
     MessagingAccountRepositoryPort,
@@ -41,6 +45,7 @@ class DiscordGatewayClientPort(Protocol):
         *,
         bot_token: str,
         on_message_create: Callable[[dict[str, Any], str | None], Awaitable[None]],
+        on_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -190,11 +195,12 @@ class DiscordGatewayService:
         if not token:
             await self._record_error(account, "Missing bot_token")
             return
-        await self._accounts.mark_gateway_success(
-            account.id,
-            owner_id=self._owner_id,
-            at=_utcnow(),
-        )
+        async def handle_ready() -> None:
+            await self._accounts.mark_gateway_success(
+                account.id,
+                owner_id=self._owner_id,
+                at=_utcnow(),
+            )
 
         async def handle_message(
             raw: dict[str, Any],
@@ -203,7 +209,19 @@ class DiscordGatewayService:
             parsed = self._message_parser(raw, bot_user_id=bot_user_id)
             if parsed is None:
                 return
-            inbound = await self._build_inbound(account, parsed)
+            try:
+                inbound = await self._build_inbound(account, parsed)
+            except MessagingMediaOwnerUnavailable:
+                # A single attachment must not tear down the live Gateway.
+                # Ownership is still fail-closed: no download/binding/dispatch.
+                _LOGGER.error(
+                    "discord inbound media owner unavailable account=%s",
+                    account.id,
+                )
+                await self._record_error(
+                    account, "Inbound media owner unavailable",
+                )
+                return
             try:
                 await self._dispatcher.handle_inbound(inbound)
             except ConversationBusyError:
@@ -230,6 +248,7 @@ class DiscordGatewayService:
         await self._gateway_client.connect(
             bot_token=token,
             on_message_create=handle_message,
+            on_ready=handle_ready,
         )
 
     async def _build_inbound(
@@ -309,14 +328,11 @@ class DiscordGatewayService:
         )
 
     async def _account_owner_id(self, account: MessagingAccount) -> str:
-        try:
-            character = await self._characters.get(account.character_id)
-        except Exception:
-            _LOGGER.exception(
-                "could not resolve owner for messaging account %s", account.id,
-            )
-            return "default"
-        return str(getattr(character, "user_id", "default") or "default")
+        return await resolve_messaging_media_owner(
+            characters=self._characters,
+            account=account,
+            logger=_LOGGER,
+        )
 
     async def _cancel_all_account_tasks(self) -> None:
         tasks = list(self._tasks.values())

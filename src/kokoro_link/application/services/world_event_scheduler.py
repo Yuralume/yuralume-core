@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from kokoro_link.application.services.event_curator_service import (
@@ -36,6 +37,7 @@ _LOGGER = logging.getLogger(__name__)
 _DEFAULT_INGEST_INTERVAL = 30 * 60.0
 _DEFAULT_CURATE_INTERVAL = 60 * 60.0
 _DEFAULT_INITIAL_DELAY = 30.0
+LeadershipGuard = Callable[[], Awaitable[bool]]
 
 
 class WorldEventScheduler:
@@ -48,6 +50,7 @@ class WorldEventScheduler:
         ingest_interval_seconds: float = _DEFAULT_INGEST_INTERVAL,
         curate_interval_seconds: float = _DEFAULT_CURATE_INTERVAL,
         initial_delay_seconds: float = _DEFAULT_INITIAL_DELAY,
+        leadership_guard: LeadershipGuard | None = None,
     ) -> None:
         self._ingest = ingestion_service
         self._curator = curator_service
@@ -55,10 +58,29 @@ class WorldEventScheduler:
         self._ingest_interval = max(60.0, ingest_interval_seconds)
         self._curate_interval = max(60.0, curate_interval_seconds)
         self._initial_delay = max(0.0, initial_delay_seconds)
+        self._leadership_guard = leadership_guard
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._next_ingest_at: float = 0.0
         self._next_curate_at: float = 0.0
+
+    def set_leadership_guard(
+        self, leadership_guard: LeadershipGuard | None,
+    ) -> None:
+        """Late-wire the coordinator lease without changing embedded mode."""
+        self._leadership_guard = leadership_guard
+
+    async def _can_run_scheduled_pass(self) -> bool:
+        guard = self._leadership_guard
+        if guard is None:
+            return True
+        try:
+            return bool(await guard())
+        except Exception:
+            _LOGGER.exception(
+                "world event scheduler leadership check failed; failing closed",
+            )
+            return False
 
     async def start(self) -> None:
         if self._task is not None:
@@ -137,14 +159,18 @@ class WorldEventScheduler:
         _LOGGER.info("world event scheduler stopped")
 
     async def _safe_ingest(self) -> None:
+        if not await self._can_run_scheduled_pass():
+            return
         try:
             report = await self._ingest.ingest_all()
             _LOGGER.info(
                 "rss ingest pass: sources=%d/%d persisted=%d "
-                "dedup=%d embed_skipped=%d errors=%d",
+                "dedup=%d embed_skipped=%d persist_failed=%d "
+                "embed_batches_failed=%d errors=%d",
                 report.sources_succeeded, report.sources_attempted,
                 report.events_persisted, report.events_skipped_dedup,
-                report.events_skipped_embed, len(report.errors),
+                report.events_skipped_embed, report.events_failed_persist,
+                report.embed_batches_failed, len(report.errors),
             )
         except Exception:
             _LOGGER.exception("rss ingest pass failed")
@@ -154,6 +180,8 @@ class WorldEventScheduler:
             _LOGGER.exception("rss gc failed")
 
     async def _safe_curate(self) -> None:
+        if not await self._can_run_scheduled_pass():
+            return
         try:
             # Frozen characters halt all background activity
             # (CHARACTER_FREEZE_PLAN): skip per-character event curation

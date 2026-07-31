@@ -14,15 +14,16 @@
  *   - Reads the stored token via :func:`getStoredToken`.
  *   - Adds ``Authorization: Bearer <token>`` when present. Existing
  *     headers (e.g. ``Content-Type``) are preserved.
- *   - On 401, kicks the user back to ``/login`` (mirrors the axios
- *     interceptor) so a stale token doesn't manifest as cryptic UI
- *     errors deep inside polling loops.
+ *   - On 401, kicks the user back to their deployment's sign-in surface
+ *     (mirrors the axios interceptor) so a stale token doesn't manifest
+ *     as cryptic UI errors deep inside polling loops.
  *   - Passes through 4xx/5xx as-is; callers continue to inspect
  *     ``res.ok`` / ``res.status`` like before.
  */
 
-import { clearStoredToken, getStoredToken } from '@/composables/useAuth'
+import { clearStoredToken, getStoredToken, useAuth } from '@/composables/useAuth'
 import router from '@/router'
+import { bounceToSignIn } from '@/utils/sessionBounce'
 
 export async function authedFetch(
   input: RequestInfo | URL,
@@ -35,18 +36,11 @@ export async function authedFetch(
   }
   const res = await fetch(input, { ...init, headers })
   if (res.status === 401) {
-    // Mirror the axios interceptor: stale token → bounce to login.
-    // Skip if we're already on /login or /setup so the form can
-    // surface the underlying error instead of routing loop.
-    const path = window.location.pathname
-    if (path !== '/login' && path !== '/setup') {
-      clearStoredToken()
-      const here = window.location.pathname + window.location.search
-      router.replace({
-        path: '/login',
-        query: here === '/' ? {} : { redirect: here },
-      })
-    }
+    bounceToSignIn({
+      router,
+      clearToken: clearStoredToken,
+      portalUrl: useAuth().portalUrl.value,
+    })
   }
   return res
 }

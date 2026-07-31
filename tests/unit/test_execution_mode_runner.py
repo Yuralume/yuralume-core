@@ -309,8 +309,16 @@ async def test_per_kind_job_routes_to_character_kind_handler() -> None:
     assert (PROACTIVE_EVALUATE_KIND, "char-1") in await queue.active_chain_keys()
 
 
-async def test_per_kind_job_unwired_handler_completes_noop() -> None:
-    from kokoro_link.contracts.due_jobs import PROACTIVE_EVALUATE_KIND
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "proactive_evaluate",
+        "persona_dream",
+        "pending_follow_up_release",
+        "post_turn",
+    ],
+)
+async def test_known_job_unwired_handler_fails_retry(kind: str) -> None:
 
     ownership = InMemoryRuntimeOwnership()
     await ownership.flip(MODE_DISTRIBUTED, 0, now=NOW)
@@ -327,12 +335,50 @@ async def test_per_kind_job_unwired_handler_completes_noop() -> None:
         # No handler wired.
     )
     disposition = await runner.execute(
-        _claimed(PROACTIVE_EVALUATE_KIND, "k", character_id="char-1"),
+        _claimed(kind, "k", character_id="char-1"),
         would_run=True, skip_reason=None, now=NOW, worker_id="w1",
         lease_seconds=120,
     )
-    assert disposition.action == "complete"
-    assert disposition.outcome["reason"] == "handler_unwired"
+    assert disposition.action == "fail_retry"
+    assert isinstance(disposition.error, RuntimeError)
+    assert "handler_unwired" in str(disposition.error)
+
+
+async def test_unwired_known_kind_reaches_dead_letter_at_attempt_cap() -> None:
+    from kokoro_link.application.services.background_shadow_worker import (
+        ShadowDryRunWorker,
+    )
+    from kokoro_link.contracts.due_jobs import PROACTIVE_EVALUATE_KIND
+
+    ownership = InMemoryRuntimeOwnership()
+    await ownership.flip(MODE_DISTRIBUTED, 0, now=NOW)
+    characters = [_character()]
+    queue = InMemoryBackgroundJobQueue()
+    runner = ExecutionModeRunner(
+        queue=queue, character_repository=_CharRepo(characters),
+        character_tick_executor=_char_executor(_RecordingDispatcher()),
+        social_tick_executor=SocialTickExecutor(
+            character_repository=_CharRepo(characters),
+        ),
+        gate_service=_gate_service(characters),
+        cursor=InMemoryBackgroundCoordinatorCursor(), bucket_seconds=300,
+    )
+    worker = ShadowDryRunWorker(
+        queue=queue, character_repository=_CharRepo(characters),
+        worker_id="w1", dry_run_hold_seconds=0.0,
+    )
+    worker.enable_execution(runtime_ownership=ownership, execution_runner=runner)
+    spec = replace(
+        _spec(PROACTIVE_EVALUATE_KIND, "unwired", character_id="char-1"),
+        max_attempts=1,
+    )
+    job_id = await queue.enqueue(spec, now=NOW)
+
+    await worker.run_once(now=NOW)
+
+    job = await queue.get(job_id)
+    assert job.status == JobStatus.DEAD
+    assert "handler_unwired" in (job.last_error or "")
 
 
 # --------------------------------------------------------------------------- #

@@ -88,11 +88,13 @@ POST_TURN_KIND = "post_turn"
 
 BEAT_DUE_KIND = "beat_due"
 SCHEDULE_MAINTENANCE_KIND = "schedule_maintenance"
+SCHEDULE_WEATHER_VET_KIND = "schedule_weather_vet"
 MEMORIALIZE_KIND = "memorialize"
 FEED_COMPOSE_KIND = "feed_compose"
 FEED_COMMENT_REPLY_KIND = "feed_comment_reply"
 PROACTIVE_EVALUATE_KIND = "proactive_evaluate"
 CHARACTER_UPKEEP_KIND = "character_upkeep"
+GOAL_REVIEW_KIND = "goal_review"
 
 
 # -- social (cross-character) kinds — the social_tick split (§13) ------------ #
@@ -163,6 +165,21 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         handler="schedule_maintenance",
         knob_gate=KnobGate.BACKGROUND,
     ),
+    SCHEDULE_WEATHER_VET_KIND: KindSpec(
+        kind=SCHEDULE_WEATHER_VET_KIND,
+        priority=2,
+        capability=JobCapability.LLM,
+        # Intra-day correction of today's planned prose against the sky right
+        # now. It CANNOT ride the daily ``schedule_maintenance`` chain: the
+        # whole point is catching a sky that turned since planning time, so a
+        # once-a-day cadence would reproduce the very bug it fixes. 30 minutes
+        # is roughly how fast a coarse WMO condition phrase moves; the service's
+        # own (head activity, condition) gate makes every pass in between free,
+        # so this cadence bounds latency, not cost.
+        base_interval_seconds=1_800.0,
+        handler="schedule_weather_vet",
+        knob_gate=KnobGate.BACKGROUND,
+    ),
     MEMORIALIZE_KIND: KindSpec(
         kind=MEMORIALIZE_KIND,
         priority=5,
@@ -202,6 +219,22 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         base_interval_seconds=300.0,
         handler="proactive_evaluate",
         knob_gate=KnobGate.PROACTIVE,
+    ),
+    GOAL_REVIEW_KIND: KindSpec(
+        kind=GOAL_REVIEW_KIND,
+        priority=5,
+        capability=JobCapability.LLM,
+        # Daily convergence pass over the character's medium-term goals
+        # (CF2 / COMMITMENT_LIFECYCLE §2 P2a). Same cadence and rationale as
+        # ``schedule_maintenance``: goal drift is a once-a-day concern, and
+        # the review must happen even for an account that never opens the
+        # chat — the turn-count trigger cannot reach those. The service's own
+        # per-(character, civil day) DB claim makes the pass idempotent, so
+        # a re-run inside the same day costs one failed insert, not one LLM
+        # call, and a missed day is picked up by the next occurrence.
+        base_interval_seconds=86_400.0,
+        handler="goal_review",
+        knob_gate=KnobGate.BACKGROUND,
     ),
     CHARACTER_UPKEEP_KIND: KindSpec(
         kind=CHARACTER_UPKEEP_KIND,

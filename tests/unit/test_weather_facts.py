@@ -15,6 +15,7 @@ import pytest
 from kokoro_link.infrastructure.weather.facts import (
     WeatherFacts,
     condition_phrase,
+    extract_condition_phrase,
 )
 
 
@@ -111,3 +112,58 @@ def test_high_only_renders_partial() -> None:
     block = facts.to_prompt_block()
     assert "今日高溫：26.0°C" in block
     assert "低溫" not in block
+
+
+class TestExtractConditionPhrase:
+    """Round-trip of the "現在" line back out of a rendered block.
+
+    The schedule weather-drift gate stores this phrase to detect "the
+    weather changed while the same activity is still running". It reads the
+    renderer's own output, so both live in this module — a format change
+    updates both sides at once.
+    """
+
+    @pytest.mark.parametrize(
+        ("code", "phrase"),
+        [
+            (0, "晴朗"),
+            (3, "陰天"),
+            (65, "大雨"),
+            (95, "雷雨"),
+            (99999, "天氣狀況不明"),
+        ],
+    )
+    def test_extracts_the_condition_from_a_rendered_block(
+        self, code: int, phrase: str,
+    ) -> None:
+        block = WeatherFacts(
+            location_label="台北", condition_code=code, temperature_c=21.2,
+        ).to_prompt_block()
+        assert extract_condition_phrase(block) == phrase
+
+    def test_extracts_when_temperature_is_absent(self) -> None:
+        # Without a temperature the "現在" line has no comma tail at all.
+        block = WeatherFacts(
+            location_label="台北", condition_code=61, precipitation_probability=80,
+        ).to_prompt_block()
+        assert extract_condition_phrase(block) == "小雨"
+
+    def test_empty_block_yields_empty_phrase(self) -> None:
+        assert extract_condition_phrase("") == ""
+        assert extract_condition_phrase(WeatherFacts(location_label="台北").to_prompt_block()) == ""
+
+    def test_block_without_a_now_line_yields_empty_phrase(self) -> None:
+        block = "\n".join(["台北目前天氣：", "- 今日高溫：26.0°C", "- 此刻為白天時段"])
+        assert extract_condition_phrase(block) == ""
+
+    def test_ignores_later_lines_that_are_not_the_now_line(self) -> None:
+        block = WeatherFacts(
+            location_label="台北",
+            condition_code=80,
+            temperature_c=19.0,
+            high_c=24.0,
+            low_c=18.0,
+            precipitation_probability=90,
+            is_day=False,
+        ).to_prompt_block()
+        assert extract_condition_phrase(block) == "陣雨"

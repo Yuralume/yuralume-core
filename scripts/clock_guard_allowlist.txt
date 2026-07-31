@@ -30,7 +30,6 @@ src/kokoro_link/application/services/provider_connection_service.py
 src/kokoro_link/application/services/quiet_hours_service.py
 src/kokoro_link/application/services/relationship_milestone_service.py
 src/kokoro_link/application/services/rss_ingestion_service.py
-src/kokoro_link/application/services/scene_access_service.py
 src/kokoro_link/application/services/schedule_memorializer.py
 src/kokoro_link/application/services/schedule_service.py
 src/kokoro_link/application/services/self_reflection_service.py

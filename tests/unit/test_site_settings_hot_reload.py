@@ -751,6 +751,27 @@ def test_boot_overlay_reports_env_fallback_when_the_read_fails(caplog) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_boot_overlay_sync_runner_uses_a_thread_inside_running_loop() -> None:
+    """FastAPI lifespan builds the sync container while its loop is running."""
+    import threading
+
+    from kokoro_link.bootstrap.app_runtime_settings_seed import (
+        _run_coroutine_factory_blocking,
+    )
+
+    caller_thread = threading.get_ident()
+
+    async def read() -> tuple[int, bool]:
+        await asyncio.sleep(0)
+        return threading.get_ident(), asyncio.get_running_loop().is_running()
+
+    worker_thread, loop_was_running = _run_coroutine_factory_blocking(read)
+
+    assert worker_thread != caller_thread
+    assert loop_was_running is True
+
+
 # --- self-host parity (single process, no PostgreSQL) ------------------------
 
 

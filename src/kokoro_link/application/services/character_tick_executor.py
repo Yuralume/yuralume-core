@@ -127,6 +127,8 @@ class CharacterTickExecutor:
         beat_due_checker=None,
         schedule_service=None,
         schedule_memorializer=None,
+        schedule_weather_drift=None,
+        goal_review_service=None,
         feed_composer=None,
         feed_comment_reply=None,
         dispatcher,
@@ -136,6 +138,8 @@ class CharacterTickExecutor:
         self._beat_due_checker = beat_due_checker
         self._schedule_service = schedule_service
         self._schedule_memorializer = schedule_memorializer
+        self._schedule_weather_drift = schedule_weather_drift
+        self._goal_review_service = goal_review_service
         self._feed_composer = feed_composer
         self._feed_comment_reply = feed_comment_reply
         self._dispatcher = dispatcher
@@ -200,14 +204,31 @@ class CharacterTickExecutor:
                 allow_dispatch=allow_dispatch,
             ),
         )
-        # (d) Eager schedule ensure — not gated by proactive_enabled.
+        # (d) Eager schedule ensure + intra-day weather-drift vet — not gated by
+        # proactive_enabled.
         if _aborted():
             return
-        await timer("ensure_schedule", self._run_ensure_schedule(character))
+        await timer(
+            "ensure_schedule",
+            self._run_ensure_schedule(
+                character, now=now, abort_check=abort_check,
+            ),
+        )
         # (e) Schedule memorialization.
         if _aborted():
             return
         await timer("memorialize", self._run_memorialize(character, now=now))
+        # (e2) Daily goal review. Runs every bucket like schedule ensure does,
+        # and like schedule ensure it is the *service* that decides whether
+        # today's work is already done — here a per-(character, civil day) DB
+        # claim, so this costs one failed insert on all but the first tick of
+        # each day. Present in the embedded tick (not only the distributed
+        # ``goal_review`` chain) because a self-host character must converge
+        # its goal list too.
+        if _aborted():
+            return
+        if self._goal_review_service is not None:
+            await timer("goal_review", self._run_goal_review(character, now=now))
         # (f) Feed compose — the ONLY per-character step gated by the tick gate.
         if _aborted():
             return
@@ -272,8 +293,32 @@ class CharacterTickExecutor:
             return
         beat_sink(character.id, result.attempted_beat_id)
 
-    async def _run_ensure_schedule(self, character: Character) -> None:
-        """Best-effort eager generation of the rolling 3-day schedule window."""
+    async def _run_ensure_schedule(
+        self, character: Character, *, now: datetime | None = None,
+        abort_check: AbortCheck | None = None,
+    ) -> None:
+        """The embedded tick's step (d): schedule ensure, then the drift vet.
+
+        The two are separate concerns on very different cadences (the window
+        needs materialising once a day, the sky turns all afternoon), so they
+        are separate private steps behind separate distributed kinds; the
+        embedded tick runs both every bucket, in this order, because the vet
+        reads the day the ensure just materialised.
+
+        The vet runs even when ``ensure_window`` failed: today is usually
+        already planned from an earlier tick, and a planner outage is no
+        reason to keep narrating yesterday's rain. ``abort_check`` is
+        re-evaluated in between — the vet is the only half of this step that
+        persists, so a runner that lost its lease during the ensure must not
+        land a schedule write afterwards.
+        """
+        await self._run_ensure_window(character)
+        if abort_check is not None and abort_check():
+            return
+        await self._run_weather_vet(character, now=now)
+
+    async def _run_ensure_window(self, character: Character) -> None:
+        """Best-effort eager generation of the rolling schedule window."""
         if self._schedule_service is None:
             return
         try:
@@ -281,6 +326,23 @@ class CharacterTickExecutor:
         except Exception:
             _LOGGER.exception(
                 "proactive scheduler: ensure_window crashed character=%s",
+                character.id,
+            )
+
+    async def _run_weather_vet(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> None:
+        """Best-effort intra-day weather-drift vet of today's remaining blocks.
+
+        The service's own gate decides whether a verdict is actually worth
+        paying for; failure degrades to "leave the day exactly as planned"."""
+        if self._schedule_weather_drift is None:
+            return
+        try:
+            await self._schedule_weather_drift.vet(character, now=now)
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: schedule weather drift crashed character=%s",
                 character.id,
             )
 
@@ -297,6 +359,25 @@ class CharacterTickExecutor:
         except Exception:
             _LOGGER.exception(
                 "proactive scheduler: schedule memorializer crashed character=%s",
+                character.id,
+            )
+
+    async def _run_goal_review(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> None:
+        """Best-effort daily goal-list convergence for one character.
+
+        The service's per-(character, civil day) claim decides whether this
+        call does any paid work, so it is safe to invoke on every cadence
+        that reaches here. Failure degrades to "the goal list keeps today's
+        shape" — never breaks the rest of the tick."""
+        if self._goal_review_service is None:
+            return
+        try:
+            await self._goal_review_service.review_if_due(character, now=now)
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: goal review crashed character=%s",
                 character.id,
             )
 
@@ -368,7 +449,11 @@ class CharacterTickExecutor:
         ``character_tick``. Defined as the two cheap, side-effect-idempotent
         pieces of the tick — rest recovery + schedule ensure — reusing the same
         fail-soft wrappers as :meth:`run` so a warm-up can never raise into the
-        worker. Beat/feed/proactive stay for the first real tick."""
+        worker. Beat/feed/proactive stay for the first real tick — and so does
+        the weather-drift vet: ``ensure_window`` just planned this day against
+        the very sky the vet would ask about, so a verdict here is guaranteed
+        waste. The first ``schedule_weather_vet`` job picks it up once the sky
+        has had a chance to move."""
         if abort_check is not None and abort_check():
             return
         if self._rest_recovery_refresher is not None:
@@ -381,7 +466,7 @@ class CharacterTickExecutor:
                 )
         if abort_check is not None and abort_check():
             return
-        await self._run_ensure_schedule(character)
+        await self._run_ensure_window(character)
 
     async def dispatch_beat(
         self, character_id: str, *, now: datetime, logical_slot: str,
@@ -441,14 +526,43 @@ class CharacterTickExecutor:
         return dispatched
 
     async def step_schedule_maintenance(self, character: Character) -> None:
-        """``schedule_maintenance`` kind: eager four-day schedule-ensure + horizon."""
-        await self._run_ensure_schedule(character)
+        """``schedule_maintenance`` kind: eager four-day schedule-ensure + horizon.
+
+        Deliberately NOT the weather-drift vet: this chain advances once a day,
+        and hanging an *intra-day* correction off it would give the distributed
+        topology exactly the once-a-midnight cadence that correction exists to
+        replace. The vet has its own kind below."""
+        await self._run_ensure_window(character)
+
+    async def step_schedule_weather_vet(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> None:
+        """``schedule_weather_vet`` kind: intra-day weather-drift correction.
+
+        The distributed counterpart of the vet half of the embedded tick's step
+        (d), on its own sub-daily cadence. It re-reads today against the sky
+        right now and never re-runs the planner, so it stays cheap when the gate
+        is closed. ``now`` defaults to the current instant (the job carries no
+        clock of its own)."""
+        await self._run_weather_vet(character, now=now)
 
     async def step_memorialize(
         self, character: Character, *, now: datetime,
     ) -> None:
         """``memorialize`` kind: sweep the schedule-completion window into memory."""
         await self._run_memorialize(character, now=now)
+
+    async def step_goal_review(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> None:
+        """``goal_review`` kind: daily convergence pass over medium-term goals.
+
+        The distributed counterpart of the embedded tick's step (e2). The
+        chain fires once a day, but the same per-(character, civil day) claim
+        still guards it — a chain that drifted, a reconciler reseed after a
+        thaw, or an overlapping chat-triggered review all collapse onto one
+        paid review per day."""
+        await self._run_goal_review(character, now=now)
 
     async def step_feed_compose(self, character: Character) -> None:
         """``feed_compose`` kind: best-effort feed-wall publish.

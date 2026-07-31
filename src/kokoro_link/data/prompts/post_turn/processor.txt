@@ -25,6 +25,21 @@ ${character_name} 回覆：${assistant_message}
 - 只輸出一個 JSON 物件，不要任何散文、前言或 code fence。
 - 物件包含六個欄位：memories、state、schedule_adjustments、arc_adjustments、message_promises、address_changes。
 
+時間紀律（memories.content、schedule_adjustments.description／reason、arc_adjustments 的
+title／summary／narrative 共同適用；state 與 address_changes 不受此限）：
+- 這些文字會被寫進角色的長期狀態，**未來好幾天後才會被讀到**，而且讀的當下沒有
+  「當時是哪一天」的上下文，只有你現在寫下的字。
+- 因此凡是指涉具體時點的敘述，**一律要換算成絕對日期**：依上方「日期換算錨點」把
+  「今天／明天／後天／昨天／前天／這週末／下禮拜X／待會」換算成 YYYY-MM-DD。
+- 兩種寫法擇一即可：
+  - 只寫絕對日期：「約好 2026-07-30 早上一起去刨冰店」
+  - 相對詞＋絕對日期雙寫：「明天（2026-07-30）早上一起去刨冰店」
+  需要時可再附註星期，格式對齊「2026-07-30（星期四）」；星期請用該欄位所使用的語言。
+- **只寫相對詞一律不合格**（壞例：「明天早上一起去」「原本今天要去，改成明天早上」
+  「這週末要出門」）——這種寫法幾天後再被讀到，會變成永遠推不掉的「明天」，
+  讓角色一直跳針說同一場還沒發生的約會。
+- 沒有指涉具體時點的內容不要硬加日期（例：「使用者住在東京」保持原樣）。
+
 memories 欄位：
 - 是一個 JSON 陣列。
 - 每個元素包含欄位：kind, content, salience, tags, participants, location, audience。
@@ -38,6 +53,10 @@ memories 欄位：
   範例（壞）：「在城市的燈火中我們找到了共鳴」「對方的話語像針一樣刺入心底」
   「某種難以言喻的情緒在心中蔓延」。
 - content 必須使用與上方對話相同的語言。
+- **content 的時點一律絕對日期化**（見上方「時間紀律」）：記憶是給幾天後的自己讀的，
+  「明天早上一起去刨冰店」這種寫法過幾天讀起來還是「明天」。
+  請寫成「約好 2026-07-30（星期四）早上一起去刨冰店」或「明天（2026-07-30）早上一起去刨冰店」。
+  談到約定改期時同樣要寫成絕對日期（好例：「原本 2026-07-29 要去吃刨冰，改成 2026-07-30 早上」）。
 - salience 是 0.0 到 1.0 的浮點數，代表重要性。
 - tags 是最多 5 個小寫短詞作為主題標籤。
 - **participants**：本筆記憶中除了角色本人以外，被提到或一同經歷此事的其他人。
@@ -91,7 +110,23 @@ schedule_adjustments 欄位：
 - start / end 為 HH:MM 24 小時制（角色所在時區）。
 - operator_involvement 僅在活動涉及使用者參與狀態時填：使用者明確答應共同活動 → "operator_confirmed_shared"；角色只是想邀請、尚未答應 → "operator_invite_pending"；只是想到對方或準備話題、未邀請 → "operator_wish"。若無使用者參與，給 null 或省略。
 - operator_display_name 可填使用者在對話中可識別的簡短稱呼；不確定就給 null。
-- 若使用者對某個尚未確認邀請明確答應，請對該 activity_id 輸出 modify 並把 operator_involvement 升級為 "operator_confirmed_shared"；若明確婉拒，請輸出 remove，或 modify 成 "operator_wish"（角色自己保留念頭但不當成共同安排）。
+- 若使用者對**今日行程清單裡**某個尚未確認的邀請明確答應，請對該 activity_id 輸出 modify 並把 operator_involvement 升級為 "operator_confirmed_shared"；若明確婉拒，請輸出 remove，或 modify 成 "operator_wish"（角色自己保留念頭但不當成共同安排）。
+- **跨日的共同約定：確認狀態必須在 add 那一筆就一次寫對**。上方「今日行程」只列出今天的活動；
+  未來日子的活動不在清單裡，你拿不到它的 activity_id，**因此沒有辦法事後用 modify 去把它升級**。
+  所以只要把「近期對話脈絡」和本輪合起來看，使用者已經明確答應了某個未來日子的共同活動，
+  就直接對那一天輸出一筆 add，並在**同一筆**裡把 operator_involvement 填成
+  "operator_confirmed_shared"、target_date_iso 填成那一天的 YYYY-MM-DD。
+  - 判準是「使用者本人有沒有明確答應」，不是「這件事是誰先提的」：
+    角色（可能是前幾輪）提議、使用者這一輪回「好啊」「就這麼說定」「明天早上見」
+    → operator_confirmed_shared。
+  - 角色單方面提議、使用者還沒回應、或只回「再看看」「有空的話」→ operator_invite_pending。
+  - 使用者明確婉拒 → 不要把它 add 成共同活動；角色若仍想自己去，可以 add 但給 operator_wish，
+    否則不要輸出這筆。
+  - 使用者要改期 → 對**新的那一天**輸出 add 並沿用同樣的確認狀態；原本那天的活動若在
+    今日清單裡，再輸出 remove／modify 收掉。
+  - 同一件約定不要同時輸出兩個不同日期的 add；以最後談定的那一天為準。
+- description 不要寫相對時間詞：這筆活動已經綁在 target_date_iso 那一天，不必在描述裡再寫「明天」；
+  若描述必須提到別的日子，請依上方「時間紀律」寫絕對日期。
 - **target_date_iso**：若 add 的時段是「未來日子」（例：「明天 7 點看電影」「下禮拜五要去看醫生」），請填當天的 YYYY-MM-DD（角色所在時區的民曆日）。今日的調整、或 remove / modify 上方既有 activity，留空 / null 即可（系統會視為今日）。**只接受 add 跨未來日；remove / modify 必須是今日既有 activity**。
 - 最多 ${max_adjustments} 筆。不確定就不要提。
 
@@ -115,6 +150,10 @@ arc_adjustments 欄位：
   beat summary；要根據剛才對話實際演出的內容寫。
 - skip_beat：需 beat_id；僅當你判斷這個 beat 不該再硬推、應該自然淡出或放棄時使用。
 - tension 必須是 setup / rising / climax / falling / resolution。
+- title／summary／narrative 同樣適用上方「時間紀律」：beat 會在清單裡存活好幾天，
+  被讀到時沒有「當初是哪一天寫的」上下文，所以涉及具體時點時一律寫絕對日期，
+  不要留下「明天」「這週末」這種會過期的說法（壞例：「木木已答應明天一起去刨冰店」；
+  好例：「木木已答應 2026-07-30（星期四）早上一起去刨冰店」）。
 - 最多 ${max_arc_adjustments} 筆；寧缺勿濫。
 
 

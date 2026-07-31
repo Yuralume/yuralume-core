@@ -33,6 +33,9 @@ from kokoro_link.application.services.story_gacha import (
     GachaResult,
     StoryGachaService,
 )
+from kokoro_link.application.services.story_seed_region import (
+    resolve_seed_region,
+)
 from kokoro_link.application.services.studio_execution_lease import (
     StudioExecutionLease,
     StudioLeaseSession,
@@ -288,8 +291,16 @@ class StoryEventService:
 
         # --- Gacha fallback (remaining slots) ---
         if remaining > 0:
+            # Regional seeds only surface for a matching player; the
+            # region is derived from the operator's primary language
+            # (plan-ratified mapping). The default tier stays ``daily``
+            # — dramatic seeds never enter this rotation.
+            region = resolve_seed_region(
+                await self._resolve_operator_language(character),
+            )
             result: GachaResult = await self._gacha.roll(
                 character=character, today=today, count=remaining,
+                region=region,
             )
             if result.picked:
                 for seed in result.picked:
@@ -418,6 +429,9 @@ class StoryEventService:
             dramatic_question=beat.dramatic_question,
             required=beat.required,
             tone=arc_tone,
+            # CF1b: gives the expander absolute-date anchors so the beat
+            # narrative it writes does not freeze a relative time word.
+            today=today,
         )
         try:
             narrative, tone = await self._expand_with_language(
@@ -658,6 +672,8 @@ class StoryEventService:
                     operator_primary_language=await self._resolve_operator_language(
                         character,
                     ),
+                    # CF1b: absolute-date anchors for the milestone prose.
+                    today=await self._today_for_character(character, None),
                 ),
             )
         except Exception:

@@ -1,1 +1,0 @@
-"""Scene Access infrastructure adapters."""

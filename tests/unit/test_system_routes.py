@@ -443,7 +443,7 @@ def test_feature_reasoning_effort_preflight_inherits_group_target(
         "/api/v1/system/preferences/feature-models",
         json={
             "overrides": {
-                "scene_access": {
+                "proactive_intention": {
                     "reasoning": {"reasoning_effort": "xhigh"},
                 },
             },
@@ -803,7 +803,6 @@ def test_routing_preference_get_allowed_for_non_admin(monkeypatch, path) -> None
 
 _PLAYER_PUT_CASES = [
     ("/api/v1/system/preferences/chat-assist", {"enabled": False}),
-    ("/api/v1/system/preferences/scene-access-hint", {"enabled": False}),
     ("/api/v1/system/preferences/tts-pregeneration", {"enabled": True}),
     (
         "/api/v1/system/preferences/visual-generation-style",
@@ -941,7 +940,7 @@ def test_routing_get_global_scope_open_to_non_admin(
     [
         "/api/v1/system/preferences/active-model",
         "/api/v1/system/preferences/chat-assist",
-        "/api/v1/system/preferences/scene-access-hint",
+        "/api/v1/system/preferences/tts-pregeneration",
     ],
 )
 def test_preference_scope_rejects_unknown_value(monkeypatch, path) -> None:

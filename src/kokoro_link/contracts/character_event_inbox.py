@@ -19,7 +19,9 @@ from kokoro_link.domain.entities.character_event_inbox import (
 class CharacterEventInboxRepositoryPort(Protocol):
     async def add_many(
         self, items: list[CharacterEventInboxItem],
-    ) -> None: ...
+    ) -> int:
+        """Atomically add unseen character/event pairs; return inserted count."""
+        ...
 
     async def list_for_character(
         self,

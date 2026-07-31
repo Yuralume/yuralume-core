@@ -13,6 +13,12 @@ import {
 } from '@/utils/api/fusionStory'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { isInsufficientCreditsFailure } from '@/utils/studioFailure'
+import ActionPriceHint from '@/components/ActionPriceHint.vue'
+import { ACTION_FUSION_STORY_ITERATE } from '@/composables/useActionPricing'
+import {
+  billingRefusalKind,
+  refreshQuotedPrices,
+} from '@/utils/api/billingRefusal'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import FusionStoryExitHub from './FusionStoryExitHub.vue'
 import FusionStoryShareCardModal from './FusionStoryShareCardModal.vue'
@@ -47,6 +53,21 @@ const { timeZone } = useTimezone()
  * carries no code at all — keeps the existing generic wording.
  */
 const outOfCredits = computed(() => isInsufficientCreditsFailure(props.story))
+
+/**
+ * The *synchronous* twin of `outOfCredits`.
+ *
+ * Every iterate button is action-priced, and its charge is raised before the
+ * 202 — so "you are out of 螢火" can arrive as a rejected promise here, long
+ * before any story ever reaches `failed`. Without this the same refusal would
+ * read as one of two different things depending on timing: a top-up card when
+ * a background run died, a raw error line when the button refused up front.
+ */
+const refusedForCredits = ref(false)
+
+const showCreditsNotice = computed(
+  () => refusedForCredits.value || outOfCredits.value,
+)
 
 const outlineHint = ref('')
 const beatHint = ref('')
@@ -112,9 +133,37 @@ function focusNames(beat: FusionStoryBeat): string {
     .join(t('common.listSeparator'))
 }
 
+/**
+ * Report an iterate failure as what it is.
+ *
+ * Two of the three outcomes are answers, not faults, and each needs its own
+ * surface: an empty wallet gets the top-up card (with its "nothing ran"
+ * promise), and a moved price gets the published list re-pulled so the hint by
+ * the button matches what the resend will cost. Everything else keeps the
+ * per-operation error line, which is why the fallback is a parameter.
+ *
+ * Returns nothing and swallows nothing — the caller's `finally` still runs.
+ */
+async function reportIterateFailure(
+  err: unknown, fallbackKey: string,
+): Promise<void> {
+  switch (billingRefusalKind(err)) {
+    case 'insufficient_credits':
+      refusedForCredits.value = true
+      return
+    case 'price_changed':
+      await refreshQuotedPrices()
+      emit('error', t('credits.price.changed'))
+      return
+    default:
+      emit('error', err instanceof Error ? err.message : t(fallbackKey))
+  }
+}
+
 async function handleOutlineRegenerate() {
   if (isBusy.value || regeneratingOutline.value) return
   regeneratingOutline.value = true
+  refusedForCredits.value = false
   try {
     const next = await iterateFusionOutline(props.story.id, {
       hint: outlineHint.value.trim() || null,
@@ -122,7 +171,9 @@ async function handleOutlineRegenerate() {
     outlineHint.value = ''
     emit('updated', next)
   } catch (err: unknown) {
-    emit('error', err instanceof Error ? err.message : t('fusionStory.viewer.errors.regenerateOutlineFailed'))
+    await reportIterateFailure(
+      err, 'fusionStory.viewer.errors.regenerateOutlineFailed',
+    )
   } finally {
     regeneratingOutline.value = false
   }
@@ -144,6 +195,7 @@ async function confirmBeatRewrite() {
   if (isBusy.value || regeneratingBeat.value) return
   const idx = beatActiveIndex.value
   regeneratingBeat.value = true
+  refusedForCredits.value = false
   try {
     const next = await iterateFusionBeat(props.story.id, {
       beat_index: idx,
@@ -153,7 +205,9 @@ async function confirmBeatRewrite() {
     beatHint.value = ''
     emit('updated', next)
   } catch (err: unknown) {
-    emit('error', err instanceof Error ? err.message : t('fusionStory.viewer.errors.rewriteBeatFailed'))
+    await reportIterateFailure(
+      err, 'fusionStory.viewer.errors.rewriteBeatFailed',
+    )
   } finally {
     regeneratingBeat.value = false
   }
@@ -218,11 +272,14 @@ async function handleExport(format: FusionStoryExportFormat) {
 async function handlePolish() {
   if (isBusy.value || polishing.value) return
   polishing.value = true
+  refusedForCredits.value = false
   try {
     const next = await polishFusionStory(props.story.id)
     emit('updated', next)
   } catch (err: unknown) {
-    emit('error', err instanceof Error ? err.message : t('fusionStory.viewer.errors.polishFailed'))
+    await reportIterateFailure(
+      err, 'fusionStory.viewer.errors.polishFailed',
+    )
   } finally {
     polishing.value = false
   }
@@ -242,7 +299,10 @@ async function handlePolish() {
         <span>{{ t('fusionStory.viewer.length', { count: totalChars }) }}</span>
       </div>
       <p class="viewer__premise">{{ story.premise }}</p>
-      <InsufficientCreditsNotice v-if="outOfCredits" class="viewer__credits" />
+      <InsufficientCreditsNotice
+        v-if="showCreditsNotice"
+        class="viewer__credits"
+      />
       <p v-else-if="story.error_message" class="viewer__error">
         {{ t('fusionStory.viewer.failureReason', { reason: story.error_message }) }}
       </p>
@@ -329,6 +389,12 @@ async function handlePolish() {
               <button class="viewer__btn" @click="cancelBeatRewrite">
                 {{ t('common.actions.cancel') }}
               </button>
+              <!-- 重寫一段是「另一次動作」，價格與整篇的一口價分開。 -->
+              <ActionPriceHint
+                :action-key="ACTION_FUSION_STORY_ITERATE"
+                tooltip-key="credits.price.fusionIterateTooltip"
+                variant="chip"
+              />
             </div>
           </div>
         </li>
@@ -357,7 +423,16 @@ async function handlePolish() {
     />
 
     <section class="viewer__section viewer__actions">
-      <h3 class="viewer__section-title">{{ t('fusionStory.viewer.iterationTitle') }}</h3>
+      <h3 class="viewer__section-title">
+        {{ t('fusionStory.viewer.iterationTitle') }}
+        <!-- 重跑大綱與單獨潤稿都走同一個「重寫」單價，按之前先讓創作者看到。 -->
+        <ActionPriceHint
+          class="viewer__iteration-price"
+          :action-key="ACTION_FUSION_STORY_ITERATE"
+          tooltip-key="credits.price.fusionIterateTooltip"
+          variant="chip"
+        />
+      </h3>
       <div class="viewer__action-row">
         <textarea
           v-model="outlineHint"
@@ -653,6 +728,13 @@ async function handlePolish() {
 .viewer__beat-rewrite-actions {
   display: flex;
   gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+/* 版面規則而已；查不到價格時元件不輸出節點，版面與改動前相同。 */
+.viewer__iteration-price {
+  margin-left: 8px;
+  vertical-align: middle;
 }
 .viewer__action-row {
   display: flex;

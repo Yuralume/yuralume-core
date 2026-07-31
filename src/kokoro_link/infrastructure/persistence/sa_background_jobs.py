@@ -347,6 +347,37 @@ class SABackgroundJobQueue:
             await session.commit()
             return result.rowcount == 1
 
+    async def release_claim(
+        self, job_id: str, worker_id: str, *, now: datetime,
+    ) -> bool:
+        now = ensure_utc(now)
+        async with self._session_factory() as session:
+            # Same conditional-UPDATE shape as ``complete``: the WHERE clause
+            # re-validates lease ownership atomically, so a concurrent reclaim
+            # (whose UPDATE moved lease_owner) simply makes this a no-op rather
+            # than requeueing a job another worker is already running. No row
+            # lock needed — there is no read-modify-write branch here, and the
+            # attempt refund is expressed as a SQL decrement.
+            result = await session.execute(
+                update(BackgroundJobRow)
+                .where(
+                    BackgroundJobRow.id == job_id,
+                    BackgroundJobRow.status == JobStatus.CLAIMED.value,
+                    BackgroundJobRow.lease_owner == worker_id,
+                    BackgroundJobRow.lease_until >= now,
+                )
+                .values(
+                    status=JobStatus.QUEUED.value,
+                    attempt_count=BackgroundJobRow.attempt_count - 1,
+                    lease_owner=None,
+                    lease_until=None,
+                    claimed_at=None,
+                    updated_at=now,
+                ),
+            )
+            await session.commit()
+            return result.rowcount == 1
+
     async def fail(
         self,
         job_id: str,

@@ -13,6 +13,16 @@ from kokoro_link.domain.value_objects.presence_frame import (
 
 
 class PresenceFramePayload(BaseModel):
+    """Wire shape of the turn's interaction surface.
+
+    The field shape is deliberately frozen across the stage-access judge's
+    retirement: ``access_context`` still accepts the legacy verdict values
+    (an already-deployed self-hosted frontend keeps sending them, and
+    stored turn metadata replays them) and ``co_presence_reason`` /
+    ``stage_access_note`` are still parsed. Folding the legacy values onto
+    ``PLAYER_DECLARED`` happens once, in ``PresenceFrame.__post_init__``.
+    """
+
     surface: ChatSurface
     channel: ChatChannel
     visibility: VisibilityMode
@@ -85,9 +95,30 @@ class SendChatMessageRequest(BaseModel):
     presence_frame: PresenceFramePayload | None = None
     """Structured context describing this turn's interaction surface.
 
-    Omitted means legacy web message interaction. Stage requires an explicit
-    Scene Access verdict with a real-world-plausible access context.
+    Omitted means legacy web message interaction. A stage frame is the
+    player *declaring* a same-place interaction — no prior verdict is
+    required and none is consulted; the character answers from its own
+    schedule inside the narrative.
     """
+    quoted_price_cr: float | None = Field(default=None, ge=0)
+    """The price this client had on screen for one chat turn (R9).
+
+    The charge is bound to what the *player* was shown, not to whatever this
+    replica's price cache happens to hold — under several hosted replicas, or
+    right after a back-office edit, those are not the same number and only the
+    first one was ever agreed to. Omitted (older client, or no unambiguous
+    price to quote) falls back to the process cache, so nothing regresses.
+
+    Under-reporting gains nothing: the User service answers ``409
+    price_changed`` when the quote does not match the published price, it never
+    charges the lower number.
+    """
+    quoted_image_price_cr: float | None = Field(default=None, ge=0)
+    """The same, for the ``image_chat_tool`` charge a turn may spawn.
+
+    Carried on the turn rather than raised by its own request because the
+    picture is decided by the model mid-turn — there is no moment where the
+    client could be asked again."""
 
     def resolved_presence_frame(self) -> PresenceFrame:
         has_attachments = bool(self.attachment_urls)
@@ -189,6 +220,14 @@ def _default_presence_display_name(channel: ChatChannel) -> str:
 
 
 def _default_access_context(surface: ChatSurface) -> AccessContext:
+    """Fill in the access context an older client did not send.
+
+    Stage defaults to ``PLAYER_DECLARED``: switching to the stage tab *is*
+    the declaration. The pre-2026-07-30 default was ``NOT_PLAUSIBLE``,
+    which only made sense while a judge had to grant access first —
+    keeping it would drop every stage turn into a blocking frame now that
+    nothing grants anything.
+    """
     if surface is ChatSurface.WEB_STAGE:
-        return AccessContext.NOT_PLAUSIBLE
+        return AccessContext.PLAYER_DECLARED
     return AccessContext.TEXT_MESSAGE_ONLY

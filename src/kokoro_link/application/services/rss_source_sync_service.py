@@ -91,7 +91,8 @@ class RssSourceSyncService:
             feed_url = (entry.get("feed_url") or "").strip()
             if not source_id or not feed_url:
                 continue
-            default_enabled = self._resolve_seed_enabled(entry)
+            retired = bool(entry.get("retired", False))
+            default_enabled = self._resolve_seed_enabled(entry) and not retired
             try:
                 seeded = RssSource(
                     id=source_id,
@@ -103,7 +104,10 @@ class RssSourceSyncService:
                     enabled=default_enabled,
                 )
             except ValueError:
-                logger.warning("rss seed entry invalid: %s", entry)
+                logger.warning(
+                    "rss seed entry invalid source_id=%s",
+                    source_id or "<missing>",
+                )
                 continue
 
             current = existing.get(source_id)
@@ -111,14 +115,30 @@ class RssSourceSyncService:
                 await self._repository.upsert(seeded)
                 touched += 1
                 continue
+            # ``retired`` is a data-driven kill switch for a bundled endpoint
+            # that no longer serves a feed. Existing rows still pointing at
+            # that exact canonical URL are disabled on upgrade. If an
+            # operator already replaced the URL under the same source id,
+            # preserve the whole row: it is no longer the retired endpoint
+            # and must not be overwritten or disabled by the seed.
+            if retired and current.feed_url != seeded.feed_url:
+                logger.info(
+                    "retired rss seed preserved operator replacement "
+                    "source_id=%s",
+                    source_id,
+                )
+                continue
             # Existing — refresh canonical fields, preserve operator
-            # flags + health columns.
+            # flags + health columns. Retirement is the sole exception to
+            # preserving ``enabled`` because leaving the known-dead canonical
+            # URL active would keep every upgraded install in an error loop.
             merged = replace(
                 current,
                 name=seeded.name,
                 feed_url=seeded.feed_url,
                 category=seeded.category,
                 locale=seeded.locale,
+                enabled=False if retired else current.enabled,
                 # ``region`` is operator-controlled once set (it's editable
                 # from the admin World-events panel), so it follows the
                 # ``enabled`` convention rather than the canonical one:
@@ -185,8 +205,8 @@ class RssSourceSyncService:
         Taiwan-only civil-alert feed is noise for an overseas deploy. All
         other sources keep their YAML ``enabled`` (default true). This
         only affects the first insert; operator enable/disable and later
-        syncs never re-apply it (existing rows preserve the operator
-        flag)."""
+        syncs never re-apply it (existing rows preserve the operator flag),
+        except for a seed explicitly marked ``retired`` by :meth:`sync`."""
         yaml_enabled = bool(entry.get("enabled", True))
         source_region = (entry.get("region") or "").strip().upper()
         category = (entry.get("category") or "").strip().lower()

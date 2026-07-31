@@ -53,6 +53,7 @@ class AnthropicChatModel(ChatModelPort):
     """Adapter for Anthropic's native ``/v1/messages`` API."""
 
     provider_id: str = "anthropic"
+    prefers_public_image_urls: bool = False
 
     def __init__(
         self,

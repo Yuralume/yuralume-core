@@ -64,9 +64,8 @@ class _CountingSchedulePlanner(SchedulePlannerPort):
     ) -> DailySchedule:
         self.calls += 1
         await asyncio.sleep(self._delay)
-        # Return ONE activity so the saved schedule has ``.activities``
-        # truthy — otherwise the "existing but empty = retry" branch
-        # would mask whether the lock worked.
+        # Return one activity to keep this concurrency test representative of
+        # the ordinary planned-day path.
         start = datetime.now(timezone.utc).replace(
             hour=9, minute=0, second=0, microsecond=0,
         )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from dataclasses import replace
 
 from kokoro_link.domain.entities.rss_source import RssSource
 
@@ -38,9 +37,16 @@ class InMemoryRssSourceRepository:
         )
 
     async def mark_error(
-        self, source_id: str, *, at: datetime, error: str,
+        self,
+        source_id: str,
+        *,
+        at: datetime,
+        error: str,
+        fetched_count: int = 0,
     ) -> None:
         existing = self._store.get(source_id)
         if existing is None:
             return
-        self._store[source_id] = existing.with_error(at=at, error=error)
+        self._store[source_id] = existing.with_error(
+            at=at, error=error, fetched_count=fetched_count,
+        )

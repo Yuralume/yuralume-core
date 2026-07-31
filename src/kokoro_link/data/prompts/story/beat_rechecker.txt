@@ -8,6 +8,7 @@
 - summary: ${character_summary}
 
 今天：${today}
+${date_context_block}
 
 Story arc：
 - title: ${arc_title}
@@ -33,6 +34,16 @@ ${recent_dialogue_summary}
 - 若 optional beat 已經失去意義或會破壞節奏，回 skip_beat。
 - 不要因為 scheduled_date 到了就 mark_realized；必須有互動事實支持。
 - 不要把使用者寫成在場，除非近期對話摘要明確表示使用者在場或參與。
+
+時間紀律（narrative 適用）：
+- mark_realized 的 narrative 會被存成這個 beat 的永久紀錄，往後好幾天都會被讀出來，
+  而讀的當下沒有「這段字是哪一天寫的」這個上下文。
+- 因此涉及具體時點時，一律依上方「日期換算錨點」寫絕對日期（「2026-06-03 下午」），
+  或相對詞＋絕對日期雙寫（「明天（2026-06-03）下午」）；需要時可附星期，
+  格式對齊「2026-06-03（星期三）」，星期用 narrative 所使用的語言。
+- 只寫「明天／後天／昨天／這週末」這類相對時間詞一律不合格——那種寫法過幾天再被讀到，
+  會變成永遠推不掉的「明天」。
+- 沒有涉及具體時點的敘述不要硬加日期。
 
 只輸出 JSON：
 {

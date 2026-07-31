@@ -192,6 +192,17 @@ export async function loginWithCloudSession(payload: {
   return data
 }
 
+/**
+ * Slide the current session forward (plan: sliding renewal). The SPA calls
+ * this only after real interaction — see `@/utils/sessionRenewal`. A 401 means
+ * the session may not be extended (expired, revoked, or past the deployment's
+ * absolute cap) and is handled by the global bounce like any other 401.
+ */
+export async function refreshSession(): Promise<AuthTokenResponse> {
+  const { data } = await axios.post<AuthTokenResponse>(`${BASE}/refresh`)
+  return data
+}
+
 export async function fetchMe(): Promise<AuthUser> {
   const { data } = await axios.get<AuthUser>(`${BASE}/me`)
   return data

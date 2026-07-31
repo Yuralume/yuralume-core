@@ -20,18 +20,11 @@ from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.proactive_dispatcher import ProactiveDispatcher
 from kokoro_link.application.services.schedule_service import ScheduleService
-from kokoro_link.application.services.scene_access_service import SceneAccessService
 from kokoro_link.contracts.proactive import (
     GateVerdict,
     ProactiveContext,
     ProactiveDecision,
     ProactiveDeciderPort,
-)
-from kokoro_link.contracts.scene_access import (
-    SceneAccessContext,
-    StageAccessAction,
-    StageAccessDecision,
-    StageAccessVerdict,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
@@ -41,10 +34,6 @@ from kokoro_link.domain.entities.schedule import (
     MeetingAffordance,
     ScenePrivacy,
     ScheduleActivity,
-)
-from kokoro_link.domain.value_objects.presence_frame import (
-    AccessContext,
-    ChatSurface,
 )
 from kokoro_link.domain.value_objects.proactive_outcome import ProactiveOutcome
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
@@ -114,21 +103,6 @@ class _SharedHomePlanner:
             character_id=character.id,
             date_=date_,
             activities=[activity],
-        )
-
-
-class _CohabitationSceneJudge:
-    def __init__(self) -> None:
-        self.seen: SceneAccessContext | None = None
-
-    async def judge(self, context: SceneAccessContext) -> StageAccessVerdict:
-        self.seen = context
-        return StageAccessVerdict(
-            decision=StageAccessDecision.ALLOW,
-            recommended_action=StageAccessAction.USE_STAGE,
-            access_context=AccessContext.ESTABLISHED_ROUTINE,
-            reason_for_user="你們住在一起，現在是在共同住所的一般日常時段。",
-            prompt_fact="同住設定讓共同住所的一般在家時段可作日常共處，但這不是共同回憶。",
         )
 
 
@@ -230,28 +204,11 @@ async def test_cohabitation_creation_to_schedule_stage_chat_and_proactive_smoke(
     assert activity.location == "家（與使用者同住）"
     assert "居住安排：住在使用者家裡" in planner.relationship_context
     assert planner.schedule_policy == "mention_only"
-
-    scene_judge = _CohabitationSceneJudge()
-    scene_access = SceneAccessService(
-        character_repository=character_repository,
-        judge=scene_judge,
-        schedule_service=schedule_service,
-        memory_repository=memory_repository,
-        conversation_repository=conversation_repository,
-        relationship_seed_repository=relationship_repository,
-    )
-    verdict = await scene_access.evaluate(
-        character.id,
-        operator_id=DEFAULT_OPERATOR_ID,
-        requested_surface=ChatSurface.WEB_STAGE,
-        current_user_id=DEFAULT_OPERATOR_ID,
-    )
-    assert verdict.access_context is AccessContext.ESTABLISHED_ROUTINE
-    assert scene_judge.seen is not None
-    assert scene_judge.seen.current_activity_location == "家（與使用者同住）"
-    assert "居住安排：住在使用者家裡" in "\n".join(
-        scene_judge.seen.initial_relationship_lines,
-    )
+    # R-SA-1: the planner's scene semantics survive the co-presence judge
+    # retirement — the fields are still landed on the activity, they just
+    # have no runtime gate reading them any more.
+    assert activity.scene_privacy is ScenePrivacy.PRIVATE
+    assert activity.meeting_affordance is MeetingAffordance.INVITE_ONLY
 
     chat_model = _CapturingFakeChatModel(provider_id="fake")
     model_registry = InMemoryChatModelRegistry(default_provider_id="fake")

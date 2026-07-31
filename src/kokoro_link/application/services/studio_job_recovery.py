@@ -122,10 +122,7 @@ class StudioJobRecoveryService:
                 target_jobs.sort(key=lambda job: job.created_at)
                 for stale in target_jobs[:-1]:
                     try:
-                        await self._jobs.save(stale.with_status(
-                            JOB_STATUS_FAILED,
-                            error_message="superseded by a newer job",
-                        ))
+                        await self._supersede(stale)
                         report["superseded"] += 1
                     except Exception:
                         _LOGGER.exception(
@@ -169,6 +166,23 @@ class StudioJobRecoveryService:
             )
             return True
         return epoch is not None
+
+    async def _supersede(self, job: StudioGenerationJob) -> None:
+        """Fail a duplicate row — via its owning service when money rides on it.
+
+        A superseded row is not just bookkeeping: a fusion row carries the ids
+        of the action charge its (losing) replica raised, and only the newest
+        row per target is re-driven. Marking it failed here without telling the
+        service would drop that reservation on the floor — the one path where a
+        player pays for a run nothing will ever finish.
+        """
+        if job.kind in FUSION_JOB_KINDS and self._fusion is not None:
+            await self._fusion.supersede_job(job)
+            return
+        await self._jobs.save(job.with_status(
+            JOB_STATUS_FAILED,
+            error_message="superseded by a newer job",
+        ))
 
     async def _dispatch(self, job: StudioGenerationJob) -> str:
         if job.kind in FUSION_JOB_KINDS and self._fusion is not None:

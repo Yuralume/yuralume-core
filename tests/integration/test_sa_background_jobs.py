@@ -270,6 +270,50 @@ async def test_complete_with_expired_lease_fails_then_reclaimable(
     assert reclaimed[0].attempt_count == 2
 
 
+async def test_release_claim_requeues_refunds_and_guards_ownership(
+    session_factory,
+) -> None:
+    # GD0 graceful stop, SA parity with the in-memory adapter: an unstarted
+    # claim goes straight back to ``queued`` (attempt refunded, ready now), and
+    # a stale owner cannot requeue a row another worker has since reclaimed.
+    epoch = await _acquire_coordinator(session_factory)
+    queue = SABackgroundJobQueue(session_factory)
+    job_id = await queue.enqueue(_spec("job", epoch=epoch), now=BASE)
+    assert job_id is not None
+
+    claimed = await queue.claim("A", now=BASE, limit=10, lease_seconds=60)
+    assert [c.id for c in claimed] == [job_id]
+    assert claimed[0].attempt_count == 1
+
+    # Wrong worker is refused, row untouched.
+    assert not await queue.release_claim(job_id, "intruder", now=BASE)
+    job = await queue.get(job_id)
+    assert job is not None and job.status == JobStatus.CLAIMED
+
+    assert await queue.release_claim(job_id, "A", now=BASE)
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.QUEUED
+    assert job.attempt_count == 0
+    assert job.lease_owner is None and job.lease_until is None
+    assert job.claimed_at is None
+
+    # Immediately re-claimable — no waiting out the original lease.
+    reclaimed = await queue.claim(
+        "B", now=BASE + timedelta(seconds=1), limit=10, lease_seconds=60,
+    )
+    assert [c.id for c in reclaimed] == [job_id]
+    assert reclaimed[0].attempt_count == 1
+
+    # The former owner's late release must not clobber B's live claim.
+    assert not await queue.release_claim(
+        job_id, "A", now=BASE + timedelta(seconds=2),
+    )
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.CLAIMED and job.lease_owner == "B"
+
+
 async def test_retry_dead_redrive_round_trip(session_factory) -> None:
     epoch = await _acquire_coordinator(session_factory)
     queue = SABackgroundJobQueue(session_factory)

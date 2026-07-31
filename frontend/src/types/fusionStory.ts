@@ -77,19 +77,33 @@ export interface FusionStorySummary {
   updated_at: string
 }
 
-export interface CreateFusionStoryPayload {
+/**
+ * The fixed action price this client had on screen (plan R9 quote binding).
+ *
+ * Attached by the transport, never by a caller: the server binds the charge to
+ * it and answers `409 price_changed` when the published number moved, so the
+ * player is never billed an amount they were not shown. Absent on self-host and
+ * on token-billed tiers, where there is no fixed price to quote.
+ */
+export interface QuotedActionPrice {
+  quoted_price_cr?: number
+}
+
+export interface CreateFusionStoryPayload extends QuotedActionPrice {
   character_ids: string[]
   prompt: string
 }
 
-export interface IterateOutlinePayload {
+export interface IterateOutlinePayload extends QuotedActionPrice {
   hint?: string | null
 }
 
-export interface IterateBeatPayload {
+export interface IterateBeatPayload extends QuotedActionPrice {
   beat_index: number
   hint?: string | null
 }
+
+export type PolishFusionStoryPayload = QuotedActionPrice
 
 export interface FusionToArcDraftPayload {
   instruction?: string | null

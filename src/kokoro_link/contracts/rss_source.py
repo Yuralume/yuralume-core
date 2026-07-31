@@ -22,5 +22,10 @@ class RssSourceRepositoryPort(Protocol):
     ) -> None: ...
 
     async def mark_error(
-        self, source_id: str, *, at: datetime, error: str,
+        self,
+        source_id: str,
+        *,
+        at: datetime,
+        error: str,
+        fetched_count: int = 0,
     ) -> None: ...

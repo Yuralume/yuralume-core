@@ -13,35 +13,36 @@ seeds:
     tags: [outdoor, people-watching]
     world_frames: [modern]
     weight: 0.7
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:daily:002
     seed_text: 捷運上看到一幕很溫馨的小插曲
     tags: [outdoor, gentle]
     world_frames: [modern]
+    regions: [tw]
     weight: 0.6
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:daily:003
     seed_text: 午餐時間排了很久的隊，結果食物普普通通
     tags: [mundane, disappointment]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 10
+    cooldown_days: 60
 
   - external_id: modern:daily:004
     seed_text: 在超市看到一個超久沒見過的懷舊零食
     tags: [nostalgia, indoor]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 21
+    cooldown_days: 60
 
   - external_id: modern:daily:005
     seed_text: 通勤時耳機突然沒電，整路很安靜
     tags: [mundane, introspective]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   # --- Tech / media -----------------------------------------------
   - external_id: modern:tech:001
@@ -49,28 +50,28 @@ seeds:
     tags: [nostalgia, tech]
     world_frames: [modern]
     weight: 0.7
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:tech:002
     seed_text: 看到一個影片裡的梗笑很久，想分享給別人
     tags: [social, happy]
     world_frames: [modern]
     weight: 0.7
-    cooldown_days: 10
+    cooldown_days: 60
 
   - external_id: modern:tech:003
     seed_text: 無意間翻到好幾年前自己寫的東西，有點害羞
     tags: [nostalgia, embarrassed]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 21
+    cooldown_days: 60
 
   - external_id: modern:tech:004
     seed_text: 收到一個很意外的通知，讓人愣了一下
     tags: [surprise, tech]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   # --- Weather / outdoor ------------------------------------------
   - external_id: modern:weather:001
@@ -78,14 +79,14 @@ seeds:
     tags: [weather, mundane]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:weather:002
     seed_text: 今天天氣好到讓人想蹺班出去玩
     tags: [weather, happy]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 10
+    cooldown_days: 60
 
   # --- Food / small indulgences -----------------------------------
   - external_id: modern:food:001
@@ -93,21 +94,22 @@ seeds:
     tags: [food, happy, discovery]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:food:002
     seed_text: 煮壞了一道很想吃的東西，小小的挫折
     tags: [food, disappointment]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:food:003
     seed_text: 手搖飲店點錯飲料，意外發現還不錯
     tags: [food, discovery]
     world_frames: [modern]
+    regions: [tw]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   # --- Work / study -----------------------------------------------
   - external_id: modern:work:001
@@ -115,14 +117,14 @@ seeds:
     tags: [work, satisfied]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 10
+    cooldown_days: 60
 
   - external_id: modern:work:002
     seed_text: 開會開得很煩，中途走神想別的事
     tags: [work, bored]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 10
+    cooldown_days: 60
 
   # --- Small interactions -----------------------------------------
   - external_id: modern:people:001
@@ -130,14 +132,14 @@ seeds:
     tags: [social, happy]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 14
+    cooldown_days: 60
 
   - external_id: modern:people:002
     seed_text: 路上幫了個陌生人一個小忙
     tags: [social, gentle]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 14
+    cooldown_days: 60
 
   # --- Media consumption ------------------------------------------
   - external_id: modern:media:001
@@ -145,11 +147,11 @@ seeds:
     tags: [media, melancholy]
     world_frames: [modern]
     weight: 0.5
-    cooldown_days: 21
+    cooldown_days: 60
 
   - external_id: modern:media:002
     seed_text: 無意間看到一個短影片，想法被打到
     tags: [media, introspective]
     world_frames: [modern]
     weight: 0.6
-    cooldown_days: 14
+    cooldown_days: 60

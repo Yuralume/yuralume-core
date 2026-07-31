@@ -190,6 +190,54 @@ async def test_extend_lease_rejected_after_expiry() -> None:
     )
 
 
+async def test_release_claim_requeues_immediately_and_refunds_the_attempt() -> None:
+    # GD0 graceful stop: an unstarted claim handed back is instantly re-claimable
+    # by another worker — no waiting out the lease — and costs no attempt.
+    queue = InMemoryBackgroundJobQueue()
+    job_id = await queue.enqueue(_spec(), now=BASE)
+    claimed = await queue.claim("w1", now=BASE, limit=10, lease_seconds=60)
+    assert claimed[0].attempt_count == 1
+
+    assert await queue.release_claim(job_id, "w1", now=BASE)
+
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.QUEUED
+    assert job.attempt_count == 0
+    assert job.lease_owner is None and job.lease_until is None
+    assert job.claimed_at is None
+    assert job.due_at == BASE  # ready now, not deferred
+
+    # A surviving worker picks it up on the very next pass, still inside what
+    # would have been the original lease window.
+    reclaimed = await queue.claim(
+        "w2", now=BASE + timedelta(seconds=1), limit=10, lease_seconds=60,
+    )
+    assert [c.id for c in reclaimed] == [job_id]
+    assert reclaimed[0].attempt_count == 1
+
+
+async def test_release_claim_requires_valid_lease_ownership() -> None:
+    queue = InMemoryBackgroundJobQueue()
+    job_id = await queue.enqueue(_spec(), now=BASE)
+    await queue.claim("w1", now=BASE, limit=10, lease_seconds=60)
+
+    # Wrong worker: refused, no state change.
+    assert not await queue.release_claim(job_id, "intruder", now=BASE)
+    job = await queue.get(job_id)
+    assert job is not None and job.status == JobStatus.CLAIMED
+
+    # Expired lease: another worker may already have reclaimed it, so the
+    # former owner must not requeue it out from under them.
+    after = BASE + timedelta(seconds=61)
+    reclaimed = await queue.claim("w2", now=after, limit=10, lease_seconds=60)
+    assert [c.id for c in reclaimed] == [job_id]
+    assert not await queue.release_claim(job_id, "w1", now=after)
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.CLAIMED and job.lease_owner == "w2"
+
+
 async def test_retry_backoff_reaches_dead_at_max_attempts() -> None:
     queue = InMemoryBackgroundJobQueue()
     job_id = await queue.enqueue(_spec(max_attempts=2), now=BASE)

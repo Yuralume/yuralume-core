@@ -9,7 +9,10 @@ from kokoro_link.application.services.account_runtime_profile import (
 )
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.value_objects.account_runtime_profile import (
+    BILLING_SHAPE_ACTION_FIXED,
+    BILLING_SHAPE_TOKEN_FLOATING,
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+    DEFAULT_DAILY_OVERAGE_LIMIT,
     DEMO_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
 )
@@ -295,3 +298,52 @@ def test_parser_non_dict_payload_is_treated_as_empty() -> None:
 
     assert profile.name == "plus"
     assert profile.max_characters is None
+
+
+def test_billing_knobs_default_to_todays_token_shape() -> None:
+    """AP0: every un-migrated tier keeps floating token billing and has
+    overage off, so the new code paths are opt-in per tier."""
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {})
+
+    assert profile.billing_shape == BILLING_SHAPE_TOKEN_FLOATING
+    assert profile.uses_action_pricing is False
+    assert profile.overage_enabled is False
+    assert profile.daily_overage_limit == DEFAULT_DAILY_OVERAGE_LIMIT
+
+
+def test_billing_knobs_parsed_from_the_control_plane() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "billing_shape": "action_fixed",
+        "overage_enabled": True,
+        "daily_overage_limit": 3,
+    })
+
+    assert profile.billing_shape == BILLING_SHAPE_ACTION_FIXED
+    assert profile.uses_action_pricing is True
+    assert profile.overage_enabled is True
+    assert profile.daily_overage_limit == 3
+
+
+def test_unknown_billing_shape_falls_back_instead_of_passing_through() -> None:
+    """An undefined third shape has no behaviour; charging must not guess."""
+    profile = AccountRuntimeProfile.from_control_plane_payload(
+        "plus", {"billing_shape": "per_vibe"},
+    )
+
+    assert profile.billing_shape == BILLING_SHAPE_TOKEN_FLOATING
+    assert profile.uses_action_pricing is False
+
+
+def test_invalid_overage_knobs_fall_back_to_the_safe_defaults() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "overage_enabled": "yes",
+        "daily_overage_limit": -1,
+    })
+
+    assert profile.overage_enabled is False
+    assert profile.daily_overage_limit == DEFAULT_DAILY_OVERAGE_LIMIT
+
+
+def test_demo_profile_is_not_action_priced() -> None:
+    assert DEMO_ACCOUNT_RUNTIME_PROFILE.uses_action_pricing is False
+    assert DEMO_ACCOUNT_RUNTIME_PROFILE.overage_enabled is False

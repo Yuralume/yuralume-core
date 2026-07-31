@@ -18,6 +18,21 @@ Design:
 - Salience is derived from ``busy_score`` with a small floor so even
   very idle blocks ("睡覺") are still remembered — they carry
   relational value even if they're not exciting.
+- An activity carrying an operator commitment is *not* a record of a
+  shared experience (CF4). The planner writes it as a plan ("與木木一起
+  前往先前約定的刨冰店"), and turning that plan into a memory verbatim is
+  how the system came to "remember" an outing the user never agreed to
+  and never attended. Such activities are memorialised only through the
+  aftermath model's own account of what happened, written under the
+  structured evidence in
+  :mod:`kokoro_link.domain.services.shared_activity_evidence`; with no
+  such account, nothing is written.
+- Because of that, ``memorialized`` means only "this run considered the
+  block" — the idempotency latch. Whether a memory actually exists is
+  ``has_memory``, and CF3's expiry sweep
+  (:func:`kokoro_link.domain.entities.schedule.expire_operator_commitment`)
+  reads that flag, not the latch: a shared plan latched with no memory is
+  still an appointment that has to lapse.
 """
 
 from __future__ import annotations
@@ -38,10 +53,11 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.entities.schedule import (
     DailySchedule,
-    OPERATOR_CONFIRMED_SHARED_ROLE,
-    OPERATOR_INVITE_PENDING_ROLE,
-    OPERATOR_WISH_ROLE,
     ScheduleActivity,
+)
+from kokoro_link.domain.services.shared_activity_evidence import (
+    SharedActivityEvidence,
+    derive_shared_activity_evidence,
 )
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
@@ -128,16 +144,22 @@ class ScheduleMemorializer:
             await self._mark_memorialized(encounter_completed)
             return 0
 
-        memory_completed: list[tuple[DailySchedule, ScheduleActivity]] = []
-        for schedule, activity in generic_completed:
-            operator_role = _operator_involvement_role(activity)
-            if operator_role in {OPERATOR_INVITE_PENDING_ROLE, OPERATOR_WISH_ROLE}:
-                continue
-            memory_completed.append((schedule, activity))
-
-        if not memory_completed:
-            await self._mark_memorialized(completed)
-            return 0
+        # CF4: read the operator's involvement off structured data before
+        # anything is written. ``last_active_at`` is the one interaction
+        # fact reachable here — the same cross-source "user last spoke"
+        # instant proactive idle-computation and the feed's silence
+        # collector use. Without a character we know nothing, which is
+        # emphatically not the same as knowing they were absent.
+        evidences: dict[str, SharedActivityEvidence] = {
+            activity.id: derive_shared_activity_evidence(
+                activity,
+                last_active_at=(
+                    character.state.last_active_at if character else None
+                ),
+                interaction_history_known=character is not None,
+            )
+            for _, activity in generic_completed
+        }
 
         # Aftermath is per-activity but the character entity is shared,
         # so we load it once. Empty mapping (no port / no character / no
@@ -145,9 +167,41 @@ class ScheduleMemorializer:
         # bare-content memory below.
         aftermaths = await self._collect_aftermaths(
             character_id=character_id,
-            activities=[activity for _, activity in memory_completed],
+            activities=[activity for _, activity in generic_completed],
             character=character,
+            evidences=evidences,
         )
+
+        # The CF3 guard, generalised. Its rule was "an activity the
+        # operator never agreed to must never become a 'we did it
+        # together' memory"; it enforced that by writing no memory at
+        # all, because the only text available was the planner's
+        # description — and that description ("與木木一起前往先前約定的
+        # 刨冰店") is a *plan*, not a record of what happened.
+        #
+        # The honest memory is now reachable: when the aftermath model
+        # returns a ``factual_summary`` written under the evidence, that
+        # line becomes the memory body and the activity is memorialised
+        # truthfully ("本來想約他一起，最後自己去了") — which is also how
+        # an expired invite gets a natural closing (P4c). With no such
+        # line (no port, fake provider, model declined) we fall back to
+        # exactly CF3's behaviour: no memory. The unproven plan text is
+        # never the fallback.
+        memory_completed: list[tuple[DailySchedule, ScheduleActivity]] = []
+        for schedule, activity in generic_completed:
+            evidence = evidences[activity.id]
+            aftermath = aftermaths.get(activity.id)
+            if (
+                evidence.involves_operator
+                and not evidence.may_claim_shared_completion
+                and (aftermath is None or not aftermath.factual_summary.strip())
+            ):
+                continue
+            memory_completed.append((schedule, activity))
+
+        if not memory_completed:
+            await self._mark_memorialized(completed)
+            return 0
 
         # Player-visible memory content follows the operator's content
         # language (plan #14): weekday label + location/companion wrappers
@@ -163,6 +217,7 @@ class ScheduleMemorializer:
                     local_tz=local_tz,
                     aftermath=aftermaths.get(activity.id, ActivityAftermath()),
                     language=language,
+                    evidence=evidences[activity.id],
                 ),
             )
             for _, activity in memory_completed
@@ -267,6 +322,7 @@ class ScheduleMemorializer:
         character_id: str,
         activities: list[ScheduleActivity],
         character: Character | None = None,
+        evidences: dict[str, SharedActivityEvidence] | None = None,
     ) -> dict[str, ActivityAftermath]:
         """Run the aftermath port over each completed activity.
 
@@ -290,6 +346,7 @@ class ScheduleMemorializer:
                 character=character,
                 activity=activity,
                 operator_primary_language=operator_language,
+                evidence=(evidences or {}).get(activity.id),
             )
             if aftermath is not None and not aftermath.is_empty:
                 results[activity.id] = aftermath
@@ -301,6 +358,7 @@ class ScheduleMemorializer:
         character: Character,
         activity: ScheduleActivity,
         operator_primary_language: str = "zh-TW",
+        evidence: SharedActivityEvidence | None = None,
     ) -> ActivityAftermath | None:
         """Fail-soft single-activity wrapper around the port."""
         if self._aftermath_port is None:
@@ -310,6 +368,7 @@ class ScheduleMemorializer:
                 character=character,
                 activity=activity,
                 operator_primary_language=operator_primary_language,
+                evidence=evidence,
             )
         except Exception:
             _LOGGER.exception(
@@ -362,6 +421,7 @@ def _activity_to_memory(
     local_tz: tzinfo,
     aftermath: ActivityAftermath | None = None,
     language: str = "zh-TW",
+    evidence: SharedActivityEvidence | None = None,
 ) -> MemoryItem:
     local_start = activity.start_at.astimezone(local_tz)
     local_end = activity.end_at.astimezone(local_tz)
@@ -387,7 +447,20 @@ def _activity_to_memory(
         )
         if companion_names else ""
     )
-    semantic_part = f"{location_part}{activity.description}{companions_part}"
+    # CF4: for an operator-involved activity the model's factual line
+    # *replaces* the planned description and its wrappers — it already
+    # states where and with whom (it was given both), and stapling a
+    # "（和 X 一起）" companion suffix onto "最後自己去了" would
+    # reintroduce the false claim through the back door.
+    factual_body = (
+        (aftermath.factual_summary.strip() if aftermath is not None else "")
+        if evidence is not None and evidence.involves_operator
+        else ""
+    )
+    semantic_part = (
+        factual_body
+        or f"{location_part}{activity.description}{companions_part}"
+    )
     content = localized_fallback_text(
         "memory.schedule_content", language,
         body=semantic_part,
@@ -443,16 +516,3 @@ def _activity_to_memory(
 
 def _is_encounter_activity(activity: ScheduleActivity) -> bool:
     return any(ref.role == "encounter_partner" for ref in activity.participant_refs)
-
-
-def _operator_involvement_role(activity: ScheduleActivity) -> str | None:
-    for ref in activity.participant_refs:
-        if ref.actor_kind != "operator":
-            continue
-        if ref.role in {
-            OPERATOR_CONFIRMED_SHARED_ROLE,
-            OPERATOR_INVITE_PENDING_ROLE,
-            OPERATOR_WISH_ROLE,
-        }:
-            return ref.role
-    return None

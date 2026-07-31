@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,12 @@ class _FakeGatewayClient:
         self.release = asyncio.Event()
         self.tokens: list[str] = []
 
-    async def connect(self, *, bot_token, on_message_create):  # noqa: ANN001
+    async def connect(
+        self, *, bot_token, on_message_create, on_ready=None,
+    ):  # noqa: ANN001
         self.tokens.append(bot_token)
+        if on_ready is not None:
+            await on_ready()
         await on_message_create(self.message, "bot-user")
         self.connected.set()
         await self.release.wait()
@@ -129,3 +134,146 @@ async def test_busy_conversation_does_not_tear_down_the_gateway() -> None:
 
     gateway.release.set()
     await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_attachment_owner_lookup_failure_does_not_store_or_dispatch(
+    tmp_path: Path,
+) -> None:
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_discord_account(
+        harness,
+        character_id=character.id,
+        bot_token="DISCORD-TOKEN",
+    )
+    await harness.character_repository.delete(character.id)
+    downloaded_for: list[str] = []
+
+    async def _record_download(**kwargs) -> str:
+        downloaded_for.append(kwargs["user_id"])
+        return "/should-not-exist.png"
+
+    service = DiscordGatewayService(
+        account_repository=harness.account_repository,
+        character_repository=harness.character_repository,
+        dispatcher=harness.dispatcher,
+        gateway_client=_FakeGatewayClient({}),
+        message_parser=parse_message_create,
+        attachment_downloader=_record_download,
+        uploads_dir=tmp_path,
+    )
+    parsed = parse_message_create(
+        {
+            "id": "message-media",
+            "channel_id": "channel-1",
+            "content": "photo",
+            "author": {"id": "user-1"},
+            "attachments": [{"url": "https://cdn.test/photo.png"}],
+        },
+        bot_user_id="bot-user",
+    )
+    assert parsed is not None
+
+    with pytest.raises(RuntimeError, match="media owner unavailable"):
+        await service._build_inbound(account, parsed)
+
+    assert downloaded_for == []
+    assert harness.discord_adapter.sent == []
+    assert await harness.binding_repository.find(account.id, "channel-1") is None
+
+
+@pytest.mark.asyncio
+async def test_media_owner_failure_drops_one_message_without_tearing_gateway(
+    tmp_path: Path,
+) -> None:
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_discord_account(
+        harness,
+        character_id=character.id,
+        bot_token="DISCORD-TOKEN",
+    )
+    await harness.character_repository.delete(character.id)
+    downloads = 0
+
+    async def _record_download(**_kwargs) -> str:
+        nonlocal downloads
+        downloads += 1
+        return "/should-not-exist.png"
+
+    gateway = _FakeGatewayClient(
+        {
+            "id": "message-media",
+            "channel_id": "channel-1",
+            "content": "photo",
+            "author": {"id": "user-1"},
+            "attachments": [{"url": "https://cdn.test/photo.png"}],
+        },
+    )
+    service = DiscordGatewayService(
+        account_repository=harness.account_repository,
+        character_repository=harness.character_repository,
+        dispatcher=harness.dispatcher,
+        gateway_client=gateway,
+        message_parser=parse_message_create,
+        attachment_downloader=_record_download,
+        uploads_dir=tmp_path,
+        owner_id="worker-1",
+        sync_interval_seconds=999,
+    )
+
+    await service.sync_once()
+    # Set only after the message callback returned: the socket stayed alive.
+    await asyncio.wait_for(gateway.connected.wait(), timeout=1)
+
+    assert downloads == 0
+    assert harness.discord_adapter.sent == []
+    assert await harness.binding_repository.find(account.id, "channel-1") is None
+    stored = await harness.account_repository.get(account.id)
+    assert stored.polling_last_error == "Inbound media owner unavailable"
+
+    gateway.release.set()
+    await service.stop()
+
+
+class _DiscordFailsBeforeReady:
+    async def connect(
+        self, *, bot_token, on_message_create, on_ready=None,
+    ):  # noqa: ANN001
+        _ = (bot_token, on_message_create, on_ready)
+        raise RuntimeError("handshake failed")
+
+
+@pytest.mark.asyncio
+async def test_gateway_health_is_not_refreshed_before_ready() -> None:
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_discord_account(
+        harness,
+        character_id=character.id,
+        bot_token="DISCORD-TOKEN",
+    )
+    locked = await harness.account_repository.try_acquire_gateway_lock(
+        account.id,
+        owner_id="worker-1",
+        now=datetime.now(timezone.utc),
+        ttl=timedelta(seconds=90),
+    )
+    assert locked is not None
+    service = DiscordGatewayService(
+        account_repository=harness.account_repository,
+        character_repository=harness.character_repository,
+        dispatcher=harness.dispatcher,
+        gateway_client=_DiscordFailsBeforeReady(),
+        message_parser=parse_message_create,
+        attachment_downloader=_download_attachment,
+        uploads_dir=Path("."),
+        owner_id="worker-1",
+    )
+
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        await service._connect_locked_account(locked)
+
+    stored = await harness.account_repository.get(account.id)
+    assert stored.polling_last_update_at is None

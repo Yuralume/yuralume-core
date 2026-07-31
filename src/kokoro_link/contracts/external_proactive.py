@@ -38,6 +38,14 @@ ENVELOPE_KIND_SYSTEM = "system"
 _ENVELOPE_KINDS = frozenset({ENVELOPE_KIND_PROACTIVE, ENVELOPE_KIND_SYSTEM})
 
 
+class ExternalProactiveTransientError(Exception):
+    """Typed retryable transport failure; the ledger row stays pending."""
+
+
+class ExternalProactiveConfigurationError(Exception):
+    """Non-retryable delivery wiring/configuration failure."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProactiveSegment:
     """One display bubble of a proactive message (OpenAPI ``segments[].text``)."""

@@ -21,6 +21,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.date_context import (
+    render_story_date_context_block,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -255,6 +258,14 @@ def _build_prompt(context: StoryBeatSceneContext) -> str:
         speaking_style=context.character.speaking_style or "自然",
         world_frame=context.character.world_frame or "modern",
         today=context.today.isoformat(),
+        # CF1b: the narrative is persisted and re-read days later, so the
+        # template forbids bare relative time words — this table is the
+        # arithmetic the model needs to obey that.
+        date_context_block=render_story_date_context_block(
+            context.today,
+            language_tag=context.operator_primary_language,
+            include_today_line=False,
+        ),
         arc_title=arc.title,
         arc_premise=arc.premise,
         arc_tone=arc.tone,

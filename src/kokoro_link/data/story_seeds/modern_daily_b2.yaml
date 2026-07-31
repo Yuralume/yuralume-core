@@ -1,0 +1,292 @@
+# Modern daily seeds — batch 2 (culture-neutral urban life).
+#
+# Contemporary city living without region-specific artifacts: shared
+# apartments, late offices, corner shops, laundromats, elevators.
+# All seeds are low-stakes daily micro-events the expander can close
+# in 2-3 sentences; hooks stay open (no names, no endings).
+pack_id: modern_daily_b2
+language: zh-TW
+
+seeds:
+  # --- 微酸吃醋 -----------------------------------------------------
+  - external_id: mdb2:heart:001
+    seed_text: 發現只屬於兩個人的老梗被對方拿去跟別人用，心裡莫名不是滋味
+    tags: [jealousy, inside-joke, introspective]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: mdb2:heart:002
+    seed_text: 從別人口中才輾轉聽說在意的人的近況，那句「咦你不知道嗎」聽得心裡有點悶
+    tags: [jealousy, left-out, introspective]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- 損友日常 -----------------------------------------------------
+  - external_id: mdb2:friend:001
+    seed_text: 朋友隨口幫自己取了個蠢綽號，抗議無效，現在連別人都跟著叫了
+    tags: [friendship, nickname, exasperated]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: mdb2:friend:002
+    seed_text: 跟朋友為了一件小事打了個賭，賭注只是一杯飲料，兩個人卻都認真得要命
+    tags: [friendship, bet, playful]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- 深夜時分 -----------------------------------------------------
+  - external_id: mdb2:night:001
+    seed_text: 夜深人靜時聽見隔壁傳來壓低音量的樂器練習聲，聽著聽著竟捨不得它停
+    tags: [night, music, gentle]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: mdb2:night:002
+    seed_text: 深夜聊天聊到一半突然安靜下來，那份沉默卻意外地自在
+    tags: [night, gentle, intimate]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: mdb2:night:003
+    seed_text: 睡不著索性出門夜間散步，發現城市安靜下來的樣子很陌生
+    tags: [night, outdoor, introspective]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- 合租屋簷下 ---------------------------------------------------
+  - external_id: mdb2:home:001
+    seed_text: 和作息完全錯開的室友靠冰箱上的便條紙交流，今天那張紙條上多了一個小塗鴉
+    tags: [roommate, notes, warm]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: mdb2:home:002
+    seed_text: 發現室友偷偷把自己最討厭的家務做完了，有點過意不去
+    tags: [roommate, gratitude, gentle]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: mdb2:home:003
+    seed_text: 半夜和室友合力圍捕一隻飛進屋裡的蟲，兩個人拿著掃把上演了半小時鬧劇
+    tags: [roommate, chaos, funny]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 加班社畜之夜 -------------------------------------------------
+  - external_id: mdb2:work:001
+    seed_text: 替請假的同事代了一天班，才發現對方平常默默扛的事比想像中多
+    tags: [work, appreciation, humbling]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: mdb2:work:002
+    seed_text: 趕完死線走出大樓，深夜的街道安靜得不太真實
+    tags: [work, night, relief]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Meet-cute ----------------------------------------------------
+  - external_id: mdb2:meet:001
+    seed_text: 被陌生人攔下來問路，憑印象熱心指了方向，事後越想越不確定是不是指錯了
+    tags: [stranger, worry, funny]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: mdb2:meet:002
+    seed_text: 迎面走來的陌生人和自己穿了幾乎一樣的衣服，擦肩那一刻兩人對看一眼同時憋笑
+    tags: [stranger, coincidence, funny]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: mdb2:meet:003
+    seed_text: 街上偶遇許久沒聯絡的老同學，聊了幾句卻一直想不起對方的名字
+    tags: [reunion, awkward, nostalgia]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 廚房翻車 -----------------------------------------------------
+  - external_id: mdb2:kitchen:001
+    seed_text: 照著食譜做點心卻一路失控，廚房一片狼藉，成品醜得讓人哭笑不得
+    tags: [baking, mishap, humor]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: mdb2:kitchen:002
+    seed_text: 照著記憶中的味道燉了一鍋湯，嚐起來總覺得差一味，卻怎麼也說不上少了什麼
+    tags: [cooking, nostalgia, bittersweet]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- 停電之夜 -----------------------------------------------------
+  - external_id: mdb2:outage:001
+    seed_text: 整區突然停電，點著蠟燭度過了一個意外安靜的夜晚
+    tags: [outage, night, cozy]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: mdb2:outage:002
+    seed_text: 停電了一整晚，來電的瞬間聽見整棟樓此起彼落的歡呼，忍不住跟著笑出來
+    tags: [outage, community, joyful]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- 撿到毛孩 -----------------------------------------------------
+  - external_id: mdb2:pet:001
+    seed_text: 路上被一隻散步中的狗熱情撲了滿懷，飼主連聲道歉，自己卻笑得很開心
+    tags: [animal, funny, warm]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 120
+
+  - external_id: mdb2:pet:002
+    seed_text: 圍觀一隻卡在窗台上進退兩難的貓，眾人比牠還緊張，最後牠自己優雅跳下來揚長而去
+    tags: [animal, funny, anticlimax]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 120
+
+  # --- 小店常客日常 -------------------------------------------------
+  - external_id: mdb2:shop:001
+    seed_text: 常去的小店裡，熟客們你一言我一語地交換著各自的小煩惱
+    tags: [regulars, community, cozy]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: mdb2:shop:002
+    seed_text: 常光顧的店換了新菜單，老客人們各有意見地議論了起來
+    tags: [regulars, change, community]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 鄰里往來 -----------------------------------------------------
+  - external_id: mdb2:neighbor:001
+    seed_text: 隔壁搬來了新鄰居，這幾天隔著門互相點頭致意好幾次，卻還不知道對方的名字
+    tags: [neighbor, new, tentative]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: mdb2:neighbor:002
+    seed_text: 收到鄰居送來的一盒自製點心，開始煩惱該回什麼禮才好
+    tags: [neighbor, gratitude, thoughtful]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: mdb2:neighbor:003
+    seed_text: 電梯裡被鄰居的小孩問了一個天真卻答不上來的問題
+    tags: [neighbor, humor, disarming]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 街頭與週末 ---------------------------------------------------
+  - external_id: mdb2:out:001
+    seed_text: 在自助洗衣店等衣服烘乾，和陌生人有一搭沒一搭地閒聊
+    tags: [errand, social, mundane]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: mdb2:out:002
+    seed_text: 週末市集買了一盆小植物，一路小心翼翼地捧回家
+    tags: [weekend, gentle, small-joy]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: mdb2:out:003
+    seed_text: 和朋友約好一起晨跑，結果兩個人都遲到，索性改成吃早餐
+    tags: [friendship, humor, morning]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  # --- 小小的發現 ---------------------------------------------------
+  - external_id: mdb2:found:001
+    seed_text: 舊外套口袋裡摸出一張忘了是誰給的紙條
+    tags: [discovery, nostalgia, mystery]
+    world_frames: [modern]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90

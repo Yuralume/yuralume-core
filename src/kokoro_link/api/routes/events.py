@@ -141,7 +141,8 @@ async def replay_frames(
     ``replayed_ids`` so the caller's live loop can de-dupe the replay/live
     boundary. Reads the out-of-order overlap tail (``read_after``) and de-dupes
     it by id within the replay itself. Fail-soft: any read/rehydrate error is
-    logged and skipped, never raised into the stream.
+    logged and never raised into the stream. A transient id is not added to
+    ``replayed_ids``, so the later live-dispatch retry remains deliverable.
     """
     try:
         rows = await outbox.read_after(
@@ -153,12 +154,12 @@ async def replay_frames(
     for stored in rows:
         if stored.id in replayed_ids:
             continue
-        replayed_ids.add(stored.id)
         try:
             event = await rehydrator.rehydrate(stored)
         except Exception:
             _LOGGER.exception("SSE replay rehydrate failed id=%s", stored.id)
             continue
+        replayed_ids.add(stored.id)
         if event is None:
             continue
         if not await is_owned(getattr(event, "character_id", None)):
@@ -194,6 +195,13 @@ async def events_stream(
     realtime_outbox = getattr(container, "realtime_outbox", None)
     realtime_rehydrator = getattr(container, "realtime_rehydrator", None)
     resume_from = _parse_last_event_id(last_event_id)
+
+    # GD1-A. An SSE connection is in-flight work as far as uvicorn's graceful
+    # shutdown is concerned, so a replica that does not close its streams burns
+    # the whole ``stop_grace_period`` on idle sockets and is SIGKILLed anyway —
+    # the api role's share of the GD0 grace only lands once these close. ``None``
+    # on hand-built containers, where the loop below is byte-identical to before.
+    drain_state = getattr(container, "drain_state", None)
 
     async def _is_owned(character_id: str | None) -> bool:
         """Server-side gate: only forward events whose character is
@@ -253,11 +261,26 @@ async def events_stream(
                 while True:
                     if await request.is_disconnected():
                         return
+                    # Drain requested before this connection even reached the
+                    # loop (router already moved on): close now rather than hold
+                    # a socket the deploy is waiting on.
+                    if drain_state is not None and drain_state.draining:
+                        return
                     waiters: list[asyncio.Task] = [
                         asyncio.create_task(proactive_queue.get()),
                     ]
                     if feed_queue is not None:
                         waiters.append(asyncio.create_task(feed_queue.get()))
+                    # Woken by the drain endpoint, so the close happens in
+                    # milliseconds instead of on the next 15s heartbeat. The
+                    # deploy's 180s budget is for finishing *turns*, not for
+                    # waiting out an idle stream's tick.
+                    drain_waiter: asyncio.Task | None = None
+                    if drain_state is not None:
+                        drain_waiter = asyncio.create_task(
+                            drain_state.wait_draining(),
+                        )
+                        waiters.append(drain_waiter)
                     try:
                         done, pending = await asyncio.wait(
                             waiters,
@@ -273,7 +296,12 @@ async def events_stream(
                     if not done:
                         yield ": ping\n\n"
                         continue
+                    draining_now = (
+                        drain_waiter is not None and drain_waiter in done
+                    )
                     for task in done:
+                        if task is drain_waiter:
+                            continue
                         try:
                             event = task.result()
                         except asyncio.CancelledError:
@@ -303,6 +331,16 @@ async def events_stream(
                             _LOGGER.exception(
                                 "failed to encode SSE event",
                             )
+                    if draining_now:
+                        # Plain ``return``: the generator finishes, the
+                        # subscriptions unwind through their context managers,
+                        # and the client sees a clean end-of-stream. Raising
+                        # here would surface as a broken connection and cost the
+                        # browser its ``EventSource`` backoff before it retries.
+                        # Anything that was ready this tick has already been
+                        # flushed above, and under the postgres backend the
+                        # reconnect replays from ``Last-Event-ID`` anyway.
+                        return
 
     return StreamingResponse(
         event_generator(),

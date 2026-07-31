@@ -30,6 +30,12 @@ from kokoro_link.application.dto.fusion_story import (
     FusionStorySummaryResponse,
     IterateBeatRequest,
     IterateOutlineRequest,
+    PolishFusionStoryRequest,
+)
+from kokoro_link.contracts.cloud_action_billing import (
+    ACTION_FUSION_STORY,
+    ACTION_FUSION_STORY_ITERATE,
+    client_quoted_price_scope,
 )
 from kokoro_link.api.routes.arc_template_intake import TemplateDraftPayload
 from kokoro_link.application.services.fusion_story_service import (
@@ -124,15 +130,23 @@ async def create_fusion_story(
         container, payload.character_ids, current_user_id,
     )
     try:
-        story = await service.create(
-            character_ids=payload.character_ids,
-            prompt=payload.prompt,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container,
-                current_user_id,
-            ),
-            user_id=current_user_id,
-        )
+        # The fixed-price charge is raised inside ``create``, before the 202,
+        # so both billing refusals reach the player synchronously: 402 to top
+        # up, 409 when the price moved under their open Studio tab.
+        with insufficient_credits_guard(), client_quoted_price_scope(
+            {ACTION_FUSION_STORY: payload.quoted_price_cr},
+        ):
+            story = await service.create(
+                character_ids=payload.character_ids,
+                prompt=payload.prompt,
+                operator_primary_language=(
+                    await _resolve_operator_primary_language(
+                        container,
+                        current_user_id,
+                    )
+                ),
+                user_id=current_user_id,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
@@ -344,15 +358,20 @@ async def iterate_outline(
     await _ensure_story_owned(container, story_id, current_user_id)
     service = _require_service(container)
     try:
-        story = await service.iterate_outline(
-            story_id,
-            hint=payload.hint,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container,
-                current_user_id,
-            ),
-            user_id=current_user_id,
-        )
+        with insufficient_credits_guard(), client_quoted_price_scope(
+            {ACTION_FUSION_STORY_ITERATE: payload.quoted_price_cr},
+        ):
+            story = await service.iterate_outline(
+                story_id,
+                hint=payload.hint,
+                operator_primary_language=(
+                    await _resolve_operator_primary_language(
+                        container,
+                        current_user_id,
+                    )
+                ),
+                user_id=current_user_id,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc),
@@ -374,16 +393,21 @@ async def iterate_beat(
     await _ensure_story_owned(container, story_id, current_user_id)
     service = _require_service(container)
     try:
-        story = await service.iterate_beat(
-            story_id,
-            beat_index=payload.beat_index,
-            hint=payload.hint,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container,
-                current_user_id,
-            ),
-            user_id=current_user_id,
-        )
+        with insufficient_credits_guard(), client_quoted_price_scope(
+            {ACTION_FUSION_STORY_ITERATE: payload.quoted_price_cr},
+        ):
+            story = await service.iterate_beat(
+                story_id,
+                beat_index=payload.beat_index,
+                hint=payload.hint,
+                operator_primary_language=(
+                    await _resolve_operator_primary_language(
+                        container,
+                        current_user_id,
+                    )
+                ),
+                user_id=current_user_id,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc),
@@ -398,20 +422,30 @@ async def iterate_beat(
 )
 async def polish_fusion_story(
     story_id: str,
+    payload: PolishFusionStoryRequest | None = None,
     container: ServiceContainer = Depends(get_container),
     current_user_id: str = Depends(get_current_user_id),
 ) -> FusionStoryResponse:
     await _ensure_story_owned(container, story_id, current_user_id)
     service = _require_service(container)
     try:
-        story = await service.iterate_polish(
-            story_id,
-            operator_primary_language=await _resolve_operator_primary_language(
-                container,
-                current_user_id,
-            ),
-            user_id=current_user_id,
-        )
+        with insufficient_credits_guard(), client_quoted_price_scope(
+            {
+                ACTION_FUSION_STORY_ITERATE: (
+                    payload.quoted_price_cr if payload else None
+                ),
+            },
+        ):
+            story = await service.iterate_polish(
+                story_id,
+                operator_primary_language=(
+                    await _resolve_operator_primary_language(
+                        container,
+                        current_user_id,
+                    )
+                ),
+                user_id=current_user_id,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc),

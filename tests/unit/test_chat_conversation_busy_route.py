@@ -18,6 +18,7 @@ from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
 )
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
+from kokoro_link.contracts.cloud_gateway import CloudGatewayRequestTooLargeError
 
 _CONVERSATION_ID = "conv-1"
 _CHARACTER_ID = "char-1"
@@ -42,6 +43,20 @@ class _RuntimeLimitedChatService:
 
     async def send_message_stream(self, payload, **_kwargs):  # noqa: ANN001
         raise ChatRuntimeLimitExceeded("session message limit reached")
+
+
+class _OversizeChatService:
+    async def send_message(self, payload, **_kwargs):  # noqa: ANN001
+        raise CloudGatewayRequestTooLargeError(
+            actual_bytes=229_377,
+            max_bytes=229_376,
+        )
+
+    async def send_message_stream(self, payload, **_kwargs):  # noqa: ANN001
+        raise CloudGatewayRequestTooLargeError(
+            actual_bytes=229_377,
+            max_bytes=229_376,
+        )
 
 
 def _client(chat_service) -> TestClient:  # noqa: ANN001
@@ -80,6 +95,27 @@ def test_conversation_busy_maps_to_409_with_structured_code(path: str) -> None:
     detail = response.json()["detail"]
     assert detail["code"] == "conversation_busy"
     assert detail["conversation_id"] == _CONVERSATION_ID
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/chat/messages", "/api/v1/chat/messages/stream"],
+)
+def test_chat_payload_too_large_is_structured_non_retryable_413(
+    path: str,
+) -> None:
+    client = _client(_OversizeChatService())
+
+    response = client.post(path, json=_payload())
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "detail": {
+            "code": "payload_too_large",
+            "message": "LLM request exceeds the size limit",
+            "retryable": False,
+        },
+    }
 
 
 class _RecordingFinalizer:

@@ -1,0 +1,123 @@
+# School dramatic seeds — batch b1.
+#
+# Tension hooks for school-frame characters: classroom politics,
+# friendships under strain, secrets and countdowns. Each seed opens
+# a scene without deciding the player's reaction or the outcome.
+# The expander LLM adapts grade, club and campus details to the
+# character's own school life; no names, no IP, no endings.
+pack_id: school_dramatic_b1
+language: zh-TW
+
+seeds:
+  # --- Friendship under strain -------------------------------------
+  - external_id: sdr1:friend:001
+    seed_text: 最好的朋友突然變得客氣起來，那種禮貌的距離感比吵架還讓人心慌
+    tags: [friendship, distance, unease]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 60
+
+  - external_id: sdr1:isolate:002
+    seed_text: 發現自己不知不覺被小團體排除在外，午餐時間成了一天裡最難熬的時刻
+    tags: [isolation, loneliness, social]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 75
+
+  - external_id: sdr1:secret:003
+    seed_text: 不小心撞見了一場告白，被迫替當事人保守一個燙手的秘密
+    tags: [secret, awkward, dilemma]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 60
+
+  # --- Suspicion & injustice ---------------------------------------
+  - external_id: sdr1:accuse:004
+    seed_text: 成績突飛猛進反而被懷疑作弊，得在不撕破臉的前提下自證清白
+    tags: [injustice, pride, pressure]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 75
+
+  - external_id: sdr1:theft:005
+    seed_text: 班上的錢不見了，猜疑的目光開始在同學之間流轉
+    tags: [suspicion, tension, class]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.35
+    cooldown_days: 75
+
+  - external_id: sdr1:note:006
+    seed_text: 課桌裡的東西被人動過，還擺放得整整齊齊，反而比被翻亂更讓人發毛
+    tags: [mystery, uncanny, unease]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.3
+    cooldown_days: 90
+
+  # --- Classroom politics ------------------------------------------
+  - external_id: sdr1:transfer:007
+    seed_text: 學期中突然來了個轉學生，班上原有的平衡被打破，人人都想知道他的來歷
+    tags: [newcomer, curiosity, tension]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 120
+
+  - external_id: sdr1:election:008
+    seed_text: 看似平常的幹部改選底下暗潮洶湧，落選與當選都各有滋味
+    tags: [politics, rivalry, class]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdr1:teacher:009
+    seed_text: 在無人的角落撞見嚴厲老師意想不到的另一面，對他的認知開始動搖
+    tags: [discovery, teacher, perception-shift]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 60
+
+  # --- Pressure & expectation --------------------------------------
+  - external_id: sdr1:relay:010
+    seed_text: 被指派跑班際接力的最後一棒，全班的期待沉甸甸壓在肩上
+    tags: [pressure, sports, expectation]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.45
+    cooldown_days: 90
+
+  - external_id: sdr1:talk:011
+    seed_text: 被導師叫去談成績下滑，回座位的路上滿是同學欲言又止的眼神
+    tags: [pressure, embarrassment, academics]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 60
+
+  # --- Endings & farewells -----------------------------------------
+  - external_id: sdr1:countdown:012
+    seed_text: 畢業倒數的日子裡，每件事都成了最後一次，有些話再不說就來不及了
+    tags: [farewell, urgency, bittersweet]
+    world_frames: [school]
+    tier: dramatic
+    regions: [global]
+    weight: 0.4
+    cooldown_days: 120

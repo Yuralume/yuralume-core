@@ -46,6 +46,7 @@ from kokoro_link.contracts.post_turn import ScheduleAdjustment
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.schedule_planner import SchedulePlannerPort
 from kokoro_link.contracts.schedule_repository import ScheduleRepositoryPort
+from kokoro_link.contracts.story import StoryEventRepositoryPort
 from kokoro_link.domain.entities.behavioral_pattern import (
     KIND_RECURRING_ACTIVITY,
     KIND_TIME_PREFERENCE,
@@ -59,12 +60,22 @@ from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.schedule import (
     DailySchedule,
+    OPERATOR_ANY_INVOLVEMENT_ROLES,
     OPERATOR_INVITE_PENDING_ROLE,
     OPERATOR_INVOLVEMENT_ROLES,
     ScheduleActivity,
+    expire_operator_commitment,
+    has_expired_operator_commitment,
+    has_live_operator_commitment,
+)
+from kokoro_link.domain.services.recent_activity_digest import (
+    RecentDayActivities,
+    recent_activity_dates,
+    summarize_recent_day,
 )
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.entities.story_arc import StoryArcBeat
+from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_FRONTIER,
     sanitize_messages_for_tolerance,
@@ -120,6 +131,33 @@ _SECONDS_PER_DAY = 86400
 # current state — a rare slow path, never a wrong one.
 _PLAN_CLAIM_SLOTS = 16
 
+# CF3 — how many prior civil days the commitment-expiry sweep walks back.
+# A commitment that went stale further back than this is already invisible
+# to every read surface (the widest of them looks two days out), so the
+# window only has to be wide enough that a character who was not planned
+# for a couple of days still gets its dead invites marked. Three days also
+# matches the rolling generation window, keeping one mental model.
+_EXPIRY_LOOKBACK_DAYS = 3
+
+# Upper bound on how many expired commitments are surfaced to the planner
+# as "do not reschedule" facts. The point of the list is to stop the model
+# re-hatching a handful of recent dead invites, not to hand it a history
+# book — an unbounded list would grow the prompt without adding signal.
+_MAX_EXPIRED_COMMITMENT_FACTS = 6
+
+# SE1 — how far back the story-event inspiration window reaches. Anchored
+# on the day being planned (same rationale as the CF5 activity digest):
+# the rolling window pre-plans future days, and "近日" must mean the days
+# just before THAT day, so the window is [target - 7, target] inclusive —
+# pre-planning tomorrow still sees today's event.
+_STORY_EVENT_LOOKBACK_DAYS = 7
+# Bounded fetch for that window. ``list_recent`` walks (character_id,
+# date desc) with a LIMIT; a character accrues at most a couple of events
+# per civil day (one gacha roll + realized arc beats), so 24 rows covers
+# the 8-day window comfortably without an unbounded scan on this
+# background-hot slow path.
+_STORY_EVENT_FETCH_LIMIT = 24
+
 
 def _plan_claim_parts(character_id: str, target: date) -> tuple[str, str]:
     """Key parts identifying one (character, date) plan slot."""
@@ -152,6 +190,7 @@ class ScheduleService:
         calendar_context_port: CalendarContextPort | None = None,
         weather_context_port: WeatherContextPort | None = None,
         behavioral_pattern_repository: BehavioralPatternRepositoryPort | None = None,
+        story_event_repository: StoryEventRepositoryPort | None = None,
         relationship_seed_repository: (
             CharacterOperatorRelationshipSeedRepositoryPort | None
         ) = None,
@@ -204,6 +243,11 @@ class ScheduleService:
         # weekly recurrences so the LLM can decide whether to continue
         # them. Absent = legacy path, planner sees only today's facts.
         self._behavioral_patterns = behavioral_pattern_repository
+        # Optional story-event repo (SE1). When wired, plan_day receives
+        # the character's recent story events as inspiration facts so the
+        # planned day can pick up what the character just lived through.
+        # Absent = legacy path, planner behaviour unchanged.
+        self._story_event_repository = story_event_repository
         # Single-flight locks per (character_id, date) so concurrent
         # callers don't each fire ``plan_day`` when the row is still
         # missing. Common race: ``/schedule/current`` poll from the
@@ -314,9 +358,11 @@ class ScheduleService:
         local_tz = await self._resolve_operator_timezone(character)
         local_today = await self.today_for_character(character, now=now)
         target = date_ or local_today
-        # Fast path: schedule already exists with activities AND has
-        # been fully planned by the LLM → no need to acquire the
-        # plan-lock just to read. A row with activities but
+        # Fast path: schedule already exists and has been fully planned by
+        # the LLM → no need to acquire the plan-lock just to read. A valid
+        # structured response may contain zero activities; that is still a
+        # terminal result for this civil day and must not become an every-tick
+        # paid retry loop. A row with activities but
         # ``is_planned=False`` (a chat-extracted future-commitment
         # seed) still needs the planner to fold a full day around it,
         # so we fall through to the slow path below.
@@ -332,8 +378,8 @@ class ScheduleService:
             existing, target=target, local_today=local_today, local_tz=local_tz,
         ):
             return existing
-        # Slow path: row missing, empty, seed-only, or a stale current-day
-        # forecast. Serialise concurrent callers on a per-(character, date)
+        # Slow path: row missing, seed-only, or a stale current-day forecast.
+        # Serialise concurrent callers on a per-(character, date)
         # lock so only one plan_day fires per day even when chat send +
         # schedule-panel poll race.
         lock = self._plan_locks.setdefault((character.id, target), asyncio.Lock())
@@ -382,15 +428,22 @@ class ScheduleService:
             existing, target=target, local_today=local_today, local_tz=local_tz,
         ):
             return existing
-        # An existing-but-empty schedule is almost always the residue
-        # of a past planner failure (pre-fix: we used to persist empty
-        # on exception). Treat it as "please retry" rather than "this
-        # day is blank" so stuck characters self-heal on the next turn.
+        # CF3 — retire commitments whose civil day is gone before anything
+        # reads them. Doing it here (rather than on the hot read paths) keeps
+        # the cost on a call that is already paying for an LLM round-trip,
+        # and every character plans at least one day per civil day.
+        existing, expired_commitments = await self._expire_stale_commitments(
+            character.id,
+            target_row=existing,
+            local_today=local_today,
+            local_tz=local_tz,
+        )
         # ``pre_commitments`` carries activities that must survive the
         # plan_day call — chat-extracted seeds (e.g. "明天 7 點看電影")
         # and, on a stale-today re-plan, any promise to the operator —
         # so the planner is told to build the day *around* them, not
-        # overwrite them.
+        # overwrite them. Expired ones are filtered out at this input layer,
+        # so the planner never sees a dead invite framed as a live promise.
         pre_commitments = self._carry_forward_commitments(existing)
         summary = await self._summarize_recent_dialogue(character)
         today_beat, upcoming = await self._collect_arc_beats(
@@ -403,6 +456,12 @@ class ScheduleService:
         )
         recurring_patterns = await self._load_recurring_patterns(
             character.id,
+        )
+        recent_activities = await self._load_recent_activity_digest(
+            character.id, target=target,
+        )
+        recent_story_events = await self._load_recent_story_events(
+            character.id, target=target,
         )
         relationship_seed = await self._load_relationship_seed(character)
         operator_persona_lines = await self._load_operator_persona_lines(
@@ -429,25 +488,30 @@ class ScheduleService:
                     if relationship_seed is not None else "none"
                 ),
                 pre_committed_activities=pre_commitments,
+                expired_operator_commitments=expired_commitments,
+                recent_activity_digest=recent_activities,
+                recent_story_events=recent_story_events,
                 recurring_patterns=recurring_patterns,
                 operator_primary_language=_operator_language(operator),
             )
         except Exception:
-            # Don't persist on failure — if we saved an empty schedule,
-            # ``ensure_schedule`` would short-circuit on the next call
-            # and the character would be "activity-less" for the rest
-            # of the day. Return an ephemeral empty so the current
-            # prompt still renders, and let the next turn retry.
+            # Fail closed on cost for this civil day. Re-running from every
+            # chat/poll/tick turned one transient upstream failure into an
+            # unbounded paid loop. The explicit regenerate route remains the
+            # operator-controlled retry path.
             _LOGGER.exception(
                 "Schedule planning failed for character=%s; "
-                "returning ephemeral empty and will retry next turn",
+                "persisting a terminal empty day",
                 character.id,
             )
-            return DailySchedule.create(
+            schedule = DailySchedule.create(
                 character_id=character.id,
                 date_=target,
                 activities=[],
+                is_planned=True,
             )
+            await self._repository.save(schedule)
+            return schedule
         await self._repository.save(schedule)
         return schedule
 
@@ -528,12 +592,13 @@ class ScheduleService:
 
         A row with activities but ``is_planned=False`` is a chat-extracted
         future-commitment seed and still needs the planner to fold a full day
-        around it; a fully-planned *today* row generated on an earlier local
+        around it. A fully-planned empty row is a terminal structured result
+        for the day; retrying it from every caller is an unbounded cost loop.
+        A fully-planned *today* row generated on an earlier local
         day is a stale forecast (see :meth:`_is_stale_current_day_plan`).
         """
         return (
             existing is not None
-            and bool(existing.activities)
             and existing.is_planned
             and not self._is_stale_current_day_plan(
                 existing, target=target, local_today=local_today,
@@ -696,10 +761,26 @@ class ScheduleService:
         # existing row so a manual regenerate doesn't silently drop
         # them. Memorialised activities (the past) we always preserve.
         existing = await self._repository.get(character.id, target)
+        existing, expired_commitments = await self._expire_stale_commitments(
+            character.id,
+            target_row=existing,
+            local_today=local_today,
+            local_tz=local_tz,
+        )
         pre_commitments: tuple[ScheduleActivity, ...] = ()
         if existing is not None and not existing.is_planned:
-            pre_commitments = tuple(existing.activities)
+            pre_commitments = tuple(
+                activity
+                for activity in existing.activities
+                if not has_expired_operator_commitment(activity)
+            )
         recurring_patterns = await self._load_recurring_patterns(character.id)
+        recent_activities = await self._load_recent_activity_digest(
+            character.id, target=target,
+        )
+        recent_story_events = await self._load_recent_story_events(
+            character.id, target=target,
+        )
         relationship_seed = await self._load_relationship_seed(character)
         operator_persona_lines = await self._load_operator_persona_lines(
             character,
@@ -722,11 +803,168 @@ class ScheduleService:
                 if relationship_seed is not None else "none"
             ),
             pre_committed_activities=pre_commitments,
+            expired_operator_commitments=expired_commitments,
+            recent_activity_digest=recent_activities,
+            recent_story_events=recent_story_events,
             recurring_patterns=recurring_patterns,
             operator_primary_language=_operator_language(operator),
         )
         await self._repository.save(schedule)
         return schedule
+
+    # -- recent-day activity input (CF5) ---------------------------------- #
+
+    async def _load_recent_activity_digest(
+        self, character_id: str, *, target: date,
+    ) -> tuple[RecentDayActivities, ...]:
+        """What the character already did on the days before ``target``.
+
+        Anchored on the day **being planned**, not on wall-clock today.
+        The rolling window plans several days in one pass, and that pass
+        is where the observed defect lived: the same one-off activity
+        landed on three consecutive days because each was planned blind
+        to the others. Anchoring on ``target`` means day N+1 sees day N's
+        row, which ``ensure_window`` has just written.
+
+        Slow-path only — deliberately alongside the CF3 expiry sweep, on
+        a call that is already paying for an LLM round-trip. The ensure
+        fast path (an already-planned day) returns before reaching here
+        and keeps its single repository read.
+
+        A day that fails to load is skipped, not fatal: a partly-informed
+        planner is strictly better than no plan at all, and the same
+        degradation rule the expiry sweep uses.
+        """
+        digest: list[RecentDayActivities] = []
+        for past_date in recent_activity_dates(target):
+            try:
+                schedule = await self._repository.get(character_id, past_date)
+            except Exception:
+                _LOGGER.exception(
+                    "recent activity digest: load failed character=%s date=%s",
+                    character_id, past_date,
+                )
+                continue
+            day = summarize_recent_day(schedule)
+            if day is not None:
+                digest.append(day)
+        return tuple(digest)
+
+    # -- recent story events input (SE1) ----------------------------------- #
+
+    async def _load_recent_story_events(
+        self, character_id: str, *, target: date,
+    ) -> tuple[StoryEvent, ...]:
+        """Story events for the civil days around ``target``, oldest first.
+
+        The planner's third freshness input (alongside the activity digest
+        and the recurring patterns): what recently *happened to* the
+        character. Window is ``[target - _STORY_EVENT_LOOKBACK_DAYS,
+        target]`` inclusive — anchored on the day being planned for the
+        same reason the CF5 digest is, so pre-planning tomorrow still
+        sees today's event.
+
+        Slow-path only, same as the digest: the ensure fast path returns
+        before reaching here. Everything degrades to "no events": an
+        unwired repository, a failing query, and a row whose stored date
+        string doesn't parse are all skipped rather than fatal — a
+        partly-informed planner beats no plan, and this input is
+        inspiration, never a dependency.
+        """
+        repository = self._story_event_repository
+        if repository is None:
+            return ()
+        try:
+            recent = await repository.list_recent(
+                character_id, limit=_STORY_EVENT_FETCH_LIMIT,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "recent story events: load failed character=%s", character_id,
+            )
+            return ()
+        window_start = target - timedelta(days=_STORY_EVENT_LOOKBACK_DAYS)
+        in_window: list[tuple[date, datetime, StoryEvent]] = []
+        for event in recent:
+            try:
+                event_date = date.fromisoformat(event.date.strip())
+            except ValueError:
+                continue
+            if window_start <= event_date <= target:
+                in_window.append((event_date, event.created_at, event))
+        in_window.sort(key=lambda entry: (entry[0], entry[1]))
+        return tuple(event for _, _, event in in_window)
+
+    # -- commitment expiry sweep (CF3) ------------------------------------ #
+
+    async def _expire_stale_commitments(
+        self,
+        character_id: str,
+        *,
+        target_row: DailySchedule | None,
+        local_today: date,
+        local_tz: tzinfo,
+    ) -> tuple[DailySchedule | None, tuple[ScheduleActivity, ...]]:
+        """Retire operator commitments whose civil day has already passed.
+
+        Walks the row being planned plus the last :data:`_EXPIRY_LOOKBACK_DAYS`
+        civil days, moving every past-dated ``operator_invite_pending`` to
+        ``operator_invite_expired`` and every past-dated
+        ``operator_confirmed_shared`` that never produced a memory to
+        ``operator_confirmed_lapsed``.
+
+        Returns ``(target_row_after_sweep, expired_facts)``. The target row is
+        handed back rather than persisted — the caller is about to replace it
+        with a fresh plan anyway — while prior days *are* written back so the
+        terminal state is durable for every later reader. ``expired_facts`` is
+        the recent-history list the planner is told never to reschedule.
+
+        Purely date arithmetic over structured role values: no user-visible
+        text is inspected or rewritten.
+        """
+        day_start = datetime.combine(
+            local_today, time.min, tzinfo=local_tz,
+        ).astimezone(timezone.utc)
+        expired: list[ScheduleActivity] = []
+
+        swept_target = target_row
+        if target_row is not None:
+            updated, target_expired = _expire_past_commitments(
+                target_row, day_start=day_start,
+            )
+            swept_target = updated if updated is not None else target_row
+            expired.extend(target_expired)
+
+        for offset in range(1, _EXPIRY_LOOKBACK_DAYS + 1):
+            past_date = local_today - timedelta(days=offset)
+            if target_row is not None and past_date == target_row.date:
+                continue  # already swept above
+            try:
+                schedule = await self._repository.get(character_id, past_date)
+            except Exception:
+                _LOGGER.exception(
+                    "commitment expiry sweep: load failed character=%s date=%s",
+                    character_id, past_date,
+                )
+                continue
+            if schedule is None:
+                continue
+            updated, past_expired = _expire_past_commitments(
+                schedule, day_start=day_start,
+            )
+            expired.extend(past_expired)
+            if updated is None:
+                continue
+            try:
+                await self._repository.save(updated)
+            except Exception:
+                _LOGGER.exception(
+                    "commitment expiry sweep: save failed character=%s date=%s",
+                    character_id, past_date,
+                )
+
+        expired.sort(key=lambda activity: activity.start_at)
+        return swept_target, tuple(expired[-_MAX_EXPIRED_COMMITMENT_FACTS:])
 
     async def _resolve_operator_language(self, character) -> str:  # noqa: ANN001
         """Resolve character owner's pinned ``primary_language``; falls
@@ -935,15 +1173,24 @@ class ScheduleService:
           refresh never silently drops "明天 7 點看電影" or a pending
           invite. Memorialised history is excluded by construction — the
           re-plan only runs while nothing has been memorialised.
+
+        Expired / lapsed commitments (CF3) are dropped from both branches:
+        a promise whose day came and went is no longer something the next
+        plan has to honour, and carrying it forward is exactly how a dead
+        invite kept resurfacing as a live future plan.
         """
         if existing is None or not existing.activities:
             return ()
         if not existing.is_planned:
-            return tuple(existing.activities)
+            return tuple(
+                activity
+                for activity in existing.activities
+                if not has_expired_operator_commitment(activity)
+            )
         return tuple(
             activity
             for activity in existing.activities
-            if _has_operator_commitment(activity)
+            if has_live_operator_commitment(activity)
         )
 
     async def _load_recurring_patterns(
@@ -1469,18 +1716,37 @@ def _is_encounter_activity(activity: ScheduleActivity) -> bool:
     return any(ref.role == "encounter_partner" for ref in activity.participant_refs)
 
 
-def _has_operator_commitment(activity: ScheduleActivity) -> bool:
-    """``True`` when the activity encodes a promise to / plan with the
-    operator (a pending invite, a wish, or a confirmed shared plan).
+def _expire_past_commitments(
+    schedule: DailySchedule,
+    *,
+    day_start: datetime,
+) -> tuple[DailySchedule | None, tuple[ScheduleActivity, ...]]:
+    """Sweep one day's row for commitments that outlived their slot.
 
-    Used to protect such commitments when a stale current-day schedule is
-    re-planned for a weather refresh — we never want a same-day refresh to
-    silently drop "明天 7 點看電影" or an unanswered invite.
+    ``day_start`` is the current civil day's midnight as an absolute UTC
+    instant; an activity that ended at or before it belongs to a day that is
+    over. Returns ``(updated_schedule_or_None, expired_activities)`` — the
+    schedule is ``None`` when nothing moved, so an already-swept day costs no
+    write. ``expired_activities`` lists everything carrying a terminal role
+    afterwards, freshly swept or not, so a caller collecting facts across
+    several days never needs a second pass.
     """
-    return any(
-        ref.role in OPERATOR_INVOLVEMENT_ROLES
-        for ref in activity.participant_refs
-    )
+    updated: list[ScheduleActivity] = []
+    expired: list[ScheduleActivity] = []
+    changed = False
+    for activity in schedule.activities:
+        current = activity
+        if activity.end_at <= day_start:
+            swept = expire_operator_commitment(activity)
+            if swept is not None:
+                current = swept
+                changed = True
+        if has_expired_operator_commitment(current):
+            expired.append(current)
+        updated.append(current)
+    if not changed:
+        return None, tuple(expired)
+    return schedule.with_activities(updated), tuple(expired)
 
 
 def _with_operator_involvement(
@@ -1492,11 +1758,18 @@ def _with_operator_involvement(
     if role is None:
         return existing
     if role not in OPERATOR_INVOLVEMENT_ROLES:
+        # Only the live roles are settable from outside; the terminal
+        # expired / lapsed states are reached solely through the sweep.
         return existing
+    # Strip terminal roles too, so re-agreeing to something that had lapsed
+    # replaces the spent ref instead of stacking a second operator entry.
     kept = tuple(
         ref
         for ref in existing
-        if not (ref.actor_kind == "operator" and ref.role in OPERATOR_INVOLVEMENT_ROLES)
+        if not (
+            ref.actor_kind == "operator"
+            and ref.role in OPERATOR_ANY_INVOLVEMENT_ROLES
+        )
     )
     return kept + (
         ParticipantRef(

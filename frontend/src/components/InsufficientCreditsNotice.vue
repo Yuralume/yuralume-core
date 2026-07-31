@@ -11,18 +11,42 @@
  * The top-up CTA only appears when the deployment advertised a Portal; with
  * no Portal (self-host, which can never reach this state anyway) the card
  * degrades to the explanation alone rather than a dead link.
+ *
+ * `requiredCr` turns the same card into the AP2 *pre-check* card: when a
+ * fixed action price is published and the known balance cannot cover it, the
+ * surface refuses before sending and states the shortfall. Both promises above
+ * hold verbatim in that case — nothing ran, nothing was charged — so the card
+ * gains one line and changes nothing else. Omitting the prop leaves the
+ * refusal card byte-identical to what every existing caller renders.
  */
 import { computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { useAuth } from '@/composables/useAuth'
 import { refreshCloudCreditsAfterAction } from '@/composables/useCloudCredits'
-import { portalCreditsUrl } from '@/utils/creditsFormat'
+import { creditAmountText, portalCreditsUrl } from '@/utils/creditsFormat'
+
+const props = withDefaults(defineProps<{
+  /** Price of the action that was refused up-front, in credits. */
+  requiredCr?: number | null
+}>(), {
+  requiredCr: null,
+})
 
 const { t } = useI18n()
 const { portalUrl } = useAuth()
 
 const topUpHref = computed(() => portalCreditsUrl(portalUrl.value))
+
+const requiredText = computed(() => {
+  const amount = props.requiredCr
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    return null
+  }
+  return t('credits.insufficient.required', {
+    amount: creditAmountText(t, amount),
+  })
+})
 
 // The refusal is itself fresh evidence about the balance — pull the real
 // number so the badge stops showing a stale, comfortable-looking figure.
@@ -38,6 +62,7 @@ onMounted(() => {
       {{ t('credits.insufficient.title') }}
     </div>
     <p class="credits-notice__body">{{ t('credits.insufficient.body') }}</p>
+    <p v-if="requiredText" class="credits-notice__body">{{ requiredText }}</p>
     <a
       v-if="topUpHref"
       class="credits-notice__cta"

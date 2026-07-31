@@ -291,6 +291,26 @@ class InMemoryBackgroundJobQueue(BackgroundJobQueuePort):
             rec.lease_until = None
             return True
 
+    async def release_claim(
+        self, job_id: str, worker_id: str, *, now: datetime,
+    ) -> bool:
+        now = ensure_utc(now)
+        async with self._mutex:
+            rec = self._records.get(job_id)
+            if not self._holds_valid_lease(rec, worker_id, now):
+                return False
+            assert rec is not None
+            rec.status = JobStatus.QUEUED
+            # The claim charged an attempt but nothing ran — refund it so a
+            # graceful stop never pushes a job closer to ``dead``. ``due_at``
+            # is left alone: the job is ready right now for the next worker.
+            rec.attempt_count = max(0, rec.attempt_count - 1)
+            rec.lease_owner = None
+            rec.lease_until = None
+            rec.claimed_at = None
+            rec.updated_at = now
+            return True
+
     async def fail(
         self,
         job_id: str,

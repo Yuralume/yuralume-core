@@ -19,6 +19,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.date_context import (
+    render_story_date_context_block,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +99,14 @@ def _build_prompt(context: StoryBeatRecheckContext) -> str:
         character_name=context.character.name,
         character_summary=context.character.summary or "（未設定）",
         today=context.today.isoformat(),
+        # CF1b: ``mark_realized`` narrative becomes the beat's permanent
+        # record, so it needs the same absolute-date anchors as every
+        # other story writer.
+        date_context_block=render_story_date_context_block(
+            context.today,
+            language_tag=context.operator_primary_language,
+            include_today_line=False,
+        ),
         arc_title=context.arc.title,
         arc_premise=context.arc.premise,
         beat_title=beat.title,

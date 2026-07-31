@@ -29,6 +29,7 @@ pytestmark = pytest.mark.asyncio
 class _FakeChatModel(ChatModelPort):
     provider_id = "fake"
     supports_vision = False
+    prefers_public_image_urls = True
     _model = "fake-default"
 
     def __init__(
@@ -77,6 +78,11 @@ async def test_plain_generate_pass_through():
     wrapper = MetadataCapturingChatModel(inner)
     out = await wrapper.generate("hi")
     assert out == "abc"
+
+
+async def test_wrapper_propagates_public_image_transport_capability():
+    wrapper = MetadataCapturingChatModel(_FakeChatModel())
+    assert wrapper.prefers_public_image_urls is True
 
 
 async def test_plain_generate_stream_pass_through():

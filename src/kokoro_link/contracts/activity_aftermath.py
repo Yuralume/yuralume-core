@@ -25,6 +25,9 @@ from typing import Protocol
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import ScheduleActivity
+from kokoro_link.domain.services.shared_activity_evidence import (
+    SharedActivityEvidence,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +51,29 @@ class ActivityAftermath:
 
     residue_summary: str = ""
     emotion_tag: str = ""
+    factual_summary: str = ""
+    """LLM-written factual framing of what actually happened, requested
+    only for activities carrying an operator commitment (CF4).
+
+    For those, the planner-written ``description`` ("與木木一起前往先前約定
+    的刨冰店") is a *plan*, not a record — folding it into a memory verbatim
+    is what manufactured the "we already went together" narrative the user
+    never lived. When the memorialiser supplies
+    :class:`SharedActivityEvidence`, the model rewrites the semantic body
+    under that evidence ("本來想約他一起去，最後自己去了") and the
+    memorialiser uses *this* line as the memory body instead of the
+    description. Blank means the model declined or was unavailable — the
+    memorialiser then writes no memory at all rather than falling back to
+    the unproven plan text.
+    """
 
     @property
     def is_empty(self) -> bool:
-        return not self.residue_summary.strip() and not self.emotion_tag.strip()
+        return (
+            not self.residue_summary.strip()
+            and not self.emotion_tag.strip()
+            and not self.factual_summary.strip()
+        )
 
 
 class ActivityAftermathPort(Protocol):
@@ -61,8 +83,17 @@ class ActivityAftermathPort(Protocol):
         character: Character,
         activity: ScheduleActivity,
         operator_primary_language: str = "zh-TW",
+        evidence: SharedActivityEvidence | None = None,
     ) -> ActivityAftermath:
         """Return the emotional residue this activity left on the character.
+
+        ``evidence`` carries the structured verdict on whether the operator
+        was really part of this activity (CF4). ``None`` / a
+        ``NOT_APPLICABLE`` policy means "ordinary solo activity" and the
+        adapter behaves exactly as before. Anything else obliges the
+        adapter to put the facts *and* the claim rule in the prompt and to
+        ask for a ``factual_summary``; the judgement of how to word it is
+        the model's, never a keyword rewrite on our side.
 
         ``operator_primary_language`` (BCP 47) is the content language for
         the player-visible residue: the memorialiser folds

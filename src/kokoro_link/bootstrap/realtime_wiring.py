@@ -193,19 +193,20 @@ def _warn_if_publishes_into_the_void(
 
     A pass-through wiring is only correct for the single-process ``all`` shape,
     where the same process both publishes and holds the SSE connections. Any
-    OTHER role that can publish (a scheduler, a worker, a connector) and lands
-    here has no outbox to write and no local SSE subscriber to serve — the event
-    is silently dropped. ``connector`` is the live example: it wires no realtime
-    component today, so the day someone adds a publish site to a connector
-    handler the event would vanish without a trace. Cheap insurance, one log
-    line at wiring time; deliberately not an exception, since a role that never
-    publishes is perfectly fine here.
+    OTHER role that actually publishes a proactive/feed bus event (an API,
+    scheduler, or distributed worker) and lands here has no outbox to write and
+    no local SSE subscriber to serve — the event is silently dropped.
+
+    ``start_connectors`` is deliberately absent from the capability test:
+    Telegram/Discord/WhatsApp connector loops transport chat messages through
+    ``MessagingDispatcher`` but do not publish either realtime bus. Treating
+    transport capability as realtime publication produced a false loss warning
+    on every healthy dedicated connector boot.
     """
 
     can_publish = (
         matrix.serve_api_routes
         or matrix.start_schedulers
-        or matrix.start_connectors
         or matrix.run_background_worker
     )
     is_single_process_shape = matrix.serve_api_routes and matrix.start_schedulers

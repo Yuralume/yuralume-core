@@ -9,6 +9,8 @@ ledger drives the accepted/pending state transitions end to end.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,9 +19,10 @@ from kokoro_link.application.services.proactive_delivery.retry_worker import (
     ProactiveDeliveryRetryWorker,
 )
 from kokoro_link.contracts.external_proactive import (
+    ENVELOPE_KIND_PROACTIVE,
     DeliveryAcceptance,
     DeliveryAcceptanceStatus,
-    ENVELOPE_KIND_PROACTIVE,
+    ExternalProactiveConfigurationError,
     ProactiveEnvelope,
     ProactiveSegment,
     envelope_to_payload,
@@ -27,6 +30,9 @@ from kokoro_link.contracts.external_proactive import (
 from kokoro_link.contracts.external_proactive_ledger import (
     ExternalProactiveEvent,
     ExternalProactiveEventState,
+)
+from kokoro_link.infrastructure.cloud.hosted_channel_proactive_client import (
+    ChannelDeliveryTransientError,
 )
 from kokoro_link.infrastructure.repositories.in_memory_external_proactive_events import (  # noqa: E501
     InMemoryExternalProactiveEventRepository,
@@ -166,7 +172,9 @@ async def test_transient_leaves_row_pending() -> None:
     ledger = InMemoryExternalProactiveEventRepository()
     envelope = _envelope("evt-2")
     await _seed_pending(ledger, envelope)
-    delivery = _FakeDelivery(raise_exc=RuntimeError("channel 503"))
+    delivery = _FakeDelivery(
+        raise_exc=ChannelDeliveryTransientError("channel 503"),
+    )
     worker = ProactiveDeliveryRetryWorker(
         ledger=ledger, external_delivery=delivery,
     )
@@ -174,6 +182,98 @@ async def test_transient_leaves_row_pending() -> None:
 
     stored = await ledger.get("evt-2")
     assert stored.state is ExternalProactiveEventState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_unexpected_delivery_failure_is_visible_and_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = InMemoryExternalProactiveEventRepository()
+    envelope = _envelope("evt-unexpected")
+    await _seed_pending(ledger, envelope)
+    worker = ProactiveDeliveryRetryWorker(
+        ledger=ledger,
+        external_delivery=_FakeDelivery(raise_exc=RuntimeError("bad wiring")),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await worker.tick(now=_NOW + timedelta(minutes=1))
+
+    stored = await ledger.get("evt-unexpected")
+    assert stored.state is ExternalProactiveEventState.TERMINAL
+    assert stored.last_error == "unexpected_delivery_error:RuntimeError"
+    assert "unexpected delivery failure event=evt-unexpected" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_configuration_failure_is_visible_and_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = InMemoryExternalProactiveEventRepository()
+    envelope = _envelope("evt-config")
+    await _seed_pending(ledger, envelope)
+    worker = ProactiveDeliveryRetryWorker(
+        ledger=ledger,
+        external_delivery=_FakeDelivery(
+            raise_exc=ExternalProactiveConfigurationError("missing base URL"),
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await worker.tick(now=_NOW + timedelta(minutes=1))
+
+    stored = await ledger.get("evt-config")
+    assert stored.state is ExternalProactiveEventState.TERMINAL
+    assert stored.last_error == (
+        "delivery_configuration_error:ExternalProactiveConfigurationError"
+    )
+    assert "configuration failure event=evt-config" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_acceptance_is_visible_and_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = InMemoryExternalProactiveEventRepository()
+    envelope = _envelope("evt-malformed-result")
+    await _seed_pending(ledger, envelope)
+    worker = ProactiveDeliveryRetryWorker(
+        ledger=ledger,
+        external_delivery=_FakeDelivery(result=None),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await worker.tick(now=_NOW + timedelta(minutes=1))
+
+    stored = await ledger.get("evt-malformed-result")
+    assert stored.state is ExternalProactiveEventState.TERMINAL
+    assert stored.last_error == "malformed_delivery_acceptance:NoneType"
+    assert "malformed acceptance event=evt-malformed-result" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_envelope_is_visible_and_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    event = replace(
+        _event(event_id="evt-malformed", expires_at=_NOW + timedelta(hours=1)),
+        envelope_json='{not valid json',
+    )
+    ledger = _RecordingLedger([event])
+    delivery = _FakeDelivery(
+        result=DeliveryAcceptance(status=DeliveryAcceptanceStatus.ACCEPTED),
+    )
+    worker = ProactiveDeliveryRetryWorker(
+        ledger=ledger,
+        external_delivery=delivery,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await worker.tick(now=_NOW)
+
+    assert ledger.terminal == [("evt-malformed", "malformed_envelope")]
+    assert delivery.envelopes == []
+    assert "malformed envelope event=evt-malformed" in caplog.text
 
 
 @pytest.mark.asyncio

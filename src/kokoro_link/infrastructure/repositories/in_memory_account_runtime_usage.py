@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from uuid import uuid4
 
 from kokoro_link.contracts.account_runtime_usage import AccountRuntimeUsageEvent
 from kokoro_link.contracts.clock import ensure_utc
@@ -15,6 +16,7 @@ class _AccountRuntimeEvent:
     event_type: str
     occurred_at: datetime
     resource_id: str | None = None
+    event_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 class InMemoryAccountRuntimeUsageRepository:
@@ -56,6 +58,43 @@ class InMemoryAccountRuntimeUsageRepository:
             and event.occurred_at >= since_utc
             and (until_utc is None or event.occurred_at <= until_utc)
         )
+
+    async def claim_event_slot(
+        self,
+        *,
+        operator_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        since: datetime,
+        limit: int,
+    ) -> str | None:
+        """Same claim-then-verify contract as the SQL repository."""
+        if limit <= 0:
+            return None
+        stamp = ensure_utc(occurred_at)
+        since_utc = ensure_utc(since)
+        claim = _AccountRuntimeEvent(
+            operator_id=operator_id,
+            event_type=event_type,
+            occurred_at=stamp,
+        )
+        self._events.append(claim)
+        used = sum(
+            1
+            for event in self._events
+            if event.operator_id == operator_id
+            and event.event_type == event_type
+            and event.occurred_at >= since_utc
+        )
+        if used > limit:
+            self._events.remove(claim)
+            return None
+        return claim.event_id
+
+    async def discard_event(self, *, event_id: str) -> None:
+        self._events = [
+            event for event in self._events if event.event_id != event_id
+        ]
 
     async def list_events(
         self,

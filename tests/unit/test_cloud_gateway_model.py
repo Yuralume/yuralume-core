@@ -6,10 +6,19 @@ import logging
 import httpx
 import pytest
 
-from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
+from kokoro_link.contracts.cloud_gateway import (
+    CloudGatewayIdentity,
+    CloudGatewayRequestTooLargeError,
+)
+from kokoro_link.contracts.llm import ImageInputRejectedError
 from kokoro_link.contracts.generation_trigger import (
     GenerationTrigger,
     generation_trigger_scope,
+)
+from kokoro_link.contracts.interaction_context import (
+    BILLING_COVERED_HEADER_NAME,
+    InteractionContext,
+    interaction_scope,
 )
 from kokoro_link.infrastructure.llm.cloud_gateway_model import (
     CloudGatewayChatModel,
@@ -233,3 +242,456 @@ async def test_cloud_gateway_model_entitlement_denied_warns_not_errors(
     assert "feature=dialogue_summary" in text
     assert "character=chr_abc" in text
     assert "account=acct_1" in text
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_model_stamps_the_covering_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AP2: inside an action scope the Gateway must be told which charge
+    already covers this call; outside one, no header at all."""
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}],
+        })
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example/",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+    )
+
+    with interaction_scope(
+        InteractionContext(interaction_id="int-1", charge_id="chg-1"),
+    ):
+        await model.generate("inside")
+    await model.generate("outside")
+
+    assert seen[0]["x-yuralume-interaction"] == "v1;id=int-1;charge=chg-1"
+    assert "x-yuralume-interaction" not in seen[1]
+
+
+def _model() -> CloudGatewayChatModel:
+    return CloudGatewayChatModel(
+        base_url="https://gateway.example/",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+    )
+
+
+def _covered_reply(content: str = "ok") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": content}}]},
+        headers={BILLING_COVERED_HEADER_NAME: "1"},
+    )
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, handler) -> None:
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_sends_exact_compact_utf8_bytes_it_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["content"] = request.content
+        return _covered_reply()
+
+    _install(monkeypatch, handler)
+    model = _model()
+
+    assert await model.generate(
+        "你好☕",
+        image_urls=("https://img.example/a.png",),
+    ) == "ok"
+
+    expected = json.dumps(
+        model._build_payload(
+            "你好☕",
+            image_urls=("https://img.example/a.png",),
+            model=None,
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert seen["content"] == expected
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_rejects_oversize_image_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _covered_reply("unexpected")
+
+    _install(monkeypatch, handler)
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+        max_request_bytes=1024,
+    )
+
+    with pytest.raises(ImageInputRejectedError) as excinfo:
+        await model.generate(
+            "look",
+            image_urls=("data:image/png;base64," + "A" * 2048,),
+        )
+
+    assert excinfo.value.status_code == 413
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_rejects_oversize_text_as_non_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _covered_reply("unexpected")
+
+    _install(monkeypatch, handler)
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+        max_request_bytes=256,
+    )
+
+    with pytest.raises(CloudGatewayRequestTooLargeError) as excinfo:
+        await model.generate("界" * 300)
+
+    assert excinfo.value.retryable is False
+    assert excinfo.value.actual_bytes > excinfo.value.max_bytes == 256
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 404, 413, 415, 422])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cloud_gateway_image_4xx_is_typed_for_one_shot_degrade(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    streaming: bool,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={
+            "error": {
+                "code": "provider_error",
+                "message": f"provider returned HTTP {status_code}",
+                "retryable": False,
+            },
+        })
+
+    _install(monkeypatch, handler)
+
+    with pytest.raises(ImageInputRejectedError) as excinfo:
+        if streaming:
+            async for _ in _model().generate_stream(
+                "look", image_urls=("https://img.example/a.png",),
+            ):
+                pass
+        else:
+            await _model().generate(
+                "look",
+                image_urls=("https://img.example/a.png",),
+            )
+
+    assert excinfo.value.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_plain_provider_413_is_not_image_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(413, json={
+            "error": {
+                "code": "provider_error",
+                "message": "provider returned HTTP 413",
+                "retryable": False,
+            },
+        })
+
+    _install(monkeypatch, handler)
+
+    with pytest.raises(ExpectedCloudRefusal) as excinfo:
+        await _model().generate("plain text")
+
+    assert not isinstance(excinfo.value, ImageInputRejectedError)
+    assert excinfo.value.code == "provider_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "code"),
+    [(400, "content_policy_denied"), (403, "entitlement_denied")],
+)
+async def test_cloud_gateway_policy_refusal_with_image_is_not_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    code: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={
+            "error": {
+                "code": code,
+                "message": "request refused by policy",
+                "retryable": False,
+            },
+        })
+
+    _install(monkeypatch, handler)
+
+    with pytest.raises(ExpectedCloudRefusal) as excinfo:
+        await _model().generate(
+            "look",
+            image_urls=("https://img.example/a.png",),
+        )
+
+    assert not isinstance(excinfo.value, ImageInputRejectedError)
+    assert excinfo.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_stream_applies_same_wire_budget_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, text="data: [DONE]\n")
+
+    _install(monkeypatch, handler)
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+        ),
+        max_request_bytes=1024,
+    )
+
+    with pytest.raises(ImageInputRejectedError):
+        async for _ in model.generate_stream(
+            "look",
+            image_urls=("data:image/png;base64," + "A" * 2048,),
+        ):
+            pass
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_covered_call_is_marked_but_a_refused_one_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consumption is what decides refund vs settle on a failed action.
+
+    A covered 200 means the Gateway waived its own billing under the covering
+    charge, so the tokens are spent whatever happens next. An upstream error
+    means nothing was served, and the player must still get a full refund.
+    """
+    answers = [
+        _covered_reply(),
+        httpx.Response(502, json={"error": {"message": "upstream down"}}),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0)
+
+    _install(monkeypatch, handler)
+    model = _model()
+
+    served = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(served):
+        await model.generate("served")
+    refused = InteractionContext(interaction_id="int-2", charge_id="chg-2")
+    with interaction_scope(refused):
+        with pytest.raises(Exception):
+            await model.generate("refused")
+
+    assert served.usage.consumed is True
+    assert refused.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_a_call_the_gateway_billed_itself_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2: no covered header ⇒ the Gateway charged this call per token.
+
+    That is the verifier-failed / budget-exhausted fallback. Counting it as
+    consumed would keep the fixed action charge on top of the per-call one and
+    bill the same reply twice.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    _install(monkeypatch, handler)
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        assert await _model().generate("hello") == "ok"
+
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_a_covered_answer_that_never_parses_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: the charge buys a *result*, not an HTTP status.
+
+    A 200 whose body carries no usable content delivered nothing, so the action
+    is still refundable in full.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": []},
+            headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    _install(monkeypatch, handler)
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        with pytest.raises(Exception):
+            await _model().generate("hello")
+
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_a_covered_stream_is_consumed_at_its_first_content_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: delivery, not connection — but before the consumer can abort.
+
+    The mark lands as the first real token is handed over, so "send, then hit
+    stop" still settles instead of becoming a free generation.
+    """
+    body = (
+        'data: {"choices":[{"delta":{"content":"he"}}]}\n'
+        'data: {"choices":[{"delta":{"content":"llo"}}]}\n'
+        "data: [DONE]\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=body, headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    _install(monkeypatch, handler)
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        stream = _model().generate_stream("hello")
+        first = await stream.__anext__()
+        assert first == "he"
+        assert context.usage.consumed is True
+        await stream.aclose()
+
+    # One covered call, however many chunks it produced.
+    assert context.usage.covered_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_covered_stream_with_no_content_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headers on the wire are not a result: an empty stream stays refundable."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="data: [DONE]\n",
+            headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    _install(monkeypatch, handler)
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        chunks = [chunk async for chunk in _model().generate_stream("hello")]
+
+    assert chunks == []
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_an_uncovered_stream_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text='data: {"choices":[{"delta":{"content":"hi"}}]}\ndata: [DONE]\n',
+        )
+
+    _install(monkeypatch, handler)
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        chunks = [chunk async for chunk in _model().generate_stream("hello")]
+
+    assert chunks == ["hi"]
+    assert context.usage.consumed is False

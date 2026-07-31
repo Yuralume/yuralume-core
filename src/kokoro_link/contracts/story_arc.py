@@ -14,6 +14,7 @@ from datetime import date
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
+from kokoro_link.domain.entities.story_seed import StorySeed
 
 
 class ActiveArcConflict(Exception):
@@ -109,6 +110,9 @@ class StoryArcPlannerPort(ABC):
         hint: str | None = None,
         recent_dialogue_summary: str = "",
         operator_primary_language: str = "zh-TW",
+        today: date | None = None,
+        seed_candidates: tuple[StorySeed, ...] = (),
+        arc_history: tuple[str, ...] = (),
     ) -> StoryArc:
         """Return a fresh ``StoryArc`` with beats scheduled between
         ``start_date`` and ``start_date + duration_days``. ``hint`` is
@@ -118,6 +122,29 @@ class StoryArcPlannerPort(ABC):
         the character's latest chat with the user — lets the arc pick
         up whatever thread the conversation is already pulling on instead
         of starting cold. Empty string = no context available.
+
+        ``today`` is the operator-local civil day the plan is being made
+        on. It is usually equal to ``start_date`` but diverges on a
+        mid-arc replan, where beats resume after the last realized one.
+        Implementations use it to give the model absolute-date anchors so
+        beat prose does not freeze relative time words ("明天") that go
+        stale the moment the beat is read back a day later. Optional:
+        implementations must degrade gracefully when it is ``None``.
+
+        ``seed_candidates`` are ``dramatic``-tier story seeds offered as
+        *subject-matter candidates* — raw material, never instructions.
+        The planner is free to weave 0–2 of them into the arc, rewrite
+        them beyond recognition, or ignore the lot; when it ignores them
+        it still owes the arc an external event of its own. Empty tuple =
+        no candidates available (empty pool, no gacha wired, or the roll
+        failed), which must render exactly like the pre-seed prompt.
+
+        ``arc_history`` is the anti-repetition input: pre-formatted
+        one-line digests of this character's previous arcs, **oldest
+        first**, already excluding whichever arc the call is about. The
+        planner must keep the new arc's core conflict clearly distinct
+        from every entry. Semantic judgement only — no keyword or
+        similarity matching anywhere in this path.
 
         The planner must always return a valid arc (at least one beat).
         On LLM failure, fall back to a sparse synthetic arc — the
@@ -140,6 +167,14 @@ class StoryArcSeasonContext:
     days_since_completed: int | None
     recent_dialogue_summary: str
     continuation_summary: str
+    arc_history: tuple[str, ...] = ()
+    """Pre-formatted one-line digests of this character's earlier arcs,
+    oldest first, excluding ``completed_arc`` (which is passed whole).
+
+    Anti-repetition input for the opener decision: the hint handed to the
+    planner must not re-run any of these. Empty tuple = no history worth
+    showing, and the decider prompt then omits the block entirely."""
+
     series_id: str | None = None
     series_title: str | None = None
     next_template_id: str | None = None
@@ -248,6 +283,13 @@ class ArcCompletionMemoryContext:
     arc: StoryArc
     realized_beats: tuple[StoryArcBeat, ...]
     operator_primary_language: str = "zh-TW"
+    today: date | None = None
+    """Operator-local civil day the milestone is written on.
+
+    Feeds the absolute-date anchors in the writer's prompt: the memory
+    outlives the day it was written by months, so relative time words
+    inside it never resolve. Optional so older callers keep working —
+    the prompt then states the discipline without the anchor table."""
 
 
 @dataclass(frozen=True, slots=True)

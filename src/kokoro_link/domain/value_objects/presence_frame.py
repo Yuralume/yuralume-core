@@ -4,6 +4,10 @@ PresenceFrame tells the LLM what kind of interaction the current turn
 belongs to: same-site stage interaction, web private message, or an
 external messaging channel. It is deliberately semantic context, not a
 branch table for scripted wording.
+
+Stage co-presence is **declared by the player**, not adjudicated: the
+character reacts to it from inside the narrative, anchored to its own
+schedule and situation. Nothing here gates a turn.
 """
 
 from dataclasses import dataclass, replace
@@ -34,15 +38,51 @@ class VisibilityMode(StrEnum):
 
 
 class AccessContext(StrEnum):
-    # Legacy compatibility only. New Scene Access verdicts should use
-    # concrete, real-world-plausible contexts or text_message_only.
+    """How this turn's co-presence is framed.
+
+    Since the stage-access judge retired (2026-07-30) a stage turn carries
+    exactly one live value: ``PLAYER_DECLARED`` — the player declared they
+    are in the same place, and plausibility is handled *inside* the
+    narrative by the character anchoring its own schedule, not by an
+    out-of-narrative gate blocking the turn.
+
+    The remaining stage values are **legacy parse compatibility only**:
+    historical turn metadata already stores those strings and
+    already-deployed self-hosted frontends still send them. They are never
+    produced any more and ``PresenceFrame.__post_init__`` folds them into
+    ``PLAYER_DECLARED``, so there is one narrative block to maintain
+    rather than two behaviours.
+
+    ``TEXT_MESSAGE_ONLY`` is not legacy — it is the live value for every
+    non-stage surface (web DM, external messaging).
+    """
+
+    PLAYER_DECLARED = "player_declared"
+    TEXT_MESSAGE_ONLY = "text_message_only"
+    # Legacy stage verdicts — parsed, folded, never produced.
     REMOTE_STAGE = "remote_stage"
     PUBLIC_ENCOUNTER = "public_encounter"
     INVITED_VISIT = "invited_visit"
     SCHEDULED_MEETUP = "scheduled_meetup"
     ESTABLISHED_ROUTINE = "established_routine"
-    TEXT_MESSAGE_ONLY = "text_message_only"
     NOT_PLAUSIBLE = "not_plausible"
+
+
+LEGACY_STAGE_ACCESS_CONTEXTS: frozenset[AccessContext] = frozenset(
+    {
+        AccessContext.REMOTE_STAGE,
+        AccessContext.PUBLIC_ENCOUNTER,
+        AccessContext.INVITED_VISIT,
+        AccessContext.SCHEDULED_MEETUP,
+        AccessContext.ESTABLISHED_ROUTINE,
+        AccessContext.NOT_PLAUSIBLE,
+    },
+)
+"""Stage verdict values that predate the judge's retirement.
+
+Kept as a named set (rather than inlined in ``__post_init__``) so the
+folding rule reads as one intent and stays greppable from tests.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +91,13 @@ class PresenceFrame:
     channel: ChatChannel
     visibility: VisibilityMode
     display_name: str
-    access_context: AccessContext = AccessContext.NOT_PLAUSIBLE
+    access_context: AccessContext = AccessContext.PLAYER_DECLARED
+    # ``co_presence_reason`` / ``stage_access_note`` were filled by the
+    # retired stage-access judge (verdict reason / prompt fact). Kept for
+    # parse compatibility with older self-hosted frontends and stored turn
+    # metadata: the reason is no longer rendered (there is no verdict to
+    # justify), the note still renders verbatim when present so an older
+    # client does not silently lose context.
     co_presence_reason: str | None = None
     stage_access_note: str | None = None
 
@@ -62,6 +108,8 @@ class PresenceFrame:
         access_context = AccessContext(self.access_context)
         if surface is not ChatSurface.WEB_STAGE:
             access_context = AccessContext.TEXT_MESSAGE_ONLY
+        elif access_context in LEGACY_STAGE_ACCESS_CONTEXTS:
+            access_context = AccessContext.PLAYER_DECLARED
         object.__setattr__(self, "surface", surface)
         object.__setattr__(self, "channel", channel)
         object.__setattr__(self, "visibility", visibility)
@@ -72,7 +120,7 @@ class PresenceFrame:
         cls,
         *,
         has_attachments: bool = False,
-        access_context: AccessContext = AccessContext.NOT_PLAUSIBLE,
+        access_context: AccessContext = AccessContext.PLAYER_DECLARED,
         co_presence_reason: str | None = None,
         stage_access_note: str | None = None,
     ) -> "PresenceFrame":

@@ -11,6 +11,7 @@ import httpx
 
 _LOGGER = logging.getLogger(__name__)
 SidecarEventHandler = Callable[[dict[str, Any]], Awaitable[None]]
+SidecarConnectedHandler = Callable[[], Awaitable[None]]
 
 
 class WhatsAppSidecarClient:
@@ -28,6 +29,7 @@ class WhatsAppSidecarClient:
         session_id: str,
         api_token: str | None,
         on_event: SidecarEventHandler,
+        on_connected: SidecarConnectedHandler | None = None,
     ) -> None:
         if not sidecar_url:
             raise ValueError("sidecar_url is required")
@@ -45,6 +47,8 @@ class WhatsAppSidecarClient:
         ) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
+                if on_connected is not None:
+                    await on_connected()
                 async for event in _iter_sse_events(response):
                     try:
                         await on_event(event)

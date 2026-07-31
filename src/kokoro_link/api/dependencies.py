@@ -71,6 +71,44 @@ def require_self_host_mode(
         )
 
 
+def ensure_not_draining(
+    container: ServiceContainer = Depends(get_container),
+) -> None:
+    """Refuse a turn-starting request while this replica drains (GD1-A).
+
+    The service layer already refuses on the first line of ``_begin_turn``, and
+    that stays as the belt. This is the suspenders, and it exists because "a
+    drain 503 leaves no trace" was not actually true at the route: the chat
+    routes resolve character ownership *before* they reach the service, and
+    that lookup runs the read-time rest-recovery refresh, which persists
+    character / state / emotion rows. A request refused only downstream would
+    therefore still have written — on a replica that is about to be killed.
+
+    Deliberately scoped to the turn-starting routes rather than installed as
+    site-wide middleware: drain must not break reads, health, or the very
+    internal management surface the deploy script is talking to.
+
+    ``getattr`` because partial containers (unit-test harnesses that build a
+    ``SimpleNamespace``) legitimately have no drain state, and because the
+    self-host red line is that an unwired / undrained replica behaves exactly
+    as it did before — which here means one attribute read and a ``False``.
+    """
+    state = getattr(container, "drain_state", None)
+    if state is not None:
+        state.ensure_accepting()
+
+
+def bearer_token_from_header(authorization: str | None) -> str | None:
+    """Extract ``Authorization: Bearer <token>``, or ``None``.
+
+    Shared so credential-issuing routes (session renewal) can accept the
+    header form *without* inheriting the SSE query-parameter fallback below.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    return authorization.split(" ", 1)[1].strip() or None
+
+
 async def get_current_user(
     request: Request,
     authorization: str | None = Header(default=None),
@@ -96,9 +134,7 @@ async def get_current_user(
         bind_cloud_actor(operator_id=default_user.id)
         return default_user
 
-    token: str | None = None
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
+    token = bearer_token_from_header(authorization)
     if not token:
         # EventSource fallback: read token from ``?access_token=`` so
         # SSE subscribers (which can't send Authorization headers) can

@@ -105,7 +105,6 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_SILLYTAVERN_NORMALIZE,
     FEATURE_MEMOIR_LOCALIZE,
     FEATURE_SCHEDULED_PROMISE,
-    FEATURE_SCENE_ACCESS,
     FEATURE_DIALOGUE_SUMMARY,
     FEATURE_FEED_COMMENT_REPLY,
     FEATURE_IDLE_DRIFT,
@@ -129,6 +128,7 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_REGISTER_PROFILE,
     FEATURE_RELATIONSHIP_COHERENCE,
     FEATURE_SCHEDULE_PLAN,
+    FEATURE_SCHEDULE_WEATHER_DRIFT,
     FEATURE_STORY_EXPAND,
     FEATURE_TTS_TRANSLATE,
 )
@@ -164,6 +164,7 @@ from kokoro_link.infrastructure.memoir.llm_localizer import LLMMemoirLocalizer
 from kokoro_link.application.services.chat_assist_service import ChatAssistService
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.chat_turn_lease import ChatTurnLease
+from kokoro_link.application.services.drain_state import DrainState
 from kokoro_link.application.services.turn_undo_service import TurnUndoService
 from kokoro_link.infrastructure.prompt.llm_material_digester import (
     LLMPromptMaterialDigester,
@@ -184,6 +185,9 @@ from kokoro_link.contracts.object_storage import (
     ObjectNotFoundError,
     ObjectStorageError,
     ObjectStoragePort,
+)
+from kokoro_link.application.services.goal_review_service import (
+    DailyGoalReviewService,
 )
 from kokoro_link.application.services.goal_service import GoalService
 from kokoro_link.application.services.memory_admin_service import (
@@ -263,6 +267,28 @@ from kokoro_link.infrastructure.cloud.credit_balance_client import (
 )
 from kokoro_link.application.services.cloud_credit_service import (
     CloudCreditService,
+)
+from kokoro_link.infrastructure.cloud.action_charge_client import (
+    ActionChargeClient,
+)
+from kokoro_link.infrastructure.cloud.action_pricing_client import (
+    ActionPricingClient,
+)
+from kokoro_link.application.services.cloud_action_billing_service import (
+    CloudActionBillingService,
+    NullActionBillingService,
+)
+from kokoro_link.application.services.cloud_pricing_service import (
+    CloudPricingService,
+)
+from kokoro_link.infrastructure.cloud.announcement_unread_client import (
+    AnnouncementUnreadClient,
+)
+from kokoro_link.application.services.cloud_announcement_service import (
+    CloudAnnouncementService,
+)
+from kokoro_link.application.services.quota_overage_service import (
+    QuotaOverageService,
 )
 from kokoro_link.application.services.player_locale_service import (
     LOCALE_CLAIM_PREFIX,
@@ -410,7 +436,9 @@ from kokoro_link.application.services.story_event_service import StoryEventServi
 from kokoro_link.application.services.story_gacha import StoryGachaService
 from kokoro_link.application.services.schedule_memorializer import ScheduleMemorializer
 from kokoro_link.application.services.schedule_service import ScheduleService
-from kokoro_link.application.services.scene_access_service import SceneAccessService
+from kokoro_link.application.services.schedule_weather_drift_service import (
+    ScheduleWeatherDriftService,
+)
 from kokoro_link.application.services.state_tracker import StateChangeTracker
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
 from kokoro_link.application.services.notification_service import NotificationService
@@ -686,7 +714,6 @@ from kokoro_link.infrastructure.prompt.default import (
     DefaultPromptContextBuilder,
     prompt_pack_hash_snapshot,
 )
-from kokoro_link.infrastructure.scene_access.llm_judge import LLMSceneAccessJudge
 from kokoro_link.infrastructure.time import SystemClock
 from kokoro_link.infrastructure.repositories.in_memory_characters import InMemoryCharacterRepository
 from kokoro_link.infrastructure.repositories.in_memory_character_encounters import (
@@ -744,6 +771,10 @@ from kokoro_link.infrastructure.feed.null_composer import NullFeedComposer
 from kokoro_link.infrastructure.schedule.llm_aftermath import (
     LLMActivityAftermathJudge,
     NullActivityAftermathJudge,
+)
+from kokoro_link.infrastructure.schedule.llm_weather_drift import (
+    LLMScheduleWeatherDriftJudge,
+    NullScheduleWeatherDriftJudge,
 )
 from kokoro_link.infrastructure.state.llm_idle_drift import (
     LLMIdleDriftJudge,
@@ -890,6 +921,7 @@ class ServiceContainer:
     model_registry: ChatModelRegistryPort
     preferences_repository: PreferencesRepositoryPort
     schedule_memorializer: ScheduleMemorializer | None = None
+    schedule_weather_drift_service: ScheduleWeatherDriftService | None = None
     active_llm_provider: ActiveLLMProviderPort | None = None
     cloud_routing_profile_resolver: CloudRoutingProfilePort | None = None
     nsfw_mode_service: NsfwModeService | None = None
@@ -897,7 +929,6 @@ class ServiceContainer:
     object_storage: ObjectStoragePort = field(
         default_factory=lambda: InMemoryObjectStorage(),
     )
-    scene_access_service: SceneAccessService | None = None
     conversation_repository: "ConversationRepositoryPort | None" = None
     image_profile_registry: ImageProfileRegistry = field(
         default_factory=lambda: ImageProfileRegistry([]),
@@ -987,6 +1018,13 @@ class ServiceContainer:
     # each tick, read by the internal metrics route. ``None`` on bare
     # ``ServiceContainer()`` test harnesses.
     scheduler_metrics: SchedulerMetrics | None = None
+    # GD1-A rolling-deploy drain switch (HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN
+    # §7.3). One per container = one per process, which is the scope a drain
+    # request addresses. Always present — including on hand-built test
+    # containers — so the internal drain route and the metrics exporter never
+    # have to answer "what if nobody wired it". Defaults to *not* draining, and
+    # not draining is byte-for-byte the historical behaviour.
+    drain_state: DrainState = field(default_factory=DrainState)
     # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). All ``None`` unless
     # YURALUME_BACKGROUND_SHADOW=postgres on a scheduler-owning role with a DB —
     # the self-host red line is that leaving the env unset changes nothing. The
@@ -1015,6 +1053,21 @@ class ServiceContainer:
     # Display-only hosted credit balance proxy (U3). Wired in cloud mode only;
     # ``None`` leaves ``GET /api/v1/cloud/credits`` degraded, never blocking play.
     cloud_credit_service: "CloudCreditService | None" = None
+    # Public hosted price list proxy (AP3). Cloud mode only; ``None`` leaves
+    # ``GET /api/v1/cloud/pricing`` degraded rather than quoting stale numbers.
+    cloud_pricing_service: "CloudPricingService | None" = None
+    # Notice-board unread flag (AN1) behind the in-game dot. None on self-host,
+    # where there is no Cloud board to have unread notices on.
+    cloud_announcement_service: "CloudAnnouncementService | None" = None
+    # Action-level credit charging (AP2). Always present — the null object
+    # covers self-host and every tier still on token billing — so instrumented
+    # entry points never branch on wiring.
+    action_billing_service: (
+        "CloudActionBillingService | NullActionBillingService | None"
+    ) = None
+    # Player-authorised quota overage (AP4). Always wired; the settings routes
+    # that read it still 404 outside cloud mode.
+    quota_overage_service: "QuotaOverageService | None" = None
     # Hosted player locale / location lifecycle (G2). Cloud mode only — ``None``
     # in self-host, where the locale routes 404 by construction.
     player_locale_service: "PlayerLocaleService | None" = None
@@ -1349,11 +1402,16 @@ def _build_goal_reviewer(
     registry: ChatModelRegistryPort,
     default_provider_id: str,
     active_provider: ActiveLLMProviderPort | None = None,
+    local_tz: tzinfo = timezone.utc,
 ) -> GoalReviewerPort:
     if active_provider is None:
         return NullGoalReviewer()
     return LLMGoalReviewer(
-        provider=active_provider, feature_key=FEATURE_GOAL_REVIEW,
+        provider=active_provider,
+        feature_key=FEATURE_GOAL_REVIEW,
+        # Site-level fallback only — a caller that resolved the owning
+        # operator's zone passes it per-review.
+        local_tz=local_tz,
     )
 
 
@@ -1791,6 +1849,9 @@ def _build_tool_registry(
     object_storage: ObjectStoragePort,
     album_service: AlbumService | None = None,
     visual_style_service: VisualGenerationStyleService | None = None,
+    action_billing: (
+        "CloudActionBillingService | NullActionBillingService | None"
+    ) = None,
 ) -> ToolRegistryPort:
     """Build the tool registry with all adapters this deployment knows.
 
@@ -1815,6 +1876,7 @@ def _build_tool_registry(
             object_storage=object_storage,
             album_service=album_service,
             visual_style_service=visual_style_service,
+            action_billing=action_billing,
         ),
     )
     # web_fetch is always on — zero external dependency besides httpx,
@@ -2412,10 +2474,57 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 ),
             ),
         )
+    # AP3 — public price list proxy. Same cloud-mode gate as the balance
+    # proxy; self-host leaves it None so the route 404s by construction.
+    cloud_pricing_service: CloudPricingService | None = None
+    if app_settings.cloud.active and app_settings.cloud.user_service_url:
+        cloud_pricing_service = CloudPricingService(
+            client=ActionPricingClient(
+                base_url=app_settings.cloud.user_service_url,
+                timeout_seconds=app_settings.cloud.introspect_timeout,
+            ),
+        )
+    # AN1 — notice-board unread proxy for the in-game dot. Same cloud-mode gate
+    # as the balance proxy it sits beside; self-host leaves it None so the route
+    # is absent by construction.
+    cloud_announcement_service: CloudAnnouncementService | None = None
+    if app_settings.cloud.active and app_settings.cloud.user_service_url:
+        cloud_announcement_service = CloudAnnouncementService(
+            client=AnnouncementUnreadClient(
+                base_url=app_settings.cloud.user_service_url,
+                timeout_seconds=app_settings.cloud.introspect_timeout,
+                internal_credential=(
+                    app_settings.cloud.internal_service_credential
+                ),
+            ),
+        )
     account_runtime_profile_resolver = AccountRuntimeProfileResolver(
         operator_profile_repository,
         tier_profile_port=tier_runtime_profile_port,
     )
+    # AP2 — action-level charging. The real service is only built in cloud
+    # mode; everywhere else the null object keeps every instrumented entry
+    # point on its historical path with no branching at the call sites. Even
+    # in cloud mode it charges nothing until a tier's control-plane profile
+    # says ``billing_shape=action_fixed``.
+    action_billing_service: (
+        CloudActionBillingService | NullActionBillingService
+    ) = NullActionBillingService()
+    if app_settings.cloud.active and app_settings.cloud.user_service_url:
+        action_billing_service = CloudActionBillingService(
+            client=ActionChargeClient(
+                base_url=app_settings.cloud.user_service_url,
+                timeout_seconds=app_settings.cloud.introspect_timeout,
+                internal_credential=(
+                    app_settings.cloud.internal_service_credential
+                ),
+            ),
+            profile_resolver=account_runtime_profile_resolver,
+            operator_profiles=operator_profile_repository,
+            # The same cache the SPA's price list is served from, so a charge
+            # is bound to the number this process actually quoted (C1).
+            pricing=cloud_pricing_service,
+        )
     async def _notification_language_resolver(user_id: str) -> str:
         profile = await operator_profile_service.get_for_user(user_id)
         if profile is None:
@@ -2469,6 +2578,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     jwt_service = JWTService(
         secret=_jwt_secret,
         ttl_seconds=app_settings.auth.jwt_ttl_seconds,
+        absolute_ttl_seconds=app_settings.auth.jwt_absolute_ttl_seconds,
         clock=clock.now,
     )
     # Reads the live holder on each lookup (G0): an Admin GeoIP endpoint /
@@ -2697,6 +2807,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         registry=model_registry,
         default_provider_id=app_settings.default_provider_id,
         active_provider=active_llm_provider,
+        local_tz=local_tz,
     )
     schedule_planner = _build_schedule_planner(
         registry=model_registry,
@@ -2718,6 +2829,35 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         state_tracker=state_tracker,
     )
     goal_service = GoalService(goal_repository)
+    # P3-Dedup §3.4 — the visible-output slot ledger. DB-backed only (the
+    # claim is a DB unique-index race); ``None`` on the in-memory / no-DB path,
+    # where the proactive + feed-reply passes fall back to their in-code caps
+    # exactly as before. Shared by the dispatcher, the feed-reply service and
+    # the daily goal review so their per-slot claims dedup against a
+    # distributed reclaimed job. Built here (rather than next to its other
+    # consumers further down) because ChatService — constructed well before
+    # them — needs the goal-review claim too.
+    from kokoro_link.infrastructure.persistence.sa_visible_slots import (
+        SAVisibleSlotRepository,
+    )
+
+    visible_slot_port = (
+        SAVisibleSlotRepository(db_session_factory)
+        if db_session_factory is not None else None
+    )
+    # CF2 — the daily (time-triggered) goal review. Shared by the chat write
+    # point (records the day as covered) and the tick / due-job trigger (runs
+    # the review). ``visible_slot_port is None`` → the daily trigger is inert
+    # and only the chat turn-count cadence reviews, exactly as before.
+    daily_goal_review_service = DailyGoalReviewService(
+        goal_service=goal_service,
+        goal_reviewer=goal_reviewer,
+        conversation_repository=conversation_repository,
+        visible_slot_port=visible_slot_port,
+        operator_profile_service=operator_profile_service,
+        local_tz=local_tz,
+        clock=clock,
+    )
     # StoryArcService must be built before ScheduleService so the latter
     # can read today's scene beat into the planner prompt. Without this
     # the schedule and the arc run on parallel tracks (the schedule
@@ -2754,6 +2894,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     studio_execution_lease = _build_studio_execution_lease(
         app_settings, db_session_factory,
     )
+    # Built here rather than next to ``StoryEventService`` below because
+    # the arc service is now its second consumer (AE0) and is constructed
+    # first — the daily event roll picks up the same instance further
+    # down. Stateless apart from its rng, so sharing one is free.
+    story_gacha = StoryGachaService(
+        seed_repository=story_seed_repository,
+        event_repository=story_event_repository,
+    )
     story_arc_service = StoryArcService(
         repository=story_arc_repository,
         planner=story_arc_planner,
@@ -2766,6 +2914,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         season_decider=story_arc_season_decider,
         beat_rechecker=story_beat_rechecker,
         operator_profile_service=operator_profile_service,
+        # AE0 — dramatic-tier seeds reach the arc planner as subject-matter
+        # candidates, so a new arc has a source other than the last few
+        # chat turns. Fail-soft end to end; an empty pool changes nothing.
+        gacha_service=story_gacha,
         template_translator=arc_template_translator,
         execution_lease=studio_execution_lease,
     )
@@ -2790,6 +2942,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         story_arc_service=story_arc_service,
         calendar_context_port=calendar_provider,
         weather_context_port=weather_provider,
+        # SE1 — recent story events reach the planner as inspiration facts.
+        story_event_repository=story_event_repository,
         relationship_seed_repository=relationship_seed_repository,
         operator_persona_service=operator_persona_service,
         operator_profile_service=operator_profile_service,
@@ -2870,6 +3024,29 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         embedder=embedder,
         aftermath_port=activity_aftermath_judge,
         character_repository=character_repository,
+        operator_profile_service=operator_profile_service,
+    )
+    # Intra-day weather-drift correction of the planned day. The judge follows
+    # the aftermath shape (Null on the fake provider so a self-host demo never
+    # pays for a verdict), and the service reads weather + operator through the
+    # SAME ports the planner used — comparing the day against a different sky
+    # would be worse than not comparing at all.
+    schedule_weather_drift_judge = (
+        LLMScheduleWeatherDriftJudge(
+            provider=active_llm_provider,
+            feature_key=FEATURE_SCHEDULE_WEATHER_DRIFT,
+        )
+        if (
+            app_settings.cloud.active
+            or app_settings.default_provider_id != _FAKE_PROVIDER_ID
+        )
+        else NullScheduleWeatherDriftJudge()
+    )
+    schedule_weather_drift_service = ScheduleWeatherDriftService(
+        schedule_repository=schedule_repository,
+        drift_port=schedule_weather_drift_judge,
+        local_tz=local_tz,
+        weather_context_port=weather_provider,
         operator_profile_service=operator_profile_service,
     )
     character_relationship_service = CharacterRelationshipService(
@@ -2978,6 +3155,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         generator=_build_character_draft_generator(
             active_provider=active_llm_provider,
         ),
+        action_billing=action_billing_service,
     )
     character_personality_type_analyzer = LLMCharacterPersonalityTypeAnalyzer(
         provider=active_llm_provider,
@@ -3077,6 +3255,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         subscription_access_guard=subscription_access_guard,
         candidate_batch_repository=character_image_candidate_batch_repository,
+        action_billing=action_billing_service,
     )
     character_lora_service = CharacterLoraService(
         character_repository=character_repository,
@@ -3094,20 +3273,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         object_storage=object_storage,
         album_service=album_service,
         visual_style_service=visual_generation_style_service,
+        action_billing=action_billing_service,
     )
     tool_orchestrator = ToolOrchestrator(
         registry=tool_registry,
         invocation_repository=tool_invocation_repository,
     )
 
-    story_gacha = StoryGachaService(
-        seed_repository=story_seed_repository,
-        event_repository=story_event_repository,
-    )
-    # arc_template_repository, story_arc_planner, story_arc_service are
-    # built earlier (before schedule_service) so the schedule planner can
-    # read scene beats. The single shared YAML repo cache covers all
-    # callers (story arc service + REST list endpoint + wizard).
+    # story_gacha, arc_template_repository, story_arc_planner and
+    # story_arc_service are built earlier (before schedule_service) so the
+    # schedule planner can read scene beats and the arc planner can draw
+    # dramatic seed candidates. The single shared YAML repo cache covers
+    # all callers (story arc service + REST list endpoint + wizard).
     story_expander = _build_story_expander(
         registry=model_registry,
         default_provider_id=app_settings.default_provider_id,
@@ -3286,6 +3463,21 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             InMemoryDispositionDriftHistoryRepository()
         )
         memoir_pin_repository = InMemoryMemoirPinRepository()
+    # AP4 — the paid escape hatch from the two tier allowances that are hard
+    # walls today. Always built (the switches must be readable and clearable
+    # even on a tier that closed overage); it grants nothing unless the tier
+    # opened overage AND the player turned that item on, so self-host and
+    # every un-migrated tier keep the walls exactly where they were.
+    quota_overage_service = QuotaOverageService(
+        preferences=preferences_repository,
+        profile_resolver=account_runtime_profile_resolver,
+        usage_repository=account_runtime_usage_repository,
+        action_billing=action_billing_service,
+        # Consent is to a price, so the switch surface and the spend check both
+        # read the same published list the player is quoted from. ``None`` on
+        # self-host, where the switches are not mounted at all.
+        pricing=cloud_pricing_service,
+    )
     turn_recorder: TurnRecorderPort = BackgroundTurnRecorder(turn_record_repository)
     usage_price_estimator = StaticPriceEstimator.from_json_file(
         os.environ.get("KOKORO_USAGE_PRICE_CATALOG_PATH"),
@@ -3644,22 +3836,6 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feature_key=FEATURE_EXPERIMENT_ANALYSIS,
     )
 
-    scene_access_judge = LLMSceneAccessJudge(
-        provider=active_llm_provider,
-        feature_key=FEATURE_SCENE_ACCESS,
-    )
-    scene_access_service = SceneAccessService(
-        character_repository=character_repository,
-        judge=scene_access_judge,
-        conversation_repository=conversation_repository,
-        schedule_service=schedule_service,
-        memory_repository=memory_repository,
-        pending_follow_up_repository=pending_follow_up_repository,
-        relationship_seed_repository=relationship_seed_repository,
-        operator_profile_service=operator_profile_service,
-        operator_persona_service=operator_persona_service,
-    )
-
     chat_persona_curiosity_service = (
         persona_curiosity_service
         if app_settings.persona.curiosity_enabled
@@ -3700,6 +3876,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         )
         else NullPromptMaterialDigester()
     )
+    # GD1-A: built before the chat service so the same instance the internal
+    # drain route flips is the one the turn path reads. Wired unconditionally —
+    # self-host simply never receives a drain request, so the flag stays False
+    # and every path below reduces to an integer increment.
+    drain_state = DrainState()
     chat_service = ChatService(
         character_repository=character_repository,
         conversation_repository=conversation_repository,
@@ -3712,6 +3893,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         state_engine=state_engine,
         goal_service=goal_service,
         goal_reviewer=goal_reviewer,
+        daily_goal_review_service=daily_goal_review_service,
         self_repetition_extractor=self_repetition_extractor,
         behavioral_pattern_repository=(
             behavioral_pattern_repository
@@ -3768,6 +3950,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # in-process otherwise) but mints a per-turn owner, so two turns exclude
         # each other whether they land on two api replicas or one.
         turn_lease=ChatTurnLease.from_studio_lease(studio_execution_lease),
+        drain_state=drain_state,
+        action_billing=action_billing_service,
+        quota_overage=quota_overage_service,
         emotion_event_repository=emotion_event_repository,
         self_reflection_repository=self_reflection_repository,
         address_preference_repository=(
@@ -3999,19 +4184,6 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     )
     proactive_event_bus = _realtime.proactive_bus
     feed_event_bus = _realtime.feed_bus
-    # P3-Dedup §3.4 — the visible-output slot ledger. DB-backed only (the
-    # claim is a DB unique-index race); ``None`` on the in-memory / no-DB path,
-    # where the proactive + feed-reply passes fall back to their in-code caps
-    # exactly as before. Shared by the dispatcher and the feed-reply service so
-    # their per-tick slots dedup against a distributed reclaimed job.
-    from kokoro_link.infrastructure.persistence.sa_visible_slots import (
-        SAVisibleSlotRepository,
-    )
-
-    visible_slot_port = (
-        SAVisibleSlotRepository(db_session_factory)
-        if db_session_factory is not None else None
-    )
     # LH4 §8.3 — the external proactive sink behind ``ExternalProactiveDeliveryPort``.
     # Self-host (and cloud mode without a configured Channel) wires the self-host
     # messaging adapter (wraps the existing account/binding repos + platform
@@ -4222,6 +4394,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ),
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
+        quota_overage=quota_overage_service,
     )
     feed_reaction_service = FeedReactionService(
         post_repository=feed_post_repository,
@@ -4325,6 +4498,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         if background_shadow_coordinator is not None:
             background_shadow_coordinator.set_runtime_ownership(runtime_ownership)
 
+    # Dedicated hosted coordinators own the site-global world-event loop, but
+    # every scheduled pass must confirm the same durable lease/epoch used by
+    # due-job coordination. Embedded all/background roles keep no guard.
+    if (
+        process_matrix.start_world_event_scheduler
+        and not process_matrix.start_schedulers
+        and background_shadow_coordinator is not None
+    ):
+        world_event_scheduler.set_leadership_guard(
+            background_shadow_coordinator.owns_live_lease,
+        )
+
     scheduler_metrics = SchedulerMetrics()
     proactive_scheduler = ProactiveScheduler(
         dispatcher=proactive_dispatcher,
@@ -4339,6 +4524,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         character_encounter_service=character_encounter_service,
         character_social_knowledge_service=character_social_knowledge_service,
         schedule_memorializer=schedule_memorializer,
+        schedule_weather_drift=schedule_weather_drift_service,
+        goal_review_service=daily_goal_review_service,
         persona_dream_service=persona_dream_service,
         persona_dream_repository=persona_repository,
         account_runtime_profile_resolver=account_runtime_profile_resolver,
@@ -4641,11 +4828,26 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         subscription_access_guard=subscription_access_guard,
     )
-    tts_pregeneration_service = TTSPregenerationService(
-        tts_service=tts_service,
-        preferences=preferences_repository,
-    )
-    chat_service.set_tts_pregenerator(tts_pregeneration_service)
+    if app_settings.cloud.active:
+        # Cloud mode charges TTS at the moment the player presses play
+        # (TTSService.synthesize, called from the play-triggered
+        # route) — that request is the billing point. Background
+        # pregeneration runs before any button press, so it would call the
+        # paid upstream TTS provider with nobody to charge, and if the
+        # player later does press play the pregenerated result is already
+        # cached, so the "charge on play" request becomes a cache hit that
+        # never reaches the metered synthesize call. Gating here — the
+        # single place cloud vs self-host wiring already branches — means
+        # ``ChatService`` never receives a pregenerator in cloud mode and
+        # both call sites' existing ``is None`` guard makes this a no-op,
+        # with zero behavior change for self-host.
+        tts_pregeneration_service = None
+    else:
+        tts_pregeneration_service = TTSPregenerationService(
+            tts_service=tts_service,
+            preferences=preferences_repository,
+        )
+        chat_service.set_tts_pregenerator(tts_pregeneration_service)
     turn_undo_service = TurnUndoService(
         journal_repository=turn_journal_repository,
         conversation_repository=conversation_repository,
@@ -4795,6 +4997,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         jobs=studio_job_repository,
         notifications=notification_service,
         execution_lease=studio_execution_lease,
+        action_billing=action_billing_service,
     )
     # Fusion material-richness stats (Creator Studio C1-P1). Shares
     # ``select_brief_memories`` with the brief builder above so the picker
@@ -4940,7 +5143,6 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         memory_consolidation_service=memory_consolidation_service,
         state_history_repository=state_history_repository,
         embedder=embedder,
-        scene_access_service=scene_access_service,
         object_storage=object_storage,
         provider_ids=model_registry.list_ids(),
         model_registry=model_registry,
@@ -4948,6 +5150,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         video_profile_registry=video_profile_registry,
         preferences_repository=preferences_repository,
         schedule_memorializer=schedule_memorializer,
+        schedule_weather_drift_service=schedule_weather_drift_service,
         active_llm_provider=active_llm_provider,
         cloud_routing_profile_resolver=cloud_routing_profile_resolver,
         nsfw_mode_service=nsfw_mode_service,
@@ -4978,6 +5181,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         character_tick_executor=proactive_scheduler.character_tick_executor,
         social_tick_executor=proactive_scheduler.social_tick_executor,
         scheduler_metrics=scheduler_metrics,
+        drain_state=drain_state,
         background_shadow_coordinator=background_shadow_coordinator,
         background_shadow_worker=background_shadow_worker,
         background_job_queue=background_job_queue,
@@ -4991,6 +5195,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         subscription_access_guard=subscription_access_guard,
         cloud_subscription_repository=cloud_subscription_repository,
         cloud_credit_service=cloud_credit_service,
+        cloud_pricing_service=cloud_pricing_service,
+        cloud_announcement_service=cloud_announcement_service,
+        action_billing_service=action_billing_service,
+        quota_overage_service=quota_overage_service,
         player_locale_service=player_locale_service,
         geocoding_client=geocoding_client,
         external_chat_roster_service=external_chat_roster_service,

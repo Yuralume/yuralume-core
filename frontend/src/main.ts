@@ -7,7 +7,8 @@ import './styles/brand-effects.css'
 import App from './App.vue'
 import router from './router'
 import { i18n } from '@/i18n'
-import { clearStoredToken, getStoredToken } from '@/composables/useAuth'
+import { clearStoredToken, getStoredToken, useAuth } from '@/composables/useAuth'
+import { bounceToSignIn } from '@/utils/sessionBounce'
 
 // Global axios interceptors — auth header + 401 handling.
 //
@@ -28,18 +29,14 @@ axios.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error?.response?.status === 401) {
-      const onLoginPage = window.location.pathname === '/login'
-      const onSetupPage = window.location.pathname === '/setup'
-      // Don't recurse: 401 from /login or /setup itself shouldn't
-      // kick us back to those pages — let the form display the error.
-      if (!onLoginPage && !onSetupPage) {
-        clearStoredToken()
-        const here = window.location.pathname + window.location.search
-        router.replace({
-          path: '/login',
-          query: here === '/' ? {} : { redirect: here },
-        })
-      }
+      // Hosted players get the Portal exit, self-host gets /login — see
+      // `@/utils/sessionRedirect`. Screens that are themselves part of
+      // signing in are skipped so the form can show its own error.
+      bounceToSignIn({
+        router,
+        clearToken: clearStoredToken,
+        portalUrl: useAuth().portalUrl.value,
+      })
     }
     return Promise.reject(error)
   },

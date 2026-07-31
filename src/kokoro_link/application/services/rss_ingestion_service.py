@@ -16,7 +16,6 @@ N minutes (see ``WorldEventScheduler``).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -26,9 +25,11 @@ from kokoro_link.contracts.embedder import EmbedderError, EmbedderPort
 from kokoro_link.contracts.rss_feed_fetcher import (
     RawWorldEvent,
     RssFeedFetcherPort,
+    RssFetchError,
 )
 from kokoro_link.contracts.rss_source import RssSourceRepositoryPort
 from kokoro_link.contracts.world_event import WorldEventRepositoryPort
+from kokoro_link.domain.entities.rss_source import RssSource
 from kokoro_link.domain.entities.world_event import WorldEvent
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,22 @@ class IngestionReport:
     events_region_corrected: int = 0
     """Already-ingested events whose denormalised ``source_region`` was
     brought back in line with the registry during this pass."""
+    events_failed_persist: int = 0
+    """Parsed events that could not be persisted. Kept separate from fetch
+    failures so a source transport can be healthy while storage is degraded."""
+    embed_batches_failed: int = 0
+    """Operational embedder batches that failed and degraded to null vectors."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceIngestionResult:
+    persisted: int = 0
+    skipped_dedup: int = 0
+    skipped_embed: int = 0
+    region_corrected: int = 0
+    failed_persist: int = 0
+    embed_batches_failed: int = 0
+    error: str | None = None
 
 
 class RssIngestionService:
@@ -73,6 +90,8 @@ class RssIngestionService:
         skipped_dedup = 0
         skipped_embed = 0
         region_corrected = 0
+        failed_persist = 0
+        embed_batches_failed = 0
         errors: list[str] = []
 
         cutoff = datetime.now(timezone.utc).replace(microsecond=0)
@@ -90,90 +109,51 @@ class RssIngestionService:
                     locale=source.locale,
                 )
             except Exception as exc:  # fail-soft per source
-                errors.append(
-                    f"{source.id} ({source.feed_url}): "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                safe_error = _safe_fetch_error(exc)
+                errors.append(f"{source.id}: {safe_error}")
                 logger.warning(
-                    "rss source fetch failed",
-                    extra={
-                        "source_id": source.id,
-                        "source_name": source.name,
-                        "feed_url": source.feed_url,
-                        "category": source.category,
-                        "error_type": type(exc).__name__,
-                        "error": repr(exc),
-                    },
+                    "rss source fetch failed source_id=%s error_code=%s "
+                    "error_type=%s",
+                    source.id,
+                    exc.code if isinstance(exc, RssFetchError)
+                    else "unexpected_fetch_error",
+                    type(exc).__name__,
                 )
-                await self._sources.mark_error(
-                    source.id, at=now, error=str(exc),
+                await self._mark_source_error(
+                    source_id=source.id, at=now, error=safe_error,
                 )
                 continue
 
-            new_events: list[RawWorldEvent] = []
-            known_urls: list[str] = []
-            for raw in raws:
-                raw = _with_trusted_published_at(raw, fetched_at=now)
-                if raw.published_at.timestamp() < cutoff_age:
-                    continue
-                if await self._events.has_url(raw.url):
-                    skipped_dedup += 1
-                    known_urls.append(raw.url)
-                    continue
-                new_events.append(raw)
-
-            region_corrected += await self._heal_source_region(
-                source_id=source.id, urls=known_urls, region=source.region,
-            )
-
-            embeddings: list[tuple[float, ...] | None] = []
-            if new_events and self._embedder.is_operational:
-                try:
-                    embeddings = await self._embedder.embed_many(
-                        [_embed_text(e) for e in new_events]
-                    )
-                except EmbedderError as exc:
-                    logger.warning(
-                        "rss embed batch failed; persisting null vectors",
-                        extra={"source_id": source.id, "error": repr(exc)},
-                    )
-                    embeddings = [None] * len(new_events)
-            else:
-                embeddings = [None] * len(new_events)
-
-            for raw, vec in zip(new_events, embeddings, strict=False):
-                if vec is None:
-                    skipped_embed += 1
-                event = WorldEvent(
-                    id=str(uuid4()),
-                    source=raw.source_name,
-                    title=raw.title,
-                    summary=raw.summary,
-                    url=raw.url,
-                    published_at=raw.published_at,
-                    fetched_at=now,
-                    category=raw.category or "news",
-                    locale=raw.locale or source.locale or None,
-                    # Region is a property of the *registry entry*, never of
-                    # the feed payload — denormalised here so the curator can
-                    # narrow the pool in SQL without joining rss_sources.
-                    source_region=source.region,
-                    topic_tags=raw.topic_tags,
-                    embedding=list(vec) if vec is not None else None,
+            try:
+                result = await self._ingest_source(
+                    source=source,
+                    raws=raws,
+                    now=now,
+                    cutoff_age=cutoff_age,
                 )
-                try:
-                    await self._events.upsert(event)
-                    persisted += 1
-                except Exception as exc:
-                    logger.warning(
-                        "world_event upsert failed",
-                        extra={"url": raw.url, "error": repr(exc)},
-                    )
+            except Exception as exc:  # fail-soft beyond transport, too
+                safe_error = f"source_processing_error: {type(exc).__name__}"
+                errors.append(f"{source.id}: {safe_error}")
+                logger.warning(
+                    "rss source processing failed source_id=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
+                await self._mark_source_error(
+                    source_id=source.id, at=now, error=safe_error,
+                )
+                continue
 
-            await self._sources.mark_success(
-                source.id, at=now, fetched_count=len(new_events),
-            )
-            succeeded += 1
+            persisted += result.persisted
+            skipped_dedup += result.skipped_dedup
+            skipped_embed += result.skipped_embed
+            region_corrected += result.region_corrected
+            failed_persist += result.failed_persist
+            embed_batches_failed += result.embed_batches_failed
+            if result.error is not None:
+                errors.append(f"{source.id}: {result.error}")
+            else:
+                succeeded += 1
 
         return IngestionReport(
             sources_attempted=attempted,
@@ -183,7 +163,148 @@ class RssIngestionService:
             events_skipped_embed=skipped_embed,
             errors=tuple(errors),
             events_region_corrected=region_corrected,
+            events_failed_persist=failed_persist,
+            embed_batches_failed=embed_batches_failed,
         )
+
+    async def _ingest_source(
+        self,
+        *,
+        source: RssSource,
+        raws: list[RawWorldEvent],
+        now: datetime,
+        cutoff_age: float,
+    ) -> _SourceIngestionResult:
+        """Process one fetched source; callers isolate any unexpected failure."""
+        skipped_dedup = 0
+        skipped_embed = 0
+        failed_persist = 0
+        embed_batches_failed = 0
+        persisted = 0
+        new_events: list[RawWorldEvent] = []
+        known_urls: list[str] = []
+        for raw in raws:
+            raw = _with_trusted_published_at(raw, fetched_at=now)
+            if raw.published_at.timestamp() < cutoff_age:
+                continue
+            if await self._events.has_url(raw.url):
+                skipped_dedup += 1
+                known_urls.append(raw.url)
+                continue
+            new_events.append(raw)
+
+        region_corrected = await self._heal_source_region(
+            source_id=source.id, urls=known_urls, region=source.region,
+        )
+
+        embeddings: list[tuple[float, ...] | None]
+        if new_events and self._embedder.is_operational:
+            try:
+                embeddings = await self._embedder.embed_many(
+                    [_embed_text(event) for event in new_events]
+                )
+            except EmbedderError as exc:
+                embed_batches_failed += 1
+                logger.warning(
+                    "rss embed batch failed source_id=%s error_type=%s; "
+                    "persisting null vectors",
+                    source.id,
+                    type(exc).__name__,
+                )
+                embeddings = [None] * len(new_events)
+        else:
+            embeddings = [None] * len(new_events)
+
+        if len(embeddings) != len(new_events):
+            embed_batches_failed += 1
+            logger.warning(
+                "rss embed batch length mismatch source_id=%s expected=%d "
+                "actual=%d; persisting missing vectors as null",
+                source.id,
+                len(new_events),
+                len(embeddings),
+            )
+            embeddings = (
+                list(embeddings[:len(new_events)])
+                + [None] * max(0, len(new_events) - len(embeddings))
+            )
+
+        for raw, vec in zip(new_events, embeddings, strict=False):
+            if vec is None:
+                skipped_embed += 1
+            event = WorldEvent(
+                id=str(uuid4()),
+                source=raw.source_name,
+                title=raw.title,
+                summary=raw.summary,
+                url=raw.url,
+                published_at=raw.published_at,
+                fetched_at=now,
+                category=raw.category or "news",
+                locale=raw.locale or source.locale or None,
+                source_region=source.region,
+                topic_tags=raw.topic_tags,
+                embedding=list(vec) if vec is not None else None,
+            )
+            try:
+                await self._events.upsert(event)
+                persisted += 1
+            except Exception as exc:
+                failed_persist += 1
+                logger.warning(
+                    "world_event upsert failed source_id=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
+
+        storage_error = None
+        if failed_persist:
+            storage_error = (
+                "storage_degraded: "
+                f"persisted={persisted} failed={failed_persist}"
+            )
+            await self._mark_source_error(
+                source_id=source.id,
+                at=now,
+                error=storage_error,
+                fetched_count=persisted,
+            )
+        else:
+            await self._sources.mark_success(
+                source.id, at=now, fetched_count=persisted,
+            )
+        return _SourceIngestionResult(
+            persisted=persisted,
+            skipped_dedup=skipped_dedup,
+            skipped_embed=skipped_embed,
+            region_corrected=region_corrected,
+            failed_persist=failed_persist,
+            embed_batches_failed=embed_batches_failed,
+            error=storage_error,
+        )
+
+    async def _mark_source_error(
+        self,
+        *,
+        source_id: str,
+        at: datetime,
+        error: str,
+        fetched_count: int = 0,
+    ) -> None:
+        """Record source health without letting health persistence abort a pass."""
+        try:
+            await self._sources.mark_error(
+                source_id,
+                at=at,
+                error=error,
+                fetched_count=fetched_count,
+            )
+        except Exception as exc:
+            logger.warning(
+                "rss source error status write failed source_id=%s error_type=%s",
+                source_id,
+                type(exc).__name__,
+            )
 
     async def _heal_source_region(
         self, *, source_id: str, urls: list[str], region: str | None,
@@ -209,12 +330,11 @@ class RssIngestionService:
             )
         except Exception as exc:  # noqa: BLE001 — repair is best-effort
             logger.warning(
-                "world_event source_region repair failed",
-                extra={
-                    "source_id": source_id,
-                    "url_count": len(urls),
-                    "error": repr(exc),
-                },
+                "world_event source_region repair failed source_id=%s "
+                "url_count=%d error_type=%s",
+                source_id,
+                len(urls),
+                type(exc).__name__,
             )
             return 0
 
@@ -266,7 +386,6 @@ def _with_trusted_published_at(
         "rss entry published_at implausible; using fetch time",
         extra={
             "source_id": raw.source_id,
-            "url": raw.url,
             "published_at": published.isoformat(),
         },
     )
@@ -286,6 +405,18 @@ def _embed_text(raw: RawWorldEvent) -> str:
         parts.append("tags: " + ", ".join(raw.topic_tags))
     parts.append(f"source: {raw.source_name} ({raw.category})")
     return "\n".join(parts)
+
+
+def _safe_fetch_error(exc: Exception) -> str:
+    """Return a stable diagnostic that cannot contain a configured URL.
+
+    Typed adapter failures already carry only an error code and bounded safe
+    detail. Unknown fetchers may put credentials or full URLs in exception
+    messages, so retain only their class name.
+    """
+    if isinstance(exc, RssFetchError):
+        return str(exc)
+    return f"unexpected_fetch_error: {type(exc).__name__}"
 
 
 def _days(n: int):

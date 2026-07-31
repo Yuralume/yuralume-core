@@ -503,6 +503,7 @@ async def test_pre_composed_external_push_sends_segments_with_attachment_last() 
     )
 
     assert attempt.outcome == ProactiveOutcome.SENT
+    assert attempt.binding_id == binding.id
     assert [message.text for message in harness.telegram_adapter.sent] == [
         "第一則",
         "第二則",
@@ -882,6 +883,99 @@ async def test_proactive_outcomes_emit_emotion_events_and_link_turn_refs() -> No
         assert record.prompt_pack_hash == "proactive-pack-with-flags"
         assert record.post_turn_refs["proactive_attempt_id"]
         assert len(record.post_turn_refs["emotion_event_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_sent_turn_record_persists_the_assembled_decider_prompt() -> None:
+    """A message that actually went out must be auditable.
+
+    Without this the operator can see *what* the character said but not
+    *what it was looking at* when it decided to say it (COMMITMENT_
+    LIFECYCLE_AND_FRESHNESS_PLAN §2 P0).
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(harness)
+    account = await create_telegram_account(harness, character_id=character.id)
+    from kokoro_link.domain.entities.channel_binding import ChannelBinding
+
+    binding = ChannelBinding.create(
+        account_id=account.id, chat_ref="c1", accepts_proactive=True,
+    )
+    await harness.binding_repository.save(binding)
+
+    assembled = "你是角色「木木」，正在考慮是否主動向使用者傳訊息。\n【接下來幾天的行程】…"
+    turn_records = InMemoryTurnRecordRepository()
+    turn_recorder = BackgroundTurnRecorder(turn_records)
+    dispatcher, _ = _make_dispatcher(
+        harness,
+        decider=_FixedDecider(
+            ProactiveDecision(
+                True,
+                "想跟你打招呼",
+                "嗨，我剛做完練習",
+                prompt_assembled=assembled,
+            ),
+        ),
+        turn_recorder=turn_recorder,
+    )
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+    await turn_recorder.flush()
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+    records = await turn_records.list_recent(character_id=character.id)
+    assert len(records) == 1
+    assert records[0].prompt_assembled == assembled
+
+
+@pytest.mark.asyncio
+async def test_skipped_and_gate_blocked_ticks_store_no_prompt() -> None:
+    """Ticks that produced no message must not carry the prompt.
+
+    A ~5-minute tick cadence means hundreds of skip/blocked rows a day
+    per character; persisting a ~17k-char prompt on each would bloat
+    ``turn_records`` for zero audit value.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(harness)
+    account = await create_telegram_account(harness, character_id=character.id)
+    from kokoro_link.domain.entities.channel_binding import ChannelBinding
+
+    binding = ChannelBinding.create(
+        account_id=account.id, chat_ref="c1", accepts_proactive=True,
+    )
+    await harness.binding_repository.save(binding)
+
+    turn_records = InMemoryTurnRecordRepository()
+    turn_recorder = BackgroundTurnRecorder(turn_records)
+    dispatcher, _ = _make_dispatcher(
+        harness,
+        decider=_FixedDecider(
+            ProactiveDecision(
+                False,
+                "現在不想打擾",
+                None,
+                prompt_assembled="（skip 也組過 prompt，但不該落庫）",
+            ),
+        ),
+        turn_recorder=turn_recorder,
+    )
+
+    skipped = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+    blocked = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+    await turn_recorder.flush()
+
+    assert skipped.outcome == ProactiveOutcome.DECIDER_SKIPPED
+    assert blocked.outcome == ProactiveOutcome.GATE_BLOCKED
+    records = await turn_records.list_recent(character_id=character.id)
+    assert len(records) == 2
+    assert [r.prompt_assembled for r in records] == ["", ""]
 
 
 # ---------------------------------------------------------------------------

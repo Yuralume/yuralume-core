@@ -594,6 +594,17 @@ class DailyScheduleRow(Base):
     is_planned: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true",
     )
+    # Intra-day weather-drift gate marker: which activity was in progress
+    # the last time the drift judge ran on this day, and the weather
+    # condition phrase that was true then. NULL = never vetted. Purely a
+    # cost gate (skip the LLM call while both halves are unchanged) — the
+    # semantic judgement always re-reads the full schedule text.
+    weather_vet_activity_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True,
+    )
+    weather_vet_condition: Mapped[str | None] = mapped_column(
+        String(80), nullable=True,
+    )
 
     activities: Mapped[list["ScheduleActivityRow"]] = relationship(
         back_populates="schedule",
@@ -1042,6 +1053,16 @@ class StorySeedRow(Base):
     world_frames: Mapped[str] = mapped_column(
         Text, nullable=False, default='["any"]',
     )
+    tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="daily",
+    )
+    """Pacing tier (``daily`` / ``dramatic``). Dramatic seeds never enter
+    the daily gacha rotation — see ``StorySeed.tier``."""
+    regions: Mapped[str] = mapped_column(
+        Text, nullable=False, default='["global"]',
+    )
+    """JSON list of region codes, same JSON-in-Text convention as
+    ``world_frames``; ``global`` is the wildcard."""
     weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     cooldown_days: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -1178,6 +1199,13 @@ class StoryArcRow(Base):
     source_template_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True,
     )
+    source_seed_ids: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]",
+    )
+    """JSON list of ``story_seeds.id`` the planner folded into this arc,
+    same JSON-in-Text convention as ``StorySeedRow.regions`` /
+    ``StoryArcBeatRow.scene_characters``. AE2 slice — no reader/writer
+    yet; a later ticket has the planner populate it."""
     start_date: Mapped[str] = mapped_column(String(10), nullable=False)
     end_date: Mapped[str] = mapped_column(String(10), nullable=False)
     status: Mapped[str] = mapped_column(

@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -105,6 +106,14 @@ class RssSourceRow(Base):
 
 class CharacterEventInboxRow(Base):
     __tablename__ = "character_event_inbox"
+    __table_args__ = (
+        Index(
+            "ix_character_event_inbox_unique",
+            "character_id",
+            "world_event_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     character_id: Mapped[str] = mapped_column(

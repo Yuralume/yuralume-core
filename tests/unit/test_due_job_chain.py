@@ -19,6 +19,7 @@ from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.background_jobs import COORDINATOR_LEASE_NAME
 from kokoro_link.contracts.due_jobs import (
     FEED_COMPOSE_KIND,
+    GOAL_REVIEW_KIND,
     PROACTIVE_EVALUATE_KIND,
     character_chain_kinds,
     kind_spec,
@@ -69,8 +70,14 @@ class _RecordingExecutor:
     async def step_schedule_maintenance(self, character):  # noqa: ANN001
         self.calls.append(("schedule_maintenance", character.id))
 
+    async def step_schedule_weather_vet(self, character, *, now):  # noqa: ANN001
+        self.calls.append(("schedule_weather_vet", character.id))
+
     async def step_memorialize(self, character, *, now):  # noqa: ANN001
         self.calls.append(("memorialize", character.id))
+
+    async def step_goal_review(self, character, *, now=None):  # noqa: ANN001
+        self.calls.append(("goal_review", character.id))
 
     async def step_feed_compose(self, character):  # noqa: ANN001
         self.calls.append(("feed_compose", character.id))
@@ -244,3 +251,21 @@ async def test_freeze_then_thaw_relinks_chain() -> None:
     char.frozen = False
     relinked = await reconciler.run_once(now=BASE + timedelta(minutes=5))
     assert relinked.reseeded == len(character_chain_kinds())
+
+
+async def test_goal_review_kind_routes_to_its_step_and_self_chains() -> None:
+    # CF2: the distributed side reaches the same daily review through its own
+    # chain, so a hosted character whose player never chats still converges.
+    queue, handler, _, executor = await _harness([_FakeCharacter()])
+    result = await handler.handle(
+        _FakeCharacter(), GOAL_REVIEW_KIND, now=BASE, logical_slot="b",
+    )
+    assert result.executed is True
+    assert ("goal_review", "c1") in executor.calls
+    assert ("goal_review", "c1") in await queue.active_chain_keys()
+    # Next occurrence is one civil day out, not one tick.
+    claimed = await queue.claim(
+        "w", now=BASE + timedelta(days=1, seconds=1), limit=10, lease_seconds=60,
+    )
+    job = next(j for j in claimed if j.kind == GOAL_REVIEW_KIND)
+    assert job.due_at - BASE == timedelta(days=1)

@@ -29,6 +29,10 @@ from kokoro_link.infrastructure.register.llm_register_profiler import (
 from kokoro_link.infrastructure.register.null_register_profiler import (
     NullRegisterProfiler,
 )
+from kokoro_link.infrastructure.schedule.llm_weather_drift import (
+    LLMScheduleWeatherDriftJudge,
+    NullScheduleWeatherDriftJudge,
+)
 from kokoro_link.infrastructure.usage.llm_metering import MeteredActiveLLMProvider
 
 
@@ -75,6 +79,42 @@ def test_container_uses_cloud_active_llm_provider_in_cloud_mode() -> None:
 
     assert isinstance(container.active_llm_provider, MeteredActiveLLMProvider)
     assert isinstance(container.active_llm_provider.inner, CloudActiveLLMProvider)
+
+
+def test_container_disables_tts_pregeneration_in_cloud_mode() -> None:
+    """TS4: cloud mode charges TTS only when the player presses play.
+
+    Background pregeneration would call the paid upstream provider before
+    any button press (nobody to charge) and would let a later play request
+    resolve from cache instead of the metered synthesize call. Cloud mode
+    must never wire the pregeneration service at all — not just leave its
+    preference permanently disabled — so neither call site in
+    ``ChatService`` can invoke it.
+    """
+    settings = AppSettings(
+        cloud=CloudSettings(
+            enabled=True,
+            user_service_url="https://users.example",
+            gateway_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+        ),
+    )
+
+    container = build_container(settings)
+
+    assert container.tts_pregeneration_service is None
+    assert container.chat_service._tts_pregenerator is None  # noqa: SLF001
+
+
+def test_container_wires_tts_pregeneration_service_in_self_host() -> None:
+    """Self-host red line: TS4 must not change self-host behavior at all."""
+    container = build_container(AppSettings(database_url=""))
+
+    assert container.tts_pregeneration_service is not None
+    assert (
+        container.chat_service._tts_pregenerator  # noqa: SLF001
+        is container.tts_pregeneration_service
+    )
 
 
 def test_container_wires_usage_recorder_after_feed_composer_is_created() -> None:
@@ -143,6 +183,48 @@ def test_container_wires_background_encounter_and_schedule_memorializer() -> Non
     assert (
         container.proactive_scheduler._demo_account_reaper  # noqa: SLF001
         is container.demo_account_reaper
+    )
+
+
+def test_container_wires_schedule_weather_drift_into_the_tick() -> None:
+    container = build_container(AppSettings(database_url=""))
+
+    service = container.schedule_weather_drift_service
+    assert service is not None
+    # The vet needs the same weather / operator sources the planner reads,
+    # otherwise it would compare the day against a different sky.
+    assert (
+        service._weather_context_port  # noqa: SLF001
+        is container.schedule_service._weather_context_port  # noqa: SLF001
+    )
+    assert (
+        service._operator_profile_service  # noqa: SLF001
+        is container.operator_profile_service
+    )
+    assert container.proactive_scheduler is not None
+    assert (
+        container.proactive_scheduler._schedule_weather_drift  # noqa: SLF001
+        is service
+    )
+    assert (
+        container.character_tick_executor._schedule_weather_drift  # noqa: SLF001
+        is service
+    )
+
+
+def test_container_uses_null_weather_drift_judge_on_the_fake_provider() -> None:
+    fake = build_container(AppSettings(database_url=""))
+    real = build_container(
+        AppSettings(database_url="", default_provider_id="lmstudio"),
+    )
+
+    assert isinstance(
+        fake.schedule_weather_drift_service._drift_port,  # noqa: SLF001
+        NullScheduleWeatherDriftJudge,
+    )
+    assert isinstance(
+        real.schedule_weather_drift_service._drift_port,  # noqa: SLF001
+        LLMScheduleWeatherDriftJudge,
     )
 
 

@@ -19,6 +19,8 @@ Plain-language release notes for everyday users — what each update actually fe
 
 | 版本 / Version | 繁中 | EN | 日本語 |
 |---|---|---|---|
+| 2026.07.31 — 同場想來就來不再審核、角色照自己的行程反應、劇情章節不重複 / same-scene needs no permission, characters react from their own schedule, story chapters stop repeating / 同席は許可不要に・キャラは自分の予定どおりに反応・ストーリーは繰り返さない | [zh-TW](zh-TW/2026-07-31.md) | [en-US](en-US/2026-07-31.md) | [ja-JP](ja-JP/2026-07-31.md) |
+| 2026.07.29 — 約定會過去不再跳針、行程跟上真實天氣、日常靈感大擴充 / promises finally lapse instead of looping, schedules follow the real weather, big everyday-inspiration expansion / 約束はちゃんと過去になる・予定は実際の天気に追従・日常ネタを大幅拡充 | [zh-TW](zh-TW/2026-07-29.md) | [en-US](en-US/2026-07-29.md) | [ja-JP](ja-JP/2026-07-29.md) |
 | 2026.07.26 — 天氣節慶各看各的所在地、新聞來源可標地區、同時觸發不再重複跑 / weather & holidays per owner's location, region-tagged news sources, no more double runs / 天気と祝日は持ち主の所在地基準・ニュースソースの地域指定・二重実行の解消 | [zh-TW](zh-TW/2026-07-26.md) | [en-US](en-US/2026-07-26.md) | [ja-JP](ja-JP/2026-07-26.md) |
 | 2026.07.22 — 閒置自動放慢更省成本、修掉默默燒 API 的重試、語音鈕該藏就藏 / gentler auto-slowdown when idle, silent API-burning retry fixed, voice button hidden when unset / アイドル時の自動スローダウン・APIを浪費する再試行を修正・音声ボタンの表示改善 | [zh-TW](zh-TW/2026-07-22.md) | [en-US](en-US/2026-07-22.md) | [ja-JP](ja-JP/2026-07-22.md) |
 | 2026.07.16 — 共演短篇更穩更好上手、供應商測試來真的、模型相容性自癒 / sturdier co-writing, provider tests that really test, model-compatibility self-healing / 共作短編の安定化・プロバイダの本当のテスト・モデル互換の自己修復 | [zh-TW](zh-TW/2026-07-16.md) | [en-US](en-US/2026-07-16.md) | [ja-JP](ja-JP/2026-07-16.md) |

@@ -3,10 +3,14 @@ import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 
 import { useLocale } from '@/composables/useLocale'
+import { useSessionRenewal } from '@/composables/useSessionRenewal'
 import { antDesignLocales } from '@/i18n/antDesign'
 import FirstLoginLocaleGate from '@/components/FirstLoginLocaleGate.vue'
 
 const { locale } = useLocale()
+// Extends the session while the player is actually using the app, so a fixed
+// hosted TTL can't sign them out mid-conversation. No-op when auth is off.
+useSessionRenewal()
 const route = useRoute()
 const antdLocale = computed(() => antDesignLocales[locale.value])
 

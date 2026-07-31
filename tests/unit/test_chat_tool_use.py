@@ -24,6 +24,13 @@ from kokoro_link.application.dto.character import CreateCharacterRequest
 from kokoro_link.application.dto.chat import SendChatMessageRequest
 from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.chat_service import ChatService
+from kokoro_link.application.services.cloud_action_billing_service import (
+    ActionChargeHandle,
+)
+from kokoro_link.application.services.quota_overage_service import (
+    OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+    OverageGrant,
+)
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
 from kokoro_link.contracts.generation_trigger import (
     GenerationTrigger,
@@ -327,6 +334,8 @@ def _build_forced_trigger_service(
     account_runtime_profile_resolver=None,
     account_runtime_usage_repository=None,
     clock=None,
+    quota_overage=None,
+    image_tool: ToolPort | None = None,
 ) -> tuple[ChatService, CharacterService, _ScriptedModel, _RealNameImageTool]:
     """Wire a ChatService with a tool registered under the production
     name ``generate_image`` — needed because the forced-trigger code path
@@ -340,7 +349,7 @@ def _build_forced_trigger_service(
     scripted = _ScriptedModel(replies)
     registry.register(scripted)
 
-    image_tool = _RealNameImageTool()
+    image_tool = image_tool or _RealNameImageTool()
     tool_registry = InMemoryToolRegistry([EchoTool(), image_tool])
     orchestrator = ToolOrchestrator(
         registry=tool_registry,
@@ -360,6 +369,7 @@ def _build_forced_trigger_service(
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
         clock=clock,
+        quota_overage=quota_overage,
     )
     character_service = CharacterService(character_repository)
     return chat_service, character_service, scripted, image_tool
@@ -847,6 +857,204 @@ async def test_demo_runtime_profile_blocks_chat_image_when_ledger_missing() -> N
     assert response.assistant_message.attachments == []
     assert response.assistant_message.content == "我先不用圖片。"
     assert len(model.calls) == 2
+
+
+@dataclass
+class _FailingImageTool(ToolPort):
+    """Same production name, but the generation itself fails."""
+
+    name: str = "generate_image"
+    description: str = "Failing production-name stub."
+    parameters_schema: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.parameters_schema is None:
+            self.parameters_schema = {
+                "type": "object",
+                "properties": {"positive": {"type": "string"}},
+                "required": ["positive"],
+            }
+        self.last_positive: str | None = None
+        self.invoke_count = 0
+
+    async def invoke(self, ctx: ToolContext) -> ToolResult:
+        self.invoke_count += 1
+        return ToolResult.failure(error="upstream image provider exploded")
+
+
+class _StubOverage:
+    """Stands in for ``QuotaOverageService`` at the chat seam."""
+
+    def __init__(
+        self, *, granted: bool = True, denied_reason: str | None = None,
+    ) -> None:
+        self._granted = granted
+        self._denied_reason = denied_reason
+        self.authorised: list[str] = []
+        self.settled = 0
+        self.released = 0
+
+    async def authorise(self, item, *, operator_id, now) -> OverageGrant:
+        self.authorised.append(item.key)
+        if not self._granted:
+            return OverageGrant(denied_reason=self._denied_reason)
+        return OverageGrant(
+            charge=ActionChargeHandle(
+                action_key=item.action_key,
+                charge_id="chg-overage",
+                interaction_id="int-overage",
+            ),
+        )
+
+    async def settle(self, grant: OverageGrant | None) -> None:
+        if grant is not None and grant.charge is not None:
+            self.settled += 1
+
+    async def release(self, grant: OverageGrant | None) -> None:
+        if grant is not None and grant.charge is not None:
+            self.released += 1
+
+
+def _over_limit_replies() -> list[str]:
+    return [
+        '```json\n{"tool": "generate_image", "args": '
+        '{"positive": "first portrait"}}\n```',
+        "第一張好了。",
+        '```json\n{"tool": "generate_image", "args": '
+        '{"positive": "second portrait"}}\n```',
+        "第二張也好了。",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authorised_overage_lets_the_image_past_the_daily_limit() -> None:
+    """AP4: over the tier limit, an authorised purchase releases the picture."""
+    overage = _StubOverage(granted=True)
+    chat, chars, _model, image_tool = _build_forced_trigger_service(
+        replies=_over_limit_replies(),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=InMemoryAccountRuntimeUsageRepository(),
+        quota_overage=overage,
+    )
+    character_id = await _seed_trigger_character(
+        chars, allowed_tools=["generate_image"],
+    )
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="傳一張你現在的照片",
+    ))
+    second = await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="再傳一張照片",
+    ))
+
+    assert image_tool.invoke_count == 2
+    assert second.assistant_message.attachments
+    # Only the over-limit call consults the paid escape hatch.
+    assert overage.authorised == ["chat_image"]
+    assert overage.settled == 1
+    assert overage.released == 0
+
+
+@pytest.mark.asyncio
+async def test_a_refused_overage_keeps_the_hard_limit() -> None:
+    overage = _StubOverage(
+        granted=False, denied_reason=OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+    )
+    chat, chars, _model, image_tool = _build_forced_trigger_service(
+        replies=_over_limit_replies(),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=InMemoryAccountRuntimeUsageRepository(),
+        quota_overage=overage,
+    )
+    character_id = await _seed_trigger_character(
+        chars, allowed_tools=["generate_image"],
+    )
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="傳一張你現在的照片",
+    ))
+    second = await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="再傳一張照片",
+    ))
+
+    assert image_tool.invoke_count == 1
+    assert second.assistant_message.attachments == []
+    assert overage.settled == 0
+    assert overage.released == 0
+
+
+@pytest.mark.asyncio
+async def test_a_refused_overage_tells_the_character_why() -> None:
+    """The player opted in and paid nothing — she must not just say "limit"."""
+    overage = _StubOverage(
+        granted=False, denied_reason=OVERAGE_DENIED_INSUFFICIENT_CREDITS,
+    )
+    chat, chars, model, _image_tool = _build_forced_trigger_service(
+        replies=_over_limit_replies(),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=InMemoryAccountRuntimeUsageRepository(),
+        quota_overage=overage,
+    )
+    character_id = await _seed_trigger_character(
+        chars, allowed_tools=["generate_image"],
+    )
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="傳一張你現在的照片",
+    ))
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="再傳一張照片",
+    ))
+
+    wrap_up_prompt = model.calls[-1]
+    assert "螢火不足" in wrap_up_prompt
+
+
+@pytest.mark.asyncio
+async def test_a_failed_generation_refunds_the_overage() -> None:
+    overage = _StubOverage(granted=True)
+    chat, chars, _model, image_tool = _build_forced_trigger_service(
+        replies=_over_limit_replies(),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=InMemoryAccountRuntimeUsageRepository(),
+        quota_overage=overage,
+        image_tool=_FailingImageTool(),
+    )
+    character_id = await _seed_trigger_character(
+        chars, allowed_tools=["generate_image"],
+    )
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="傳一張你現在的照片",
+    ))
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="再傳一張照片",
+    ))
+
+    assert image_tool.invoke_count == 2
+    assert overage.settled == 0
+    assert overage.released == 1
+
+
+@pytest.mark.asyncio
+async def test_under_the_limit_never_reaches_the_paid_path() -> None:
+    overage = _StubOverage(granted=True)
+    chat, chars, _model, image_tool = _build_forced_trigger_service(
+        replies=_over_limit_replies()[:2],
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=InMemoryAccountRuntimeUsageRepository(),
+        quota_overage=overage,
+    )
+    character_id = await _seed_trigger_character(
+        chars, allowed_tools=["generate_image"],
+    )
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=character_id, message="傳一張你現在的照片",
+    ))
+
+    assert image_tool.invoke_count == 1
+    assert overage.authorised == []
 
 
 @pytest.mark.asyncio

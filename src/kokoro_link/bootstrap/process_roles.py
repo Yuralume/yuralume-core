@@ -11,7 +11,8 @@ blast radius is minimal.
 
 §2.1 dedicated roles: the ``coordinator`` / ``worker`` / ``connector`` processes
 each start one slice and nothing else. ``coordinator`` runs the leader-lease +
-due-discovery + global social_tick enqueue loop; ``worker`` runs the queue
+due-discovery loop and the lease-gated site-global world-event scheduler;
+``worker`` runs the queue
 claim/execute loop (+ realtime outbox writer); ``connector`` runs only the
 messaging connectors. None of the three serve public API routes — a hard
 security red line (§11): the only surface they expose is the loopback
@@ -28,8 +29,10 @@ class ComponentMatrix:
     """Booleans describing which subsystems a process role turns on.
 
     ``serve_metrics_route`` gates the Phase 0 internal metrics endpoint (loopback
-    scrape). ``start_schedulers`` is the *embedded* in-process scheduler
-    (proactive + world-event singletons) — distinct from the distributed
+    scrape). ``start_schedulers`` is the *embedded* in-process scheduler pair
+    (proactive + world-event); ``start_world_event_scheduler`` additionally
+    assigns only the world-event singleton to a dedicated coordinator — distinct
+    from the distributed
     ``run_background_coordinator`` / ``run_background_worker`` loops, which are
     the §2.1 dedicated roles' coordinator/worker tasks and can run in a process
     that starts no embedded scheduler at all. ``enable_realtime_outbox_writer``
@@ -46,6 +49,19 @@ class ComponentMatrix:
     run_background_coordinator: bool
     run_background_worker: bool
     enable_realtime_outbox_writer: bool
+
+    @property
+    def start_world_event_scheduler(self) -> bool:
+        """Whether this role owns the site-global RSS/curation loop.
+
+        Embedded roles keep their existing scheduler shape. In the dedicated
+        topology the coordinator is the sole eligible owner; its replicas are
+        fenced by the existing coordinator lease.
+        """
+        return self.start_schedulers or (
+            self.run_background_coordinator
+            and not self.run_background_worker
+        )
 
     @property
     def requires_cloud_provider_credentials(self) -> bool:
@@ -66,8 +82,8 @@ class ComponentMatrix:
 # ``all`` / ``background`` keep BOTH the embedded scheduler AND the durable
 # coordinator/worker (the transitional Phase 1/2 shape: they ride together when
 # the postgres backend / shadow is on). The dedicated §2.1 roles split those
-# apart: ``coordinator`` runs only the coordinator loop, ``worker`` only the
-# worker loop, ``connector`` only the connectors.
+# apart: ``coordinator`` runs its loop plus the lease-gated global world-event
+# scheduler, ``worker`` only the worker loop, ``connector`` only the connectors.
 _MATRIX: dict[str, ComponentMatrix] = {
     "all": ComponentMatrix(
         serve_api_routes=True,
@@ -104,8 +120,9 @@ _MATRIX: dict[str, ComponentMatrix] = {
     ),
     # §2.1 dedicated coordinator: leader lease + due discovery + global
     # social_tick enqueue + reconcile, obeying the three-state execution-mode
-    # barrier. No embedded scheduler, no worker execution, no connectors, no
-    # Studio recovery, no public API. It only enqueues, so it never publishes
+    # barrier, plus the lease-gated site-global world-event loop. No proactive
+    # scheduler, worker execution, connectors, Studio recovery, or public API.
+    # It never publishes
     # proactive/feed events → no realtime outbox writer.
     "coordinator": ComponentMatrix(
         serve_api_routes=False,

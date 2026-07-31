@@ -776,6 +776,58 @@ async def test_schedule_activity_has_memory_round_trips(
 
 
 @pytest.mark.asyncio
+async def test_schedule_weather_vet_marker_round_trips(
+    session_factory: sessionmaker,
+) -> None:
+    from datetime import date as date_cls
+
+    repo = SAScheduleRepository(session_factory)
+    target = date_cls(2026, 4, 18)
+    schedule = _schedule("char-A", target, [(9, 10, "河堤散步", "leisure", "河堤")])
+    await repo.save(schedule.with_weather_vet(schedule.activities[0].id, "小雨"))
+
+    loaded = await repo.get("char-A", target)
+    assert loaded is not None
+    assert loaded.weather_vet_activity_id == schedule.activities[0].id
+    assert loaded.weather_vet_condition == "小雨"
+
+    # Same day re-saved with a turned sky — the marker must move in place so
+    # the drift gate re-opens instead of skipping for the rest of the day.
+    await repo.save(loaded.with_weather_vet(loaded.activities[0].id, "晴朗"))
+    revetted = await repo.get("char-A", target)
+    assert revetted is not None
+    assert revetted.weather_vet_condition == "晴朗"
+
+
+@pytest.mark.asyncio
+async def test_set_weather_vet_leaves_concurrent_activity_writes_alone(
+    session_factory: sessionmaker,
+) -> None:
+    # The marker-only outcome ("asked, nothing contradicted") is the vet's
+    # common case. Going through ``save`` would replace the whole activity
+    # collection and revert anything a concurrent runner wrote — including the
+    # memorialize CAS — so it takes a targeted two-column UPDATE instead.
+    from datetime import date as date_cls
+
+    repo = SAScheduleRepository(session_factory)
+    target = date_cls(2026, 4, 19)
+    schedule = _schedule("char-A", target, [(9, 10, "河堤散步", "leisure", "河堤")])
+    await repo.save(schedule)
+    activity_id = schedule.activities[0].id
+    assert await repo.claim_memorialize([activity_id]) == {activity_id}
+
+    await repo.set_weather_vet(
+        "char-A", target, activity_id=activity_id, condition="大雨",
+    )
+
+    loaded = await repo.get("char-A", target)
+    assert loaded is not None
+    assert loaded.weather_vet_condition == "大雨"
+    assert loaded.activities[0].memorialized is True
+    assert loaded.activities[0].description == "河堤散步"
+
+
+@pytest.mark.asyncio
 async def test_schedule_upsert_by_character_and_date(session_factory: sessionmaker) -> None:
     from datetime import date as date_cls
 

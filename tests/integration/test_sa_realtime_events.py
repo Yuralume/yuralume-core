@@ -90,6 +90,24 @@ async def test_rollback_leaves_no_event_row(session_factory) -> None:
         assert await session.get(AppPreferenceRow, "pref-b") is None
 
 
+async def test_unserializable_payload_fails_without_durable_empty_object(
+    session_factory,
+) -> None:
+    outbox = SARealtimeOutbox(session_factory)
+    bad = RealtimeEventSpec(
+        event_kind=EVENT_KIND_PROACTIVE,
+        payload={"not_json": {"a", "set"}},
+        created_at=BASE,
+    )
+
+    async with session_factory() as session:
+        with pytest.raises(TypeError, match="JSON-serializable"):
+            await outbox.append(session, bad)
+        await session.rollback()
+
+    assert await _count_events(session_factory) == 0
+
+
 async def test_out_of_order_commit_is_recovered_by_overlap_window(
     session_factory,
 ) -> None:

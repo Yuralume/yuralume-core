@@ -17,7 +17,12 @@ import yaml
 
 from kokoro_link.contracts.story import StorySeedRepositoryPort
 from kokoro_link.contracts.story_seed_translator import StorySeedTranslatorPort
-from kokoro_link.domain.entities.story_seed import StorySeed
+from kokoro_link.domain.entities.story_seed import (
+    KNOWN_SEED_REGIONS,
+    SEED_REGION_GLOBAL,
+    SEED_TIER_DAILY,
+    StorySeed,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -192,11 +197,18 @@ def _raw_to_domain(
         raise ValueError("world_frames must be a list")
     frames = tuple(str(f) for f in frames_raw if isinstance(f, str)) or ("any",)
 
+    # ``StorySeed.create`` enforces the tier whitelist; a bad value makes
+    # this seed an error-report entry without aborting the pack.
+    tier = str(raw.get("tier") or SEED_TIER_DAILY).strip()
+    regions = _parse_regions(raw.get("regions"))
+
     language = str(raw.get("language") or default_language).strip() or "zh-TW"
     return StorySeed.create(
         seed_text=seed_text,
         tags=list(tags),
         world_frames=list(frames),
+        tier=tier,
+        regions=list(regions),
         weight=float(raw.get("weight", 1.0)),
         cooldown_days=int(raw.get("cooldown_days", 7)),
         enabled=bool(raw.get("enabled", True)),
@@ -204,6 +216,32 @@ def _raw_to_domain(
         external_id=external_id,
         pack_id=raw.get("pack_id") or default_pack_id,
     )
+
+
+def _parse_regions(raw: Any) -> tuple[str, ...]:
+    """Parse + vocabulary-check a seed's ``regions``.
+
+    Missing → ``["global"]`` (backward compatible: every legacy seed was
+    drawable everywhere). The entity keeps ``regions`` open-vocabulary,
+    but packs go through here, and a typo'd region would make a seed
+    silently undrawable for every real player — so the controlled
+    vocabulary is enforced at import and the offending seed lands in the
+    error report instead of the pool."""
+    if raw is None:
+        return (SEED_REGION_GLOBAL,)
+    if not isinstance(raw, list):
+        raise ValueError("regions must be a list")
+    regions = tuple(
+        str(r).strip() for r in raw if isinstance(r, str) and str(r).strip()
+    )
+    if not regions:
+        return (SEED_REGION_GLOBAL,)
+    unknown = sorted(set(regions) - set(KNOWN_SEED_REGIONS))
+    if unknown:
+        raise ValueError(
+            f"unknown regions {unknown}; allowed: {list(KNOWN_SEED_REGIONS)}",
+        )
+    return regions
 
 
 def default_pack_paths() -> list[Path]:

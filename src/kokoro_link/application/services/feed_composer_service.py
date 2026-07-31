@@ -38,6 +38,12 @@ from kokoro_link.application.services.location_context import (
     weather_location_from_operator,
 )
 from kokoro_link.application.services.memory_embedding import attach_embeddings
+from kokoro_link.application.services.quota_overage_service import (
+    FEED_POST_OVERAGE,
+    OVERAGE_DENIED_TIER_OFF,
+    OverageGrant,
+    QuotaOverageService,
+)
 from kokoro_link.application.services.visual_generation_style import (
     VisualGenerationStyleService,
 )
@@ -164,6 +170,7 @@ class FeedComposerService:
         account_runtime_usage_repository: (
             AccountRuntimeUsageRepositoryPort | None
         ) = None,
+        quota_overage: "QuotaOverageService | None" = None,
     ) -> None:
         self._repo = repository
         self._candidates = candidates
@@ -205,6 +212,11 @@ class FeedComposerService:
             or PermissiveAccountRuntimeProfileResolver()
         )
         self._account_runtime_usage_repository = account_runtime_usage_repository
+        # AP4: the only credit spend in this service, and the only one in the
+        # product that a player pre-authorises rather than presses a button
+        # for. ``None`` (self-host, legacy tests) means the tier's daily post
+        # limit stays the hard wall it has always been.
+        self._quota_overage = quota_overage
 
     def set_usage_recorder(self, recorder: UsageEventRecorderPort | None) -> None:
         self._usage_recorder = recorder
@@ -223,8 +235,30 @@ class FeedComposerService:
             return None
         if await self._is_current_activity_high_busy(character, when):
             return None
+        overage: OverageGrant | None = None
         if await self._runtime_feed_post_quota_exhausted(character, when):
-            return None
+            overage = await self._authorise_feed_post_overage(character, when)
+            if not overage.granted:
+                # Every denial — tier closed, switch off, ceiling spent, out
+                # of 螢火, upstream down — lands here as the historical silent
+                # skip. This is a background path: it has no player in front
+                # of it to tell, and inventing an error would be worse than
+                # the day simply staying quiet.
+                return None
+        try:
+            post = await self._compose_first_viable(character, when, local_tz)
+        except BaseException:
+            await self._release_feed_post_overage(overage)
+            raise
+        if post is None:
+            await self._release_feed_post_overage(overage)
+        else:
+            await self._settle_feed_post_overage(overage)
+        return post
+
+    async def _compose_first_viable(
+        self, character: Character, when: datetime, local_tz: tzinfo,
+    ) -> FeedPost | None:
         candidates = await self._candidates.collect(
             character, now=when, local_tz=local_tz,
         )
@@ -238,6 +272,44 @@ class FeedComposerService:
             if post is not None:
                 return post
         return None
+
+    async def _authorise_feed_post_overage(
+        self, character: Character, now: datetime,
+    ) -> OverageGrant:
+        """AP4: may this character buy one post past the tier allowance?
+
+        Never raises — an unwired service and every refusal alike come back
+        as a denial, so the caller falls through to the silent skip."""
+        if self._quota_overage is None:
+            return OverageGrant(denied_reason=OVERAGE_DENIED_TIER_OFF)
+        return await self._quota_overage.authorise(
+            FEED_POST_OVERAGE, operator_id=character.user_id, now=now,
+        )
+
+    async def _settle_feed_post_overage(
+        self, grant: OverageGrant | None,
+    ) -> None:
+        """Keep the purchase: the post the player paid for is published.
+
+        ``gateway_delivered=False`` because this is the one action whose
+        deliverable is not a Gateway call. Composing a post runs as *background*
+        work, which the Gateway never waives, so the covered-call cross-check
+        that protects every foreground action from a double bill would refund
+        every single post here — while the post itself is live in the feed.
+        """
+        if self._quota_overage is not None:
+            await self._quota_overage.settle(grant, gateway_delivered=False)
+
+    async def _release_feed_post_overage(
+        self, grant: OverageGrant | None,
+    ) -> None:
+        """Give the purchase back when no post was published.
+
+        The composer can no-op on every candidate, and ``_materialise`` can
+        roll its own post back; either way the player bought nothing, so the
+        credits must not stay reserved."""
+        if self._quota_overage is not None:
+            await self._quota_overage.release(grant)
 
     # ------------------------------------------------------------------
     # Gates

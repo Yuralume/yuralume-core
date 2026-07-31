@@ -145,10 +145,9 @@ class EventCuratorService:
         scored = self._score_candidates(candidates, profile, excluded_vecs)
         scored.sort(key=lambda t: t[1], reverse=True)
 
-        added = 0
         new_items: list[CharacterEventInboxItem] = []
         for event, score in scored:
-            if added >= self._max_new_per_pass:
+            if len(new_items) >= self._max_new_per_pass:
                 break
             if score < self._match_threshold:
                 break
@@ -163,14 +162,15 @@ class EventCuratorService:
                     created_at=datetime.now(timezone.utc),
                 )
             )
-            added += 1
 
         if new_items:
-            await self._inbox.add_many(new_items)
-            await self._inbox.trim_oldest(
-                character.id, keep=self._inbox_cap,
-            )
-        return added
+            inserted = await self._inbox.add_many(new_items)
+            if inserted:
+                await self._inbox.trim_oldest(
+                    character.id, keep=self._inbox_cap,
+                )
+            return inserted
+        return 0
 
     async def _resolve_operator_region(
         self, character: Character,

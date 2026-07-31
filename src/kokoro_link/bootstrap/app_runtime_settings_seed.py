@@ -13,9 +13,11 @@ seed* while the DB becomes the source of truth:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import logging
-from typing import Sequence
+from typing import Any, Sequence, TypeVar
 
 from pydantic import BaseModel
 
@@ -41,6 +43,29 @@ from kokoro_link.infrastructure.app_runtime_settings.schemas import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
+
+
+def _run_coroutine_factory_blocking(
+    factory: Callable[[], Coroutine[Any, Any, _T]],
+) -> _T:
+    """Run one async boot read from synchronous container construction.
+
+    ``build_container`` can be called either before an event loop exists or from
+    FastAPI's async lifespan.  ``asyncio.run`` is valid only in the first case.
+    When a loop is already running, execute the short-lived coroutine (and the
+    engine it creates) in a dedicated thread so startup still receives the DB
+    overlay synchronously without nesting event loops or leaking a coroutine.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="site-settings-overlay",
+    ) as executor:
+        return executor.submit(lambda: asyncio.run(factory())).result()
 
 
 def _weather_default(settings: AppSettings) -> WeatherRuntimeConfig:
@@ -262,7 +287,7 @@ def resolve_site_settings_overlay(
             finally:
                 await engine.dispose()
 
-        groups = asyncio.run(_run())
+        groups = _run_coroutine_factory_blocking(_run)
     except Exception as exc:  # fail-soft — keep env settings, still boot
         _LOGGER.warning(
             "site settings DB overlay FAILED; this process is running on env "

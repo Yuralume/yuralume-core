@@ -318,3 +318,49 @@ async def test_busy_conversation_leaves_the_offset_for_the_next_sweep(
     assert stored is not None
     assert stored.polling_offset != 11
     assert stored.polling_last_error is None
+
+
+@pytest.mark.asyncio
+async def test_photo_owner_lookup_failure_does_not_store_or_dispatch(
+    tmp_path: Path,
+) -> None:
+    harness = build_messaging_harness()
+    character = await create_character(harness)
+    account = await create_telegram_account(
+        harness,
+        character_id=character.id,
+        delivery_mode=DeliveryMode.POLLING,
+    )
+    await harness.character_repository.delete(character.id)
+    raw = _telegram_message_update(update_id=51, message_id=12)
+    raw["message"]["photo"] = [{"file_id": "photo-1"}]
+    downloaded_for: list[str] = []
+
+    async def _record_download(**kwargs) -> str:
+        downloaded_for.append(kwargs["user_id"])
+        return "/should-not-exist.png"
+
+    service = TelegramPollingService(
+        account_repository=harness.account_repository,
+        character_repository=harness.character_repository,
+        dispatcher=harness.dispatcher,
+        polling_client=FakeTelegramPollingClient(
+            [{"ok": True, "result": [raw]}],
+        ),
+        update_parser=parse_update,
+        photo_downloader=_record_download,
+        uploads_dir=tmp_path,
+        owner_id="worker-1",
+        long_poll_timeout_seconds=0,
+    )
+
+    result = await service.poll_once()
+
+    assert result.dispatched == 0
+    assert result.errors == ("Telegram update 51 processing failed",)
+    assert downloaded_for == []
+    assert harness.telegram_adapter.sent == []
+    assert await harness.binding_repository.find(account.id, "42") is None
+    stored = await harness.account_repository.get(account.id)
+    assert stored.polling_offset is None
+    assert stored.polling_last_error == "Telegram update 51 processing failed"

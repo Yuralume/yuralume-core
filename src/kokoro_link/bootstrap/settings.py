@@ -835,6 +835,12 @@ class AuthSettings:
     enabled: bool = False
     jwt_secret: str = ""
     jwt_ttl_seconds: int = 7 * 24 * 60 * 60
+    # Hard ceiling on how far sliding renewal may carry one session, measured
+    # from first sign-in. ``0`` (the self-host default) means unbounded: a
+    # single-machine owner should not be signed out on a timer. Hosted sets it
+    # so a session eventually returns through the Portal and re-runs the
+    # account / tier gate.
+    jwt_absolute_ttl_seconds: int = 0
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
 
@@ -853,6 +859,13 @@ class AuthSettings:
             os.getenv("JWT_TTL_SECONDS", os.getenv("KOKORO_JWT_TTL_SECONDS")),
             default=7 * 24 * 60 * 60,
         ))
+        absolute_ttl = max(0, _parse_int(
+            os.getenv(
+                "JWT_ABSOLUTE_TTL_SECONDS",
+                os.getenv("KOKORO_JWT_ABSOLUTE_TTL_SECONDS"),
+            ),
+            default=0,
+        ))
         # Bootstrap admin credentials are sensitive — strip whitespace
         # but do not lowercase here; ``AuthService._normalise_email``
         # handles canonicalisation at the service boundary.
@@ -868,6 +881,7 @@ class AuthSettings:
             enabled=enabled,
             jwt_secret=secret,
             jwt_ttl_seconds=ttl,
+            jwt_absolute_ttl_seconds=absolute_ttl,
             bootstrap_admin_email=bootstrap_email,
             bootstrap_admin_password=bootstrap_password,
         )
@@ -899,10 +913,17 @@ class CloudSettings:
     # (caller=core, audience=yuralume-channel, scopes delivery:eligibility-read,
     # delivery:create). Blank leaves proactive delivery on the self-host local
     # messaging adapter even when cloud mode is active.
+    channel_required: bool = False
     channel_base_url: str = ""
     channel_service_credential: str = ""
     introspect_timeout: float = 5.0
     session_ttl_seconds: int = 3600
+    # How long one hosted session may be slid forward by renewal before the
+    # player has to re-enter through the Portal (which re-runs the tier gate).
+    # Matched to the Portal's own 7-day session: a player bounced at the cap
+    # usually still holds a Portal session, so re-entry costs one click rather
+    # than a full OAuth round trip.
+    session_absolute_ttl_seconds: int = 7 * 24 * 60 * 60
     llm_model_presets: dict[str, str] = field(default_factory=dict)
     image_preset: str = "yuralume-anime"
     video_preset: str = "yuralume-anime"
@@ -1545,6 +1566,27 @@ class AppSettings:
         # the coordinator role holds no provider/federation credential, so it is
         # exempted from the deployment-token requirement other roles enforce.
         cloud = _load_cloud_settings(role=process.role)
+        # Cloud Core has no safe in-memory persistence mode: identity projections,
+        # conversations, durable jobs and delivery ledgers would silently diverge or
+        # disappear. Manual AppSettings construction remains available to explicit
+        # unit tests; the real env-driven boot path always fails closed.
+        if cloud.active and not database_url:
+            raise ValueError(
+                "YURALUME_CLOUD_ENABLED=true requires DATABASE_URL; "
+                "Cloud Core cannot boot on in-memory persistence",
+            )
+        # A split API/headless publisher cannot use a process-local realtime bus:
+        # player events would reach only that replica (or no SSE subscriber at all).
+        # The single-process `all` role is safe; connector/coordinator do not publish
+        # proactive/feed bus events and are deliberately exempt.
+        if (
+            process.role in {"api", "worker", "background"}
+            and process.realtime_backend == "memory"
+        ):
+            raise ValueError(
+                "YURALUME_REALTIME_BACKEND=memory is unsafe for split process role "
+                f"{process.role}; set YURALUME_REALTIME_BACKEND=postgres",
+            )
         # P2-B shadow runtime needs the durable PostgreSQL queue — refuse to
         # boot a shadow-on process without a database rather than silently
         # running a no-op coordinator/worker (HOSTED_CORE_SCALING §13 Phase 2).
@@ -1578,6 +1620,7 @@ class AppSettings:
                 enabled=True,
                 jwt_secret=auth.jwt_secret,
                 jwt_ttl_seconds=cloud.session_ttl_seconds,
+                jwt_absolute_ttl_seconds=cloud.session_absolute_ttl_seconds,
                 bootstrap_admin_email="",
                 bootstrap_admin_password="",
             )
@@ -1670,6 +1713,9 @@ def _load_cloud_settings(role: str = "all") -> CloudSettings:
     channel_service_credential = os.getenv(
         "KOKORO_CHANNEL_SERVICE_CREDENTIAL", "",
     ).strip()
+    channel_required = _parse_bool(
+        os.getenv("YURALUME_CLOUD_CHANNEL_REQUIRED"), default=False,
+    )
     portal_url = _parse_cloud_portal_url(
         os.getenv("YURALUME_CLOUD_PORTAL_URL"), enabled=enabled,
     )
@@ -1682,6 +1728,7 @@ def _load_cloud_settings(role: str = "all") -> CloudSettings:
         deployment_audience=deployment_audience,
         hosted_play_internal_token=hosted_play_internal_token,
         internal_service_credential=internal_service_credential,
+        channel_required=channel_required,
         channel_base_url=channel_base_url,
         channel_service_credential=channel_service_credential,
         introspect_timeout=max(
@@ -1696,6 +1743,13 @@ def _load_cloud_settings(role: str = "all") -> CloudSettings:
             _parse_int(
                 os.getenv("YURALUME_CLOUD_SESSION_TTL_SECONDS"),
                 default=3600,
+            ),
+        ),
+        session_absolute_ttl_seconds=max(
+            0,
+            _parse_int(
+                os.getenv("YURALUME_CLOUD_SESSION_ABSOLUTE_TTL_SECONDS"),
+                default=7 * 24 * 60 * 60,
             ),
         ),
         llm_model_presets=_parse_cloud_llm_presets(
@@ -1727,6 +1781,11 @@ def _load_cloud_settings(role: str = "all") -> CloudSettings:
         ),
         portal_url=portal_url,
     )
+    # Inactive self-host tolerates stale partial Hosted env from an old deployment;
+    # the adapter is unreachable in that mode. Active Cloud and the explicit
+    # required flag both validate fail-closed.
+    if settings.active or settings.channel_required:
+        _validate_cloud_channel_settings(settings)
     if not settings.active:
         return settings
     # Role-aware credential requirement (§11 / sol #1). The dedicated
@@ -1757,6 +1816,67 @@ def _load_cloud_settings(role: str = "all") -> CloudSettings:
             + ", ".join(missing),
         )
     return settings
+
+
+def _validate_cloud_channel_settings(settings: CloudSettings) -> None:
+    """Fail closed on partial or mis-bound Hosted Channel configuration.
+
+    The descriptor is parsed by the same source used to build outbound headers;
+    no secret is included in any error message.
+    """
+
+    has_base_url = bool(settings.channel_base_url)
+    has_credential = bool(settings.channel_service_credential)
+    if has_base_url != has_credential:
+        raise RuntimeError(
+            "KOKORO_CHANNEL_BASE_URL and KOKORO_CHANNEL_SERVICE_CREDENTIAL "
+            "must be configured all-or-none",
+        )
+    if settings.channel_required and not has_base_url:
+        raise RuntimeError(
+            "YURALUME_CLOUD_CHANNEL_REQUIRED=true requires KOKORO_CHANNEL_BASE_URL "
+            "and KOKORO_CHANNEL_SERVICE_CREDENTIAL",
+        )
+    if not has_base_url:
+        return
+
+    parsed_url = urlparse(settings.channel_base_url)
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ValueError(
+            "KOKORO_CHANNEL_BASE_URL must be an http(s) service base URL "
+            "without credentials, query, or fragment",
+        )
+
+    from kokoro_link.infrastructure.cloud.internal_service_auth import (
+        InternalServiceCredential,
+    )
+
+    credential = InternalServiceCredential.parse(
+        settings.channel_service_credential,
+    )
+    if credential.caller != "core":
+        raise ValueError(
+            "KOKORO_CHANNEL_SERVICE_CREDENTIAL must bind caller=core",
+        )
+    if credential.audience != "yuralume-channel":
+        raise ValueError(
+            "KOKORO_CHANNEL_SERVICE_CREDENTIAL must bind "
+            "audience=yuralume-channel",
+        )
+    required_scopes = {"delivery:eligibility-read", "delivery:create"}
+    missing_scopes = required_scopes - credential.scopes
+    if missing_scopes:
+        raise ValueError(
+            "KOKORO_CHANNEL_SERVICE_CREDENTIAL is missing required scopes: "
+            + ", ".join(sorted(missing_scopes)),
+        )
 
 
 def _parse_cloud_portal_url(raw: str | None, *, enabled: bool) -> str | None:

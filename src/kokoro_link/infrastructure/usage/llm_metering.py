@@ -136,6 +136,9 @@ class MeteredChatModel(ChatModelPort):
         self._metered_by = metered_by
         self.provider_id = inner.provider_id
         self.supports_vision = inner.supports_vision
+        self.prefers_public_image_urls = bool(
+            getattr(inner, "prefers_public_image_urls", False),
+        )
 
     @property
     def last_request_id(self) -> str:

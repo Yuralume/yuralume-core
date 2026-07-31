@@ -1,0 +1,330 @@
+# School daily seeds — batch 2 (culture-neutral campus life).
+#
+# Contemporary campus slice-of-life: classroom, friends, clubs,
+# quiet corners. Kept culture-neutral (regions: global) — no
+# region-specific rituals; the expander adapts flavour to the
+# character's world. Complements frame_school (b1) without
+# overlapping its seeds.
+pack_id: school_daily_b2
+language: zh-TW
+
+seeds:
+  # --- Classroom ----------------------------------------------------
+  - external_id: sdb2:class:001
+    seed_text: 上課偷偷在課本底下墊著課外書看，連翻頁都不敢太大聲
+    tags: [class, thrill, books]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:002
+    seed_text: 安靜的課堂上鉛筆盒摔到地上，響得全班回頭，恨不得鑽進桌子底下
+    tags: [class, embarrassed, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: sdb2:class:003
+    seed_text: 上課快睡著的時候被鄰座輕輕戳醒，交換了一個心照不宣的眼神
+    tags: [class, friend, gentle]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:004
+    seed_text: 幫老師發講義繞了全班一圈，收到好幾聲小小的謝謝
+    tags: [class, social, warm]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:005
+    seed_text: 輪到自己上台分組報告，結束的瞬間鬆了好大一口氣
+    tags: [class, nervous, relief]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdb2:class:006
+    seed_text: 老師講了個冷笑話全班一片安靜，自己卻憋笑憋得好辛苦
+    tags: [class, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:007
+    seed_text: 一早到教室才想起有作業沒寫，手忙腳亂地趕工
+    tags: [class, panic, mundane]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:008
+    seed_text: 差點遲到，在鐘響前一秒衝進教室，喘得說不出話
+    tags: [class, rush]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:class:009
+    seed_text: 重新排座位後和一個不太熟的同學變成鄰座，一時不知道該聊什麼
+    tags: [class, social, awkward]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  # --- Friends ------------------------------------------------------
+  - external_id: sdb2:friend:001
+    seed_text: 連著幾天想一起回家的朋友都先跟別人有約，一個人走的那段路突然變得好長
+    tags: [friend, jealousy, lonely]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: sdb2:friend:002
+    seed_text: 和朋友發明了只有彼此懂的暗號，一整天用眼神和手勢對話，樂此不疲
+    tags: [friend, playful, bond]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: sdb2:friend:003
+    seed_text: 發現朋友一整天悶悶的卻說沒事，安靜地陪在旁邊，猶豫著該不該追問
+    tags: [friend, concern, gentle]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: sdb2:friend:004
+    seed_text: 慢了一步進食堂，發現同學早就順手幫自己佔好了位子，心裡暖暖的
+    tags: [friend, warm, small-kindness]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: sdb2:friend:005
+    seed_text: 在走廊和不算太熟的熟人狹路相逢，兩秒鐘內上演了該不該打招呼的內心小劇場
+    tags: [friend, awkward, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: sdb2:friend:006
+    seed_text: 向鄰座借了塊橡皮擦，還的時候多聊了兩句，感覺交情前進了一小步
+    tags: [friend, gentle, mundane]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: sdb2:friend:007
+    seed_text: 把筆記借給請假的同學，隔天被鄭重地道謝，反而有點不好意思
+    tags: [friend, warm, shy]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:friend:008
+    seed_text: 發現隔壁班有個和自己同名同姓的人，老師點名都得多確認一次，兩人遠遠互相點頭致意
+    tags: [encounter, coincidence, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdb2:friend:009
+    seed_text: 和同學交換了午餐裡各自不敢吃的菜，結果兩邊都很滿意
+    tags: [friend, food, happy]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  # --- Clubs --------------------------------------------------------
+  - external_id: sdb2:club:001
+    seed_text: 社團招新的攤位前被拉去體驗一個從沒想過的活動，意外玩得很開心
+    tags: [club, discovery, happy]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdb2:club:002
+    seed_text: 社辦大掃除翻出歷屆前輩留下的舊物和合照，一群人圍著考古了一下午
+    tags: [club, nostalgia, together]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  # --- Study / exams ------------------------------------------------
+  - external_id: sdb2:study:001
+    seed_text: 考前和同學交換各自整理的重點，發現兩人劃的重點完全不一樣，頓時都慌了
+    tags: [study, exam, panic]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:study:002
+    seed_text: 教同學一題想了很久的題目，講著講著自己反而更懂了
+    tags: [study, satisfied]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:study:003
+    seed_text: 考完試當天放學，整個人輕飄飄的，故意繞了遠路慢慢走回家
+    tags: [study, relief, peaceful]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:study:004
+    seed_text: 放學後留在空教室自習，夕陽照進來，安靜得讓人有點捨不得走
+    tags: [study, peaceful, sunset]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:study:005
+    seed_text: 常坐的圖書館位子被人捷足先登，站了兩秒認命換了一格，意外發現新位子視野更好
+    tags: [study, library, adaptable]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  # --- Campus life --------------------------------------------------
+  - external_id: sdb2:campus:001
+    seed_text: 為了班上的活動大家留下來一起佈置教室，忙到天都黑了
+    tags: [campus, event, together]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdb2:campus:002
+    seed_text: 體育課換了個從沒試過的項目，笨拙了半節課後忽然開竅，還被同學誇了一句
+    tags: [campus, sports, proud]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: sdb2:campus:003
+    seed_text: 午餐時最喜歡的菜偏偏被打得特別少，小小的悲劇
+    tags: [campus, food, disappointment]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60
+
+  - external_id: sdb2:campus:004
+    seed_text: 放學下起大雨又沒帶傘，索性把外套頂在頭上衝進雨裡，跑到一半反而笑了出來
+    tags: [campus, rain, carefree]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 75
+
+  - external_id: sdb2:campus:005
+    seed_text: 校門口那隻常出現的流浪貓今天主動蹭了過來，蹲下來陪牠待了好一會
+    tags: [campus, animal, gentle]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:campus:006
+    seed_text: 實驗課做出來的結果和課本說的不一樣，全組盯著那管顏色不對的液體面面相覷
+    tags: [campus, science, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.5
+    cooldown_days: 90
+
+  - external_id: sdb2:campus:007
+    seed_text: 換教室上課走錯間，推開門對上整班陌生的視線，僵了三秒默默退出去
+    tags: [campus, embarrassed, funny]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: sdb2:campus:008
+    seed_text: 下課沿著走廊亂晃，聽到別間教室傳來練唱的歌聲，忍不住停下來聽了一會
+    tags: [campus, music, peaceful]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 60
+
+  - external_id: sdb2:campus:009
+    seed_text: 撿到一本掉在走廊的別班筆記本，送去失物招領前忍不住好奇主人是誰
+    tags: [campus, curiosity]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.6
+    cooldown_days: 75
+
+  - external_id: sdb2:campus:010
+    seed_text: 午休趴在桌上睡著，醒來手臂發麻、臉上還印著壓痕，被同學笑了一下
+    tags: [campus, funny, mundane]
+    world_frames: [school]
+    tier: daily
+    regions: [global]
+    weight: 0.7
+    cooldown_days: 60

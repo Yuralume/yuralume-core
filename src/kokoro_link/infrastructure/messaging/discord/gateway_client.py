@@ -39,6 +39,7 @@ _DEFAULT_INTENTS = (
 )
 
 GatewayEventHandler = Callable[[dict[str, Any], str | None], Awaitable[None]]
+GatewayReadyHandler = Callable[[], Awaitable[None]]
 
 
 class DiscordGatewayClient:
@@ -60,6 +61,7 @@ class DiscordGatewayClient:
         *,
         bot_token: str,
         on_message_create: GatewayEventHandler,
+        on_ready: GatewayReadyHandler | None = None,
     ) -> None:
         if not bot_token:
             raise ValueError("bot_token is required")
@@ -107,6 +109,8 @@ class DiscordGatewayClient:
                         continue
                     if event_name == "READY":
                         bot_user_id = _ready_user_id(data)
+                        if on_ready is not None:
+                            await on_ready()
                         continue
                     if event_name == "MESSAGE_CREATE":
                         await on_message_create(data, bot_user_id)

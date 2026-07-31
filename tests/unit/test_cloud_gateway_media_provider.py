@@ -15,6 +15,12 @@ from kokoro_link.contracts.generation_trigger import (
     generation_trigger_scope,
 )
 from kokoro_link.contracts.image_provider import ImageTokenUsage
+from kokoro_link.contracts.interaction_context import (
+    BILLING_COVERED_HEADER_NAME,
+    InteractionContext,
+    confirm_deferred_deliveries,
+    interaction_scope,
+)
 from kokoro_link.contracts.tts import TTSRequest
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.character_state import CharacterState
@@ -367,3 +373,191 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
     assert payload["text"] == "hello"
     assert payload["voice_id"] == "voice_default"
     assert payload["options"]["text_lang"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_image_provider_stamps_the_covering_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AP2: ``image_portrait`` / ``image_chat_tool`` are action-priced, so
+    their Gateway call must name the charge that already covers it."""
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b"png").decode()}],
+        })
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    provider = CloudGatewayImageProvider(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        preset="yuralume-anime",
+        feature_key="image_portrait",
+        identity_resolver=_IdentityResolver(),
+    )
+
+    with interaction_scope(
+        InteractionContext(interaction_id="int-1", charge_id="chg-1"),
+    ):
+        await provider.generate(
+            character=_character(), positive="a", aspect="square",
+        )
+    await provider.generate(
+        character=_character(), positive="b", aspect="square",
+    )
+
+    assert seen[0]["x-yuralume-interaction"] == "v1;id=int-1;charge=chg-1"
+    assert "x-yuralume-interaction" not in seen[1]
+
+
+def _image_provider() -> CloudGatewayImageProvider:
+    return CloudGatewayImageProvider(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        preset="yuralume-anime",
+        feature_key="image_portrait",
+        identity_resolver=_IdentityResolver(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_covered_image_is_consumed_only_once_it_is_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2/C4': waived by the Gateway, delivered as bytes — and *stored*.
+
+    Bytes in memory are not the thing the player bought. Until the caller has
+    persisted them the charge stays refundable, because a storage failure after
+    this point would otherwise leave a paid-for picture that exists nowhere.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(b"png").decode()}]},
+            headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        images = await _image_provider().generate(
+            character=_character(), positive="a", aspect="square",
+        )
+        assert context.usage.consumed is False  # bytes only, nothing stored
+
+        assert confirm_deferred_deliveries() == 1
+
+    assert images == [b"png"]
+    assert context.usage.consumed is True
+
+
+@pytest.mark.asyncio
+async def test_an_image_that_is_never_persisted_stays_refundable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The C4' hole: the storage write fails, so the player keeps their money."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(b"png").decode()}]},
+            headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        await _image_provider().generate(
+            character=_character(), positive="a", aspect="square",
+        )
+        # the caller's object-storage write raised — nothing confirms
+
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_an_image_the_gateway_billed_itself_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(b"png").decode()}]},
+        )
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        await _image_provider().generate(
+            character=_character(), positive="a", aspect="square",
+        )
+
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_a_covered_answer_with_no_downloadable_image_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job answered but produced nothing — the player keeps their money."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": []}, headers={BILLING_COVERED_HEADER_NAME: "1"},
+        )
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        with pytest.raises(Exception):
+            await _image_provider().generate(
+                character=_character(), positive="a", aspect="square",
+            )
+
+    assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_artifact_download_fails_is_not_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generation call was waived, but nothing was ever delivered."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/generations"):
+            return httpx.Response(
+                200,
+                json={"data": [{"url": "/artifacts/a.png"}]},
+                headers={BILLING_COVERED_HEADER_NAME: "1"},
+            )
+        return httpx.Response(500, text="gone")
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+
+    context = InteractionContext(interaction_id="int-1", charge_id="chg-1")
+    with interaction_scope(context):
+        with pytest.raises(Exception):
+            await _image_provider().generate(
+                character=_character(), positive="a", aspect="square",
+            )
+
+    assert context.usage.consumed is False

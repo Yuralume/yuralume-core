@@ -134,6 +134,13 @@ services:
     build: *yuralume-app-build
     container_name: yuralume-container-app
     restart: unless-stopped
+    # Docker's default 10s between SIGTERM and SIGKILL is shorter than the work
+    # this container legitimately has in flight: a streamed turn with a tool
+    # cycle runs for minutes, and a background job holds a 120s execution lease.
+    # Killed mid-run, the turn dies, its conversation lease sits until TTL and
+    # any reserved credits wait for the sweeper. Give uvicorn's graceful shutdown
+    # room to drain instead (the crash-safe paths stay as the backstop).
+    stop_grace_period: 180s
     ports:
       - "8012:8002"
     volumes:

@@ -169,6 +169,22 @@ async def test_lease_lost_drops_to_passive_then_reacquires_new_epoch() -> None:
     assert coord.epoch == 3
 
 
+async def test_live_lease_guard_rejects_passive_and_stale_coordinators() -> None:
+    chars = [_FakeCharacter("c1")]
+    lease, queue, cursor, journal, repo = _wiring(chars)
+    leader = _coordinator(lease, queue, cursor, journal, repo, owner="A")
+    passive = _coordinator(lease, queue, cursor, journal, repo, owner="B")
+
+    await leader.run_once(now=BASE)
+    assert await leader.owns_live_lease(now=BASE) is True
+    assert await passive.owns_live_lease(now=BASE) is False
+
+    takeover_at = BASE + timedelta(seconds=400)
+    await passive.run_once(now=takeover_at)
+    assert await passive.owns_live_lease(now=takeover_at) is True
+    assert await leader.owns_live_lease(now=takeover_at) is False
+
+
 class _FakeOperatorRepo:
     def __init__(self, tenants: dict[str, str | None]) -> None:
         self._tenants = tenants  # operator_id -> cloud_tenant_id

@@ -136,3 +136,61 @@ class TestDailySchedule:
             within=timedelta(hours=3),
         )
         assert len(upcoming) == 1
+
+
+class TestDailyScheduleWeatherVet:
+    """The intra-day weather-drift trigger gate marker.
+
+    Only a cost gate — "we already asked the LLM about THIS activity under
+    THIS weather phrase". Never a semantic input.
+    """
+
+    def test_vet_marker_defaults_to_unset(self) -> None:
+        schedule = DailySchedule.create(
+            character_id="c1", date_=date(2026, 4, 18), activities=[_activity(9, 10)],
+        )
+        assert schedule.weather_vet_activity_id is None
+        assert schedule.weather_vet_condition is None
+
+    def test_with_weather_vet_stamps_both_halves(self) -> None:
+        schedule = DailySchedule.create(
+            character_id="c1", date_=date(2026, 4, 18), activities=[_activity(9, 10)],
+        )
+        stamped = schedule.with_weather_vet("act-1", "小雨")
+        assert stamped.weather_vet_activity_id == "act-1"
+        assert stamped.weather_vet_condition == "小雨"
+        # Frozen entity — the original stays untouched.
+        assert schedule.weather_vet_activity_id is None
+
+    def test_with_weather_vet_preserves_the_rest_of_the_day(self) -> None:
+        activity = _activity(9, 10, description="上午工作")
+        schedule = DailySchedule.create(
+            character_id="c1",
+            date_=date(2026, 4, 18),
+            activities=[activity],
+            is_planned=True,
+        )
+        stamped = schedule.with_weather_vet("act-1", "陰天")
+        assert stamped.id == schedule.id
+        assert stamped.activities == schedule.activities
+        assert stamped.is_planned is True
+        assert stamped.generated_at == schedule.generated_at
+
+    def test_with_weather_vet_accepts_empty_condition_as_unset(self) -> None:
+        # An empty weather block yields no condition phrase; storing the empty
+        # string as ``None`` keeps "never vetted" a single representable state.
+        schedule = DailySchedule.create(
+            character_id="c1", date_=date(2026, 4, 18), activities=[_activity(9, 10)],
+        )
+        stamped = schedule.with_weather_vet("act-1", "")
+        assert stamped.weather_vet_condition is None
+
+    def test_with_activities_keeps_the_vet_marker(self) -> None:
+        # Drift rewrites replace the activity tuple; the marker written in the
+        # same pass must survive that call, or the gate never latches.
+        schedule = DailySchedule.create(
+            character_id="c1", date_=date(2026, 4, 18), activities=[_activity(9, 10)],
+        ).with_weather_vet("act-1", "大雨")
+        rewritten = schedule.with_activities([_activity(9, 10, description="改室內")])
+        assert rewritten.weather_vet_activity_id == "act-1"
+        assert rewritten.weather_vet_condition == "大雨"

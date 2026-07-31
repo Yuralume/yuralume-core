@@ -25,6 +25,27 @@ class InMemoryStudioJobRepository:
         with self._lock:
             self._jobs[job.id] = job
 
+    async def save_terminal_if_running(
+        self, job: StudioGenerationJob,
+    ) -> bool:
+        """The SQL twin's CAS, mirrored — see the port doc for why it matters.
+
+        The lock stands in for the database's row-level atomicity: the read of
+        the stored status and the write that supersedes it are one step, so two
+        concurrent finalizers cannot both observe ``running``.
+        """
+        if job.status == JOB_STATUS_RUNNING:
+            raise ValueError(
+                "save_terminal_if_running needs a terminal job status, "
+                f"got {job.status!r}",
+            )
+        with self._lock:
+            current = self._jobs.get(job.id)
+            if current is None or current.status != JOB_STATUS_RUNNING:
+                return False
+            self._jobs[job.id] = job
+            return True
+
     async def get(self, job_id: str) -> StudioGenerationJob | None:
         with self._lock:
             return self._jobs.get(job_id)

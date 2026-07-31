@@ -24,6 +24,14 @@ vi.mock('@/composables/useCloudCredits', () => ({
   refreshCloudCreditsAfterAction: vi.fn(),
 }))
 
+// The viewer quotes the per-rewrite price next to its iterate buttons; the
+// real transport pulls in the router at module scope, which has no `window`
+// under SSR. A degraded list is also the honest default here — this suite is
+// about failure copy, not prices.
+vi.mock('@/utils/api/cloudPricing', () => ({
+  fetchCloudPricing: vi.fn(async () => ({ kind: 'degraded' as const })),
+}))
+
 vi.mock('@/utils/api/fusionStory', () => ({
   exportFusionStory: vi.fn(),
   iterateFusionBeat: vi.fn(),

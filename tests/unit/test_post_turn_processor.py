@@ -150,6 +150,66 @@ async def test_post_turn_prompt_injects_operator_local_current_time() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_turn_prompt_injects_date_anchor_table() -> None:
+    """P3 absolute-date discipline is only obeyable if the model can do
+    the conversion — the anchor table is that arithmetic, resolved in the
+    operator's timezone (23:30 UTC is already the next civil day in
+    Taipei)."""
+    model = _ScriptedModel('{"memories": []}')
+    processor = LLMPostTurnProcessor(model=model)
+
+    await processor.process(
+        character=_character(),
+        conversation_id="conv-1",
+        user_message="明天早上一起去刨冰店吧",
+        assistant_message="好啊，說定了。",
+        now=datetime(2026, 6, 19, 23, 30, tzinfo=timezone.utc),
+        operator=OperatorProfile(
+            id="operator-1",
+            display_name="User",
+            timezone_id="Asia/Taipei",
+        ),
+    )
+
+    prompt = model.prompts[0]
+    assert "日期換算錨點" in prompt
+    assert "- 今天＝2026-06-20（星期六）" in prompt
+    assert "- 明天＝2026-06-21（星期日）" in prompt
+    assert "- 昨天＝2026-06-19（星期五）" in prompt
+
+
+@pytest.mark.asyncio
+async def test_post_turn_prompt_states_absolute_date_discipline() -> None:
+    """Frozen 「明天」 in memories / arc beats is the zombie-appointment
+    bug (COMMITMENT_LIFECYCLE_AND_FRESHNESS §0 loop A); the rule lives in
+    the template, never in post-hoc text rewriting."""
+    model = _ScriptedModel('{"memories": []}')
+    processor = LLMPostTurnProcessor(model=model)
+
+    await processor.process(
+        character=_character(),
+        conversation_id="conv-1",
+        user_message="明天早上一起去刨冰店吧",
+        assistant_message="好啊，說定了。",
+        now=datetime(2026, 7, 26, 2, 0, tzinfo=timezone.utc),
+    )
+
+    prompt = model.prompts[0]
+    assert "時間紀律" in prompt
+    # Applies to every field that becomes long-term state.
+    assert "memories.content" in prompt
+    assert "arc_adjustments" in prompt
+    # Both accepted shapes are spelled out.
+    assert "只寫絕對日期" in prompt
+    assert "相對詞＋絕對日期雙寫" in prompt
+    assert "只寫相對詞一律不合格" in prompt
+    # Aligned with the aftermath memory convention.
+    assert "（星期四）" in prompt
+    # Don't over-apply: date-free facts stay date-free.
+    assert "不要硬加日期" in prompt
+
+
+@pytest.mark.asyncio
 async def test_nsfw_content_mode_injects_born_safe_memory_instruction() -> None:
     model = _ScriptedModel('{"memories": []}')
     processor = LLMPostTurnProcessor(model=model)

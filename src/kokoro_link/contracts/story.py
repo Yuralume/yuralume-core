@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import TYPE_CHECKING, Protocol
 
 from kokoro_link.domain.entities.story_event import StoryEvent
@@ -35,6 +36,15 @@ class SceneContext:
     same scene structure can read as gentle slice-of-life or grim
     drama. Unknown tones fall back to ``daily`` framing in the
     expander."""
+
+    today: date | None = None
+    """Operator-local civil day this scene is being played on.
+
+    Not scene *structure* — calendar plumbing, so it is deliberately
+    excluded from :meth:`is_meaningful`. The expander turns it into the
+    absolute-date anchors its prompt needs: the narrative it writes is
+    persisted as a StoryEvent and re-read for days, so a relative time
+    word frozen into it never resolves (CF1b)."""
 
     def is_meaningful(self) -> bool:
         """``True`` when at least one structured field is populated.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -11,6 +11,13 @@ from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.persona_curiosity import PersonaCuriosityPlan
 from kokoro_link.contracts.proactive import ProactiveContext
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.schedule import (
+    OPERATOR_CONFIRMED_LAPSED_ROLE,
+    OPERATOR_INVITE_EXPIRED_ROLE,
+    DailySchedule,
+    ScheduleActivity,
+)
+from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.personality_type import CharacterPersonalityType
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
@@ -47,6 +54,8 @@ def _context(
     persona_curiosity_plan: PersonaCuriosityPlan | None = None,
     initial_relationship_lines: tuple[str, ...] = (),
     personality_type: CharacterPersonalityType | None = None,
+    weather_context: str = "天氣：台北陰天，23 度。",
+    upcoming_day_schedules: tuple = (),
 ) -> ProactiveContext:
     character = Character.create(
         name="Mio",
@@ -77,13 +86,14 @@ def _context(
         sent_today=sent_today,
         unanswered_streak=unanswered_streak,
         last_proactive_at=None,
-        weather_context="天氣：台北陰天，23 度。",
+        weather_context=weather_context,
         recent_dialogue_summary="昨天對方說今天要去面試。",
         operator_persona_lines=operator_persona_lines,
         initial_relationship_lines=initial_relationship_lines,
         world_event_seed_title=world_event_seed_title,
         world_event_seed_summary="多個網站與 API 服務異常。",
         persona_curiosity_plan=persona_curiosity_plan,
+        upcoming_day_schedules=upcoming_day_schedules,
     )
 
 
@@ -341,6 +351,38 @@ async def test_prompt_omits_streak_block_when_not_a_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_weather_fact_carries_freshness_authority() -> None:
+    """Same directive the chat prompt and decider get: the live fact wins
+    over any weather implied by memory / dialogue / schedule text."""
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+    await judge.judge(
+        _context(weather_context="台北目前天氣（事實層）：\n- 現在：晴朗，氣溫 26°C"),
+    )
+    prompt = model.captured_prompt or ""
+    assert "晴朗，氣溫 26°C" in prompt
+    assert "以此刻天氣事實為準" in prompt
+    assert "不要延續已經過時的天氣狀態" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_omits_weather_directive_when_no_weather_fact() -> None:
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+    await judge.judge(_context(weather_context=""))
+    prompt = model.captured_prompt or ""
+    assert "以此刻天氣事實為準" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_prompt_judges_user_relevance_without_role_expertise() -> None:
     model = _StubModel(
         '{"should_consume_slot": false, "inner_motive": "", '
@@ -362,3 +404,114 @@ async def test_prompt_judges_user_relevance_without_role_expertise() -> None:
     assert "不要假裝專家" in prompt
     assert "角色能否用符合自身身份" in prompt
     assert "Cloudflare" in prompt
+
+
+# ------------------------------------------------------------------
+# Retired commitments must not reach the judge as future plans
+# (COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P1c, proactive half)
+# ------------------------------------------------------------------
+
+_TOMORROW = date(2026, 4, 19)
+
+
+def _activity(
+    description: str, *, hour: int, role: str | None = None,
+) -> ScheduleActivity:
+    base = datetime.combine(_TOMORROW, datetime.min.time(), tzinfo=timezone.utc)
+    refs = (
+        (
+            ParticipantRef(
+                actor_kind="operator",
+                actor_id=None,
+                display_name="使用者",
+                role=role,
+            ),
+        )
+        if role
+        else ()
+    )
+    return ScheduleActivity.create(
+        start_at=base.replace(hour=hour),
+        end_at=base.replace(hour=hour + 1),
+        description=description,
+        category="social" if role else "work",
+        participant_refs=refs,
+    )
+
+
+def _tomorrow(activities: list[ScheduleActivity]):
+    return DailySchedule.create(
+        character_id="char-x", date_=_TOMORROW, activities=activities,
+    )
+
+
+@pytest.mark.asyncio
+async def test_upcoming_days_drop_expired_operator_commitments() -> None:
+    """The judge weighs upcoming days as reasons to spend a slot ("明天要一起
+    去…，先問幾點集合"), so a commitment the sweep retired must never appear
+    there — same filter the chat renderer and the decider apply.
+
+    The retired block sits at the head of the day, so the filter also has to
+    run *before* the three-item slice, or it would silently evict a live
+    block from the list.
+    """
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+
+    await judge.judge(
+        _context(
+            upcoming_day_schedules=(
+                _tomorrow([
+                    _activity(
+                        "和使用者一起去吃刨冰",
+                        hour=9,
+                        role=OPERATOR_INVITE_EXPIRED_ROLE,
+                    ),
+                    _activity("晨間散步", hour=10),
+                    _activity("改稿", hour=11),
+                    _activity("練吉他", hour=12),
+                ]),
+            ),
+        ),
+    )
+    prompt = model.captured_prompt or ""
+
+    assert "刨冰" not in prompt
+    assert "晨間散步" in prompt
+    assert "改稿" in prompt
+    assert "練吉他" in prompt
+
+
+@pytest.mark.asyncio
+async def test_upcoming_day_row_disappears_when_every_block_expired() -> None:
+    """A day left empty by the filter renders as no row at all — this
+    renderer already omits days with no activities (``if snippets``), so the
+    filtered-empty day simply takes the same path."""
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+
+    await judge.judge(
+        _context(
+            upcoming_day_schedules=(
+                _tomorrow([
+                    _activity(
+                        "和使用者一起去共享工作室",
+                        hour=15,
+                        role=OPERATOR_CONFIRMED_LAPSED_ROLE,
+                    ),
+                ]),
+            ),
+        ),
+    )
+    prompt = model.captured_prompt or ""
+
+    assert "共享工作室" not in prompt
+    assert _TOMORROW.isoformat() not in prompt
