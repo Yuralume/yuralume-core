@@ -65,8 +65,8 @@ tts/SoVITS_weights_v4/
 tts/pretrained/
 tts/refs/
 tts/*.wav
-/docs/x-devlog/
 
 /.env.demo
 /custom-tts-kokoro/
 /.claude/
+

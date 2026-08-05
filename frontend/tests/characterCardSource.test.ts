@@ -19,6 +19,17 @@ import {
   shouldOfferInstallTranslateToggle,
   shouldShowOfficialCardsUnavailableNotice,
 } from '@/utils/characterCardSource'
+import type { CharacterCardPreview } from '@/utils/api/characters'
+
+// The predicates' contract (`Pick<..., 'source'>`) deliberately leaves
+// `localized` out, but every real caller hands over a full preview that
+// carries it. A fresh object literal with `localized` trips TS's
+// excess-property check against that narrow Pick, so the fixtures that pin
+// "localized cannot change the answer" go through this wider alias — a
+// variable of an assignable type is exactly what production code passes.
+const card = (
+  fixture: Pick<CharacterCardPreview, 'source' | 'localized'>,
+): Pick<CharacterCardPreview, 'source' | 'localized'> => fixture
 
 describe('isCloudCard', () => {
   it('is true only for a card whose source is the Cloud catalog', () => {
@@ -35,7 +46,7 @@ describe('isCloudCard', () => {
 
 describe('shouldHideTranslateToggle', () => {
   it('hides the toggle for a cloud card the catalog already answered in the operator language', () => {
-    expect(shouldHideTranslateToggle({ source: 'cloud', localized: true })).toBe(true)
+    expect(shouldHideTranslateToggle(card({ source: 'cloud', localized: true }))).toBe(true)
   })
 
   it('hides it for a cloud card that fell back to another language too', () => {
@@ -43,7 +54,7 @@ describe('shouldHideTranslateToggle', () => {
     // ignored it (the catalog's fallback text came back either way) while
     // install acted on it and paid for an LLM pass. A control that changes
     // nothing on screen but bills on click is not a preference.
-    expect(shouldHideTranslateToggle({ source: 'cloud', localized: false })).toBe(true)
+    expect(shouldHideTranslateToggle(card({ source: 'cloud', localized: false }))).toBe(true)
   })
 
   it('hides it for a cloud card with no localized flag at all', () => {
@@ -54,8 +65,8 @@ describe('shouldHideTranslateToggle', () => {
     // A local `.lumecard` cannot claim localized=true — only the Cloud
     // catalog resolves a locale chain — but the toggle's visibility must
     // stay pinned to `source`, not to `localized` alone.
-    expect(shouldHideTranslateToggle({ source: 'local', localized: true })).toBe(false)
-    expect(shouldHideTranslateToggle({ source: 'local', localized: false })).toBe(false)
+    expect(shouldHideTranslateToggle(card({ source: 'local', localized: true }))).toBe(false)
+    expect(shouldHideTranslateToggle(card({ source: 'local', localized: false }))).toBe(false)
   })
 
   it('keeps the toggle when there is no source at all (uploaded-file preview)', () => {
