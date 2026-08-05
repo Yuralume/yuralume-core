@@ -6,7 +6,9 @@ explicit and to let unit tests exercise the mapping in isolation.
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
+from kokoro_link.contracts.memory import MemorySummary
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
@@ -48,11 +50,7 @@ def item_to_row(item: MemoryItem) -> MemoryItemRow:
 
 
 def row_to_item(row: MemoryItemRow) -> MemoryItem:
-    try:
-        tags_raw = json.loads(row.tags) if row.tags else []
-    except json.JSONDecodeError:
-        tags_raw = []
-    tags = tuple(str(tag) for tag in tags_raw if isinstance(tag, (str, int, float)))
+    tags = _decode_tags(row.tags)
     created_at = _ensure_utc(row.created_at)
     assert created_at is not None  # column is NOT NULL
     embedding = _coerce_vector(row.embedding)
@@ -75,6 +73,54 @@ def row_to_item(row: MemoryItemRow) -> MemoryItem:
         world_id=row.world_id,
         location=row.location,
         audience=row.audience or "",
+    )
+
+
+def row_to_summary(row: Any) -> MemorySummary:
+    """Build the browse projection from a column-list ``Row``.
+
+    Takes a plain result row (see
+    ``sa_memory_repository.build_memory_page_stmt``), not an ORM entity —
+    the point of that statement is that no ``MemoryItemRow`` is ever
+    constructed, so the two vector columns stay in Postgres.
+    ``has_embedding`` arrives already computed by the database.
+
+    Lives here rather than in the repository so ``tags`` decoding has
+    exactly one home: it is a JSON-encoded text column, and a second
+    hand-rolled ``json.loads`` in the repo is how the two paths would
+    eventually disagree about a malformed row.
+    """
+    created_at = _ensure_utc(row.created_at)
+    assert created_at is not None  # column is NOT NULL
+    return MemorySummary(
+        id=row.id,
+        character_id=row.character_id,
+        conversation_id=row.conversation_id,
+        kind=MemoryKind.from_string(row.kind),
+        content=row.content,
+        salience=float(row.salience),
+        tags=_decode_tags(row.tags),
+        created_at=created_at,
+        last_accessed_at=_ensure_utc(row.last_accessed_at),
+        access_count=int(row.access_count),
+        has_embedding=bool(row.has_embedding),
+    )
+
+
+def _decode_tags(raw: str | None) -> tuple[str, ...]:
+    """``tags`` is JSON-encoded text; malformed values degrade to empty.
+
+    The read path stays forgiving so one hand-edited row cannot break
+    every query that touches it — same policy as
+    :func:`_coerce_participants`."""
+    try:
+        decoded = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        decoded = []
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(
+        str(tag) for tag in decoded if isinstance(tag, (str, int, float))
     )
 
 

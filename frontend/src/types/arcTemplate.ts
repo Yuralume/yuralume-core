@@ -19,6 +19,14 @@ export type ArcTemplateTension =
   | 'falling'
   | 'resolution'
 
+/**
+ * The operator's (player's) dramatic place in a beat (OP0). Closed
+ * three-value enum; `null` = unjudged — never coerce a missing value
+ * to `'absent'`, that's a judgement call only the LLM or the operator
+ * gets to make (see docs/plans/ARC_PLAYER_POSITION_PLAN.md §3.1).
+ */
+export type OperatorPosition = 'absent' | 'present' | 'central'
+
 export interface ArcTemplateBeat {
   sequence: number
   day_offset: number
@@ -30,6 +38,8 @@ export interface ArcTemplateBeat {
   scene_characters: string[]
   dramatic_question: string | null
   required: boolean
+  operator_position: OperatorPosition | null
+  operator_note: string | null
 }
 
 export interface ArcTemplateBinding {

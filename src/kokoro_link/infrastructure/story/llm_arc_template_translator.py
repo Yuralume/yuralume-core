@@ -12,13 +12,17 @@ Only prose fields are ever sent to the model:
 
 - top-level ``title`` / ``premise``
 - each beat's ``title`` / ``summary`` / ``location`` /
-  ``scene_characters`` / ``dramatic_question``
+  ``scene_characters`` / ``dramatic_question`` / ``operator_note``
 
 Structural fields (``theme`` / ``tone`` / ``tension`` / ``scene_type`` /
 ``day_offset`` / ``sequence`` / ``required`` / ``duration_days`` /
-``world_frames`` / applicability / target ids) are never placed in the
-payload — the model cannot see them and therefore cannot reshape the
-arc or reinterpret an enum.
+``world_frames`` / ``operator_position`` / applicability / target ids)
+are never placed in the payload — the model cannot see them and
+therefore cannot reshape the arc or reinterpret an enum.
+``operator_position`` in particular is a closed-vocabulary structural
+flag (OP0), not prose — translating it would be nonsensical (it isn't
+language-bearing) and letting the model reinterpret it would be exactly
+the kind of enum reshaping this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -42,12 +46,18 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 _LOGGER = logging.getLogger(__name__)
 
 # Prose fields only — structural fields are deliberately excluded.
+# ``operator_position`` (OP0's closed-vocabulary structural flag) is
+# never in this list; ``operator_note`` is the player-visible prose
+# twin and is optional exactly like ``location`` / ``dramatic_question``
+# — the merge loop below already treats "originally None" as "never
+# fabricate one" for every field in this tuple.
 _TEMPLATE_SCALAR_FIELDS = ("title", "premise")
 _BEAT_SCALAR_FIELDS = (
     "title",
     "summary",
     "location",
     "dramatic_question",
+    "operator_note",
 )
 _BEAT_LIST_FIELDS = ("scene_characters",)
 
@@ -133,6 +143,9 @@ def _template_payload(template: ArcTemplate) -> dict[str, Any]:
             "location": beat.location,
             "scene_characters": list(beat.scene_characters),
             "dramatic_question": beat.dramatic_question,
+            "operator_note": beat.operator_note,
+            # operator_position is deliberately absent — see module
+            # docstring: structural, never sent to the model.
         }
         for beat in template.beats
     ]

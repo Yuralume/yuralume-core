@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from kokoro_link.contracts.memory import (
     MemoryRepositoryPort,
+    MemorySummary,
     ScoredMemory,
     WorldScope,
 )
@@ -19,6 +20,7 @@ from kokoro_link.infrastructure.persistence.models import MemoryItemRow
 from kokoro_link.infrastructure.persistence.sa_memory_mapping import (
     item_to_row,
     row_to_item,
+    row_to_summary,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -42,6 +44,60 @@ def _apply_world_filter(stmt, world_scope: WorldScope):
             MemoryItemRow.world_id.is_(None),
         )
     )
+
+
+def build_memory_page_stmt(
+    character_id: str,
+    *,
+    kinds: Sequence[MemoryKind] | None = None,
+    world_scope: WorldScope = "all",
+    limit: int,
+    before: datetime | None = None,
+):
+    """Build the SELECT behind the operator-facing memory browser.
+
+    Two things about this statement are load-bearing.
+
+    **It is a column list, not** ``select(MemoryItemRow)``. The entity
+    carries ``embedding`` and ``tags_embedding``, two ``Vector(1024)``
+    columns that the browse response never emits — it emits one boolean
+    saying whether the first is populated. Selecting the entity meant
+    Postgres serialising, and the driver plus ``_coerce_vector``
+    deserialising, 2048 floats per row for a value the caller discards.
+    On a character with 1567 memories that is ~3.2 million floats per
+    listing. ``embedding IS NOT NULL`` answers the same question in the
+    engine, so the vectors never move.
+
+    **The cursor is keyset, not offset**: ``before`` is the ``created_at``
+    of the last row the caller already holds, matched strictly older.
+    Same convention as the feed (plan D8), so the ordering column and the
+    cursor column are the same one and paging cannot drift under
+    concurrent writes. Ties on ``created_at`` would still straddle a page
+    boundary; ``MemoryItem.create`` stamps microsecond-precision UTC per
+    row, so this is the feed's accepted trade-off rather than a new one.
+
+    Kept module-level and side-effect-free so the column list can be
+    asserted without a database.
+    """
+    stmt = select(
+        MemoryItemRow.id,
+        MemoryItemRow.character_id,
+        MemoryItemRow.conversation_id,
+        MemoryItemRow.kind,
+        MemoryItemRow.content,
+        MemoryItemRow.salience,
+        MemoryItemRow.tags,
+        MemoryItemRow.created_at,
+        MemoryItemRow.last_accessed_at,
+        MemoryItemRow.access_count,
+        MemoryItemRow.embedding.is_not(None).label("has_embedding"),
+    ).where(MemoryItemRow.character_id == character_id)
+    if kinds:
+        stmt = stmt.where(MemoryItemRow.kind.in_([k.value for k in kinds]))
+    stmt = _apply_world_filter(stmt, world_scope)
+    if before is not None:
+        stmt = stmt.where(MemoryItemRow.created_at < before)
+    return stmt.order_by(MemoryItemRow.created_at.desc()).limit(limit)
 
 
 class SAMemoryRepository(MemoryRepositoryPort):
@@ -180,6 +236,26 @@ class SAMemoryRepository(MemoryRepositoryPort):
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
         return [row_to_item(row) for row in rows]
+
+    async def list_page_for_character(
+        self,
+        character_id: str,
+        *,
+        kinds: Sequence[MemoryKind] | None = None,
+        world_scope: WorldScope = "all",
+        limit: int = 50,
+        before: datetime | None = None,
+    ) -> list[MemorySummary]:
+        stmt = build_memory_page_stmt(
+            character_id,
+            kinds=kinds,
+            world_scope=world_scope,
+            limit=limit,
+            before=before,
+        )
+        async with self._session_factory() as session:
+            rows = list((await session.execute(stmt)).all())
+        return [row_to_summary(row) for row in rows]
 
     async def count_for_character(self, character_id: str) -> int:
         from sqlalchemy import func

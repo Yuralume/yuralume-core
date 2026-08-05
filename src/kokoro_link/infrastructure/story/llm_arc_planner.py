@@ -37,6 +37,7 @@ from kokoro_link.domain.entities.story_arc import (
     TENSION_RESOLUTION,
     TENSION_RISING,
     TENSION_SETUP,
+    normalise_operator_position,
 )
 from kokoro_link.domain.entities.story_seed import StorySeed
 from kokoro_link.infrastructure.prompt.character_identity import (
@@ -76,6 +77,12 @@ _MAX_SEED_IDS_USED = 8
 # Arc-history digests arrive pre-formatted from the service; the clamp
 # is a prompt-size guard, not a content rule.
 _MAX_ARC_HISTORY_LINE_CHARS = 200
+# ``operator_note`` is one sentence about the player's dramatic place in
+# a scene; same budget as ``dramatic_question``, which it sits beside.
+_MAX_OPERATOR_NOTE_CHARS = 120
+# Relationship facts arrive pre-rendered from the service (one label per
+# line). The clamp only guards the prompt against a pathological seed.
+_MAX_OPERATOR_RELATIONSHIP_LINE_CHARS = 200
 
 
 class NullStoryArcPlanner(StoryArcPlannerPort):
@@ -99,13 +106,16 @@ class NullStoryArcPlanner(StoryArcPlannerPort):
         today: date | None = None,
         seed_candidates: tuple[StorySeed, ...] = (),
         arc_history: tuple[str, ...] = (),
+        operator_relationship_lines: tuple[str, ...] = (),
     ) -> StoryArc:
         # ``today`` only shapes the LLM prompt; the template fallback has
         # no dates in its prose so it is deliberately ignored here. Seed
-        # candidates and arc history are prompt-only inputs for the same
-        # reason: this path never calls a model, so there is nothing to
-        # weave them into and no provenance to record.
-        del today, seed_candidates, arc_history
+        # candidates, arc history and the relationship material are
+        # prompt-only inputs for the same reason: this path never calls a
+        # model, so there is nothing to weave them into, no provenance to
+        # record, and no judgement to make about where the player stands
+        # (the template's beats stay ``None`` = unjudged).
+        del today, seed_candidates, arc_history, operator_relationship_lines
         return _synthetic_arc(
             character=character,
             start_date=start_date,
@@ -141,6 +151,7 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
         today: date | None = None,
         seed_candidates: tuple[StorySeed, ...] = (),
         arc_history: tuple[str, ...] = (),
+        operator_relationship_lines: tuple[str, ...] = (),
     ) -> StoryArc:
         if await self._resolver.is_fake(character=character):
             return _synthetic_arc(
@@ -162,6 +173,7 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
             today=today,
             seed_candidates=seed_candidates,
             arc_history=arc_history,
+            operator_relationship_lines=operator_relationship_lines,
         )
         try:
             raw = await self._resolver.generate(prompt, character=character)
@@ -236,6 +248,8 @@ class LLMStoryArcPlanner(StoryArcPlannerPort):
                 dramatic_question=b["dramatic_question"],
                 scene_type=b["scene_type"],
                 required=b["required"],
+                operator_position=b["operator_position"],
+                operator_note=b["operator_note"],
             )
             for i, b in enumerate(beats)
         ]
@@ -257,6 +271,7 @@ def _build_prompt(
     today: date | None = None,
     seed_candidates: tuple[StorySeed, ...] = (),
     arc_history: tuple[str, ...] = (),
+    operator_relationship_lines: tuple[str, ...] = (),
 ) -> str:
     personality = "、".join(character.personality) or "（未設定）"
     interests = "、".join(character.interests) or "（未設定）"
@@ -284,6 +299,9 @@ def _build_prompt(
         interests=interests,
         aspirations=aspirations,
         world_frame=character.world_frame or "modern",
+        operator_block=_render_operator_relationship_block(
+            operator_relationship_lines,
+        ),
         dialogue_block=dialogue_line,
         seed_block=_render_seed_candidates_block(seed_candidates),
         history_block=_render_arc_history_block(arc_history),
@@ -308,6 +326,42 @@ def _optional_block(lines: list[str]) -> str:
     adjacent placeholder, never another template line.
     """
     return "\n".join(lines) + "\n\n"
+
+
+def _render_operator_relationship_block(lines: tuple[str, ...]) -> str:
+    """OP1-A — who the player is to this character, in the planner's words.
+
+    Before this block the planner's only knowledge of the player was the
+    continuity constraint "promises already made must still hold": it
+    could not name them, did not know how close they stand, and was
+    therefore in no position to decide whether a beat is *about* them.
+    Facts arrive pre-rendered from the service (same contract as
+    ``arc_history``); the instruction on what to do with them lives here,
+    beside the ``operator_position`` schema it exists to serve.
+
+    Empty tuple renders as the empty string — no heading, no placeholder.
+    A section titled "the player's relationship" with nothing under it is
+    worse than silence: the model treats the hole as something to fill
+    and invents a relationship nobody agreed to.
+    """
+    entries = []
+    for raw in lines:
+        cleaned = " ".join(str(raw).split())
+        if not cleaned:
+            continue
+        if len(cleaned) > _MAX_OPERATOR_RELATIONSHIP_LINE_CHARS:
+            cleaned = cleaned[:_MAX_OPERATOR_RELATIONSHIP_LINE_CHARS] + "…"
+        entries.append(cleaned)
+    if not entries:
+        return ""
+    return _optional_block([
+        "玩家（使用者本人）與這個角色的關係（使用者創角時確認的設定）：",
+        *entries,
+        "用途：決定每顆 beat 的 operator_position 與 operator_note 時，你需要知道玩家在這個"
+        "角色的生活裡是什麼位置、被怎麼稱呼、能靠多近。beat.summary 與 operator_note 提到玩家時，"
+        "請用上面這個稱呼，不要另外發明一個。",
+        "邊界：這裡沒有寫到的共同往事不得當成已經發生過；不足的部分讓劇情自然發生，不要補完。",
+    ])
 
 
 def _render_dialogue_block(recent_dialogue_summary: str) -> str:
@@ -515,6 +569,13 @@ def _build_beats(
                 entry.get("dramatic_question"), max_len=120,
             ),
             "required": _coerce_required(entry.get("required")),
+            "operator_position": _coerce_operator_position(
+                entry.get("operator_position"),
+            ),
+            "operator_note": _coerce_optional_str(
+                entry.get("operator_note"),
+                max_len=_MAX_OPERATOR_NOTE_CHARS,
+            ),
         })
     cleaned.sort(key=lambda b: b["scheduled_date"])
     return cleaned[:_MAX_BEATS]
@@ -563,6 +624,29 @@ def _coerce_scene_type(raw: Any) -> str:
         if lowered in _CANONICAL_SCENE_TYPES:
             return lowered
     return SCENE_ENCOUNTER
+
+
+def _coerce_operator_position(raw: Any) -> str | None:
+    """Ingest side of the closed player-position vocabulary (OP1-A).
+
+    ``normalise_operator_position`` is strict by design — the domain
+    boundary must not let a fourth position exist — but a planner
+    response is untrusted input: an older model that never saw the field,
+    one that answers ``"spectator"``, and one that answers ``42`` must
+    all still produce a usable arc. So every rejection lands on ``None``
+    (*unjudged*), which is exactly what a beat planned before this field
+    existed reads back as, and every consumer already derives a framing
+    for it semantically.
+
+    Note what is deliberately absent: no synonym table, no "watching ⇒
+    present" mapping. The vocabulary is taught in the prompt; a model
+    that answers outside it has not judged, and pretending otherwise
+    would be this path inventing a position the model never chose.
+    """
+    try:
+        return normalise_operator_position(raw)
+    except ValueError:
+        return None
 
 
 def _coerce_optional_str(raw: Any, *, max_len: int) -> str | None:

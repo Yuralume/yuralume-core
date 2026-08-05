@@ -46,6 +46,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.persona_curiosity import (
     render_persona_curiosity_plan_lines,
 )
+from kokoro_link.infrastructure.prompt.proactive_beat_invitation import (
+    render_awaiting_player_invitation_lines,
+)
 from kokoro_link.infrastructure.prompt.proactive_streak import (
     render_unanswered_streak_lines,
 )
@@ -372,11 +375,35 @@ def _build_prompt(context: ProactiveContext) -> str:
         if context.upcoming_beats:
             arc_lines.append("- 接下來的節拍：")
             for beat in context.upcoming_beats:
+                # Deliberately position-free (OP3). The forward feed is
+                # ambient colour about what is coming; telling the model
+                # here that a *future* beat cannot be played without the
+                # player would hand it the invitation motive days early,
+                # while ``beat_awaiting_player`` below — the one place
+                # that decides a scene is actually owed — is still None.
+                # Keeping this line byte-identical to its pre-OP3 form is
+                # what makes "no due central beat ⇒ no behaviour change"
+                # true for judged arcs too, not just legacy ones.
                 arc_lines.append(
                     f"  · {beat.scheduled_date.isoformat()} "
                     f"{beat.title} — {beat.summary}"
                 )
         sections.append("\n".join(arc_lines))
+
+    # OP3 — a scene that is about the player has come due and cannot be
+    # played without them. Surfaced as one more candidate motive, never
+    # as an instruction to push: the block itself tells the model that
+    # staying silent is still a good answer, and no gate / cooldown /
+    # quota upstream knows this block exists.
+    if context.beat_awaiting_player is not None:
+        sections.append(
+            "\n".join(
+                render_awaiting_player_invitation_lines(
+                    context.beat_awaiting_player,
+                    today=to_timezone(context.now, context.local_tz).date(),
+                ),
+            ),
+        )
 
     if context.world_event_seed_title:
         seed_lines = [

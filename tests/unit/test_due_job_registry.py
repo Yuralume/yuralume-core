@@ -16,6 +16,7 @@ from kokoro_link.contracts.due_jobs import (
     PROACTIVE_EVALUATE_KIND,
     SCHEDULE_MAINTENANCE_KIND,
     SCHEDULE_WEATHER_VET_KIND,
+    STORY_SCENE_TIMEOUT_KIND,
     character_chain_kinds,
     is_character_chain_kind,
     kind_spec,
@@ -33,6 +34,7 @@ def test_registry_covers_all_character_kinds() -> None:
         FEED_COMMENT_REPLY_KIND,
         PROACTIVE_EVALUATE_KIND,
         GOAL_REVIEW_KIND,
+        STORY_SCENE_TIMEOUT_KIND,
         CHARACTER_UPKEEP_KIND,
     }
 
@@ -42,6 +44,9 @@ def test_priorities_match_section_5() -> None:
     assert kind_spec(BEAT_DUE_KIND).priority == 2
     assert kind_spec(SCHEDULE_MAINTENANCE_KIND).priority == 2
     assert kind_spec(SCHEDULE_WEATHER_VET_KIND).priority == 2
+    # SC1-E rides the precisely-timed tier: an open scene's idle deadline
+    # is exact, and the wrap-up is output the player already paid for.
+    assert kind_spec(STORY_SCENE_TIMEOUT_KIND).priority == 2
     assert kind_spec(PROACTIVE_EVALUATE_KIND).priority == 3
     assert kind_spec(FEED_COMPOSE_KIND).priority == 4
     assert kind_spec(FEED_COMMENT_REPLY_KIND).priority == 4
@@ -61,6 +66,7 @@ def test_capability_mapping() -> None:
         FEED_COMMENT_REPLY_KIND,
         PROACTIVE_EVALUATE_KIND,
         GOAL_REVIEW_KIND,
+        STORY_SCENE_TIMEOUT_KIND,
     ):
         assert kind_spec(llm_kind).capability is JobCapability.LLM
 
@@ -72,7 +78,15 @@ def test_knob_gate_mapping() -> None:
     assert kind_spec(SCHEDULE_WEATHER_VET_KIND).knob_gate is KnobGate.BACKGROUND
     assert kind_spec(GOAL_REVIEW_KIND).knob_gate is KnobGate.BACKGROUND
     # Cheap DB-only + precisely-timed kinds are never down-shifted.
-    for none_kind in (BEAT_DUE_KIND, MEMORIALIZE_KIND, CHARACTER_UPKEEP_KIND):
+    for none_kind in (
+        BEAT_DUE_KIND,
+        MEMORIALIZE_KIND,
+        CHARACTER_UPKEEP_KIND,
+        # SC1-E: the idle window is the promise that a paid opening always
+        # produces something — a down-shifted account must not get a longer
+        # one, or 起幕 stays blocked for the player most likely to return.
+        STORY_SCENE_TIMEOUT_KIND,
+    ):
         assert kind_spec(none_kind).knob_gate is KnobGate.NONE
 
 
@@ -133,3 +147,18 @@ def test_weather_vet_runs_on_a_sub_daily_cadence() -> None:
     maintenance = kind_spec(SCHEDULE_MAINTENANCE_KIND)
     assert weather_vet.base_interval_seconds <= 1_800.0
     assert weather_vet.base_interval_seconds < maintenance.base_interval_seconds
+
+
+def test_story_scene_timeout_is_a_character_chain_with_a_cheap_recheck() -> None:
+    # SC1-E. The chain exists for a state almost no character is in, so its
+    # base cadence is only the fallback recheck (one indexed read per hour);
+    # a live scene's exact deadline arrives as ``explicit_next_due`` instead.
+    spec = kind_spec(STORY_SCENE_TIMEOUT_KIND)
+    assert spec is not None
+    assert spec.base_interval_seconds == 3_600.0
+    assert spec.handler == "story_scene_timeout"
+    assert spec.chained is True
+    assert spec.character_scoped is True
+    assert spec.event_driven is False
+    assert STORY_SCENE_TIMEOUT_KIND in character_chain_kinds()
+    assert is_character_chain_kind(STORY_SCENE_TIMEOUT_KIND) is True

@@ -40,6 +40,7 @@ from kokoro_link.api.routes.chat_assist import router as chat_assist_router
 from kokoro_link.api.routes.chat import router as chat_router
 from kokoro_link.api.routes.auth_locale import router as auth_locale_router
 from kokoro_link.api.routes.cloud_credits import router as cloud_credits_router
+from kokoro_link.api.routes.cloud_limits import router as cloud_limits_router
 from kokoro_link.api.routes.cloud_pricing import router as cloud_pricing_router
 from kokoro_link.api.routes.cloud_announcements import (
     router as cloud_announcements_router,
@@ -60,6 +61,12 @@ from kokoro_link.api.routes.external_chat import (
 )
 from kokoro_link.api.routes.internal_cloud import (
     router as internal_cloud_router,
+)
+from kokoro_link.api.routes.internal_cloud_official_cards import (
+    router as internal_cloud_official_cards_router,
+)
+from kokoro_link.api.routes.internal_cloud_showcase import (
+    router as internal_cloud_showcase_router,
 )
 from kokoro_link.api.routes.internal_drain import (
     router as internal_drain_router,
@@ -92,6 +99,7 @@ from kokoro_link.api.routes.schedule import router as schedule_router
 from kokoro_link.api.routes.system import router as system_router
 from kokoro_link.api.routes.story import router as story_router
 from kokoro_link.api.routes.story_arc import router as story_arc_router
+from kokoro_link.api.routes.story_scene import router as story_scene_router
 from kokoro_link.api.routes.tools import router as tools_router
 from kokoro_link.api.routes.tts import router as tts_router
 from kokoro_link.api.routes.ui import router as ui_router
@@ -517,6 +525,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         app.include_router(
             cloud_announcements_router, prefix="/api/v1", dependencies=_auth_dep,
         )
+        # Runtime-limit hints (character slots / daily creates / daily 起幕 /
+        # session message cap / capability switches). Conditional for the same
+        # reason: the ceilings only exist on hosted tiers, so self-host should
+        # not carry the route at all. The handler still 404s outside cloud
+        # mode, which is what a direct mount in a test exercises.
+        app.include_router(
+            cloud_limits_router, prefix="/api/v1", dependencies=_auth_dep,
+        )
     # G2 hosted locale lifecycle + city search. Same unconditional mount /
     # in-handler 404: self-host's route inventory is unchanged, and both
     # already carry their own per-handler bearer dependency (the locale
@@ -561,6 +577,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(tools_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(story_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(story_arc_router, prefix="/api/v1", dependencies=_auth_dep)
+    app.include_router(story_scene_router, prefix="/api/v1", dependencies=_auth_dep)
     # Intake router must come before arc_templates_router so that the
     # static `/arc-templates/scaffolds` and `/arc-templates/intake/...`
     # routes match before the greedy `/arc-templates/{template_id}` in
@@ -591,6 +608,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # HTTP relay route to mount.
     if matrix.serve_cloud_internal_routes:
         app.include_router(internal_cloud_router, prefix="/api/internal/v1")
+        app.include_router(internal_cloud_showcase_router, prefix="/api/internal/v1")
+        app.include_router(
+            internal_cloud_official_cards_router, prefix="/api/internal/v1",
+        )
         app.include_router(external_chat_router, prefix="/api/internal/v1")
     app.include_router(ui_router)
     return app

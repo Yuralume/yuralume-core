@@ -30,11 +30,12 @@ from kokoro_link.infrastructure.llm.cloud_refusal import refusal_from_response
 _LOGGER = logging.getLogger(__name__)
 
 
-# Forwarded feature string the upstream/usage ledger sees. Kept as ``tts`` for
-# attribution continuity; the control-plane routes the voice default under the
-# manifest's routable TTS key (below), which is an internal lookup detail.
-_TTS_FEATURE_KEY = "tts"
-_TTS_PROFILE_FEATURE_KEY = "tts_synthesis"
+# The TTS service body keeps its capability-local key, while the trusted Gateway
+# attribution header and control-plane route use the player-visible foreground
+# feature.  Keeping these names separate prevents a valid synthesis from being
+# classified as an unknown/no-charge trusted call.
+_TTS_SERVICE_FEATURE_KEY = "tts"
+_TTS_SYNTHESIS_FEATURE_KEY = "tts_synthesis"
 
 
 class CloudGatewayTTSAdapter:
@@ -120,7 +121,7 @@ class CloudGatewayTTSAdapter:
         payload = {
             "text": request.text,
             "voice_id": voice_id,
-            "feature_key": _TTS_FEATURE_KEY,
+            "feature_key": _TTS_SERVICE_FEATURE_KEY,
             "options": {
                 "text_lang": request.text_lang,
                 "prompt_lang": request.prompt_lang,
@@ -181,7 +182,7 @@ class CloudGatewayTTSAdapter:
                 user_id=identity.account_id,
                 tier=identity.tenant_tier,
             )
-            voice = profile.preset_for("tts", _TTS_PROFILE_FEATURE_KEY)
+            voice = profile.preset_for("tts", _TTS_SYNTHESIS_FEATURE_KEY)
             if voice:
                 return voice
         return self._default_voice_id.strip()
@@ -191,7 +192,7 @@ class CloudGatewayTTSAdapter:
         headers.update({
             "X-Yuralume-Tenant": identity.tenant_id,
             "X-Yuralume-Account": identity.account_id,
-            "X-Yuralume-Feature": _TTS_FEATURE_KEY,
+            "X-Yuralume-Feature": _TTS_SYNTHESIS_FEATURE_KEY,
             "X-Yuralume-Character": identity.character_ref,
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         })

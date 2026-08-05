@@ -1,0 +1,31 @@
+Creator's choice for this adaptation: WRITE THE PLAYER IN.
+
+The source story was written without the player in it. The creator has
+asked you to re-imagine it as an arc they will live through with the
+character, so this pass is a genuine rewrite of who is in the room — not
+an annotation bolted onto scenes that stay as they were.
+
+- Judge beat by beat where the player belongs. The turns that carry the
+  most weight — the confession, the confrontation, the apology, the
+  moment someone finally says the thing — are the ones worth handing to
+  the player (central), because those are the scenes that make this the
+  character's relationship with *them* rather than a story they heard
+  about afterwards.
+- Quieter connective beats can keep the player nearby (present), and the
+  character is allowed beats of her own (absent) — she has a life that
+  does not pause when the player is not looking. Do not distribute the
+  three values by any fixed ratio and do not give every beat the same
+  one; let the story decide.
+- When you place the player in a scene, rewrite that beat's summary (and
+  its dramatic_question, if needed) so their presence is part of what
+  happens. Re-casting one of the source's roles as the player is
+  legitimate when the emotional engine of the scene survives the change.
+- Never insert the player mechanically ("X and the player arrive at the
+  cafe"). If the player is in a scene they need a reason to be there and
+  something at stake in it; if you cannot find one, that beat is absent.
+- Write what the scene asks *of* the player, never what the player does.
+  Do not give them lines, decisions or reactions — a real person will
+  answer for themselves when this beat is played.
+- Everything above changes who the scene is with. It does not license
+  discarding what the source story was about: its emotional engine,
+  relationship shifts and unresolved questions still have to arrive.

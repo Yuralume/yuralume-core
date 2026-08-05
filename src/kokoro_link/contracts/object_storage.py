@@ -9,9 +9,28 @@ New DB rows should persist the returned app-relative media URL
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Protocol
+
+DEFAULT_STREAM_CHUNK_BYTES = 64 * 1024
+
+#: Key prefixes whose objects are short-lived staging material, not durable
+#: media. Three independent components have to agree on this set, which is why
+#: it lives on the port rather than in any one of them:
+#:
+#: * the **writer** (``CharacterDraftService``) builds keys under it and deletes
+#:   them as soon as the call that needed them is over;
+#: * the **storage service** TTL-sweeps it as the backstop for whatever a crash
+#:   or a failed delete left behind;
+#: * the **variant decorator** skips its WebP fan-out for it — nothing under
+#:   these prefixes is ever rendered by a UI, so the renditions would be dead
+#:   weight paid for in the foreground latency of a charged action.
+#:
+#: A prefix restated in any of those three places instead of imported here is a
+#: second definition that can drift: a writer whose keys nobody sweeps, or a
+#: sweeper deleting a prefix nothing writes.
+EPHEMERAL_OBJECT_KEY_PREFIXES: tuple[str, ...] = ("draft-uploads/",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,3 +109,28 @@ class ObjectStoragePort(Protocol):
 
     def object_key_from_url(self, url: str) -> str | None:
         """Best-effort reverse lookup for URLs produced by this adapter."""
+
+
+class SupportsObjectStream(Protocol):
+    """Optional capability: read an object without materialising it.
+
+    Deliberately kept **out** of :class:`ObjectStoragePort` so it stays an
+    additive capability: adapters written before this existed, test
+    doubles, and any decorator that wraps a port without forwarding
+    unknown attributes all remain valid ports. Callers detect it with
+    ``getattr`` and fall back to :meth:`ObjectStoragePort.get_bytes`.
+    """
+
+    def iter_bytes(
+        self,
+        *,
+        object_key: str,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+    ) -> AsyncIterator[bytes]:
+        """Yield the object's bytes in chunks.
+
+        Raises :class:`ObjectNotFoundError` when the key is absent — but
+        *lazily*, on first iteration. Callers that owe the client a real
+        404 must ``stat()`` first: once a streaming response has begun,
+        its headers are already on the wire.
+        """

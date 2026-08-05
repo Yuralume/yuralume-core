@@ -17,6 +17,8 @@ ${npc_line}
 ${question_line}
 ${required_line}
 
+${operator_position_block}
+
 劇情骨架（這是這場戲的編劇大綱，請演出來而不是照抄）：
 ${seed_text}
 

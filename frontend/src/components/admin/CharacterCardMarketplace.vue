@@ -7,7 +7,7 @@
  * 成功後 emit ``installed`` 讓父頁刷新角色 picker。市集來源目前是 repo
  * 出貨；遠端 registry 列在 backlog（見 docs/CHARACTER_CARD_PLAN.md §8）。
  */
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { notification } from 'ant-design-vue'
 import type { Character } from '@/types/character'
@@ -16,6 +16,10 @@ import {
   installCharacterCard,
   type CharacterCardPackSummary,
 } from '@/utils/api/characters'
+import {
+  isCloudCard,
+  shouldOfferInstallTranslateToggle,
+} from '@/utils/characterCardSource'
 import { UiCard, UiButton, UiBadge } from '@/components/ui'
 
 const emit = defineEmits<{
@@ -32,12 +36,17 @@ const installingId = ref<string | null>(null)
 // LLM-translating the A-layer profile + bundled arc templates on install
 // (same flag the player gallery already sends). Off by default.
 const translateOnInstall = ref(false)
+// ...and it is hidden when nothing on the shelf would act on it. An official
+// card's install path takes no `translate` parameter — the catalog already
+// carries an approved translation per locale — so on an all-official grid the
+// checkbox is a sentence about LLM translation that nothing keeps.
+const offersTranslateToggle = computed(() => shouldOfferInstallTranslateToggle(packs.value))
 
 async function load() {
   loading.value = true
   loadError.value = null
   try {
-    packs.value = await listCharacterCards()
+    packs.value = (await listCharacterCards()).cards
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -80,7 +89,11 @@ onMounted(load)
 
     <p class="marketplace__hint">{{ t('admin.page.characters.marketplace.hint') }}</p>
 
-    <label class="marketplace__translate" :title="t('admin.page.characters.marketplace.translateHint')">
+    <label
+      v-if="offersTranslateToggle"
+      class="marketplace__translate"
+      :title="t('admin.page.characters.marketplace.translateHint')"
+    >
       <input type="checkbox" v-model="translateOnInstall" />
       <span>{{ t('admin.page.characters.marketplace.translateLabel') }}</span>
     </label>
@@ -114,6 +127,18 @@ onMounted(load)
         </div>
 
         <p v-if="pack.note" class="marketplace__note">{{ pack.note }}</p>
+
+        <!--
+          Only when the checkbox is on screen: on an all-official shelf it is
+          already gone, and repeating "this one is not affected" under every
+          row of a grid where nothing is affected is noise.
+        -->
+        <p
+          v-if="offersTranslateToggle && isCloudCard(pack)"
+          class="marketplace__official-note"
+        >
+          {{ t('admin.page.characters.marketplace.officialTranslated') }}
+        </p>
 
         <UiButton
           variant="primary"
@@ -220,5 +245,12 @@ onMounted(load)
   border: 1px dashed var(--color-border);
   border-radius: 4px;
   line-height: 1.5;
+}
+.marketplace__official-note {
+  margin: 0;
+  font-size: var(--font-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+  opacity: 0.85;
 }
 </style>

@@ -135,11 +135,14 @@ def _build_service(directory: Path) -> tuple[
     )
 
 
-def test_list_available_projects_bundled_series_summary(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_list_available_projects_bundled_series_summary(
+    tmp_path: Path,
+) -> None:
     _write_series_pack(tmp_path)
     service, _series_repo = _build_service(tmp_path)
 
-    [summary] = service.list_available()
+    [summary] = (await service.list_available()).cards
 
     assert summary.pack_id == "mio_series"
     assert summary.has_arc_series is True

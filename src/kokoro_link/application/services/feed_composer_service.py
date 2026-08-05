@@ -14,7 +14,7 @@ service is stateless; tick safety comes from the repo's daily-count +
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from pathlib import Path
@@ -78,6 +78,7 @@ from kokoro_link.contracts.register_profile import (
     RegisterProfilePort,
 )
 from kokoro_link.contracts.reply_quality import ReplyDiversityEvidence
+from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.contracts.weather_context import WeatherContextPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.feed_post import FeedPost
@@ -127,6 +128,12 @@ unclaimed and can fire on a later tick when the schedule becomes reachable.
 """
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeFeedQuotaDecision:
+    allowed: bool
+    claim_id: str | None = None
+
+
 class FeedComposerService:
     """Tick-driven post composer.
 
@@ -170,6 +177,7 @@ class FeedComposerService:
         account_runtime_usage_repository: (
             AccountRuntimeUsageRepositoryPort | None
         ) = None,
+        character_repository: CharacterRepositoryPort | None = None,
         quota_overage: "QuotaOverageService | None" = None,
     ) -> None:
         self._repo = repository
@@ -212,6 +220,7 @@ class FeedComposerService:
             or PermissiveAccountRuntimeProfileResolver()
         )
         self._account_runtime_usage_repository = account_runtime_usage_repository
+        self._character_repository = character_repository
         # AP4: the only credit spend in this service, and the only one in the
         # product that a player pre-authorises rather than presses a button
         # for. ``None`` (self-host, legacy tests) means the tier's daily post
@@ -235,8 +244,11 @@ class FeedComposerService:
             return None
         if await self._is_current_activity_high_busy(character, when):
             return None
+        quota = await self._claim_runtime_feed_post_quota(
+            character, when, local_tz,
+        )
         overage: OverageGrant | None = None
-        if await self._runtime_feed_post_quota_exhausted(character, when):
+        if not quota.allowed:
             overage = await self._authorise_feed_post_overage(character, when)
             if not overage.granted:
                 # Every denial — tier closed, switch off, ceiling spent, out
@@ -248,9 +260,11 @@ class FeedComposerService:
         try:
             post = await self._compose_first_viable(character, when, local_tz)
         except BaseException:
+            await self._discard_runtime_feed_post_claim(quota.claim_id)
             await self._release_feed_post_overage(overage)
             raise
         if post is None:
+            await self._discard_runtime_feed_post_claim(quota.claim_id)
             await self._release_feed_post_overage(overage)
         else:
             await self._settle_feed_post_overage(overage)
@@ -587,102 +601,196 @@ class FeedComposerService:
                         character.id, item_id,
             )
             return None
-        if not await self._record_runtime_feed_post(character, when):
-            _LOGGER.error(
-                "feed runtime quota record failed after persist; "
-                "deleting unmetered post character=%s post=%s",
-                character.id,
-                post.id,
-            )
-            try:
-                await self._repo.delete(post.id)
-            except Exception:
-                _LOGGER.exception(
-                    "feed runtime quota rollback delete failed character=%s "
-                    "post=%s",
-                    character.id,
-                    post.id,
-                )
-            if (
-                candidate.claim_token is not None
-                and self._event_seed_dispenser is not None
-            ):
-                item_id, surface = candidate.claim_token
-                try:
-                    await self._event_seed_dispenser.release(
-                        item_id=item_id,
-                        surface=surface,
-                    )
-                except Exception:
-                    _LOGGER.exception(
-                        "feed: world-event release after quota-record-fail "
-                        "crashed character=%s item=%s",
-                        character.id,
-                        item_id,
-                    )
-            return None
         await self._publish(post)
         await self._notify_web_push(character, post)
         await self._memorialize(character, post)
         return post
 
-    async def _runtime_feed_post_quota_exhausted(
+    async def _claim_runtime_feed_post_quota(
         self,
         character: Character,
         now: datetime,
-    ) -> bool:
-        profile = await self._account_runtime_profile_resolver.resolve_for_operator(
-            character.user_id,
-        )
+        local_tz: tzinfo,
+    ) -> _RuntimeFeedQuotaDecision:
+        """Reserve one base-quota post for this character's local day.
+
+        The account ceiling remains authoritative.  When it can cover every
+        active character, one slot is held for each character until that
+        character publishes its first post of the civil day.  Any remaining
+        slots are shared normally after those floors have been satisfied.
+        """
+        try:
+            profile = (
+                await self._account_runtime_profile_resolver.resolve_for_operator(
+                    character.user_id,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "feed runtime quota profile check failed (operator=%s)",
+                character.user_id,
+            )
+            return _RuntimeFeedQuotaDecision(allowed=False)
         limit = profile.daily_feed_post_limit
         if limit is None:
-            return False
-        if self._account_runtime_usage_repository is None:
+            return _RuntimeFeedQuotaDecision(allowed=True)
+        usage = self._account_runtime_usage_repository
+        if usage is None:
             _LOGGER.error(
                 "feed runtime quota ledger is not configured (operator=%s)",
                 character.user_id,
             )
-            return True
-        try:
-            used = await self._account_runtime_usage_repository.count_events(
-                operator_id=character.user_id,
-                event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
-                since=now - timedelta(hours=24),
-                until=now,
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception(
-                "feed runtime quota check failed (operator=%s)",
-                character.user_id,
-            )
-            return True
-        return used >= limit
+            return _RuntimeFeedQuotaDecision(allowed=False)
 
-    async def _record_runtime_feed_post(
-        self,
-        character: Character,
-        now: datetime,
-    ) -> bool:
-        profile = await self._account_runtime_profile_resolver.resolve_for_operator(
-            character.user_id,
-        )
-        if profile.daily_feed_post_limit is None:
-            return True
-        if self._account_runtime_usage_repository is None:
-            return False
+        day_start = _local_day_start(now, local_tz)
+        local_today = to_timezone(now, local_tz).date()
         try:
-            await self._account_runtime_usage_repository.record_event(
+            active = await self._active_feed_characters(character)
+            reservations_enabled = bool(active) and limit >= len(active)
+            if active and not reservations_enabled:
+                _LOGGER.warning(
+                    "feed daily floor cannot cover every active character; "
+                    "using account ceiling only operator=%s limit=%s active=%s",
+                    character.user_id,
+                    limit,
+                    len(active),
+                )
+
+            effective_limit = limit
+            resource_limit: int | None = None
+            if reservations_enabled:
+                current_used = await usage.count_events(
+                    operator_id=character.user_id,
+                    event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
+                    since=day_start,
+                    until=now,
+                    resource_id=character.id,
+                )
+                if current_used == 0:
+                    # Rows written before character attribution have NULL
+                    # resource_id. The actual feed row preserves fairness
+                    # across a mid-day rolling deploy; attributed claims still
+                    # provide single-flight before a new post is persisted.
+                    current_used = await self._repo.count_on_date(
+                        character.id,
+                        on=local_today,
+                        local_tz=local_tz,
+                    )
+                if current_used == 0:
+                    resource_limit = 1
+                else:
+                    unserved_others = 0
+                    for other in active:
+                        if other.id == character.id:
+                            continue
+                        used = await usage.count_events(
+                            operator_id=character.user_id,
+                            event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
+                            since=day_start,
+                            until=now,
+                            resource_id=other.id,
+                        )
+                        if used == 0:
+                            used = await self._repo.count_on_date(
+                                other.id,
+                                on=local_today,
+                                local_tz=local_tz,
+                            )
+                        if used == 0:
+                            unserved_others += 1
+                    effective_limit = max(0, limit - unserved_others)
+
+            claim_id = await usage.claim_event_slot(
                 operator_id=character.user_id,
                 event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
                 occurred_at=now,
+                since=day_start,
+                limit=effective_limit,
+                resource_id=character.id,
+                resource_limit=resource_limit,
             )
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
-                "feed runtime quota record failed (operator=%s)",
+                "feed runtime quota claim failed (operator=%s character=%s)",
                 character.user_id,
+                character.id,
+            )
+            return _RuntimeFeedQuotaDecision(allowed=False)
+        return _RuntimeFeedQuotaDecision(
+            allowed=claim_id is not None,
+            claim_id=claim_id,
+        )
+
+    async def _active_feed_characters(
+        self,
+        character: Character,
+    ) -> tuple[Character, ...]:
+        repository = self._character_repository
+        if repository is None:
+            return (character,)
+        characters = await repository.list_for_user(character.user_id)
+        active = tuple(
+            item
+            for item in characters
+            if item.feed_daily_limit > 0
+            and not item.frozen
+            and not item.subscription_locked
+        )
+        if any(item.id == character.id for item in active):
+            return active
+        return (*active, character)
+
+    async def _discard_runtime_feed_post_claim(
+        self,
+        claim_id: str | None,
+    ) -> None:
+        if claim_id is None or self._account_runtime_usage_repository is None:
+            return
+        try:
+            await self._account_runtime_usage_repository.discard_event(
+                event_id=claim_id,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "feed runtime quota claim release failed (claim=%s)",
+                claim_id,
+            )
+
+    async def needs_daily_floor_retry(
+        self,
+        character: Character,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return whether the character still lacks today's first post."""
+        if not self._is_feed_enabled(character):
+            return False
+        when = now or datetime.now(timezone.utc)
+        try:
+            profile = (
+                await self._account_runtime_profile_resolver.resolve_for_operator(
+                    character.user_id,
+                )
+            )
+            if (
+                profile.daily_feed_post_limit is not None
+                and profile.daily_feed_post_limit <= 0
+            ):
+                return False
+            local_tz = await self._resolve_operator_timezone(character)
+            local_today = to_timezone(when, local_tz).date()
+            count = await self._repo.count_on_date(
+                character.id,
+                on=local_today,
+                local_tz=local_tz,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "feed daily floor retry check failed character=%s",
+                character.id,
             )
             return False
-        return True
+        return count == 0
 
     async def _runtime_video_generation_enabled(self, character: Character) -> bool:
         try:
@@ -1350,6 +1458,14 @@ def _post_to_memory(post: FeedPost, *, language: str = "zh-TW") -> MemoryItem:
         tags=tags,
         created_at=post.created_at,
     )
+
+
+def _local_day_start(now: datetime, local_tz: tzinfo) -> datetime:
+    local = to_timezone(now, local_tz)
+    start = datetime(
+        local.year, local.month, local.day, tzinfo=local_tz,
+    )
+    return start.astimezone(timezone.utc)
 
 
 def _operator_language(operator: OperatorProfile | None) -> str:

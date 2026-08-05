@@ -44,6 +44,7 @@ const UNIT_COPY_KEYS: Readonly<Record<string, string>> = {
   per_draft: 'credits.price.perDraft',
   per_post: 'credits.price.perPost',
   per_iteration: 'credits.price.perIteration',
+  per_scene: 'credits.price.perScene',
 }
 
 const price = computed(() => (

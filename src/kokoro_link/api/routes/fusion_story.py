@@ -310,6 +310,11 @@ async def adapt_fusion_story_to_arc(
                     current_user_id,
                 ),
                 instruction=(payload.instruction if payload else None) or "",
+                # OP1-C — which of the three creator choices this
+                # conversion runs under. An omitted body is a caller who
+                # never saw the choice, and the service resolves that to
+                # the plan's protocol default (leave the story alone).
+                operator_mode=(payload.operator_mode if payload else None),
             )
     except ValueError as exc:
         message = str(exc)

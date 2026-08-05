@@ -66,14 +66,18 @@ class SAAlbumRepository(AlbumRepositoryPort):
         *,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[AlbumItem]:
         async with self._session_factory() as session:
             stmt = (
                 select(CharacterAlbumItemRow)
                 .where(CharacterAlbumItemRow.character_id == character_id)
-                .order_by(CharacterAlbumItemRow.created_at.desc())
-                .offset(offset)
             )
+            if before is not None:
+                stmt = stmt.where(CharacterAlbumItemRow.created_at < before)
+            stmt = stmt.order_by(
+                CharacterAlbumItemRow.created_at.desc(),
+            ).offset(offset)
             if limit is not None:
                 stmt = stmt.limit(limit)
             result = await session.execute(stmt)

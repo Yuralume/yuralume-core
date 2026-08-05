@@ -19,6 +19,8 @@ Plain-language release notes for everyday users — what each update actually fe
 
 | 版本 / Version | 繁中 | EN | 日本語 |
 |---|---|---|---|
+| 2026.08.05 — 官方角色新增 7 位、藝廊與官方目錄同步、官方卡三語內建零翻譯 / seven new official characters, gallery syncs with the official catalog, cards ship in three languages / 公式キャラ7人追加・ギャラリーは公式カタログと同期・カードは3言語内蔵 | [zh-TW](zh-TW/2026-08-05.md) | [en-US](en-US/2026-08-05.md) | [ja-JP](ja-JP/2026-08-05.md) |
+| 2026.08.02 — 起幕按鈕隨時開戲、你住進她的故事、圖片與清單大提速 / start a scene any time, you live inside her story now, images & lists get fast / 「幕開け」でいつでも物語・あなたが物語の登場人物に・画像とリストが軽快に | [zh-TW](zh-TW/2026-08-02.md) | [en-US](en-US/2026-08-02.md) | [ja-JP](ja-JP/2026-08-02.md) |
 | 2026.07.31 — 同場想來就來不再審核、角色照自己的行程反應、劇情章節不重複 / same-scene needs no permission, characters react from their own schedule, story chapters stop repeating / 同席は許可不要に・キャラは自分の予定どおりに反応・ストーリーは繰り返さない | [zh-TW](zh-TW/2026-07-31.md) | [en-US](en-US/2026-07-31.md) | [ja-JP](ja-JP/2026-07-31.md) |
 | 2026.07.29 — 約定會過去不再跳針、行程跟上真實天氣、日常靈感大擴充 / promises finally lapse instead of looping, schedules follow the real weather, big everyday-inspiration expansion / 約束はちゃんと過去になる・予定は実際の天気に追従・日常ネタを大幅拡充 | [zh-TW](zh-TW/2026-07-29.md) | [en-US](en-US/2026-07-29.md) | [ja-JP](ja-JP/2026-07-29.md) |
 | 2026.07.26 — 天氣節慶各看各的所在地、新聞來源可標地區、同時觸發不再重複跑 / weather & holidays per owner's location, region-tagged news sources, no more double runs / 天気と祝日は持ち主の所在地基準・ニュースソースの地域指定・二重実行の解消 | [zh-TW](zh-TW/2026-07-26.md) | [en-US](en-US/2026-07-26.md) | [ja-JP](ja-JP/2026-07-26.md) |

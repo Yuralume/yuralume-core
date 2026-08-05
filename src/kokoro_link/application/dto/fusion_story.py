@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from kokoro_link.contracts.fusion_to_arc import (
+    VALID_FUSION_OPERATOR_MODES,
+    normalise_fusion_operator_mode,
+)
 from kokoro_link.domain.entities.fusion_story import (
     FusionStory,
     FusionStoryBeat,
@@ -249,3 +253,23 @@ class PolishFusionStoryRequest(QuotedActionPriceMixin):
 
 class FusionToArcDraftRequest(BaseModel):
     instruction: str | None = Field(default=None, max_length=2000)
+    # --- Creator's choice: how the player enters this story (OP1-C) ---
+    # ``None`` (or an omitted body) means nobody chose and resolves to the
+    # plan's protocol default — the one mode that leaves the creator's
+    # story alone. An off-vocabulary value is a 422 rather than a
+    # best-guess branch: which of three creator intents a typo meant is
+    # not something this endpoint may decide.
+    operator_mode: str | None = Field(default=None, max_length=32)
+
+    @field_validator("operator_mode")
+    @classmethod
+    def _check_operator_mode(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        try:
+            return normalise_fusion_operator_mode(value)
+        except ValueError as exc:
+            raise ValueError(
+                "operator_mode must be one of "
+                f"{sorted(VALID_FUSION_OPERATOR_MODES)}",
+            ) from exc

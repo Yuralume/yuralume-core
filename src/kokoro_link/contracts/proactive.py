@@ -90,6 +90,23 @@ class ProactiveContext:
     upcoming_beats: tuple[StoryArcBeat, ...] = ()
     """Next 1–2 pending beats (today + near-future) from ``active_arc``.
     Empty when there is no active arc or all beats are realised / skipped."""
+    beat_awaiting_player: StoryArcBeat | None = None
+    """A due beat whose ``operator_position`` is ``central`` — a scene
+    that is *about* the player and therefore cannot be played without
+    them (ARC_PLAYER_POSITION_PLAN §3.4, OP3).
+
+    Deliberately **not** a slice of ``upcoming_beats``: that tuple is a
+    forward feed (``scheduled_date >= today``) and drops a beat the day
+    after it comes due, which is exactly when it has been waiting the
+    longest. This field instead names the earliest *due* one (scheduled
+    on or before today, still pending), so "a scene has been waiting for
+    you since Tuesday" stays visible.
+
+    ``None`` — the overwhelmingly common case — means no such beat, and
+    both proactive prompts then render exactly as they did before OP3.
+    It is a fact for the LLM to weigh alongside every other candidate
+    motive: nothing in the pipeline branches on it beyond surfacing it,
+    and no gate, cooldown or quota is relaxed because of it."""
     recent_sent_attempts: tuple[ProactiveAttempt, ...] = ()
     """Most-recent SENT proactive messages the character pushed (newest
     first, typically up to ~8 so several days of pushes stay visible).

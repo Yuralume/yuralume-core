@@ -66,6 +66,7 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplateBinding,
 )
 from kokoro_link.domain.entities.arc_template import ArcTemplate
+from kokoro_link.domain.services.story_tone_policy import fold_stored_tone
 from kokoro_link.infrastructure.character_card.arc_template_yaml import (
     load_arc_template_from_yaml,
 )
@@ -137,7 +138,13 @@ class CharacterCardImportService:
         arc_series_repository: ArcSeriesRepositoryPort | None = None,
         translator: CharacterCardTranslatorPort | None = None,
         arc_template_translator: ArcTemplateTranslatorPort | None = None,
+        cloud_mode: bool = False,
     ) -> None:
+        # GF6 — a ``.lumecard`` is untrusted third-party content, so it
+        # is one of the two "匯入" paths a hosted deployment must not let
+        # land a tone its AUP forbids. Default ``False`` keeps self-host
+        # imports byte-identical.
+        self._cloud_mode = cloud_mode
         self._character_service = character_service
         self._character_image_service = character_image_service
         self._arc_template_repository = arc_template_repository
@@ -159,6 +166,7 @@ class CharacterCardImportService:
         translate: bool = False,
         target_language: str | None = None,
         initial_relationship: InitialRelationshipPayload | None = None,
+        profile_translator: CharacterCardTranslatorPort | None = None,
     ) -> ImportedCard:
         unpacked = unpack_character_card(blob)
         manifest = self._validate_manifest(unpacked)
@@ -166,6 +174,7 @@ class CharacterCardImportService:
             manifest,
             translate=translate,
             target_language=target_language,
+            profile_translator=profile_translator,
         )
 
         create_request = manifest.character.to_create_request(
@@ -291,12 +300,27 @@ class CharacterCardImportService:
         *,
         translate: bool,
         target_language: str | None,
+        profile_translator: CharacterCardTranslatorPort | None = None,
     ) -> CharacterCardManifest:
+        """Localize the profile prose, if there is anything to localize with.
+
+        ``profile_translator`` is the official-card seam: it carries a
+        translation the Cloud console already approved, so it runs whether or
+        not the player ticked "translate". There is nothing for them to opt
+        into — the card is *published* in their language, and the toggle they
+        never saw would otherwise be the only way to see it. The ``translate``
+        flag still gates ``self._translator``, which is the one that costs a
+        model call.
+        """
         target = (target_language or "").strip()
-        if not translate or not target or self._translator is None:
+        if profile_translator is not None:
+            translator: CharacterCardTranslatorPort = profile_translator
+        elif translate and target and self._translator is not None:
+            translator = self._translator
+        else:
             return manifest
         try:
-            translated = await self._translator.translate_profile(
+            translated = await translator.translate_profile(
                 manifest.character,
                 target_language=target,
             )
@@ -381,6 +405,13 @@ class CharacterCardImportService:
                 template,
                 target_character_ref_map=target_character_ref_map,
             )
+            folded_tone = fold_stored_tone(
+                template.tone,
+                cloud_mode=self._cloud_mode,
+                context=f"character card import ({filename})",
+            )
+            if folded_tone != template.tone:
+                template = replace(template, tone=folded_tone)
             template = await self._maybe_translate_template(
                 template,
                 translate=translate,
@@ -464,7 +495,13 @@ class CharacterCardImportService:
                     title=bundled.title,
                     premise=bundled.premise,
                     theme=bundled.theme,
-                    tone=bundled.tone,
+                    # GF6: a series' tone reaches the continuation
+                    # planner's prompt the same way a template's does.
+                    tone=fold_stored_tone(
+                        bundled.tone,
+                        cloud_mode=self._cloud_mode,
+                        context=f"character card import series ({bundled.id})",
+                    ),
                     binding=ArcTemplateBinding(
                         world_frames=tuple(bundled.binding.world_frames),
                         required_traits=tuple(bundled.binding.required_traits),

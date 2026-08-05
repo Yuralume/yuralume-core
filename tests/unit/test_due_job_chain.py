@@ -21,6 +21,7 @@ from kokoro_link.contracts.due_jobs import (
     FEED_COMPOSE_KIND,
     GOAL_REVIEW_KIND,
     PROACTIVE_EVALUATE_KIND,
+    STORY_SCENE_TIMEOUT_KIND,
     character_chain_kinds,
     kind_spec,
 )
@@ -56,9 +57,12 @@ class _FakeCharacter:
 
 
 class _RecordingExecutor:
-    def __init__(self, *, allowed: bool = True) -> None:
+    def __init__(
+        self, *, allowed: bool = True, feed_needs_retry: bool = False,
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
         self._allowed = allowed
+        self._feed_needs_retry = feed_needs_retry
 
     async def subscription_allows(self, character) -> bool:  # noqa: ANN001
         return self._allowed
@@ -79,8 +83,9 @@ class _RecordingExecutor:
     async def step_goal_review(self, character, *, now=None):  # noqa: ANN001
         self.calls.append(("goal_review", character.id))
 
-    async def step_feed_compose(self, character):  # noqa: ANN001
+    async def step_feed_compose(self, character, *, now=None):  # noqa: ANN001
         self.calls.append(("feed_compose", character.id))
+        return self._feed_needs_retry
 
     async def step_feed_comment_reply(self, character, *, logical_slot):  # noqa: ANN001
         self.calls.append(("feed_comment_reply", character.id))
@@ -89,13 +94,21 @@ class _RecordingExecutor:
         self.calls.append(("proactive_evaluate", character.id))
         return True
 
+    async def step_scene_timeout(self, character, *, now):  # noqa: ANN001
+        self.calls.append(("story_scene_timeout", character.id))
+
     async def step_upkeep(self, character, *, now):  # noqa: ANN001
         self.calls.append(("character_upkeep", character.id))
 
 
 class _FakeResolver:
+    def __init__(
+        self, profile: AccountRuntimeProfile = DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+    ) -> None:
+        self._profile = profile
+
     async def resolve_for_operator(self, operator_id: str) -> AccountRuntimeProfile:
-        return DEFAULT_ACCOUNT_RUNTIME_PROFILE
+        return self._profile
 
 
 class _FakeRepo:
@@ -109,7 +122,11 @@ class _FakeRepo:
         return next((c for c in self._characters if c.id == character_id), None)
 
 
-async def _harness(characters, *, allowed=True, ownership=None):
+async def _harness(
+    characters, *, allowed=True, ownership=None,
+    feed_needs_retry=False,
+    profile=DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+):
     lease = InMemoryBackgroundCoordinatorLease()
     queue = InMemoryBackgroundJobQueue(lease=lease)
     # A week-long lease keeps the coordinator epoch live across simulated time
@@ -117,8 +134,10 @@ async def _harness(characters, *, allowed=True, ownership=None):
     epoch = await lease.acquire(
         COORDINATOR_LEASE_NAME, "coord", ttl_seconds=7 * 86400, now=BASE,
     )
-    calc = NextDueCalculator(resolver=_FakeResolver())
-    executor = _RecordingExecutor(allowed=allowed)
+    calc = NextDueCalculator(resolver=_FakeResolver(profile))
+    executor = _RecordingExecutor(
+        allowed=allowed, feed_needs_retry=feed_needs_retry,
+    )
     handler = CharacterKindHandler(
         executor=executor,
         queue=queue,
@@ -165,6 +184,29 @@ async def test_chain_is_idempotent_within_window() -> None:
     assert second.next_enqueued is False  # same logical window → deduped
     stats = await queue.stats(now=BASE)
     assert stats.kind_counts[FEED_COMPOSE_KIND] == 1
+
+
+async def test_missing_daily_feed_floor_retries_at_unscaled_base_cadence() -> None:
+    profile = AccountRuntimeProfile(
+        name="hosted-busy",
+        background_activity_multiplier=6,
+    )
+    queue, handler, _, _ = await _harness(
+        [_FakeCharacter()],
+        feed_needs_retry=True,
+        profile=profile,
+    )
+
+    result = await handler.handle(
+        _FakeCharacter(), FEED_COMPOSE_KIND, now=BASE, logical_slot="b",
+    )
+
+    assert result.next_enqueued is True
+    claimed = await queue.claim(
+        "w", now=BASE + timedelta(minutes=90), limit=10, lease_seconds=60,
+    )
+    feed_job = next(job for job in claimed if job.kind == FEED_COMPOSE_KIND)
+    assert feed_job.due_at == BASE + timedelta(minutes=90)
 
 
 async def test_frozen_character_stops_chain() -> None:
@@ -269,3 +311,44 @@ async def test_goal_review_kind_routes_to_its_step_and_self_chains() -> None:
     )
     job = next(j for j in claimed if j.kind == GOAL_REVIEW_KIND)
     assert job.due_at - BASE == timedelta(days=1)
+
+
+async def test_scene_timeout_kind_routes_to_its_step_and_self_chains() -> None:
+    # SC1-E: the distributed line reaches the idle wrap-up through its own
+    # chain, so a hosted player who walked away mid-scene is not waiting on a
+    # tick loop that hosted mode does not run.
+    queue, handler, _, executor = await _harness([_FakeCharacter()])
+    result = await handler.handle(
+        _FakeCharacter(), STORY_SCENE_TIMEOUT_KIND, now=BASE, logical_slot="b",
+    )
+    assert result.executed is True
+    assert ("story_scene_timeout", "c1") in executor.calls
+    assert ("story_scene_timeout", "c1") in await queue.active_chain_keys()
+    # With no live scene the chain falls back to its hourly recheck.
+    claimed = await queue.claim(
+        "w", now=BASE + timedelta(hours=1, seconds=1), limit=10, lease_seconds=60,
+    )
+    job = next(j for j in claimed if j.kind == STORY_SCENE_TIMEOUT_KIND)
+    assert job.due_at - BASE == timedelta(hours=1)
+
+
+async def test_scene_timeout_chain_jumps_to_a_live_scenes_deadline() -> None:
+    # An open scene's idle deadline is exact, so the chain must land ON it
+    # instead of rechecking hourly until an hour after the window passed.
+    deadline = BASE + timedelta(hours=20)
+    queue, handler, _, _ = await _harness([_FakeCharacter()])
+    handler._scene_timeout_due_provider = (  # noqa: SLF001
+        lambda character, now: _resolved(deadline)
+    )
+    await handler.handle(
+        _FakeCharacter(), STORY_SCENE_TIMEOUT_KIND, now=BASE, logical_slot="b",
+    )
+    claimed = await queue.claim(
+        "w", now=deadline + timedelta(seconds=1), limit=10, lease_seconds=60,
+    )
+    job = next(j for j in claimed if j.kind == STORY_SCENE_TIMEOUT_KIND)
+    assert job.due_at == deadline
+
+
+async def _resolved(value):  # noqa: ANN001, ANN202
+    return value

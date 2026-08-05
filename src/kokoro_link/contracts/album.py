@@ -8,6 +8,7 @@ so the newest image lands at the top of the grid.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from kokoro_link.domain.entities.album_item import AlbumItem
@@ -26,11 +27,21 @@ class AlbumRepositoryPort(Protocol):
         *,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[AlbumItem]:
         """Newest-first listing, optionally paged.
 
-        ``limit=None`` returns everything — fine for the album UI at
-        current scale; paginate once a single character holds hundreds.
+        ``limit=None`` returns everything — used by the GC sweep
+        (``AlbumService._gc_to_fit``), which needs the full tail to
+        evict from. Paged callers (the list endpoint) should use
+        ``before`` — a keyset cursor on ``created_at`` — rather than
+        ``offset``: this matches the codebase's one existing pagination
+        convention (the feed wall, see ``FeedPostRepositoryPort``) and
+        stays correct while new rows keep landing at the top (an
+        ``offset`` page shifts under a concurrent insert; a ``before``
+        cursor doesn't). ``offset`` is kept for callers that already
+        depend on it; the two may be combined but list callers should
+        prefer ``before`` alone.
         """
 
     async def count_for_character(self, character_id: str) -> int:

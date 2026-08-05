@@ -17,7 +17,9 @@ ${characters_json}
 Operator adaptation instruction:
 ${instruction}
 
-Output only one JSON object. Do not include prose, markdown, comments,
+${operator_mode_block}
+
+${operator_relationship_block}Output only one JSON object. Do not include prose, markdown, comments,
 or code fences.
 
 Required JSON schema:
@@ -41,7 +43,9 @@ Required JSON schema:
       "location": "optional location",
       "scene_characters": ["optional NPC or cast labels"],
       "dramatic_question": "optional scene question",
-      "required": true
+      "required": true,
+      "operator_position": "absent|present|central",
+      "operator_note": "optional one sentence, may be empty"
     }
   ]
 }
@@ -53,5 +57,19 @@ Constraints:
 - At least 60% of beats should be required=true.
 - Beat summaries must be playable instructions, not literary synopsis.
 - Use character names in scene_characters when they matter to the scene.
+- scene_characters holds cast and NPC labels only. Never put the player
+  there — not by name, not as "the partner" / "伴侶" / "you". Where the
+  player stands is said by operator_position and nothing else.
+- operator_position is the structural slot for the player (the human who
+  will live this arc with the character), one of:
+  - absent: the player is not in this scene at all.
+  - present: the player is there, but the scene is not about them.
+  - central: the scene is about the player and cannot be played without
+    them.
+  It is machine-read, never shown to anyone, and never translated: emit
+  the literal English token.
+- operator_note is one optional sentence of player-visible prose naming
+  the player's dramatic place in the scene ("she has to tell you here").
+  Emit an empty string when there is nothing to say.
 - Do not write storage instructions. This draft is unsaved and will be
   reviewed by the wizard.

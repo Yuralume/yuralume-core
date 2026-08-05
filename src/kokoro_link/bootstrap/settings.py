@@ -1006,6 +1006,52 @@ class WebPushSettings:
         return bool(self.vapid_public_key and self.vapid_private_key)
 
 
+DEFAULT_OFFICIAL_CARD_CATALOG_URL = (
+    "https://app.yuralume.com/api/user/v1/public/official-cards"
+)
+"""Where the official character cards live for everybody.
+
+They used to ship inside this repo as binaries; now every deployment reads
+them from one anonymous public endpoint, hosted or self-hosted alike
+(OFFICIAL_CARD_CLOUD_CATALOG_PLAN D1). The path includes the portal edge's
+``/api/user`` prefix because that is the address a browser and a Core
+process can both reach.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialCardCatalogSettings:
+    """The one outbound call a self-hosted Yuralume makes on its own behalf.
+
+    It is an anonymous ``GET`` for a public list of characters: no account,
+    no deployment id, no telemetry, nothing that would let anyone build a
+    census of who is running this software. It is also **the only such
+    call**, and setting ``KOKORO_OFFICIAL_CARD_CATALOG_URL=`` (empty) turns
+    it off completely — the official shelf goes away, local ``.lumecard``
+    packs and every installed character are untouched, and the deployment
+    makes no outbound connection for cards at all. Air-gapped installs and
+    anyone who simply prefers not to phone home get a one-line answer.
+    """
+
+    catalog_url: str = DEFAULT_OFFICIAL_CARD_CATALOG_URL
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.catalog_url)
+
+    @classmethod
+    def from_env(cls) -> "OfficialCardCatalogSettings":
+        # Unset → the official catalog. Set-but-empty → off. The difference
+        # matters: "I never configured this" and "I do not want this" are
+        # different answers and only the second one is a decision.
+        return cls(
+            catalog_url=os.getenv(
+                "KOKORO_OFFICIAL_CARD_CATALOG_URL",
+                DEFAULT_OFFICIAL_CARD_CATALOG_URL,
+            ).strip().rstrip("/"),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AppSettings:
     default_provider_id: str = "fake"
@@ -1031,6 +1077,9 @@ class AppSettings:
     process: ProcessSettings = field(default_factory=ProcessSettings)
     demo_oauth: DemoOAuthSettings = field(default_factory=DemoOAuthSettings)
     web_push: WebPushSettings = field(default_factory=WebPushSettings)
+    official_cards: OfficialCardCatalogSettings = field(
+        default_factory=OfficialCardCatalogSettings,
+    )
     config_encryption_key: str = ""
     openai_compatible_providers: tuple[dict[str, str | None], ...] = field(default_factory=tuple)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
@@ -1642,6 +1691,7 @@ class AppSettings:
             process=process,
             demo_oauth=DemoOAuthSettings.from_env(),
             web_push=web_push,
+            official_cards=OfficialCardCatalogSettings.from_env(),
             config_encryption_key=(
                 os.getenv("CONFIG_ENCRYPTION_KEY", "").strip()
                 or os.getenv("KOKORO_CONFIG_ENCRYPTION_KEY", "").strip()

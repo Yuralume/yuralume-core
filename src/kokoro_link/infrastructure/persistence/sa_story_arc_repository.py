@@ -6,6 +6,13 @@ beat rows atomically in a single transaction. The beat set is small
 about than per-beat diffing and doesn't measurably hurt write
 performance at our scale.
 
+Its cost is that the rebuild is last-writer-wins over every beat row:
+whatever another writer committed since the caller loaded the arc is
+gone. ``skip_beats_if_pending`` / ``complete_arc_if_all_terminal`` are
+the narrow way out — single conditional statements whose predicate is
+evaluated by the database, so a caller retiring dead beats cannot
+un-realize a scene that finished (and was charged) underneath it.
+
 Both writes are fenced by ``uq_story_arcs_active_character``, the partial
 unique index that makes "one active arc per character" a schema invariant
 instead of a service-layer hope. A violation is the cross-replica planning
@@ -20,9 +27,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from collections.abc import Sequence
+from datetime import date, datetime, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -33,9 +41,14 @@ from kokoro_link.contracts.story_arc import (
 )
 from kokoro_link.domain.entities.story_arc import (
     ARC_ACTIVE,
+    ARC_COMPLETED,
+    BEAT_PENDING,
+    BEAT_REALIZED,
+    BEAT_SKIPPED,
     SCENE_ENCOUNTER,
     StoryArc,
     StoryArcBeat,
+    normalise_operator_position,
 )
 from kokoro_link.infrastructure.persistence.models import (
     StoryArcBeatRow,
@@ -181,6 +194,77 @@ class SAStoryArcRepository(StoryArcRepositoryPort):
                 session.add(_beat_to_row(arc.id, beat))
             await session.commit()
 
+    async def skip_beats_if_pending(
+        self,
+        arc_id: str,
+        beat_ids: Sequence[str],
+        *,
+        play_result: str,
+    ) -> int:
+        """One ``UPDATE`` fenced on ``status = 'pending'``. See the port doc.
+
+        Deliberately not expressed as read → edit → ``save``: the whole
+        point is that the DB, not this process's snapshot, decides which
+        rows may move. ``synchronize_session=False`` because no ORM
+        objects are loaded here — the rows are read back by the caller.
+        """
+        ids = list(dict.fromkeys(beat_ids))
+        if not ids:
+            return 0
+        stmt = (
+            update(StoryArcBeatRow)
+            .where(
+                StoryArcBeatRow.arc_id == arc_id,
+                StoryArcBeatRow.id.in_(ids),
+                StoryArcBeatRow.status == BEAT_PENDING,
+            )
+            .values(
+                status=BEAT_SKIPPED,
+                last_play_attempt_result=play_result,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(result.rowcount or 0)
+
+    async def complete_arc_if_all_terminal(self, arc_id: str) -> bool:
+        """One ``UPDATE`` whose terminality test is a correlated subquery.
+
+        Evaluating "are all beats terminal?" inside the statement is what
+        keeps a beat realized a moment ago from being erased: the flip
+        either sees the newer row and declines, or it never runs.
+        """
+        unfinished = (
+            exists()
+            .where(
+                StoryArcBeatRow.arc_id == arc_id,
+                StoryArcBeatRow.status.not_in((BEAT_REALIZED, BEAT_SKIPPED)),
+            )
+        )
+        any_beat = exists().where(StoryArcBeatRow.arc_id == arc_id)
+        stmt = (
+            update(StoryArcRow)
+            .where(
+                StoryArcRow.id == arc_id,
+                StoryArcRow.status == ARC_ACTIVE,
+                # A beat-less arc is not "finished" — same rule the
+                # service's ``_all_terminal`` applies to an empty list.
+                any_beat,
+                ~unfinished,
+            )
+            .values(
+                status=ARC_COMPLETED,
+                updated_at=datetime.now(timezone.utc),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return bool(result.rowcount)
+
     async def delete(self, arc_id: str) -> None:
         async with self._session_factory() as session:
             row = await session.get(StoryArcRow, arc_id)
@@ -276,11 +360,15 @@ def _beat_to_row(arc_id: str, beat: StoryArcBeat) -> StoryArcBeatRow:
         last_play_attempt_source=beat.last_play_attempt_source,
         last_play_attempt_result=beat.last_play_attempt_result,
         last_play_push_intensity=beat.last_play_push_intensity,
+        play_failure_count=beat.play_failure_count,
+        last_play_failure_at=beat.last_play_failure_at,
         scene_characters=json.dumps(list(beat.scene_characters), ensure_ascii=False),
         location=beat.location,
         dramatic_question=beat.dramatic_question,
         scene_type=beat.scene_type,
         required=beat.required,
+        operator_position=beat.operator_position,
+        operator_note=beat.operator_note,
     )
 
 
@@ -330,12 +418,42 @@ def _row_to_beat(row: StoryArcBeatRow) -> StoryArcBeat:
         last_play_push_intensity=getattr(
             row, "last_play_push_intensity", None,
         ),
+        # ``getattr`` defaults keep pre-SC0 rows readable the same way
+        # the older attempt columns do: no known failures, no anchor.
+        play_failure_count=getattr(row, "play_failure_count", 0) or 0,
+        last_play_failure_at=_ensure_optional_aware(
+            getattr(row, "last_play_failure_at", None),
+        ),
         scene_characters=_decode_scene_characters(row.scene_characters),
         location=row.location,
         dramatic_question=row.dramatic_question,
         scene_type=row.scene_type or SCENE_ENCOUNTER,
         required=bool(row.required),
+        operator_position=_decode_operator_position(
+            getattr(row, "operator_position", None),
+        ),
+        operator_note=getattr(row, "operator_note", None),
     )
+
+
+def _decode_operator_position(raw: object) -> str | None:
+    """Best-effort read of the closed-vocabulary position column.
+
+    Same forgiving contract as ``_decode_scene_characters``: a value the
+    domain would reject (hand-edited row, a label from a newer Core than
+    this one) degrades to ``None`` = unjudged rather than crashing arc
+    load. ``None`` is a real state here, so falling back to it costs a
+    framing decision, never a beat.
+    """
+    try:
+        return normalise_operator_position(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "story_arc_beats.operator_position %r is not a known position "
+            "— treating as unjudged",
+            raw,
+        )
+        return None
 
 
 def _decode_scene_characters(raw: str | None) -> tuple[str, ...]:
@@ -398,7 +516,6 @@ def _decode_source_seed_ids(raw: str | None) -> tuple[str, ...]:
 def _ensure_aware(value: datetime) -> datetime:
     # asyncpg returns tz-aware; safety net for mixed-backend tests.
     if value.tzinfo is None:
-        from datetime import timezone
         return value.replace(tzinfo=timezone.utc)
     return value
 

@@ -54,6 +54,16 @@ class AccountRuntimeProfile:
     strict_no_fallback: bool = False
     daily_chat_image_limit: int | None = None
     daily_feed_post_limit: int | None = None
+    story_scene_daily_limit: int | None = None
+    """SC3-B — per-tier daily ceiling on 起幕 (story scene) openings.
+
+    ``None`` (the default) means unlimited, and is the *only* spelling of
+    unlimited: unlike ``daily_overage_limit``, this knob has no neutral
+    nonzero default to fall back to, so the control-plane column is nullable
+    and a ``0`` is rejected there rather than reinterpreted (STORY_SCENE_PLAN
+    §3.3 / §4.1 SC3-B). Enforced by :class:`StorySceneQuotaGuard`
+    (``application/services/story_scene_quota.py``), not read directly by
+    any billing path — hosted pacing only."""
     album_generation_enabled: bool = True
     video_generation_enabled: bool = True
     tts_enabled: bool = True
@@ -166,6 +176,16 @@ class AccountRuntimeProfile:
             daily_feed_post_limit=_int_knob(
                 data, "daily_feed_post_limit", minimum=0,
                 default=default.daily_feed_post_limit,
+                nullable=True, name=name,
+            ),
+            # SC3-B: minimum=1, not 0 — the control-plane CHECK is
+            # ``story_scene_daily_limit IS NULL OR ... > 0``, the mirror image
+            # of daily_overage_limit's (NOT NULL, 0 rejected). A stray 0 here
+            # is therefore exactly as invalid as a negative value, not a second
+            # spelling of "unlimited".
+            story_scene_daily_limit=_int_knob(
+                data, "story_scene_daily_limit", minimum=1,
+                default=default.story_scene_daily_limit,
                 nullable=True, name=name,
             ),
             album_generation_enabled=_bool_knob(

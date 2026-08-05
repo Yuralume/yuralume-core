@@ -133,9 +133,12 @@ def test_character_card_listing_includes_preview_image_url(
 
     assert response.status_code == 200
     body = response.json()
-    assert body[0]["pack_id"] == "demo_mio"
-    assert body[0]["name"] == "美緒"
-    assert body[0]["image_urls"] == [
+    assert body["official_cards_unavailable"] is False
+    cards = body["cards"]
+    assert cards[0]["pack_id"] == "demo_mio"
+    assert cards[0]["name"] == "美緒"
+    assert cards[0]["source"] == "local"
+    assert cards[0]["image_urls"] == [
         "/api/v1/character-cards/demo_mio/images/0",
     ]
 

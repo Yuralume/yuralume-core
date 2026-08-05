@@ -13,9 +13,12 @@ import {
 } from '@/utils/api/characters'
 import { characterDisplayRef } from '@/utils/characterDisplay'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { useRuntimeLimits } from '@/composables/useRuntimeLimits'
 import type { MessagingPlatform } from '@/types/messaging'
 import { resolveWebPushNudge } from '@/utils/webPushNudge'
+import { UiImage } from '@/components/ui'
 import SidebarBrand from './SidebarBrand.vue'
+import CharacterLimitAdvisory from './CharacterLimitAdvisory.vue'
 import CloudCreditsBadge from './CloudCreditsBadge.vue'
 import CloudNoticeDot from './CloudNoticeDot.vue'
 import PostCreateChannelGuide from './PostCreateChannelGuide.vue'
@@ -59,7 +62,28 @@ const {
   buildInfo,
 } = useAuth()
 const confirmDialog = useConfirmDialog()
+const runtimeLimits = useRuntimeLimits()
 const showAdminEntrances = computed(() => isAdmin.value)
+
+/**
+ * Hosted character-slot line above the list ("角色槽位 2 / 3").
+ *
+ * `null` on self-host, before the snapshot lands, and when slots are
+ * uncapped — the whole node stays out of the DOM in all three cases rather
+ * than rendering an empty shell. When the ceiling is known but the tally is
+ * not, the ceiling is still worth saying; a fabricated `0 / 3` is not.
+ */
+const characterSlotsText = computed<string | null>(() => {
+  const slots = runtimeLimits.characterSlots.value
+  if (!slots) return null
+  if (slots.used === null) {
+    return t('playerSidebar.limits.slotsLimitOnly', { limit: slots.limit })
+  }
+  return t('playerSidebar.limits.slots', {
+    used: slots.used,
+    limit: slots.limit,
+  })
+})
 
 // 自架首次部署：玩家落在玩家頁，但若還沒接上任何真實 LLM provider 聊天會跑不起來。
 // 只對能進後台處理的管理者顯示引導（非管理者沒有後台入口，提示也無從操作）。
@@ -67,7 +91,19 @@ const providerSetupNeeded = ref(false)
 const showProviderSetupGuide = computed(() => isAdmin.value && providerSetupNeeded.value)
 
 onMounted(async () => {
+  void runtimeLimits.ensureLoaded()
   providerSetupNeeded.value = await resolveNeedsProviderSetup(cloudMode.value)
+})
+
+// Deletions re-read the counter via the roster shrinking (the parent owns
+// the delete, so this component only sees the prop change); creations and
+// imports re-read in `handleCharacterCreated` below. A growing roster is
+// deliberately NOT a trigger: the initial `[] → N` fill after login would
+// otherwise fire a second, redundant request right behind `ensureLoaded()`,
+// and the endpoint does a roster read plus up to two counts per call.
+// Re-reading is a no-op off cloud mode (the composable gates it).
+watch(() => props.characters.length, (next, prev) => {
+  if (next < prev) void runtimeLimits.refresh()
 })
 
 const buildVersionLabel = computed(() => formatBuildVersion(buildInfo.value))
@@ -145,6 +181,10 @@ function handleCharacterCreated(char: Character) {
   emit('characterCreated', char)
   postCreateChannelGuideCharacter.value = char
   createModalOpen.value = false
+  // One slot and one daily-create just got spent — re-read so the slot line
+  // and the create advisory move with the roster instead of waiting for the
+  // next page load. (Deletions are covered by the length watch above.)
+  void runtimeLimits.refresh()
 }
 
 async function openChannelSetup(platform: MessagingPlatform) {
@@ -312,11 +352,16 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
           @dismiss="dismissPostCreateChannelGuide"
         />
 
+        <!-- 角色槽位一行：僅 hosted 且拿得到槽位數時輸出，self-host 完全沒有這個節點。 -->
+        <p v-if="characterSlotsText" class="slot-status">{{ characterSlotsText }}</p>
+
         <div v-if="characters.length === 0" class="character-list">
           <PlayerOnboardingGuide
             @create="openCreateModal"
             @browse-cards="openOnboardingCardBrowse"
           />
+          <!-- 空狀態不另外掛提示：下方角色卡區塊在這個分支預設展開，它自己那份
+               advisory 就是同一句話，重複貼兩次只是噪音。 -->
           <CollapsibleSection
             :title="t('playerSidebar.characterCards.sectionTitle')"
             :hint="t('playerSidebar.characterCards.sectionHint')"
@@ -339,13 +384,12 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
           @click="emit('selectCharacter', char)"
         >
           <div class="card-avatar">
-            <img
+            <UiImage
               v-if="char.image_urls && char.image_urls.length > 0"
               :src="char.image_urls[0]"
               :alt="char.name"
+              variant="avatar"
               class="card-avatar-img"
-              loading="lazy"
-              @error="($event.target as HTMLImageElement).style.display = 'none'"
             />
             <span v-else class="card-avatar-letter">{{ char.name.charAt(0) }}</span>
             <span
@@ -374,9 +418,13 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
         </div>
         </div>
 
+        <!-- 按鈕永遠可按、外觀也不變：伺服端才是強制點，會被擋的原因由下方
+             advisory 那句話獨自承擔。降低透明度在這套 UI 是 disabled 的既有
+             語彙，掛上去等於用視覺宣告一個程式上不存在的 disabled。 -->
         <button class="btn-new-char" @click="openCreateModal">
           {{ t('playerSidebar.actions.newCharacter') }}
         </button>
+        <CharacterLimitAdvisory />
 
         <CollapsibleSection
           :title="t('playerSidebar.characterCards.sectionTitle')"
@@ -778,6 +826,13 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
 .btn-new-char:hover {
   background: rgba(255, 255, 255, 0.08);
   color: var(--color-text);
+}
+
+.slot-status {
+  margin: 0;
+  font-size: var(--font-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 /* 回憶錄入口卡片：玩家側專屬導引 */

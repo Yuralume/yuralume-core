@@ -111,6 +111,15 @@ const completedFiles = [
   'src/components/ChatBubble.vue',
   'src/components/ChatFirstTurnGuide.vue',
   'src/components/ChatPanel.vue',
+  // Story scene ("Start a Scene") player surface — plan SC, ticket SC2.
+  'src/components/SceneFrame.vue',
+  'src/components/StorySceneChips.vue',
+  'src/components/StorySceneControl.vue',
+  'src/composables/useStoryScene.ts',
+  'src/types/storyScene.ts',
+  'src/utils/api/storyScene.ts',
+  'src/utils/sceneMessages.ts',
+  'src/utils/storySceneErrors.ts',
   'src/utils/api/worldEvents.ts',
   // Demo conversion copy moved into the trilingual catalog (plan U1-D);
   // these modules now own links/classification only, never display strings.

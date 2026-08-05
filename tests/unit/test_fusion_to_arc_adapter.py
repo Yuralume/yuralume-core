@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from kokoro_link.contracts.fusion_to_arc import FusionToArcContext
+from kokoro_link.contracts.fusion_to_arc import (
+    FUSION_OPERATOR_MODE_OBSERVER,
+    FUSION_OPERATOR_MODE_UNCHANGED,
+    FUSION_OPERATOR_MODE_WRITE_IN,
+    FusionToArcContext,
+)
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.fusion_story import FusionStory
 from kokoro_link.domain.value_objects.character_state import CharacterState
@@ -115,6 +120,43 @@ def _draft_json() -> str:
     )
 
 
+def _positioned_draft_json(
+    *pairs: tuple[str | None, str | None],
+) -> str:
+    """Two-beat draft whose beats carry the given (position, note).
+
+    ``None`` for a field omits the key entirely, which is how a model
+    that predates OP1-C answers.
+    """
+    payload = json.loads(_draft_json())
+    for beat, (position, note) in zip(payload["beats"], pairs, strict=True):
+        if position is not None:
+            beat["operator_position"] = position
+        if note is not None:
+            beat["operator_note"] = note
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _adapt(
+    response: str,
+    *,
+    mode: str | None = None,
+    relationship_lines: tuple[str, ...] = (),
+) -> tuple[object, _ScriptedModel]:
+    model = _ScriptedModel(response)
+    adapter = LLMFusionToArcAdapter(model=model)
+    kwargs = {} if mode is None else {"operator_mode": mode}
+    draft = await adapter.adapt(
+        FusionToArcContext(
+            story=_ready_story(),
+            characters=(_character("c-a", "Aki"), _character("c-b", "Ren")),
+            operator_relationship_lines=relationship_lines,
+            **kwargs,
+        )
+    )
+    return draft, model
+
+
 @pytest.mark.asyncio
 async def test_adapter_returns_template_draft_from_ready_story_context() -> None:
     model = _ScriptedModel(_draft_json())
@@ -153,3 +195,147 @@ async def test_adapter_bad_json_returns_none() -> None:
     )
 
     assert draft is None
+
+
+# ---------- OP1-C: the creator's three-way choice ----------------------
+
+
+@pytest.mark.asyncio
+async def test_write_in_mode_keeps_the_positions_the_model_judged() -> None:
+    """`write_in` is the one mode where the answer is per beat, so the
+    adapter must not overwrite what the model decided."""
+    draft, model = await _adapt(
+        _positioned_draft_json(
+            ("central", "她要在這裡把話說完"),
+            ("absent", ""),
+        ),
+        mode=FUSION_OPERATOR_MODE_WRITE_IN,
+    )
+
+    assert draft is not None
+    assert [b.operator_position for b in draft.beats] == ["central", "absent"]
+    assert draft.beats[0].operator_note == "她要在這裡把話說完"
+    assert draft.beats[1].operator_note is None
+    assert "WRITE THE PLAYER IN" in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_write_in_mode_survives_a_model_that_omits_the_fields() -> None:
+    """An older model that never saw the schema still adapts; the beats
+    read back unjudged rather than the call failing."""
+    draft, _ = await _adapt(
+        _draft_json(), mode=FUSION_OPERATOR_MODE_WRITE_IN,
+    )
+
+    assert draft is not None
+    assert [b.operator_position for b in draft.beats] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_write_in_mode_carries_the_player_relationship_facts() -> None:
+    _, model = await _adapt(
+        _draft_json(),
+        mode=FUSION_OPERATOR_MODE_WRITE_IN,
+        relationship_lines=("Aki：", "- 角色怎麼稱呼玩家：小羽"),
+    )
+
+    assert "- 角色怎麼稱呼玩家：小羽" in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_no_relationship_facts_renders_no_heading() -> None:
+    """An empty heading is a hole the model fills by inventing a
+    relationship nobody agreed to."""
+    _, model = await _adapt(_draft_json(), mode=FUSION_OPERATOR_MODE_WRITE_IN)
+
+    assert "Who the player is to this cast" not in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_observer_mode_puts_the_player_at_every_beat_as_a_witness() -> None:
+    draft, model = await _adapt(
+        _positioned_draft_json(
+            ("central", "你就站在她面前"),
+            (None, None),
+        ),
+        mode=FUSION_OPERATOR_MODE_OBSERVER,
+    )
+
+    assert draft is not None
+    # "I watch this story" means the player is a witness to all of it —
+    # including the beat the model tried to make about them.
+    assert [b.operator_position for b in draft.beats] == ["present", "present"]
+    # The witness note is prose the writer prompts will use; it survives.
+    assert draft.beats[0].operator_note == "你就站在她面前"
+    assert "THE PLAYER WATCHES THIS STORY" in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_unchanged_mode_forces_every_beat_absent_and_drops_notes() -> None:
+    """紅線 5 — 「純角色戲保持原樣」 really is unchanged: a model that
+    tries to hand the player a scene anyway cannot."""
+    draft, _ = await _adapt(
+        _positioned_draft_json(
+            ("central", "她要向你坦白"),
+            ("present", "你在旁邊看著"),
+        ),
+        mode=FUSION_OPERATOR_MODE_UNCHANGED,
+    )
+
+    assert draft is not None
+    assert [b.operator_position for b in draft.beats] == ["absent", "absent"]
+    assert [b.operator_note for b in draft.beats] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_unchanged_mode_prompt_never_licenses_a_rewrite() -> None:
+    """紅線 5, negative — the instructions that permit re-casting scenes
+    around the player are physically absent from the prompt, not merely
+    overridden later in it. The player's name never reaches the model
+    either, even when the caller supplies it."""
+    _, model = await _adapt(
+        _draft_json(),
+        mode=FUSION_OPERATOR_MODE_UNCHANGED,
+        relationship_lines=("Aki：", "- 角色怎麼稱呼玩家：小羽"),
+    )
+    prompt = model.last_prompt or ""
+
+    assert "KEEP IT A PURE CHARACTER STORY" in prompt
+    assert "WRITE THE PLAYER IN" not in prompt
+    assert "THE PLAYER WATCHES THIS STORY" not in prompt
+    assert "re-imagine" not in prompt
+    assert "Re-casting" not in prompt
+    assert "小羽" not in prompt
+    assert "Who the player is to this cast" not in prompt
+    # The source-preserving instruction that the mode exists for.
+    assert "Adapt the source as it was written" in prompt
+
+
+@pytest.mark.asyncio
+async def test_unknown_mode_falls_back_to_the_conservative_branch() -> None:
+    """The API rejects an unknown mode outright; this adapter is also a
+    library seam, so it degrades instead of failing mid-generation — and
+    the prompt it renders and the rule it applies agree on which mode
+    that was."""
+    draft, model = await _adapt(
+        _positioned_draft_json(("central", "她要向你坦白"), ("present", "")),
+        mode="spectator",
+    )
+
+    assert draft is not None
+    assert [b.operator_position for b in draft.beats] == ["absent", "absent"]
+    assert "KEEP IT A PURE CHARACTER STORY" in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_unstated_mode_leaves_the_creators_story_alone() -> None:
+    """ARC_PLAYER_POSITION_PLAN §3.2 — a caller that never chose (an
+    omitted field, a pre-OP1-C client) gets the mode that does not touch
+    the prose, not a rewrite nobody asked for."""
+    draft, model = await _adapt(
+        _positioned_draft_json(("central", "她要向你坦白"), (None, None)),
+    )
+
+    assert draft is not None
+    assert [b.operator_position for b in draft.beats] == ["absent", "absent"]
+    assert "KEEP IT A PURE CHARACTER STORY" in (model.last_prompt or "")

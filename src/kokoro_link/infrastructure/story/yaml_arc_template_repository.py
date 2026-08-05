@@ -200,6 +200,19 @@ def build_arc_template_from_mapping(
                     raw_beat.get("dramatic_question"),
                 ),
                 required=_coerce_bool(raw_beat.get("required"), default=True),
+                # Both keys are optional: a YAML written before the slot
+                # existed simply omits them and the beat reads back as
+                # "unjudged". An *off-vocabulary* position is a
+                # different thing — the entity raises, this file is
+                # logged and skipped, which is what an authoring-time
+                # typo deserves (silently downgrading it would ship a
+                # template whose player framing nobody chose).
+                operator_position=_coerce_optional_str(
+                    raw_beat.get("operator_position"),
+                ),
+                operator_note=_coerce_optional_str(
+                    raw_beat.get("operator_note"),
+                ),
             )
         )
 

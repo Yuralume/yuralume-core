@@ -16,11 +16,16 @@ Wizard state lives on the client; these endpoints are stateless.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from kokoro_link.api.dependencies import get_container, get_current_user_id
+from kokoro_link.api.dependencies import (
+    get_container,
+    get_current_user_id,
+    is_cloud_mode,
+)
 from kokoro_link.api.operator_language import (
     resolve_stored_operator_primary_language,
 )
@@ -33,6 +38,7 @@ from kokoro_link.application.services.arc_template_intake_service import (
 )
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.arc_template import ARC_TEMPLATE_SCOPE_GENERIC
+from kokoro_link.domain.services.story_tone_policy import selectable_tones
 
 router = APIRouter(tags=["arc-template-intake"])
 
@@ -231,6 +237,16 @@ class BeatDraftPayload(BaseModel):
     scene_characters: list[str] = Field(default_factory=list)
     dramatic_question: str | None = None
     required: bool = True
+    # --- Player's place in this scene (OP0 / OP1-B) -------------------
+    # ``None`` = unjudged. ``generate-summary`` (below) now proposes a
+    # value the wizard pre-fills here; the operator can still overwrite
+    # or clear it. Restricted to the domain's closed vocabulary
+    # (same rationale as ``arc_templates.ArcTemplateBeatPayload``, Medium
+    # 4) so a stray off-vocabulary value is rejected as a 422 at the
+    # request boundary instead of only being caught downstream by
+    # ``save_template``'s ``ValueError`` → 409 mapping.
+    operator_position: Literal["absent", "present", "central"] | None = None
+    operator_note: str | None = None
 
     def to_domain(self) -> BeatDraft:
         return BeatDraft(
@@ -244,6 +260,8 @@ class BeatDraftPayload(BaseModel):
             scene_characters=tuple(self.scene_characters),
             dramatic_question=self.dramatic_question,
             required=self.required,
+            operator_position=self.operator_position,
+            operator_note=self.operator_note,
         )
 
 
@@ -254,12 +272,17 @@ class GenerateSummaryRequest(BaseModel):
 
 class GenerateSummaryResponse(BaseModel):
     summary: str
+    # --- Player's place in this scene (OP1-B) -------------------------
+    # A suggestion the wizard pre-fills into the beat draft's two OP0
+    # columns; the operator can still edit or clear it back to unjudged.
+    operator_position: str | None = None
+    operator_note: str | None = None
 
 
 @router.post(
     "/arc-templates/intake/generate-summary",
     response_model=GenerateSummaryResponse,
-    summary="Stage 4：依 beat 結構寫 100–150 字 summary",
+    summary="Stage 4：依 beat 結構寫 100–150 字 summary，並提案玩家位置",
 )
 async def generate_summary(
     payload: GenerateSummaryRequest,
@@ -270,12 +293,16 @@ async def generate_summary(
     language = await resolve_stored_operator_primary_language(
         container, current_user_id,
     )
-    summary = await service.generate_beat_summary(
+    suggestion = await service.generate_beat_summary(
         beat=payload.beat.to_domain(),
         context=payload.context.to_domain(),
         operator_primary_language=language,
     )
-    return GenerateSummaryResponse(summary=summary)
+    return GenerateSummaryResponse(
+        summary=suggestion.summary,
+        operator_position=suggestion.operator_position,
+        operator_note=suggestion.operator_note,
+    )
 
 
 # ---------- Fast-path: full draft --------------------------------------
@@ -350,6 +377,8 @@ class TemplateDraftPayload(BaseModel):
                     scene_characters=list(b.scene_characters),
                     dramatic_question=b.dramatic_question,
                     required=b.required,
+                    operator_position=b.operator_position,
+                    operator_note=b.operator_note,
                 )
                 for b in draft.beats
             ],
@@ -530,13 +559,13 @@ _RHYTHM_SCAFFOLDS: list[dict] = [
 
 # Stable ``id`` enums only — labels/descriptions live in the frontend
 # trilingual bundle (plan #4 / D6). Do not reintroduce zh-TW strings.
-_TONE_CATALOGUE: list[dict] = [
-    {"id": "daily"},
-    {"id": "dramatic"},
-    {"id": "mature"},
-    {"id": "dark"},
-    {"id": "lighthearted"},
-]
+#
+# GF6: the list is derived from ``story_tone_policy`` rather than
+# hardcoded so the wizard's chips, the intake prompts' vocabulary and
+# the save-side fold can never drift apart. Hosted deployments serve the
+# catalogue minus the tones their AUP forbids.
+def _tone_catalogue(*, cloud_mode: bool) -> list[dict]:
+    return [{"id": tone} for tone in selectable_tones(cloud_mode=cloud_mode)]
 
 
 _THEME_CATALOGUE: list[dict] = [
@@ -572,10 +601,12 @@ class ScaffoldsResponse(BaseModel):
     response_model=ScaffoldsResponse,
     summary="Wizard 用：列出所有節奏 pattern / tone / theme / scene_type / world_frame 選項",
 )
-async def get_scaffolds() -> ScaffoldsResponse:
+async def get_scaffolds(
+    container: ServiceContainer = Depends(get_container),
+) -> ScaffoldsResponse:
     return ScaffoldsResponse(
         rhythm_patterns=_RHYTHM_SCAFFOLDS,
-        tones=_TONE_CATALOGUE,
+        tones=_tone_catalogue(cloud_mode=is_cloud_mode(container)),
         themes=_THEME_CATALOGUE,
         scene_types=_SCENE_TYPE_CATALOGUE,
         world_frames=["modern", "fantasy", "school", "custom"],

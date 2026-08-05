@@ -695,3 +695,58 @@ async def test_an_uncovered_stream_is_not_consumed(
 
     assert chunks == ["hi"]
     assert context.usage.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_with_supports_vision_binds_a_clone_and_leaves_the_base_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control-plane pin lands on a per-call copy, not on the base.
+
+    The constructor default stays ``True`` so an unpinned preset keeps the
+    pre-existing hosted behaviour; only the clone handed to the caller
+    carries the pinned capability.
+    """
+    seen: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "url": str(request.url),
+                "feature": request.headers.get("X-Yuralume-Feature"),
+                "payload": json.loads(request.content.decode()),
+            },
+        )
+        return _covered_reply("bound")
+
+    _install(monkeypatch, handler)
+    base = _model()
+    assert base.supports_vision is True
+
+    text_only = base.with_supports_vision(False)
+
+    assert text_only is not base
+    assert text_only.supports_vision is False
+    # The base singleton is shared across every hosted call; a pin that
+    # mutated it in place would leak onto unrelated features.
+    assert base.supports_vision is True
+
+    # Everything else about the clone still behaves like the base adapter.
+    assert await text_only.generate("你好") == "bound"
+    assert seen[0]["url"] == "https://gateway.example/v1/chat/completions"
+    assert seen[0]["feature"] == "chat"
+    assert seen[0]["payload"] == base._build_payload(
+        "你好", image_urls=(), model=None,
+    )
+    assert text_only.prefers_public_image_urls is True
+    assert text_only.provider_id == base.provider_id
+
+
+@pytest.mark.asyncio
+async def test_with_supports_vision_can_pin_true_explicitly() -> None:
+    base = _model()
+
+    pinned = base.with_supports_vision(True)
+
+    assert pinned is not base
+    assert pinned.supports_vision is True

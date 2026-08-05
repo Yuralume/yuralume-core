@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 
 import httpx
 
 from kokoro_link.contracts.object_storage import (
+    DEFAULT_STREAM_CHUNK_BYTES,
     ObjectMetadata,
     ObjectNotFoundError,
     ObjectStorageError,
@@ -64,6 +65,40 @@ class HttpObjectStorage:
         if response.status_code >= 400:
             raise ObjectStorageError(_error_text(response))
         return response.content
+
+    async def iter_bytes(
+        self,
+        *,
+        object_key: str,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+    ) -> AsyncIterator[bytes]:
+        """Stream object bytes straight through, never buffering the whole file.
+
+        The public media proxy fronts multi-MB images; ``get_bytes`` would
+        pull each one fully into this process before a single byte reaches
+        the client. Here the upstream response body is relayed chunk by
+        chunk, so peak memory is one chunk regardless of object size.
+        """
+        key = validate_object_key(object_key)
+        url = f"{self._base_url}/v1/objects/content/{key}"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream(
+                    "GET", url, headers=self._headers(),
+                ) as response:
+                    if response.status_code == 404:
+                        raise ObjectNotFoundError(key)
+                    if response.status_code >= 400:
+                        # Error bodies are small and must be read before
+                        # they can be described.
+                        await response.aread()
+                        raise ObjectStorageError(_error_text(response))
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        yield chunk
+        except httpx.HTTPError as exc:
+            raise ObjectStorageUnavailableError(
+                f"object storage unreachable at {self._base_url}: {exc}",
+            ) from exc
 
     async def stat(self, *, object_key: str) -> ObjectMetadata | None:
         key = validate_object_key(object_key)

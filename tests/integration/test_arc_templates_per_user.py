@@ -327,6 +327,88 @@ def test_patch_with_explicit_language_overwrites_it(
     assert patched.json()["language"] == "ja-JP"
 
 
+def test_patch_round_trips_the_player_position_pair(
+    arc_template_app: tuple[TestClient, str, str],
+) -> None:
+    """OP0-B: the wizard/management PATCH beat payload must not drop the
+    player-position pair on the way in or back out."""
+    client, alice_token, _ = arc_template_app
+
+    beats_with_position = [
+        {
+            **_SAMPLE_BEATS[0],
+            "operator_position": "central",
+            "operator_note": "她要向你坦白",
+        },
+    ]
+    client.post(
+        "/api/v1/arc-templates",
+        json={
+            "draft": {
+                "id": "alice_position_pair",
+                "title": "原始標題",
+                "premise": "一段測試 premise，足夠長度通過驗證。",
+                "theme": "ambition",
+                "tone": "dramatic",
+                "duration_days": 14,
+                "world_frames": ["modern"],
+                "required_traits": [],
+                "beats": beats_with_position,
+            },
+            "overwrite": False,
+        },
+        headers=_auth(alice_token),
+    )
+
+    fetched = client.get(
+        "/api/v1/arc-templates/alice_position_pair", headers=_auth(alice_token),
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["beats"][0]["operator_position"] == "central"
+    assert fetched.json()["beats"][0]["operator_note"] == "她要向你坦白"
+
+    patch_payload = _patch_payload(title="覆寫後的標題")
+    patch_payload["beats"] = beats_with_position
+    patched = client.patch(
+        "/api/v1/arc-templates/alice_position_pair",
+        json=patch_payload,
+        headers=_auth(alice_token),
+    )
+    assert patched.status_code == 200
+    assert patched.json()["beats"][0]["operator_position"] == "central"
+    assert patched.json()["beats"][0]["operator_note"] == "她要向你坦白"
+
+
+def test_patch_rejects_illegal_operator_position_with_4xx(
+    arc_template_app: tuple[TestClient, str, str],
+) -> None:
+    """Medium 4 regression: an off-vocabulary ``operator_position`` in
+    the PATCH beat payload must be rejected as a client error (422,
+    from the Literal-typed DTO field) rather than raising an unhandled
+    ``ValueError`` out of ``ArcTemplateBeat.create`` — which, before
+    this fix, was built outside the route's existing 400/409 mapping
+    and surfaced as a 500."""
+    client, alice_token, _ = arc_template_app
+
+    client.post(
+        "/api/v1/arc-templates",
+        json=_draft("alice_bad_position", title="原始標題"),
+        headers=_auth(alice_token),
+    )
+
+    bad_payload = _patch_payload(title="非法位置更新")
+    bad_payload["beats"] = [
+        {**_SAMPLE_BEATS[0], "operator_position": "protagonist"},
+    ]
+    response = client.patch(
+        "/api/v1/arc-templates/alice_bad_position",
+        json=bad_payload,
+        headers=_auth(alice_token),
+    )
+    assert response.status_code == 422
+    assert response.status_code < 500
+
+
 def test_patch_pack_row_returns_409(
     arc_template_app: tuple[TestClient, str, str],
 ) -> None:

@@ -21,6 +21,7 @@ nothing vs orphan file wastes disk).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from kokoro_link.contracts.album import AlbumRepositoryPort
@@ -84,8 +85,23 @@ class AlbumService:
         _ = uploads_dir, url_prefix
         self._object_storage = object_storage
 
-    async def list_for_character(self, character_id: str) -> list[AlbumItem]:
-        return await self._album_repository.list_for_character(character_id)
+    async def list_for_character(
+        self,
+        character_id: str,
+        *,
+        limit: int | None = None,
+        before: datetime | None = None,
+    ) -> list[AlbumItem]:
+        """Newest-first page. ``before`` is the feed-style keyset cursor
+        (an item's ``created_at``); omit both kwargs for the full list
+        (used internally by ``_gc_to_fit`` and by callers that predate
+        pagination)."""
+        return await self._album_repository.list_for_character(
+            character_id, limit=limit, before=before,
+        )
+
+    async def count_for_character(self, character_id: str) -> int:
+        return await self._album_repository.count_for_character(character_id)
 
     async def add_auto(
         self,

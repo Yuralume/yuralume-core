@@ -34,8 +34,15 @@ const KIND_LABEL_KEY: Record<string, string> = {
 
 const FILTER_KINDS: KindFilter[] = ['all', 'semantic', 'relationship', 'episodic', 'reflection']
 
+// 一次只載一頁。開啟面板時的成本從「整個角色的記憶」降回一頁；
+// 其餘往下捲時再取（keyset，游標是本頁最舊一筆的 created_at）。
+const PAGE_SIZE = 50
+
 const memories = ref<Memory[]>([])
 const loading = ref(false)
+const loadingMore = ref(false)
+const hasMore = ref(false)
+const nextBefore = ref<string | null>(null)
 const errorMsg = ref<string | null>(null)
 const kindFilter = ref<KindFilter>('all')
 
@@ -49,21 +56,55 @@ const searchQuery = ref('')
 const searchResults = ref<MemoryScored[] | null>(null)
 const searchBusy = ref(false)
 
+function currentKind(): string | undefined {
+  return kindFilter.value === 'all' ? undefined : kindFilter.value
+}
+
+function resetPaging() {
+  hasMore.value = false
+  nextBefore.value = null
+}
+
 async function reload() {
   if (!props.characterId) {
     memories.value = []
+    resetPaging()
     return
   }
   loading.value = true
   errorMsg.value = null
   try {
-    memories.value = await listMemories(props.characterId, {
-      kind: kindFilter.value === 'all' ? undefined : kindFilter.value,
+    const page = await listMemories(props.characterId, {
+      kind: currentKind(),
+      limit: PAGE_SIZE,
     })
+    memories.value = page.items
+    hasMore.value = page.has_more
+    nextBefore.value = page.next_before
   } catch (err) {
     errorMsg.value = err instanceof Error ? err.message : t('memoryBrowser.errors.loadFailed')
   } finally {
     loading.value = false
+  }
+}
+
+async function loadMore() {
+  if (!props.characterId || !hasMore.value || !nextBefore.value) return
+  loadingMore.value = true
+  errorMsg.value = null
+  try {
+    const page = await listMemories(props.characterId, {
+      kind: currentKind(),
+      limit: PAGE_SIZE,
+      before: nextBefore.value,
+    })
+    memories.value = [...memories.value, ...page.items]
+    hasMore.value = page.has_more
+    nextBefore.value = page.next_before
+  } catch (err) {
+    errorMsg.value = err instanceof Error ? err.message : t('memoryBrowser.errors.loadMoreFailed')
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -329,6 +370,14 @@ watch(kindFilter, () => reload())
             </div>
           </template>
         </div>
+
+        <div v-if="hasMore" class="memory-load-more">
+          <UiButton
+            size="sm"
+            :loading="loadingMore"
+            @click="loadMore"
+          >{{ loadingMore ? t('memoryBrowser.loadMoreLoading') : t('memoryBrowser.loadMore') }}</UiButton>
+        </div>
       </div>
     </template>
   </div>
@@ -461,6 +510,12 @@ watch(kindFilter, () => reload())
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.memory-load-more {
+  display: flex;
+  justify-content: center;
+  padding-top: 4px;
 }
 
 .memory-card {

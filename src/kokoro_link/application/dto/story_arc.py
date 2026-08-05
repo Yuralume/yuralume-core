@@ -36,6 +36,11 @@ class StoryArcBeatResponse(BaseModel):
     last_play_attempt_source: str | None = None
     last_play_attempt_result: str | None = None
     last_play_push_intensity: str | None = None
+    # --- Player's place in this scene (OP0) --------------------------
+    operator_position: str | None = None
+    """One of ``VALID_OPERATOR_POSITIONS``, or ``None`` = unjudged."""
+    operator_note: str | None = None
+    """Optional prose about how the player figures in this scene."""
 
     @classmethod
     def from_domain(cls, beat: StoryArcBeat) -> "StoryArcBeatResponse":
@@ -59,6 +64,8 @@ class StoryArcBeatResponse(BaseModel):
             last_play_attempt_source=beat.last_play_attempt_source,
             last_play_attempt_result=beat.last_play_attempt_result,
             last_play_push_intensity=beat.last_play_push_intensity,
+            operator_position=beat.operator_position,
+            operator_note=beat.operator_note,
         )
 
 

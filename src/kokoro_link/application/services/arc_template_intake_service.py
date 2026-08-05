@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from kokoro_link.application.services.feature_keys import (
@@ -42,12 +42,24 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplateBeat,
     ArcTemplateBinding,
 )
+from kokoro_link.domain.entities.story_arc import normalise_operator_position
+from kokoro_link.domain.services.story_tone_policy import (
+    filter_suggested_tones,
+    fold_stored_tone,
+    resolve_prompt_tone,
+    tone_vocabulary,
+)
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 
 _LOGGER = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"```(?:\w+)?\n?")
+# Mirrors the planner ingest path's bound (OP1-A,
+# ``llm_arc_planner._MAX_OPERATOR_NOTE_CHARS``) — every other optional
+# string this file's LLM-response parsers accept is length-clamped;
+# ``operator_note`` wasn't (Codex review, bonus finding alongside M1/M2).
+_MAX_OPERATOR_NOTE_CHARS = 120
 
 
 # ---------- DTOs (plain dataclasses, REST layer adapts to Pydantic) ----
@@ -97,6 +109,39 @@ class BeatDraft:
     scene_characters: tuple[str, ...] = ()
     dramatic_question: str | None = None
     required: bool = True
+    # --- Player's place in this scene (OP0 / OP1-B) -------------------
+    # ``None`` = unjudged. ``generate_beat_summary`` below proposes a
+    # value (``BeatSummarySuggestion``); the wizard pre-fills it here
+    # and the operator can still overwrite or clear it back to unjudged.
+    operator_position: str | None = None
+    operator_note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BeatSummarySuggestion:
+    """Result of ``generate_beat_summary`` (OP1-B).
+
+    The same LLM call that writes the beat's prose now also proposes
+    where the operator (player) stands in the scene — the wizard's old
+    hard rule ("don't write the operator into the scene") is retired in
+    favour of asking the model to judge honestly. ``operator_position``/
+    ``operator_note`` are a *suggestion* the wizard pre-fills into the
+    beat draft; the operator can still edit or clear it back to
+    unjudged. Both default to ``None`` (unjudged) so a model response
+    that only manages to produce a summary (the pre-OP1-B contract, or
+    a fallback) never fabricates a position.
+
+    Codex review fix (M1): when the incoming ``beat`` already carries a
+    decided ``operator_position``/``operator_note``, ``generate_beat_summary``
+    anchors this suggestion back onto that existing decision before
+    returning it (see ``_anchor_operator_decision``) — regenerating the
+    summary must write *around* an operator's call, never renegotiate
+    it out from under them.
+    """
+
+    summary: str
+    operator_position: str | None = None
+    operator_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +216,7 @@ class ArcTemplateIntakeService:
         repository: ArcTemplateRepositoryPort,
         model: ChatModelPort | None = None,
         provider: ActiveLLMProviderPort | None = None,
+        cloud_mode: bool = False,
     ) -> None:
         self._repository = repository
         self._resolver = ModelResolver(
@@ -178,6 +224,12 @@ class ArcTemplateIntakeService:
             model=model,
             feature_key=FEATURE_ARC_TEMPLATE_INTAKE,
         )
+        # GF6 — hosted deployments must not author ``mature`` templates:
+        # the tone vocabulary the prompts name drops it, a model that
+        # proposes it anyway gets filtered, and a draft that still
+        # carries it is folded on save. Default ``False`` keeps the
+        # self-host wizard byte-identical.
+        self._cloud_mode = cloud_mode
 
     # ----- Stage 1: meta -----
 
@@ -197,7 +249,9 @@ class ArcTemplateIntakeService:
             return empty
         if await self._resolver.is_fake():
             return _meta_fallback(pitch)
-        prompt = _build_meta_prompt(pitch, operator_primary_language)
+        prompt = _build_meta_prompt(
+            pitch, operator_primary_language, cloud_mode=self._cloud_mode,
+        )
         try:
             raw = await self._resolver.generate(prompt)
         except Exception:
@@ -209,7 +263,13 @@ class ArcTemplateIntakeService:
         return MetaSuggestions(
             titles=_coerce_str_list(data.get("titles"), limit=3, max_len=20),
             themes=_coerce_str_list(data.get("themes"), limit=3, max_len=24),
-            tones=_coerce_str_list(data.get("tones"), limit=3, max_len=24),
+            # GF6: the prompt already omits blocked tones from the
+            # vocabulary; a model that proposes one anyway must not put
+            # it in front of a hosted operator.
+            tones=filter_suggested_tones(
+                _coerce_str_list(data.get("tones"), limit=3, max_len=24),
+                cloud_mode=self._cloud_mode,
+            ),
             world_frames=_coerce_str_list(
                 data.get("world_frames"), limit=4, max_len=20,
             ),
@@ -237,6 +297,7 @@ class ArcTemplateIntakeService:
             logline=logline, start_state=start_state,
             end_state=end_state, tone=tone,
             operator_primary_language=operator_primary_language,
+            cloud_mode=self._cloud_mode,
         )
         try:
             raw = await self._resolver.generate(prompt)
@@ -270,7 +331,9 @@ class ArcTemplateIntakeService:
         )
         if await self._resolver.is_fake():
             return _beat_options_fallback(context)
-        prompt = _build_beat_options_prompt(context, operator_primary_language)
+        prompt = _build_beat_options_prompt(
+            context, operator_primary_language, cloud_mode=self._cloud_mode,
+        )
         try:
             raw = await self._resolver.generate(prompt)
         except Exception:
@@ -301,27 +364,33 @@ class ArcTemplateIntakeService:
         beat: BeatDraft,
         context: BeatContext,
         operator_primary_language: str = "zh-TW",
-    ) -> str:
+    ) -> BeatSummarySuggestion:
         """Write a 100–150 char summary for a single beat from the
-        skeleton fields. The summary is what eventually feeds the
-        runtime expander, so the prose register matters."""
+        skeleton fields, plus a proposal for the operator's place in
+        the scene (OP1-B). The summary is what eventually feeds the
+        runtime expander, so the prose register matters; the position
+        proposal is a suggestion the wizard pre-fills — never a save.
+
+        Every return path is anchored (``_anchor_operator_decision``)
+        against ``beat``'s own already-decided position/note before
+        going back to the caller — a crash, a stale-format response, or
+        a model that simply judges differently on rerun must never
+        silently revert an operator's call (Codex review fix, M1)."""
         if await self._resolver.is_fake():
-            return _beat_summary_fallback(beat)
+            return _anchor_operator_decision(_beat_summary_fallback(beat), beat)
         prompt = _build_beat_summary_prompt(
             beat=beat, context=context,
             operator_primary_language=operator_primary_language,
+            cloud_mode=self._cloud_mode,
         )
         try:
             raw = await self._resolver.generate(prompt)
         except Exception:
             _LOGGER.exception("intake generate_beat_summary LLM call failed")
-            return _beat_summary_fallback(beat)
-        cleaned = _strip_fences(raw).strip()
-        if not cleaned:
-            return _beat_summary_fallback(beat)
-        if len(cleaned) > 250:
-            cleaned = cleaned[:250].rstrip() + "…"
-        return cleaned
+            return _anchor_operator_decision(_beat_summary_fallback(beat), beat)
+        return _anchor_operator_decision(
+            _parse_beat_summary_response(raw, beat), beat,
+        )
 
     # ----- One-shot fast path -----
 
@@ -346,6 +415,7 @@ class ArcTemplateIntakeService:
         prompt = _build_full_draft_prompt(
             pitch=pitch, hint=hint,
             operator_primary_language=operator_primary_language,
+            cloud_mode=self._cloud_mode,
         )
         try:
             raw = await self._resolver.generate(prompt)
@@ -382,6 +452,19 @@ class ArcTemplateIntakeService:
         metadata passthrough, not structural behaviour — see
         ``ArcTemplate.language`` docstring.
         """
+        # GF6: hosted, a draft that still carries a blocked tone (a
+        # hand-crafted request, or an edit of a legacy row) is corrected
+        # rather than refused — the wizard echoes the saved row back, so
+        # the substitution is visible and the operator is never locked
+        # out of editing their own template.
+        draft = replace(
+            draft,
+            tone=fold_stored_tone(
+                draft.tone,
+                cloud_mode=self._cloud_mode,
+                context="arc template wizard save",
+            ),
+        )
         template = _draft_to_template(draft, fallback_language=operator_language)
         return await self._repository.save_for_user(
             template, user_id=user_id, overwrite=overwrite,
@@ -391,7 +474,12 @@ class ArcTemplateIntakeService:
 # ---------- Prompt builders ----------
 
 
-def _build_meta_prompt(pitch: str, operator_primary_language: str = "zh-TW") -> str:
+def _build_meta_prompt(
+    pitch: str,
+    operator_primary_language: str = "zh-TW",
+    *,
+    cloud_mode: bool = False,
+) -> str:
     language_hint = render_operator_language_hint(operator_primary_language)
     language_line = f"{language_hint}\n" if language_hint else ""
     return (
@@ -407,7 +495,9 @@ def _build_meta_prompt(pitch: str, operator_primary_language: str = "zh-TW") -> 
         "各從不同切入角度提案。\n"
         "- themes：3 個從 ambition / friendship / loss / discovery / "
         "transformation / redemption / custom 中挑出最契合的。\n"
-        "- tones：3 個從 daily / dramatic / mature / dark / lighthearted "
+        # GF6: hosted drops ``mature`` from the vocabulary the model is
+        # allowed to pick from; self-host keeps the full catalogue.
+        f"- tones：3 個從 {tone_vocabulary(cloud_mode=cloud_mode)} "
         "中挑出最契合的。\n"
         "- world_frames：1–4 個從 modern / fantasy / school / custom 中"
         "挑（不確定就空陣列）。\n"
@@ -421,9 +511,16 @@ def _build_premise_prompt(
     end_state: str,
     tone: str,
     operator_primary_language: str = "zh-TW",
+    cloud_mode: bool = False,
 ) -> str:
     language_hint = render_operator_language_hint(operator_primary_language)
     language_line = f"{language_hint}\n" if language_hint else ""
+    # GF6: the wizard's in-progress tone is operator input that lands
+    # verbatim in a prompt, so hosted it goes through the same policy
+    # the runtime scene writers use.
+    tone = resolve_prompt_tone(
+        tone, cloud_mode=cloud_mode, context="intake premise",
+    )
     return (
         f"{language_line}"
         "你是 Yuralume 的劇情骨架編輯。"
@@ -441,8 +538,14 @@ def _build_premise_prompt(
 
 
 def _build_beat_options_prompt(
-    context: BeatContext, operator_primary_language: str = "zh-TW",
+    context: BeatContext,
+    operator_primary_language: str = "zh-TW",
+    *,
+    cloud_mode: bool = False,
 ) -> str:
+    tone = resolve_prompt_tone(
+        context.tone, cloud_mode=cloud_mode, context="intake beat options",
+    )
     prior = (
         "、".join(context.prior_titles)
         if context.prior_titles else "（這是第一個 beat）"
@@ -458,7 +561,7 @@ def _build_beat_options_prompt(
         f"範本標題：{context.template_title}\n"
         f"premise：{context.premise}\n"
         f"theme：{context.theme}\n"
-        f"tone：{context.tone}\n"
+        f"tone：{tone}\n"
         f"world_frames：{frames}\n"
         f"持續天數：{context.duration_days}\n"
         f"這個 beat 在第 {context.beat_position + 1} / {context.total_beats} 個位置，"
@@ -485,38 +588,88 @@ def _build_beat_summary_prompt(
     beat: BeatDraft,
     context: BeatContext,
     operator_primary_language: str = "zh-TW",
+    cloud_mode: bool = False,
 ) -> str:
+    tone = resolve_prompt_tone(
+        context.tone, cloud_mode=cloud_mode, context="intake beat summary",
+    )
     npcs = (
         "、".join(beat.scene_characters)
         if beat.scene_characters else "（獨白）"
     )
     language_hint = render_operator_language_hint(operator_primary_language)
     language_line = f"{language_hint}\n" if language_hint else ""
+    # Codex review fix (M1): a beat the operator has already judged
+    # must not be re-opened by a "regenerate summary" click. When
+    # ``beat.operator_position`` is already decided, tell the model
+    # this is a fixed fact to write the summary *around* — not a
+    # question to answer again — instead of the open three-way ask
+    # below. ``_anchor_operator_decision`` is the enforcement backstop
+    # for a model that ignores this and answers differently anyway.
+    if beat.operator_position is not None:
+        note_clause = f"（{beat.operator_note}）" if beat.operator_note else ""
+        position_instruction = (
+            f"使用者在這場戲的位置已經確定為 {beat.operator_position}"
+            f"{note_clause}，這是既定事實、不是待你判斷的問題——"
+            "請把 summary 寫成與這個位置一致的版本。"
+            "JSON 裡的 operator_position／operator_note 請直接照抄這個"
+            "既定值，不要另外判斷或改寫。\n\n"
+        )
+        schema_position_literal = f"\"{beat.operator_position}\""
+    else:
+        position_instruction = (
+            "使用者的位置請依劇情誠實判斷，分三種：\n"
+            "- absent：使用者不在這場戲（角色獨自行動，或只與上述 NPC 互動）。\n"
+            "- present：使用者在場，但這場戲的重心不是使用者"
+            "（例如使用者陪伴、旁觀，戲劇問題仍是角色自己的）。\n"
+            "- central：這場戲就是關於使用者——沒有使用者這場戲演不下去"
+            "（例如角色向使用者告白、求助、對峙、坦白）。\n"
+            "不要因為習慣把使用者排除在外就一律選 absent："
+            "若 dramatic_question 本來就指向角色與使用者的關係，"
+            "應誠實標為 present 或 central。\n"
+            "operator_note 選填，一句話描述使用者在這場戲的戲劇位置"
+            "（例如「她要向你坦白」）；沒有明確立場就給空字串。\n\n"
+        )
+        schema_position_literal = "\"absent\"|\"present\"|\"central\""
     return (
         f"{language_line}"
         "你是 Yuralume 的劇情骨架編輯。"
         "依下方 beat 結構寫一段 100–150 字的 summary，"
-        "供 runtime 的 expander 將來「演出」這場戲。\n\n"
-        f"範本 tone：{context.tone}（影響語氣，不要與此衝突）\n"
+        "供 runtime 的 expander 將來「演出」這場戲；"
+        "同時提案使用者（玩家）在這場戲裡的位置。\n\n"
+        f"範本 tone：{tone}（影響語氣，不要與此衝突）\n"
         f"範本 premise：{context.premise}\n"
         f"beat 標題：{beat.title}\n"
         f"day_offset：{beat.day_offset}（在 {context.duration_days} 天 arc 中）\n"
         f"tension：{beat.tension}\n"
         f"scene_type：{beat.scene_type}\n"
         f"location：{beat.location or '未指定'}\n"
-        f"scene_characters：{npcs}\n"
+        f"scene_characters（其他登場角色，不含使用者）：{npcs}\n"
         f"dramatic_question：{beat.dramatic_question or '未指定'}\n\n"
+        f"{position_instruction}"
         "輸出規則：\n"
-        "- 100–150 字，第三人稱，純文字（不要 JSON、不要編號）。\n"
-        "- 寫成「這場戲的氛圍與發生的核心動作」，不要寫成條列式大綱。\n"
-        "- 包含：場景在哪、誰在做什麼、角色感受到什麼、戲劇問題如何浮現。\n"
-        "- 維持範本的整體 tone（daily 不要塞戰爭場面，mature 不要過度收斂）。\n"
-        "- 不要把使用者寫進場景。\n"
+        "- 只輸出一個 JSON 物件，不要任何前言、不要 code fence。\n"
+        "- 形狀：{\"summary\": str, "
+        f"\"operator_position\": {schema_position_literal}, "
+        "\"operator_note\": str}\n"
+        "- summary：100–150 字，第三人稱，純文字，"
+        "寫成「這場戲的氛圍與發生的核心動作」，不要寫成條列式大綱。\n"
+        "- summary 包含：場景在哪、誰在做什麼、角色感受到什麼、"
+        "戲劇問題如何浮現。\n"
+        # GF6: the "heavy register" example names ``mature`` self-host;
+        # hosted it names whatever the policy folds ``mature`` into.
+        f"- 維持範本的整體 tone（daily 不要塞戰爭場面，"
+        f"{resolve_prompt_tone('mature', cloud_mode=cloud_mode)}"
+        " 不要過度收斂）。\n"
     )
 
 
 def _build_full_draft_prompt(
-    *, pitch: str, hint: str, operator_primary_language: str = "zh-TW",
+    *,
+    pitch: str,
+    hint: str,
+    operator_primary_language: str = "zh-TW",
+    cloud_mode: bool = False,
 ) -> str:
     hint_line = (
         f"使用者額外說明：{hint.strip()}\n"
@@ -531,6 +684,30 @@ def _build_full_draft_prompt(
         f"使用者 pitch：{pitch.strip()}\n"
         f"{hint_line}"
         "\n"
+        # Codex review fix (M2): the one-shot "全部交給 AI" fast path
+        # used to never ask for a player position at all — every beat
+        # it produced landed unjudged even though the parse side
+        # (OP0-B) has carried the two columns since day one. Mirrors
+        # the planner's guidance (arc_planner.txt, OP1-A) so the two
+        # producer paths teach the model the same vocabulary and the
+        # same LLM-first mixed-cadence instruction (no fixed ratio).
+        "每個 beat 也要提案使用者（玩家）在這場戲裡的位置，用 "
+        "operator_position 這個獨立欄位表達，三選一：\n"
+        "- absent：玩家不在這場戲裡。角色自己、或角色與 scene_characters "
+        "就能把這場戲演完。\n"
+        "- present：玩家在場，但這場戲不是關於他——他在旁邊、陪著、看著、"
+        "被牽動。\n"
+        "- central：這場戲是關於玩家的，少了他就演不成"
+        "（攤牌、告白、決裂、和解、只想說給他聽的那種話）。\n"
+        "張力最高的節點（tension 是 climax 或 resolution，以及任何攤牌／"
+        "告白／決裂／和解性質的戲）傾向讓玩家在場、甚至成為核心——這是一段"
+        "有玩家在裡面的關係故事；日常推進、角色自己的工作與內心整理、純"
+        "鋪陳性質的 beat，讓角色一個人（或跟 scene_characters）走完是好"
+        "的。不要按固定比例分配，也不要每顆 beat 都填同一個值，依這條 arc "
+        "的劇情本身逐顆判斷。\n"
+        "operator_note 是選填的一句話，寫玩家在這場戲裡的戲劇位置"
+        "（例如「她要在這裡對你說出那件事」）；absent 的 beat 通常不需要，"
+        "用不到就填空字串。\n\n"
         "輸出規則：\n"
         "- 只輸出一個 JSON 物件，不要任何前言、不要 code fence。\n"
         "- 形狀：{\n"
@@ -538,7 +715,10 @@ def _build_full_draft_prompt(
         "    \"title\": str (約 8–14 個全形字或等寬長度，用玩家語言),\n"
         "    \"premise\": str (60–120 字，第三人稱),\n"
         "    \"theme\": str (ambition/friendship/loss/discovery/transformation/redemption/custom),\n"
-        "    \"tone\": str (daily/dramatic/mature/dark/lighthearted),\n"
+        # GF6: hosted, the one-shot path must not be told ``mature``
+        # is on the menu either.
+        "    \"tone\": str ("
+        f"{tone_vocabulary(cloud_mode=cloud_mode, separator='/')}),\n"
         "    \"duration_days\": int (7–30),\n"
         "    \"world_frames\": [str, ...] (modern/fantasy/school/custom 中挑),\n"
         "    \"required_traits\": [],\n"
@@ -551,7 +731,9 @@ def _build_full_draft_prompt(
         "        \"location\": str (可空字串),\n"
         "        \"scene_characters\": [str, ...] (可空陣列),\n"
         "        \"dramatic_question\": str (可空字串),\n"
-        "        \"required\": bool\n"
+        "        \"required\": bool,\n"
+        "        \"operator_position\": str (absent/present/central 之一),\n"
+        "        \"operator_note\": str (可空字串)\n"
         "      }, ...\n"
         "    ]\n"
         "  }\n"
@@ -589,7 +771,13 @@ def _beat_options_fallback(context: BeatContext) -> BeatOptions:
     )
 
 
-def _beat_summary_fallback(beat: BeatDraft) -> str:
+def _beat_summary_fallback(beat: BeatDraft) -> BeatSummarySuggestion:
+    """Static fallback (fake provider / LLM crash). Stitches the
+    structured fields into a usable sentence like ``_meta_fallback``'s
+    siblings — but it has no semantic judgement to offer, so the
+    player-position proposal stays unjudged (``None``) rather than
+    guessing. That judgement call is exactly what OP1-B hands to the
+    LLM; a rule-based heuristic must not fake it (LLM-first)."""
     bits: list[str] = []
     if beat.location:
         bits.append(f"在{beat.location}")
@@ -599,7 +787,44 @@ def _beat_summary_fallback(beat: BeatDraft) -> str:
         bits.append(f"發生「{beat.title}」")
     if beat.dramatic_question:
         bits.append(f"——{beat.dramatic_question}")
-    return "，".join(bits) or beat.title
+    summary = "，".join(bits) or beat.title
+    return BeatSummarySuggestion(summary=summary)
+
+
+def _anchor_operator_decision(
+    suggestion: BeatSummarySuggestion, beat: BeatDraft,
+) -> BeatSummarySuggestion:
+    """Never let a regenerated summary silently reopen a player-position
+    call the operator already made (Codex review fix, M1).
+
+    Gated per field, independently: a beat whose ``operator_position``
+    is already decided keeps that exact value no matter what this call
+    produced — crash fallback, off-vocabulary hallucination, or a
+    model that simply judges differently on rerun; a beat whose
+    ``operator_note`` already carries text keeps that note. Only a
+    still-unjudged field (``None`` / blank) accepts this call's fresh
+    proposal. ``_build_beat_summary_prompt`` already tells the model
+    about an existing decision so the *summary prose* it writes stays
+    consistent with it — this function is the enforcement backstop for
+    when the model doesn't comply (or the call fails outright).
+    """
+    position = (
+        beat.operator_position
+        if beat.operator_position is not None
+        else suggestion.operator_position
+    )
+    note = (
+        beat.operator_note
+        if (beat.operator_note or "").strip()
+        else suggestion.operator_note
+    )
+    if position == suggestion.operator_position and note == suggestion.operator_note:
+        return suggestion
+    return BeatSummarySuggestion(
+        summary=suggestion.summary,
+        operator_position=position,
+        operator_note=note,
+    )
 
 
 # ---------- JSON / coercion helpers ----------
@@ -685,6 +910,8 @@ def _draft_to_template(
             scene_characters=b.scene_characters,
             dramatic_question=b.dramatic_question,
             required=b.required,
+            operator_position=b.operator_position,
+            operator_note=b.operator_note,
         )
         for b in draft.beats
     ]
@@ -731,6 +958,18 @@ def _build_full_draft_from_json(data: dict[str, Any]) -> TemplateDraft | None:
                 ),
                 dramatic_question=_optional_str(raw.get("dramatic_question")),
                 required=bool(raw.get("required", True)),
+                # The full-draft prompt now asks for both columns too
+                # (M2, Codex review — it used to only ask per-beat via
+                # ``_build_beat_summary_prompt``). Parsed defensively
+                # regardless: a garbage value degrades to unjudged
+                # rather than failing the whole draft; it's a
+                # review-step suggestion, not a save.
+                operator_position=_decode_operator_position(
+                    raw.get("operator_position"),
+                ),
+                operator_note=_optional_str(
+                    raw.get("operator_note"), max_len=_MAX_OPERATOR_NOTE_CHARS,
+                ),
             )
         )
     if not beats:
@@ -781,11 +1020,72 @@ def _coerce_int(raw: Any, *, default: int) -> int:
     return default
 
 
-def _optional_str(raw: Any) -> str | None:
+def _optional_str(raw: Any, *, max_len: int | None = None) -> str | None:
     if isinstance(raw, str):
         cleaned = raw.strip()
-        return cleaned or None
+        if not cleaned:
+            return None
+        return cleaned[:max_len] if max_len is not None else cleaned
     return None
+
+
+def _decode_operator_position(raw: Any) -> str | None:
+    """Best-effort read of an LLM-suggested position value.
+
+    Same forgiving contract as the persistence-layer twins
+    (``sa_arc_template_repository._decode_operator_position`` /
+    ``sa_story_arc_repository._decode_operator_position``): a value the
+    domain would reject degrades to ``None`` (unjudged) rather than
+    failing the whole draft — this is a review-step suggestion the
+    operator can still edit, not a persisted row.
+    """
+    try:
+        return normalise_operator_position(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "arc template intake: LLM operator_position %r is not a "
+            "known position — treating as unjudged",
+            raw,
+        )
+        return None
+
+
+def _clip_summary(text: str) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) > 250:
+        cleaned = cleaned[:250].rstrip() + "…"
+    return cleaned
+
+
+def _parse_beat_summary_response(
+    raw: str, beat: BeatDraft,
+) -> BeatSummarySuggestion:
+    """Decode ``generate_beat_summary``'s LLM response (OP1-B).
+
+    Prefers the JSON envelope (summary + player-position proposal). A
+    model that ignores the envelope and returns plain prose degrades to
+    treating the whole response as the summary text — the pre-OP1-B
+    contract — rather than discarding a usable answer; the position
+    proposal is simply absent for that call (stays unjudged, same as
+    every other degradation path in this file).
+    """
+    data = _extract_json_object(raw)
+    if isinstance(data, dict) and isinstance(data.get("summary"), str):
+        summary = _clip_summary(data["summary"])
+        if summary:
+            return BeatSummarySuggestion(
+                summary=summary,
+                operator_position=_decode_operator_position(
+                    data.get("operator_position"),
+                ),
+                operator_note=_optional_str(
+                    data.get("operator_note"), max_len=_MAX_OPERATOR_NOTE_CHARS,
+                ),
+            )
+    cleaned = _clip_summary(_strip_fences(raw).strip())
+    if not cleaned:
+        return _beat_summary_fallback(beat)
+    return BeatSummarySuggestion(summary=cleaned)
 
 
 def _slug_from_title(title: str) -> str:

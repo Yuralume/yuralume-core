@@ -11,12 +11,20 @@ import type { ScheduleActivity } from '@/types/schedule'
 import {
   ChatRuntimeLimitError,
   ChatStreamProtocolError,
+  getLatestConversation,
   sendChatMessageStream,
   uploadChatAttachments,
   undoLastTurn,
 } from '@/utils/api/chat'
+import {
+  prependOlderMessages,
+  restoredScrollTop,
+  shiftPinnedIndex,
+  shouldLoadOlder,
+} from '@/utils/chatHistoryScroll'
 import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { isPriceChangedError } from '@/utils/api/priceChanged'
+import { billingRefusalKind, refreshQuotedPrices } from '@/utils/api/billingRefusal'
 import { creditAmountText } from '@/utils/creditsFormat'
 import { suggestChatAssistMessages } from '@/utils/api/chatAssist'
 import { getCharacter } from '@/utils/api/characters'
@@ -25,11 +33,15 @@ import { getCurrentActivity } from '@/utils/api/schedule'
 import ChatBubble from '@/components/ChatBubble.vue'
 import ChatAssistDiscoveryHint from '@/components/ChatAssistDiscoveryHint.vue'
 import ChatFirstTurnGuide from '@/components/ChatFirstTurnGuide.vue'
+import SceneFrame from '@/components/SceneFrame.vue'
+import StorySceneChips from '@/components/StorySceneChips.vue'
+import StorySceneControl from '@/components/StorySceneControl.vue'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
 import { UiButton } from '@/components/ui'
 import { useChatAssistPreference } from '@/composables/useChatAssistPreference'
+import { useStoryScene } from '@/composables/useStoryScene'
 import { useAuth } from '@/composables/useAuth'
 import {
   refreshCloudCreditsAfterAction,
@@ -38,14 +50,18 @@ import {
 import {
   ACTION_CHAT,
   ACTION_IMAGE_CHAT_TOOL,
+  ACTION_STORY_SCENE_OPEN,
   useActionPricing,
 } from '@/composables/useActionPricing'
 import { useNsfwMode } from '@/composables/useNsfwMode'
+import { useRuntimeLimits } from '@/composables/useRuntimeLimits'
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { formatTimeRange } from '@/i18n/formatters'
 import { characterDisplayRef } from '@/utils/characterDisplay'
 import { splitAssistantBubbles } from '@/utils/chatSegments'
+import { isSceneNarration, sceneHeadingIndex } from '@/utils/sceneMessages'
+import { STORY_SCENE_DAILY_LIMIT_KEY } from '@/utils/storySceneErrors'
 import { shouldSendChatInputOnKeydown } from '@/utils/chatInputKeys'
 import { resolveTTSAvailability } from '@/utils/ttsAvailability'
 import {
@@ -64,6 +80,7 @@ const { cloudMode, portalUrl } = useAuth()
 const { pt } = usePlayerCopy()
 const cloudCredits = useCloudCredits()
 const actionPricing = useActionPricing()
+const runtimeLimits = useRuntimeLimits()
 // A turn that was refused for lack of credits shows the shared notice card in
 // the message stream instead of a generic "chat failed" bubble.
 const creditsExhausted = ref(false)
@@ -104,10 +121,25 @@ const {
   stopNsfwModeClock,
 } = useNsfwMode()
 
+/**
+ * Where the page in `messages` sits inside the whole thread (IV10).
+ *
+ * The parent loads the newest page; this panel owns the scroll container, so
+ * it owns fetching the older ones. A *new object* on this prop is the signal
+ * that the parent reseeded the thread and the cursor must restart — identity
+ * rather than value, because a send also replaces `messages` and must not
+ * rewind pagination.
+ */
+interface ChatHistoryPage {
+  hasMore: boolean
+  nextBefore: number | null
+}
+
 const props = defineProps<{
   character: Character | null
   conversationId: string | null
   messages: ChatMessage[]
+  historyPage?: ChatHistoryPage | null
   loadingHistory?: boolean
   // 桌面 landscape 版面偏好 toggle：只在非 portrait 時顯示（由
   // StagePage 決定是否傳入 true）。StagePage 持有 stageLayout 狀態，
@@ -133,8 +165,31 @@ const messagesContainer = ref<HTMLElement>()
 const textareaRef = ref<HTMLTextAreaElement>()
 const fileInputRef = ref<HTMLInputElement>()
 const localMessages = ref<ChatMessage[]>([])
+// --- Older-history pagination (IV10) ---------------------------------
+// Seeded from `props.historyPage` and then advanced locally: once the reader
+// has pulled two pages back, only this panel knows where the window ends.
+const olderHasMore = ref(false)
+const olderCursor = ref<number | null>(null)
+const loadingOlder = ref(false)
 const streamingText = ref('')
 const ttsAvailable = ref(false)
+/**
+ * Whether a bubble may offer to be read aloud.
+ *
+ * Two independent "no"s, and the bubbles only need the conjunction: the
+ * deployment may have no working voice channel at all, and a hosted plan may
+ * have voice switched off (`tts_enabled`). Both are answered here rather than
+ * inside `ChatBubble`, so the bubble keeps one reason to hide the control and
+ * the panel keeps the knowledge of what a plan includes.
+ *
+ * `ttsEnabled` reads `true` on self-host and whenever the limits are unknown,
+ * so this narrows the existing behaviour only where a loaded hosted snapshot
+ * positively says voice is not part of this plan — where pressing play could
+ * only ever return "TTS is not enabled".
+ */
+const ttsUsable = computed(
+  () => ttsAvailable.value && runtimeLimits.ttsEnabled.value,
+)
 const revealingMessageIndex = ref<number | null>(null)
 const currentActivity = ref<ScheduleActivity | null>(null)
 const currentActivityLoading = ref(false)
@@ -146,6 +201,42 @@ const chatAssistCharacterId = ref<string | null>(null)
 const chatAssistDiscovered = ref(isChatAssistDiscovered(getChatAssistDiscoveryStorage()))
 const chatAssistHintDismissed = ref(isChatAssistHintDismissed(getChatAssistDiscoveryStorage()))
 const composingInput = ref(false)
+
+// --- Story scene ("Start a Scene") -----------------------------------
+// Declared here, above the character watcher, because that watcher runs
+// immediately at setup and restores whatever scene is already running.
+const {
+  session: storySceneSession,
+  suggestedActions: storySceneChips,
+  opening: storySceneOpening,
+  ending: storySceneEnding,
+  unavailable: storySceneUnavailable,
+  errorKey: storySceneErrorKey,
+  isOpen: storySceneActive,
+  clear: clearStoryScene,
+  setSuggestedActions: setStorySceneChips,
+  adoptClosed: adoptClosedStoryScene,
+  restore: restoreStoryScene,
+  sync: syncStoryScene,
+  open: openStoryScene,
+  end: endStoryScene,
+} = useStoryScene()
+/**
+ * A money refusal of the 起幕 button, as a catalog key (SC3-C).
+ *
+ * Kept beside the scene state rather than inside it: "out of Lumes" and
+ * "the price moved" are answers about the wallet, and the scene state
+ * machine is deliberately unaware there is one. Cleared on the next press
+ * and whenever the thread changes.
+ */
+const storySceneBillingErrorKey = ref<string | null>(null)
+/**
+ * Where the closing narration landed in the thread, so the scene's heading
+ * stays on the narration that *opened* it rather than jumping to its
+ * send-off. Null until a scene is closed from this screen.
+ */
+const closingNarrationIndex = ref<number | null>(null)
+
 let chatAssistRequestSeq = 0
 let pendingRevealResolve: (() => void) | null = null
 let pendingFirstRevealRelease: (() => void) | null = null
@@ -235,6 +326,171 @@ async function useStarterMessage(message: string) {
 async function useChatAssistSuggestion(message: string) {
   await useStarterMessage(message)
   chatAssistOpen.value = false
+}
+
+/** Whatever went wrong last, in the player's language. */
+const storySceneErrorMessage = computed(() => {
+  // The billing refusal wins while it is fresh: it is always the most
+  // recent press, and the scene machine never sets its own key in the
+  // same turn (it rethrows those).
+  const key = storySceneBillingErrorKey.value ?? storySceneErrorKey.value
+  return key ? t(key) : null
+})
+
+/** No character, or the composer is already busy with a turn. */
+const storySceneControlDisabled = computed(
+  () => !props.character || sending.value || undoing.value,
+)
+
+// --- Today's allowance of openings (hosted only) ----------------------
+/**
+ * The hosted ceiling on openings per rolling 24h, or null when there is
+ * none — self-host, an uncapped plan, or limits we could not read. Null
+ * renders no node at all, so nothing below this line exists off cloud.
+ */
+const storySceneQuota = computed(() => runtimeLimits.storyScenesDaily.value)
+
+/**
+ * Today's allowance is provably spent.
+ *
+ * Narrow on purpose: a counted `used` at or over a real `limit`. A `null`
+ * count means the backend served the ceiling without the tally, and "we
+ * could not count" must never present as "you are out" — that is the one
+ * mistake that takes something away from a player who still has it.
+ */
+const storySceneQuotaExhausted = computed(() => {
+  const quota = storySceneQuota.value
+  return quota !== null && quota.used !== null && quota.used >= quota.limit
+})
+
+/** The sentence beside the button, or null when we cannot say anything. */
+const storySceneQuotaNote = computed<string | null>(() => {
+  const quota = storySceneQuota.value
+  if (!quota) return null
+  if (storySceneQuotaExhausted.value) {
+    return t('chat.storyScene.quota.exhausted')
+  }
+  // Ceiling without a tally: say what the ceiling is and stop there rather
+  // than subtracting a number we do not have.
+  if (quota.used === null) {
+    return t('chat.storyScene.quota.limitOnly', { limit: quota.limit })
+  }
+  return t('chat.storyScene.quota.remaining', {
+    remaining: quota.limit - quota.used,
+  })
+})
+
+/** Which narration in the thread wears the scene's heading (see the util). */
+const sceneHeadingAt = computed<number | null>(() => sceneHeadingIndex(
+  localMessages.value,
+  {
+    hasSession: storySceneSession.value !== null,
+    closingIndex: closingNarrationIndex.value,
+  },
+))
+
+async function handleStorySceneOpen() {
+  const character = props.character
+  if (!character || sending.value) return
+  closeActionMenu()
+  storySceneBillingErrorKey.value = null
+  // AP2 pre-check: the price is published and the balance is already on
+  // screen, so an unaffordable press is answered here rather than after a
+  // round trip that ends in a 402. Deliberately timid — an unknown or
+  // stale balance never refuses (see `shortfallFor`).
+  const shortfall = actionPricing.shortfallFor(
+    ACTION_STORY_SCENE_OPEN, currentBalanceView(),
+  )
+  if (shortfall !== null) {
+    creditsRequiredCr.value = shortfall
+    creditsExhausted.value = true
+    await scrollToBottom()
+    return
+  }
+  creditsExhausted.value = false
+  creditsRequiredCr.value = null
+  let response: Awaited<ReturnType<typeof openStoryScene>>
+  try {
+    response = await openStoryScene(character.id)
+  } catch (err) {
+    // Both refusals mean the same thing about the scene: it did not open
+    // and nothing was charged. What differs is what the player does next.
+    const refusal = billingRefusalKind(err)
+    if (refusal === 'insufficient_credits') {
+      creditsExhausted.value = true
+      await scrollToBottom()
+    } else if (refusal === 'price_changed') {
+      // The published price moved between the hint beside the button and
+      // the press. Re-pull it, or the next press resends the same number
+      // the server just refused.
+      void refreshQuotedPrices()
+      storySceneBillingErrorKey.value = 'chat.storyScene.errors.priceChanged'
+    } else {
+      // The state machine only rethrows money refusals, so nothing else
+      // should arrive here — and a wrong explanation would be worse than
+      // a vague one.
+      storySceneBillingErrorKey.value = 'chat.storyScene.errors.generic'
+    }
+    return
+  }
+  if (!response) {
+    // "You are out for today" makes the count beside the button stale by
+    // definition — the server counted more openings than this tab knew
+    // about (another device, another character). Re-read so the note
+    // agrees with the refusal the player is looking at.
+    if (storySceneErrorKey.value === STORY_SCENE_DAILY_LIMIT_KEY) {
+      void runtimeLimits.refresh()
+    }
+    return
+  }
+  closingNarrationIndex.value = null
+  // Kind is forced rather than trusted: the frame is the whole point of the
+  // press, and a payload that forgot the marker would silently render the
+  // opening as a chat bubble.
+  localMessages.value.push(
+    { ...response.narration, kind: 'scene_narration' },
+    response.character_message,
+  )
+  emit(
+    'conversationUpdate',
+    response.session.conversation_id,
+    [...localMessages.value],
+    character,
+  )
+  // The curtain is up, so the one price has been charged — settle the
+  // badge on the real number instead of leaving the player to guess.
+  refreshCloudCreditsAfterAction()
+  // ...and one of today's openings is spent, so the note beside the button
+  // counts down with it instead of waiting for the next page load.
+  void runtimeLimits.refresh()
+  await scrollToBottom()
+  focusInput()
+}
+
+async function handleStorySceneEnd() {
+  const character = props.character
+  if (!character || !storySceneActive.value) return
+  if (!await confirmDialog({
+    title: t('chat.storyScene.endConfirmTitle'),
+    content: t('chat.storyScene.endConfirm', { name: characterDisplayName.value }),
+    okText: t('chat.storyScene.endConfirmAction'),
+  })) return
+  const response = await endStoryScene(character.id)
+  if (!response) return
+  if (response.closing_narration) {
+    closingNarrationIndex.value = localMessages.value.length
+    localMessages.value.push({
+      ...response.closing_narration,
+      kind: 'scene_narration',
+    })
+  }
+  emit(
+    'conversationUpdate',
+    response.session.conversation_id,
+    [...localMessages.value],
+    character,
+  )
+  await scrollToBottom()
 }
 
 const stageTabSubtitle = computed(() => {
@@ -536,7 +792,20 @@ function formatActivityTime(activity: ScheduleActivity): string {
 
 watch(() => props.messages, (msgs) => {
   localMessages.value = [...msgs]
+  // Unchanged since before pagination: a freshly loaded thread lands at the
+  // bottom, on the newest message. Prepending older ones takes the other path
+  // (`loadOlderMessages`) and never comes through here.
   scrollToBottom()
+}, { immediate: true })
+
+// The parent handing over a *new* page object means it reloaded the thread —
+// restart the cursor. Value-watching would be wrong twice over: it would miss
+// a reload that happens to land on the same numbers, and it would not fire at
+// all for the case that matters most (same character, fresh reload).
+watch(() => props.historyPage, (page) => {
+  olderHasMore.value = page?.hasMore ?? false
+  olderCursor.value = page?.nextBefore ?? null
+  loadingOlder.value = false
 }, { immediate: true })
 
 watch(() => props.character?.id ?? null, (characterId) => {
@@ -547,12 +816,19 @@ watch(() => props.character?.id ?? null, (characterId) => {
   chatAssistError.value = null
   chatAssistSuggestions.value = []
   chatAssistCharacterId.value = characterId
+  clearStoryScene()
+  storySceneBillingErrorKey.value = null
+  closingNarrationIndex.value = null
   if (activityTimer) {
     clearInterval(activityTimer)
     activityTimer = null
   }
   if (characterId) {
     interactionMode.value = 'dm'
+    // A scene lives in the database, not in this tab: reopening the thread
+    // (or reloading the page mid-scene) must come back to the scene the
+    // player left, not to a button that would refuse them.
+    restoreStoryScene(characterId)
     refreshCurrentActivity()
     activityTimer = setInterval(() => {
       refreshCurrentActivity()
@@ -645,6 +921,9 @@ async function handleSend() {
   creditsExhausted.value = false
   creditsRequiredCr.value = null
   demoLimitReached.value = false
+  // The chips belonged to the previous turn; leaving them up through the send
+  // would invite a second press on an action the scene has already moved past.
+  setStorySceneChips([])
   const sendingLockId = beginSendingLock()
 
   // Upload first so the assistant turn has real URLs to reference.
@@ -728,11 +1007,33 @@ async function handleSend() {
       }
     }
 
+    // SC1-D: the turn that answers the scene's dramatic question says so on
+    // its own reply, so the closed session and its send-off arrive with the
+    // answer instead of costing a second round trip. Applied before the
+    // emit so the parent receives the thread with the send-off already in
+    // it, and before the chips so a closed scene drops them.
+    const sceneClosed = adoptClosedStoryScene(reply.story_scene_session)
+    if (reply.story_scene_closing) {
+      closingNarrationIndex.value = localMessages.value.length
+      localMessages.value.push({
+        ...reply.story_scene_closing,
+        kind: 'scene_narration',
+      })
+    }
+
     const updatedChar: Character = {
       ...props.character!,
       state: reply.state,
     }
     emit('conversationUpdate', reply.conversation_id, [...localMessages.value], updatedChar)
+    // Suggested actions ride the ordinary reply and only mean anything inside
+    // a scene, which is exactly what the setter enforces.
+    setStorySceneChips(reply.suggested_actions ?? [])
+    // The fallback for a backend that predates those fields: the scene may
+    // still have closed server-side with nothing on the reply to say so.
+    if (!sceneClosed && storySceneActive.value && props.character) {
+      syncStoryScene(props.character.id)
+    }
     // The post-turn processor may have nudged the character forward in
     // their schedule; refresh the cheap activity badge.
     refreshCurrentActivity()
@@ -832,6 +1133,103 @@ async function scrollToBottom() {
   }
 }
 
+// --- Older history (IV10) --------------------------------------------
+/**
+ * A turn in flight forbids reflowing the thread.
+ *
+ * Not a nicety: `waitForMessageReveal` pins the typewriter animation to an
+ * array *index*, and the send path reads that index one statement before it
+ * pushes the message. Insert rows above it in between and the animation
+ * silently plays on the wrong bubble.
+ */
+const historyReflowBlocked = computed(
+  () => sending.value || revealInProgress.value || undoing.value,
+)
+
+/**
+ * There is more *and* we know where to ask for it. Both halves, because a
+ * `has_more` with no cursor would otherwise render a button that can only
+ * ever do nothing.
+ */
+const canLoadOlder = computed(
+  () => olderHasMore.value && olderCursor.value !== null,
+)
+
+function handleMessagesScroll() {
+  const el = messagesContainer.value
+  if (!el) return
+  if (!shouldLoadOlder({
+    scrollTop: el.scrollTop,
+    hasMore: canLoadOlder.value,
+    loading: loadingOlder.value,
+    busy: historyReflowBlocked.value,
+  })) return
+  void loadOlderMessages()
+}
+
+/**
+ * Fetch the page before the one we hold and put it on top — without the
+ * viewport moving (IV10 red line).
+ *
+ * The anchor is taken before *any* mutation and applied after the DOM has
+ * settled, so the correction covers everything the same update changed: the
+ * inserted messages, and the "load older" button disappearing on the last
+ * page.
+ */
+async function loadOlderMessages() {
+  const character = props.character
+  const cursor = olderCursor.value
+  if (!character || cursor === null) return
+  if (!canLoadOlder.value || loadingOlder.value) return
+  if (historyReflowBlocked.value) return
+  const el = messagesContainer.value
+  const anchor = el
+    ? { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight }
+    : null
+  loadingOlder.value = true
+  try {
+    const page = await getLatestConversation(character.id, { before: cursor })
+    // The reader switched characters while this was in flight — the messages
+    // that came back belong to a thread nobody is looking at.
+    if (props.character?.id !== character.id) return
+    // Re-checked after the await, not only before it: a send can start mid
+    // request, and by then it is holding indices into the array below.
+    if (historyReflowBlocked.value) return
+    if (!page || page.messages.length === 0) {
+      olderHasMore.value = false
+      olderCursor.value = null
+      return
+    }
+    // A different thread became "latest" (a new web conversation started while
+    // we were reading). Positions are per-conversation, so ours mean nothing
+    // there — stop rather than splice one thread into another.
+    if (props.conversationId && page.id !== props.conversationId) {
+      olderHasMore.value = false
+      olderCursor.value = null
+      return
+    }
+    const { messages, added } = prependOlderMessages(
+      page.messages, localMessages.value,
+    )
+    localMessages.value = messages
+    closingNarrationIndex.value = shiftPinnedIndex(
+      closingNarrationIndex.value, added,
+    )
+    olderHasMore.value = page.has_more ?? false
+    olderCursor.value = page.next_before ?? null
+    await nextTick()
+    if (el && anchor) {
+      el.scrollTop = restoredScrollTop(anchor, el.scrollHeight)
+    }
+  } catch {
+    // Fail-soft: the thread stays exactly as it is and the next scroll (or
+    // press) retries. An error banner here would sit above a thread that is
+    // perfectly readable.
+  } finally {
+    loadingOlder.value = false
+  }
+}
+
 // Touch devices: never auto-focus the textarea. Popping the on-screen
 // keyboard without the user asking for it shrinks visualViewport and
 // — on portrait, where chat is an absolute overlay that can be
@@ -893,6 +1291,9 @@ onMounted(() => {
   void resolveTTSAvailability().then((available) => {
     ttsAvailable.value = available
   })
+  // Cloud-only and shared across the whole SPA: one request at most, and
+  // none at all on self-host.
+  void runtimeLimits.ensureLoaded()
   loadChatAssistPreference()
   if (!cloudMode.value) {
     startNsfwModeClock()
@@ -991,7 +1392,25 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <div ref="messagesContainer" class="messages-container">
+      <div
+        ref="messagesContainer"
+        class="messages-container"
+        @scroll.passive="handleMessagesScroll"
+      >
+        <!-- 更早的訊息（IV10）。捲到頂端附近會自動載入；這顆按鈕是給
+             「內容比容器短所以捲不動」與鍵盤操作的人用的。 -->
+        <div v-if="canLoadOlder" class="messages-older">
+          <UiButton
+            variant="ghost"
+            size="sm"
+            :loading="loadingOlder"
+            :disabled="loadingOlder"
+            @click="loadOlderMessages"
+          >
+            {{ loadingOlder ? t('chat.history.loadingOlder') : t('chat.history.loadOlder') }}
+          </UiButton>
+        </div>
+
         <ChatFirstTurnGuide
           v-if="localMessages.length === 0 && !sending && !loadingHistory"
           :character-name="character.name"
@@ -1000,24 +1419,34 @@ onUnmounted(() => {
           @select-starter="useStarterMessage"
         />
 
-        <ChatBubble
-          v-for="(msg, i) in localMessages"
-          :key="i"
-          :message="msg"
-          :character-id="character?.id ?? null"
-          :tts-available="ttsAvailable"
-          :animate-reveal="revealingMessageIndex === i"
-          :text-message-mode="interactionMode === 'dm'"
-          @reveal-complete="handleBubbleRevealComplete(i)"
-          @reveal-progress="handleBubbleRevealProgress(i)"
-          @insufficient-credits="creditsExhausted = true"
-        />
+        <template v-for="(msg, i) in localMessages" :key="i">
+          <!-- 旁白走場景框，不是氣泡：說話的是故事本身。 -->
+          <SceneFrame
+            v-if="isSceneNarration(msg)"
+            :text="msg.content"
+            :title="i === sceneHeadingAt ? storySceneSession?.title : null"
+            :location="i === sceneHeadingAt ? storySceneSession?.location : null"
+            :mood="i === sceneHeadingAt ? storySceneSession?.mood : null"
+            :closing="i === closingNarrationIndex"
+          />
+          <ChatBubble
+            v-else
+            :message="msg"
+            :character-id="character?.id ?? null"
+            :tts-available="ttsUsable"
+            :animate-reveal="revealingMessageIndex === i"
+            :text-message-mode="interactionMode === 'dm'"
+            @reveal-complete="handleBubbleRevealComplete(i)"
+            @reveal-progress="handleBubbleRevealProgress(i)"
+            @insufficient-credits="creditsExhausted = true"
+          />
+        </template>
         <!-- 串流中的 bubble -->
         <ChatBubble
           v-if="streamingText"
           :message="{ role: 'assistant', content: streamingText }"
           :character-id="character?.id ?? null"
-          :tts-available="ttsAvailable"
+          :tts-available="ttsUsable"
           @insufficient-credits="creditsExhausted = true"
         />
         <!-- 首 token 到達前的 typing indicator -->
@@ -1050,6 +1479,32 @@ onUnmounted(() => {
       </div>
 
       <div class="chat-input-area">
+        <!-- 起幕：放在輸入框正上方，讓「想不到要說什麼」的玩家一眼看到。 -->
+        <StorySceneControl
+          :scene-open="storySceneActive"
+          :scene-title="storySceneSession?.title ?? null"
+          :opening="storySceneOpening"
+          :ending="storySceneEnding"
+          :disabled="storySceneControlDisabled"
+          :unavailable="storySceneUnavailable"
+          :error-message="storySceneErrorMessage"
+          :quota-note="storySceneQuotaNote"
+          :quota-exhausted="storySceneQuotaExhausted"
+          @open="handleStorySceneOpen"
+          @end="handleStorySceneEnd"
+        >
+          <!-- 開場一口價：按之前就看得到。場景裡的每一輪是普通聊天、照
+               chat 計價，所以價格只掛在按鈕旁、不掛在場景框上。查不到
+               價格（自架、按用量計費）時連節點都不輸出。 -->
+          <template #price>
+            <ActionPriceHint
+              :action-key="ACTION_STORY_SCENE_OPEN"
+              tooltip-key="credits.price.storySceneTooltip"
+              variant="chip"
+            />
+          </template>
+        </StorySceneControl>
+
         <ChatAssistDiscoveryHint
           :visible="chatAssistHintVisible"
           :character-name="characterDisplayName"
@@ -1110,6 +1565,14 @@ onUnmounted(() => {
             {{ t('chat.assist.empty') }}
           </div>
         </div>
+
+        <!-- 場景中的建議行動：填入輸入框、不自動送出（沿既有 chip 慣例）。 -->
+        <StorySceneChips
+          v-if="storySceneActive"
+          :actions="storySceneChips"
+          :disabled="sending"
+          @select="useStarterMessage"
+        />
 
         <div
           v-if="stagedAttachments.length > 0 || uploadError"
@@ -1539,6 +2002,32 @@ onUnmounted(() => {
      which on iOS can otherwise lift the input area above the keyboard
      unexpectedly mid-scroll. */
   overscroll-behavior: contain;
+}
+
+/* 離屏訊息不進 layout / paint（IV5-C, 計畫 D6-3）。
+   只掛在兩種「訊息項」上，不是 `> *`：載入更早的按鈕、首輪引導、typing
+   indicator、螢火／試玩卡片都是單一、恆在兩端的元素，套上 paint containment
+   只有風險沒有收益。
+
+   `contain-intrinsic-size` 的兩件事：
+   - `auto` 關鍵字＝渲染過一次之後改用記住的真實尺寸，這是「已經捲過的訊息
+     不會再讓捲軸長度跳動」的關鍵，別拿掉。
+   - 114px 是實測平均，不是猜的：那條被量到的對話串是 316 則訊息、39059px
+     捲動高度，扣掉 315 個 10px gap ＝ 每則約 113.6px。只有沒渲染過的訊息會
+     用到它。單值形式（寬高同值）是刻意的——寬度估錯不影響任何東西（離屏不
+     繪製、也不會撐出橫向捲動），而四值語法一旦有瀏覽器解析不了，整條宣告會
+     被丟掉，離屏訊息就變成 0 高度，捲軸直接壞掉。 */
+.messages-container > .bubble,
+.messages-container > .scene-frame {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 114px;
+}
+
+/* 更早的訊息入口（IV10）。只有版面規則：視覺屬性交給 UiButton。 */
+.messages-older {
+  display: flex;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .chat-credits-notice {

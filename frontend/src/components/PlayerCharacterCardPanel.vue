@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
 import CharacterCardGalleryModal from '@/components/CharacterCardGalleryModal.vue'
+import CharacterLimitAdvisory from '@/components/CharacterLimitAdvisory.vue'
 import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
 import type { Character, InitialRelationshipPayload } from '@/types/character'
 import {
@@ -32,6 +33,7 @@ const { pt } = usePlayerCopy()
 const packs = ref<CharacterCardPackSummary[]>([])
 const loadingPacks = ref(false)
 const packsError = ref<string | null>(null)
+const officialCardsUnavailable = ref(false)
 const exporting = ref(false)
 const importing = ref(false)
 const previewing = ref(false)
@@ -43,6 +45,10 @@ const browseTranslate = ref(false)
 const translatingBrowse = ref(false)
 const browseTranslateError = ref<string | null>(null)
 const translatedBrowseCards = ref<Record<string, CharacterCardPreview>>({})
+// 官方卡的 list 項只有 title/summary/tags/author/一張圖；personality/interests/
+// appearance/companions 等要靠 preview 才有（OC6g §3）。開卡時零計費、零 LLM，
+// 走 Core 端 TTL cache，所以每次瀏覽到一張新的官方卡就補打一次不吃虧。
+const enrichedBrowseCards = ref<Record<string, CharacterCardPreview>>({})
 const previewVisible = ref(false)
 const originalPreviewCard = ref<CharacterCardPreview | null>(null)
 const translatedPreviewCard = ref<CharacterCardPreview | null>(null)
@@ -59,12 +65,13 @@ const pendingRelationshipAction = ref<
 let previewRequestToken = 0
 let browseRequestToken = 0
 
-const browseCards = computed<CharacterCardPreview[]>(() => {
-  if (!browseTranslate.value) {
-    return packs.value
-  }
-  return packs.value.map((card) => translatedBrowseCards.value[card.pack_id] ?? card)
-})
+const browseCards = computed<CharacterCardPreview[]>(() => (
+  packs.value.map((card) => (
+    (browseTranslate.value ? translatedBrowseCards.value[card.pack_id] : undefined)
+    ?? enrichedBrowseCards.value[card.pack_id]
+    ?? card
+  ))
+))
 
 const previewCards = computed(() => {
   const card = previewTranslate.value && translatedPreviewCard.value
@@ -83,7 +90,9 @@ async function loadPacks() {
   loadingPacks.value = true
   packsError.value = null
   try {
-    packs.value = await listCharacterCards()
+    const catalog = await listCharacterCards()
+    packs.value = catalog.cards
+    officialCardsUnavailable.value = catalog.official_cards_unavailable
   } catch (error) {
     packsError.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -98,8 +107,10 @@ async function openBrowse() {
   translatingBrowse.value = false
   browseTranslateError.value = null
   translatedBrowseCards.value = {}
+  enrichedBrowseCards.value = {}
   browseRequestToken += 1
   await loadPacks()
+  void ensureActiveBrowseCardDetailed()
 }
 
 async function exportSelectedCharacter() {
@@ -188,9 +199,7 @@ async function setBrowseTranslate(enabled: boolean) {
 
 function changeBrowseIndex(index: number) {
   browseIndex.value = index
-  if (browseTranslate.value) {
-    void ensureActiveBrowseCardTranslated()
-  }
+  void ensureActiveBrowseCardDetailed()
 }
 
 async function ensureActiveBrowseCardTranslated() {
@@ -220,6 +229,47 @@ async function ensureActiveBrowseCardTranslated() {
     if (requestToken === browseRequestToken) {
       translatingBrowse.value = false
     }
+  }
+}
+
+/**
+ * The active card's full detail, if it needs one. Translate mode already
+ * fetches full detail as a side effect of translating, so this only takes
+ * the enrichment path when translate is off — never both for the same card.
+ */
+async function ensureActiveBrowseCardDetailed() {
+  if (browseTranslate.value) {
+    await ensureActiveBrowseCardTranslated()
+    return
+  }
+  await ensureActiveBrowseCardEnriched()
+}
+
+/**
+ * A cloud card's list row only carries title/summary/tags/author/one image
+ * (OC6g §3) — the catalog document is thin by design. Fetching the full
+ * preview is a cache read on the Core side and never calls a model, so it
+ * costs nothing to do it once per card, the moment the player is actually
+ * looking at it.
+ */
+async function ensureActiveBrowseCardEnriched() {
+  const card = packs.value[browseIndex.value]
+  const packId = card?.pack_id
+  if (!card || !packId || card.source !== 'cloud' || enrichedBrowseCards.value[packId]) {
+    return
+  }
+  const requestToken = ++browseRequestToken
+  try {
+    const detailed = await previewCharacterCardPack(packId)
+    if (requestToken !== browseRequestToken) return
+    enrichedBrowseCards.value = {
+      ...enrichedBrowseCards.value,
+      [packId]: detailed,
+    }
+  } catch {
+    // Fail-soft: the thin list summary keeps rendering and install still
+    // works off the pack id alone. One card's detail failing to load must
+    // not interrupt browsing the rest of the shelf.
   }
 }
 
@@ -268,6 +318,7 @@ function resetBrowseModal() {
   translatingBrowse.value = false
   browseTranslateError.value = null
   translatedBrowseCards.value = {}
+  enrichedBrowseCards.value = {}
 }
 
 async function confirmPreviewImport(_card?: CharacterCardPreview) {
@@ -385,6 +436,9 @@ defineExpose({
       </UiButton>
     </div>
 
+    <!-- 帶入角色卡＝建立一位角色，吃的是同一組 hosted 上限；按鈕照樣可按。 -->
+    <CharacterLimitAdvisory />
+
     <input
       ref="importInputRef"
       type="file"
@@ -404,6 +458,7 @@ defineExpose({
       :translate-enabled="browseTranslate"
       :translate-loading="translatingBrowse"
       :translate-error="browseTranslateError"
+      :official-cards-unavailable="officialCardsUnavailable"
       @close="closeBrowse"
       @change="changeBrowseIndex"
       @confirm="installPack"

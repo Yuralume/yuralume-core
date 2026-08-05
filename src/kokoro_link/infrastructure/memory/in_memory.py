@@ -10,12 +10,25 @@ from math import sqrt
 
 from kokoro_link.contracts.memory import (
     MemoryRepositoryPort,
+    MemorySummary,
     ScoredMemory,
     WorldScope,
 )
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC before comparing.
+
+    Postgres does this for us on the SQL path (both sides are
+    ``timestamptz``); in-process we would otherwise raise ``TypeError``
+    the first time a caller hands the keyset cursor over as a naive
+    datetime."""
+    return value if value.tzinfo is not None else value.replace(
+        tzinfo=timezone.utc,
+    )
 
 
 def _matches_world(item: MemoryItem, world_scope: WorldScope) -> bool:
@@ -119,6 +132,23 @@ class InMemoryMemoryRepository(MemoryRepositoryPort):
             items = [it for it in items if _matches_world(it, world_scope)]
         items.sort(key=lambda it: it.created_at, reverse=True)
         return items
+
+    async def list_page_for_character(
+        self,
+        character_id: str,
+        *,
+        kinds: Sequence[MemoryKind] | None = None,
+        world_scope: WorldScope = "all",
+        limit: int = 50,
+        before: datetime | None = None,
+    ) -> list[MemorySummary]:
+        items = await self.list_all_for_character(
+            character_id, kinds=kinds, world_scope=world_scope,
+        )
+        if before is not None:
+            cutoff = _as_utc(before)
+            items = [it for it in items if _as_utc(it.created_at) < cutoff]
+        return [MemorySummary.from_item(it) for it in items[:limit]]
 
     async def count_for_character(self, character_id: str) -> int:
         return len(self._by_character.get(character_id, []))

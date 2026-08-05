@@ -156,6 +156,74 @@ def test_suggest_beat_options_round_trips() -> None:
     assert body["scene_types"] == ["encounter"]
 
 
+# ---------- generate-summary --------------------------------------------
+
+
+def test_generate_summary_round_trips_position_proposal() -> None:
+    """OP1-B: the generate-summary response carries the player-position
+    proposal alongside the prose so the wizard can pre-fill the draft's
+    two OP0 columns, not just the summary text."""
+    payload = (
+        '{"summary": "鏡子裡只剩自己，呼吸卻還是不夠穩。", '
+        '"operator_position": "present", "operator_note": "你在一旁看著"}'
+    )
+    client = _client(_build_container(payload))
+    resp = client.post(
+        "/api/v1/arc-templates/intake/generate-summary",
+        json={
+            "beat": {
+                "sequence": 0, "day_offset": 0,
+                "title": "第一次撞牆", "tension": "rising",
+                "scene_type": "conflict", "location": "音樂教室",
+                "scene_characters": ["指導老師"],
+                "dramatic_question": "她要承認嗎？",
+            },
+            "context": {
+                "template_title": "三週的試鏡",
+                "premise": "她報名了試鏡。",
+                "theme": "ambition",
+                "tone": "dramatic",
+                "duration_days": 14,
+                "world_frames": ["modern"],
+                "beat_position": 1,
+                "total_beats": 6,
+                "day_offset": 5,
+                "tension": "rising",
+                "prior_titles": [],
+            },
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "鏡子" in body["summary"]
+    assert body["operator_position"] == "present"
+    assert body["operator_note"] == "你在一旁看著"
+
+
+def test_generate_summary_defaults_position_to_unjudged_when_absent() -> None:
+    """Plain-prose model response (no JSON envelope) -> summary still
+    comes through, position/note default to unjudged rather than the
+    endpoint failing."""
+    client = _client(_build_container("鏡子裡只剩自己，呼吸卻還是不夠穩。"))
+    resp = client.post(
+        "/api/v1/arc-templates/intake/generate-summary",
+        json={
+            "beat": {
+                "sequence": 0, "day_offset": 0, "title": "t",
+            },
+            "context": {
+                "template_title": "t", "premise": "p", "theme": "ambition",
+                "beat_position": 0, "total_beats": 1, "day_offset": 0,
+            },
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "鏡子" in body["summary"]
+    assert body["operator_position"] is None
+    assert body["operator_note"] is None
+
+
 # ---------- save -------------------------------------------------------
 
 
@@ -183,6 +251,8 @@ def test_save_persists_template_and_returns_full_payload() -> None:
                         "scene_characters": ["夏目"],
                         "dramatic_question": "她敢嗎？",
                         "required": True,
+                        "operator_position": "central",
+                        "operator_note": "她要向你坦白",
                     },
                 ],
             },
@@ -194,6 +264,10 @@ def test_save_persists_template_and_returns_full_payload() -> None:
     assert body["template_id"] == "test_route_save"
     assert body["template"]["title"] == "REST 儲存測試"
     assert body["template"]["tone"] == "dramatic"
+    # OP0-B: the wizard save round trip must carry the player-position
+    # pair through the beat payload, not just the NPC-facing fields.
+    assert body["template"]["beats"][0]["operator_position"] == "central"
+    assert body["template"]["beats"][0]["operator_note"] == "她要向你坦白"
 
     # The row lands in the DB-backed repo owned by the test user.
     # No filesystem side-effect — that was the whole point of the
@@ -204,6 +278,46 @@ def test_save_persists_template_and_returns_full_payload() -> None:
             "test_route_save", user_id=_TEST_USER_ID,
         ),
     ) is not None
+
+
+def test_save_rejects_illegal_operator_position_with_422() -> None:
+    """Medium 4 (intake-side): the same payload family as the PATCH
+    management route restricts ``operator_position`` to the domain's
+    closed vocabulary. An off-vocabulary value is now rejected at
+    request-validation time (422) instead of reaching
+    ``ArcTemplateBeat.create`` and being remapped to a generic 409 by
+    ``save_template``'s ``ValueError`` handling."""
+    container = _build_container()
+    client = _client(container)
+    resp = client.post(
+        "/api/v1/arc-templates",
+        json={
+            "draft": {
+                "id": "test_route_save_bad_position",
+                "title": "非法位置測試",
+                "premise": "一段測試 premise，足夠長度通過驗證。",
+                "theme": "ambition",
+                "tone": "dramatic",
+                "duration_days": 14,
+                "world_frames": ["modern"],
+                "required_traits": [],
+                "beats": [
+                    {
+                        "sequence": 0, "day_offset": 0,
+                        "title": "起點", "summary": "場景一摘要。",
+                        "tension": "setup", "scene_type": "encounter",
+                        "location": "教室",
+                        "scene_characters": ["夏目"],
+                        "dramatic_question": "她敢嗎？",
+                        "required": True,
+                        "operator_position": "protagonist",
+                    },
+                ],
+            },
+            "overwrite": False,
+        },
+    )
+    assert resp.status_code == 422
 
 
 def test_save_returns_409_on_id_collision() -> None:

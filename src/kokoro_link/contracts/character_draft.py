@@ -28,6 +28,11 @@ from kokoro_link.domain.value_objects.visual_subject import (
 class ImageInput:
     data: bytes
     mime_type: str
+    public_url: str | None = None
+    """Absolute, provider-fetchable public URL for this image, filled in by
+    the upload side (application layer) when it already persisted the bytes
+    to object storage; the generator sends this URL instead of an inline
+    base64 data URL when the resolved model has ``prefers_public_image_urls``."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,10 +5,13 @@ its ``_call`` is patched to return canned strings. This keeps the test
 focused on the parsing/sanitisation behaviour.
 """
 
+import base64
+import logging
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from kokoro_link.application.services.feature_keys import (
@@ -16,8 +19,13 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_IMAGE_RECOGNITION,
 )
 from kokoro_link.contracts.character_draft import ImageInput
+from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
+from kokoro_link.contracts.llm import ImageInputRejectedError
 from kokoro_link.infrastructure.character_draft.llm_generator import (
     LLMCharacterDraftGenerator,
+)
+from kokoro_link.infrastructure.llm.cloud_gateway_model import (
+    CloudGatewayChatModel,
 )
 from kokoro_link.contracts.character_draft import CompanionGenerationContext
 from kokoro_link.infrastructure.character_draft.stub import (
@@ -32,6 +40,16 @@ def _generator() -> LLMCharacterDraftGenerator:
         api_key="test",
         model="test-model",
     )
+
+
+class _MockAsyncClient(httpx.AsyncClient):
+    """Same transport stub the Cloud gateway adapter's own tests use."""
+
+    def __init__(self, handler, **kwargs) -> None:  # noqa: ANN001, ANN003
+        super().__init__(
+            transport=httpx.MockTransport(handler),
+            timeout=kwargs["timeout"],
+        )
 
 
 class _RecordingModel:
@@ -72,6 +90,26 @@ class _RecordingModel:
 
     async def list_models(self) -> list[str]:
         return []
+
+
+class _PublicUrlAwareModel(_RecordingModel):
+    """A model that declares the Cloud-gateway carrier preference.
+
+    ``_RecordingModel`` deliberately doesn't declare
+    ``prefers_public_image_urls`` at all — that mirrors legacy adapters and
+    keeps the ``getattr(..., False)`` default under test. This subclass is for
+    the adapters that do declare it (Cloud gateway = True, self-host = False).
+    """
+
+    def __init__(
+        self,
+        *,
+        supports_vision: bool,
+        response: str,
+        prefers_public_image_urls: bool,
+    ) -> None:
+        super().__init__(supports_vision=supports_vision, response=response)
+        self.prefers_public_image_urls = prefers_public_image_urls
 
 
 class _RoutingProvider:
@@ -426,6 +464,320 @@ class TestLLMGeneratorParsing:
         final_prompt = str(draft_model.calls[0]["prompt"])
         assert "圖片狀態" in final_prompt
         assert "不要假裝看過圖片" in final_prompt
+
+
+_PUBLIC_IMAGE_URL = "https://example.com/v1/public/draft-uploads/u1/x.png"
+
+
+class TestDraftImageCarrier:
+    """VP4: hosted Cloud routes drafts through a gateway with a bounded
+    serialized request budget, so an inline base64 image always blows the
+    envelope. When the resolved model prefers public URLs *and* the upload
+    side managed to persist the bytes, we send the URL instead."""
+
+    @pytest.mark.asyncio
+    async def test_vision_draft_model_receives_public_url_when_preferred(
+        self,
+    ) -> None:
+        draft_model = _PublicUrlAwareModel(
+            supports_vision=True,
+            response=_draft_response("公開網址直讀"),
+            prefers_public_image_urls=True,
+        )
+        provider = _RoutingProvider(draft_model=draft_model)
+        gen = LLMCharacterDraftGenerator(
+            provider=provider,
+            feature_key=FEATURE_CHARACTER_DRAFT,
+        )
+
+        draft = await gen.generate(
+            prompt="做成校園角色",
+            image=ImageInput(
+                data=b"fake",
+                mime_type="image/png",
+                public_url=_PUBLIC_IMAGE_URL,
+            ),
+        )
+
+        assert draft.name == "公開網址直讀"
+        assert len(draft_model.calls) == 1
+        assert draft_model.calls[0]["image_urls"] == (_PUBLIC_IMAGE_URL,)
+        assert not str(draft_model.calls[0]["image_urls"][0]).startswith("data:")
+        # Resolve-then-generate must keep forwarding the resolved model id.
+        assert draft_model.calls[0]["model"] == "draft-model"
+
+    @pytest.mark.asyncio
+    async def test_image_recognition_route_receives_public_url_when_preferred(
+        self,
+    ) -> None:
+        draft_model = _RecordingModel(
+            supports_vision=False,
+            response=_draft_response("摘要轉寫"),
+        )
+        image_model = _PublicUrlAwareModel(
+            supports_vision=True,
+            response="藍色短髮、白色外套。",
+            prefers_public_image_urls=True,
+        )
+        provider = _RoutingProvider(
+            draft_model=draft_model,
+            image_model=image_model,
+        )
+        gen = LLMCharacterDraftGenerator(
+            provider=provider,
+            feature_key=FEATURE_CHARACTER_DRAFT,
+        )
+
+        draft = await gen.generate(
+            prompt="做成校園角色",
+            image=ImageInput(
+                data=b"fake",
+                mime_type="image/png",
+                public_url=_PUBLIC_IMAGE_URL,
+            ),
+        )
+
+        assert draft.name == "摘要轉寫"
+        assert len(image_model.calls) == 1
+        assert image_model.calls[0]["image_urls"] == (_PUBLIC_IMAGE_URL,)
+        assert not str(image_model.calls[0]["image_urls"][0]).startswith("data:")
+        assert image_model.calls[0]["model"] == "vision-model"
+        assert FEATURE_IMAGE_RECOGNITION in provider.resolve_calls
+
+    @pytest.mark.asyncio
+    async def test_self_host_model_still_receives_inline_data_url(self) -> None:
+        """Reverse pin: a stored public URL must not leak into the request
+        for adapters that talk to the provider directly — self-host has no
+        gateway budget problem and the URL may not even be reachable."""
+        draft_model = _PublicUrlAwareModel(
+            supports_vision=True,
+            response=_draft_response("內聯自架"),
+            prefers_public_image_urls=False,
+        )
+        provider = _RoutingProvider(draft_model=draft_model)
+        gen = LLMCharacterDraftGenerator(
+            provider=provider,
+            feature_key=FEATURE_CHARACTER_DRAFT,
+        )
+
+        draft = await gen.generate(
+            prompt="做成校園角色",
+            image=ImageInput(
+                data=b"fake",
+                mime_type="image/png",
+                public_url=_PUBLIC_IMAGE_URL,
+            ),
+        )
+
+        assert draft.name == "內聯自架"
+        assert len(draft_model.calls) == 1
+        assert str(draft_model.calls[0]["image_urls"][0]).startswith(
+            "data:image/png;base64,",
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_public_url_falls_back_to_inline_data_url(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Degradation pin: the upload side is fail-soft, so ``public_url``
+        can be None even on hosted. Better an oversized inline request that
+        may still fit than an image silently dropped.
+
+        It must not be *silent*, though. This is the only place where the
+        requirement ("this model asked for a URL") and the fact ("there is
+        none") are both in hand, so it is the only place that can say so — the
+        staging side, three layers up, cannot know whether anyone needed it.
+        """
+        draft_model = _PublicUrlAwareModel(
+            supports_vision=True,
+            response=_draft_response("上傳失敗降級"),
+            prefers_public_image_urls=True,
+        )
+        provider = _RoutingProvider(draft_model=draft_model)
+        gen = LLMCharacterDraftGenerator(
+            provider=provider,
+            feature_key=FEATURE_CHARACTER_DRAFT,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            draft = await gen.generate(
+                prompt="做成校園角色",
+                image=ImageInput(data=b"fake", mime_type="image/jpeg"),
+            )
+
+        assert draft.name == "上傳失敗降級"
+        assert len(draft_model.calls) == 1
+        assert str(draft_model.calls[0]["image_urls"][0]).startswith(
+            "data:image/jpeg;base64,",
+        )
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any("prefers public image URLs" in text for text in warnings), warnings
+
+    @pytest.mark.asyncio
+    async def test_self_host_carrier_fallback_stays_silent(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The warning fires where the requirement exists, nowhere else.
+
+        Self-host has no gateway budget and no object storage to stage into;
+        inline is its normal, correct path. Warning there would train operators
+        to ignore the message that matters.
+        """
+        draft_model = _PublicUrlAwareModel(
+            supports_vision=True,
+            response=_draft_response("自架安靜"),
+            prefers_public_image_urls=False,
+        )
+        provider = _RoutingProvider(draft_model=draft_model)
+        gen = LLMCharacterDraftGenerator(
+            provider=provider,
+            feature_key=FEATURE_CHARACTER_DRAFT,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await gen.generate(
+                prompt="做成校園角色",
+                image=ImageInput(data=b"fake", mime_type="image/jpeg"),
+            )
+
+        noisy = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert noisy == [], [r.getMessage() for r in noisy]
+
+
+class TestDraftImageCarrierThroughTheRealAdapter:
+    """L4: the carrier decision must survive the *real* adapter, not a stub.
+
+    Every test above resolves to a hand-written double that declares
+    ``prefers_public_image_urls`` itself. That pins the generator's branch and
+    nothing else — the assumption actually holding VP4 up is that the flag is
+    still readable on whatever object ``ModelResolver`` hands back, and that
+    the URL the flag selects is what lands on the wire. A wrapper inserted into
+    that chain later (metadata capture, a routing decorator) would not fail a
+    single stub-based test; it would just quietly send base64 again, and the
+    only symptom would be hosted drafts degrading to text-only.
+
+    So this one drives the genuine ``CloudGatewayChatModel`` with a 3 MB image
+    over a mocked transport, and asserts the thing the stubs cannot: the
+    request that leaves is small.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_3mb_image_travels_as_a_url_within_the_gateway_budget(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seen: list[bytes] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": _draft_response("真轉接器")}},
+                    ],
+                },
+            )
+
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+        )
+        adapter = CloudGatewayChatModel(
+            base_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+            default_model="preset-chat",
+            feature_key=FEATURE_CHARACTER_DRAFT,
+            identity=CloudGatewayIdentity(
+                operator_id="cloud:acct_1",
+                account_id="acct_1",
+                tenant_id="tenant_1",
+                character_ref="chr_abc",
+            ),
+        )
+        assert adapter.prefers_public_image_urls is True
+        gen = LLMCharacterDraftGenerator(model_port=adapter)
+
+        # 3 MB — inlined as base64 this is ~4 MB, an order of magnitude over
+        # the adapter's 224 KB wire budget, so the pre-VP4 carrier would be
+        # rejected before the request was ever sent.
+        draft = await gen.generate(
+            prompt="做成校園角色",
+            image=ImageInput(
+                data=b"\x89PNG" + b"\x00" * (3 * 1024 * 1024),
+                mime_type="image/png",
+                public_url=_PUBLIC_IMAGE_URL,
+            ),
+        )
+
+        assert draft.name == "真轉接器"
+        # Exactly one request. The generator swallows an image-path failure and
+        # silently retries text-only, so a count of two would be VP4 not
+        # working while every other assertion here still passed.
+        assert len(seen) == 1
+        content = seen[0]
+        assert _PUBLIC_IMAGE_URL.encode() in content
+        assert b"base64," not in content
+        assert len(content) < 224 * 1024
+
+    @pytest.mark.asyncio
+    async def test_the_same_image_without_a_url_is_rejected_before_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reverse pin that gives the one above its meaning.
+
+        Without ``public_url`` the identical draft cannot be sent at all — so
+        the test above is measuring staging's effect, not an image the budget
+        would have accepted either way. (``generate`` still returns a draft:
+        the generator catches the rejection and retries text-only, which is the
+        degradation VP4 exists to avoid.)
+        """
+        calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": _draft_response("純文字降級")}},
+                    ],
+                },
+            )
+
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+        )
+        adapter = CloudGatewayChatModel(
+            base_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+            default_model="preset-chat",
+            feature_key=FEATURE_CHARACTER_DRAFT,
+            identity=CloudGatewayIdentity(
+                operator_id="cloud:acct_1",
+                account_id="acct_1",
+                tenant_id="tenant_1",
+                character_ref="chr_abc",
+            ),
+        )
+
+        with pytest.raises(ImageInputRejectedError):
+            await adapter.generate(
+                "做成校園角色",
+                image_urls=(
+                    "data:image/png;base64,"
+                    + base64.b64encode(b"\x00" * (3 * 1024 * 1024)).decode(
+                        "ascii",
+                    ),
+                ),
+            )
+
+        assert calls == 0
 
 
 class TestStubGenerator:

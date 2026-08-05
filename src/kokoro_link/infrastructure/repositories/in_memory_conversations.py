@@ -2,6 +2,7 @@ from dataclasses import replace
 
 from kokoro_link.contracts.repositories import (
     AppendResult,
+    ConversationMessagePage,
     ConversationRepositoryPort,
 )
 from kokoro_link.domain.entities.conversation import (
@@ -90,17 +91,65 @@ class InMemoryConversationRepository(ConversationRepositoryPort):
         self._conversations[conversation.id] = merged
         self._order.append(conversation.id)
 
-    async def latest_for_character(
-        self, character_id: str, *, source: str | None = "web",
+    def _select_latest(
+        self, character_id: str, source: str | None,
     ) -> Conversation | None:
+        """Which conversation is "the latest" — the single source of that
+        answer for both the full read and the paginated one, mirroring the SA
+        twin's shared statement so pagination cannot drift the selection."""
         for conv_id in reversed(self._order):
             conversation = self._conversations[conv_id]
             if conversation.character_id != character_id:
                 continue
             if source is not None and conversation.source != source:
                 continue
-            return self._stamp_read(conversation)
+            return conversation
         return None
+
+    async def latest_for_character(
+        self, character_id: str, *, source: str | None = "web",
+    ) -> Conversation | None:
+        conversation = self._select_latest(character_id, source)
+        if conversation is None:
+            return None
+        return self._stamp_read(conversation)
+
+    async def latest_page_for_character(
+        self,
+        character_id: str,
+        *,
+        source: str | None = "web",
+        limit: int,
+        before_position: int | None = None,
+    ) -> ConversationMessagePage | None:
+        """SA twin (IV10). ``position`` is the list index here: the CAS append
+        assigns positions from ``len(messages)``, so index and position are the
+        same number and the cursor arithmetic is identical to the SQL one."""
+        conversation = self._select_latest(character_id, source)
+        if conversation is None:
+            return None
+        end = (
+            len(conversation.messages)
+            if before_position is None
+            else max(0, min(before_position, len(conversation.messages)))
+        )
+        if limit <= 0:
+            return ConversationMessagePage(
+                conversation_id=conversation.id,
+                character_id=conversation.character_id,
+                messages=(),
+                has_more=False,
+                next_before=None,
+            )
+        start = max(0, end - limit)
+        has_more = start > 0
+        return ConversationMessagePage(
+            conversation_id=conversation.id,
+            character_id=conversation.character_id,
+            messages=tuple(conversation.messages[start:end]),
+            has_more=has_more,
+            next_before=start if has_more else None,
+        )
 
     async def recent_messages_for_character(
         self,

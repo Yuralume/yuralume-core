@@ -8,6 +8,8 @@ the vector; the next post-turn write will refresh it).
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from kokoro_link.api.dependencies import (
@@ -17,34 +19,59 @@ from kokoro_link.api.dependencies import (
     get_current_user_id,
 )
 from kokoro_link.application.dto.memory import (
+    MemoryPageResponse,
     MemoryResponse,
     MemoryScoredResponse,
     MemorySearchRequest,
     MemoryUpdateRequest,
 )
+from kokoro_link.application.services.memory_admin_service import (
+    DEFAULT_PAGE_LIMIT,
+)
 from kokoro_link.bootstrap.container import ServiceContainer
 
 router = APIRouter(tags=["memory"])
 
+_MAX_LIMIT = 200
+"""Hard ceiling on a single page. The bug this endpoint shipped with was
+not "the default was too high" — it was that ``limit`` was never
+declared at all, so FastAPI dropped it and every caller got the whole
+table. A declared, bounded parameter is what closes that."""
+
 
 @router.get(
     "/characters/{character_id}/memories",
-    response_model=list[MemoryResponse],
+    response_model=MemoryPageResponse | list[MemoryResponse],
 )
 async def list_memories(
     character_id: str,
     kind: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=_MAX_LIMIT),
+    before: datetime | None = Query(default=None),
     container: ServiceContainer = Depends(get_container),
     _owned_character_id: str = Depends(ensure_owned_character_id),
-) -> list[MemoryResponse]:
+) -> MemoryPageResponse | list[MemoryResponse]:
+    """List a character's memories, with a legacy rolling-deploy seam.
+
+    ``limit`` + ``before`` -> ``{items, has_more, next_before}``, the feed's
+    keyset convention (plan D8).  A request without either pagination
+    parameter keeps the old bare-array response so cached pre-IV8 clients stay
+    usable while replicas and browser assets roll forward.
+    """
     service = container.memory_admin_service
     try:
-        items = await service.list_for_character(character_id, kind=kind)
+        if limit is None and before is None:
+            items = await service.list_for_character(character_id, kind=kind)
+            return [MemoryResponse.from_domain(item) for item in items]
+        page_limit = limit or DEFAULT_PAGE_LIMIT
+        summaries = await service.list_page_for_character(
+            character_id, kind=kind, limit=page_limit, before=before,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
         ) from exc
-    return [MemoryResponse.from_domain(item) for item in items]
+    return MemoryPageResponse.from_summaries(summaries, limit=page_limit)
 
 
 @router.post(

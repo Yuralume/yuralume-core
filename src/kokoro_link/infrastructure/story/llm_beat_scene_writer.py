@@ -14,6 +14,7 @@ from kokoro_link.contracts.story_arc import (
     StoryBeatSceneDraft,
     StoryBeatSceneWriterPort,
 )
+from kokoro_link.domain.services.story_tone_policy import resolve_prompt_tone
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
@@ -21,6 +22,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.beat_operator_position import (
+    render_beat_operator_position_block,
+)
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
@@ -175,12 +179,16 @@ class LLMStoryBeatSceneWriter(StoryBeatSceneWriterPort):
         model: ChatModelPort | None = None,
         provider: ActiveLLMProviderPort | None = None,
         feature_key: str | None = None,
+        cloud_mode: bool = False,
     ) -> None:
         self._resolver = ModelResolver(
             provider=provider,
             model=model,
             feature_key=feature_key,
         )
+        # GF6 — hosted tone policy. Default ``False`` keeps self-host
+        # prompts byte-identical (see ``domain.services.story_tone_policy``).
+        self._cloud_mode = cloud_mode
 
     async def write_scene(
         self, context: StoryBeatSceneContext,
@@ -191,7 +199,7 @@ class LLMStoryBeatSceneWriter(StoryBeatSceneWriterPort):
         if await self._resolver.is_fake(character=context.character):
             return await _fallback()
 
-        prompt = _build_prompt(context)
+        prompt = _build_prompt(context, cloud_mode=self._cloud_mode)
         try:
             raw = await self._resolver.generate(
                 prompt,
@@ -228,7 +236,9 @@ class LLMStoryBeatSceneWriter(StoryBeatSceneWriterPort):
         )
 
 
-def _build_prompt(context: StoryBeatSceneContext) -> str:
+def _build_prompt(
+    context: StoryBeatSceneContext, *, cloud_mode: bool = False,
+) -> str:
     beat = context.beat
     arc = context.arc
     scene_characters = (
@@ -268,7 +278,12 @@ def _build_prompt(context: StoryBeatSceneContext) -> str:
         ),
         arc_title=arc.title,
         arc_premise=arc.premise,
-        arc_tone=arc.tone,
+        # GF6: hosted, ``mature`` renders as ``dramatic`` — this label is
+        # the only channel the arc's tone has into the scene the model
+        # writes, so it is also the whole gate. Self-host: unchanged.
+        arc_tone=resolve_prompt_tone(
+            arc.tone, cloud_mode=cloud_mode, context="beat scene writer",
+        ),
         beat_title=beat.title,
         beat_summary=beat.summary,
         beat_tension=beat.tension,
@@ -279,7 +294,15 @@ def _build_prompt(context: StoryBeatSceneContext) -> str:
         beat_dramatic_question=beat.dramatic_question or "（未指定）",
         beat_required="是" if beat.required else "否",
         attempt_block="\n".join(attempt_lines),
-        user_involvement_policy=context.user_involvement_policy,
+        # OP2-C: the blanket "the user may not be around, write around
+        # them" policy is gone; the beat says where the player stands
+        # and the shared renderer turns that into the same framing the
+        # expander's scene mode uses for the very same beat.
+        operator_position_block=render_beat_operator_position_block(
+            beat.operator_position,
+            beat.operator_note,
+            caller_directive=context.user_involvement_policy,
+        ),
     )
     return f"{language_hint}\n\n{body}" if language_hint else body
 

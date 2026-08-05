@@ -217,6 +217,29 @@ async def test_play_beat_passes_no_user_policy_and_companion_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_default_involvement_policy_is_injected() -> None:
+    """OP2-C. Characterized before flipping: with no caller override the
+    service used to substitute 「使用者目前不保證在場…讓 beat 不依賴使用者
+    也能完成。」 — a standing instruction to route around the player.
+    Retired: an absent override is now simply absent, and the beat's own
+    ``operator_position`` is what the writer frames from.
+    """
+    today = date(2026, 6, 1)
+    writer = _RecordingWriter()
+    scene_service, arc_service, *_ = _services(today, writer)
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+
+    await scene_service.play_beat(
+        character,
+        beat_id=arc.beats[0].id,
+        now=datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert writer.contexts[0].user_involvement_policy == ""
+
+
+@pytest.mark.asyncio
 async def test_play_beat_empty_scene_records_attempt_without_event() -> None:
     today = date(2026, 6, 1)
     scene_service, arc_service, arc_repo, event_repo, memory_repo = _services(

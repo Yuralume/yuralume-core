@@ -1,0 +1,11 @@
+# Deliberately empty.
+#
+# Official character cards are no longer shipped as binaries in this repo —
+# they live in the Yuralume Cloud catalog and every deployment reads them
+# from there (OFFICIAL_CARD_CLOUD_CATALOG_PLAN D1/D5).
+#
+# The directory stays because the local pack mechanism does: drop your own
+# `.lumecard` files here (or point CHARACTER_CARD_PACK_DIR at a folder
+# outside the image) and they appear in the card gallery alongside — or,
+# with the catalog switched off, instead of — the official ones. That is the
+# air-gapped path, and it needs no network at all.

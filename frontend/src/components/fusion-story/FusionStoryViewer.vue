@@ -2,7 +2,11 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { Character } from '@/types/character'
-import type { FusionStory, FusionStoryBeat } from '@/types/fusionStory'
+import type {
+  FusionStory,
+  FusionStoryBeat,
+  FusionToArcOperatorMode,
+} from '@/types/fusionStory'
 import {
   exportFusionStory,
   iterateFusionBeat,
@@ -37,7 +41,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'updated', story: FusionStory): void
   (e: 'error', message: string): void
-  (e: 'adapt-requested'): void
+  (e: 'adapt-requested', mode: FusionToArcOperatorMode): void
   (e: 'continue-requested'): void
   (e: 'branch-requested'): void
 }>()
@@ -328,7 +332,7 @@ async function handlePolish() {
       :celebrate="celebrate"
       :adapting-to-arc="adaptingToArc"
       :exporting-format="exportingFormat"
-      @adapt="emit('adapt-requested')"
+      @adapt="(mode: FusionToArcOperatorMode) => emit('adapt-requested', mode)"
       @continue="emit('continue-requested')"
       @branch="emit('branch-requested')"
       @export="handleExport"

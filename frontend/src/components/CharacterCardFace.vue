@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { UiBadge, UiButton } from '@/components/ui'
+import { UiBadge, UiButton, UiImage } from '@/components/ui'
+import { isCloudCard } from '@/utils/characterCardSource'
 import type { CharacterCardPreview } from '@/utils/api/characters'
 
 const props = withDefaults(
@@ -36,6 +37,14 @@ const initial = computed(() => (props.card.name || title.value || '?').trim().ch
 
 const detailRows = computed(() => {
   const rows: Array<{ label: string; value: string }> = []
+  // A cloud card's response body carries no structural settings — the
+  // catalog only publishes prose and images (OC6g). The fields below sit at
+  // the shared DTO's non-empty defaults on a cloud card (a "medium" band on
+  // every disposition axis, "modern" world, 3/day proactive cadence…), which
+  // would read as facts about the character if shown. Skip them for a cloud
+  // card; they become real once the card is installed and the `.lumecard`
+  // itself is unpacked.
+  const structural = !isCloudCard(props.card)
   addRow(rows, 'summary', props.card.summary)
   addListRow(rows, 'personality', props.card.personality)
   addListRow(rows, 'interests', props.card.interests)
@@ -46,30 +55,38 @@ const detailRows = computed(() => {
   addRow(rows, 'genderIdentity', props.card.gender_identity)
   addRow(rows, 'pronoun', props.card.third_person_pronoun)
   addRow(rows, 'visualPresentation', props.card.visual_gender_presentation)
-  addRow(
-    rows,
-    'visualSubjectType',
-    props.card.visual_subject_type
-      ? t(`characterCreate.fields.visualSubjectType.options.${props.card.visual_subject_type}`)
-      : '',
-  )
-  addRow(rows, 'birthday', props.card.date_of_birth ?? '')
-  addRow(rows, 'worldFrame', props.card.world_frame)
+  if (structural) {
+    addRow(
+      rows,
+      'visualSubjectType',
+      props.card.visual_subject_type
+        ? t(`characterCreate.fields.visualSubjectType.options.${props.card.visual_subject_type}`)
+        : '',
+    )
+    addRow(rows, 'birthday', props.card.date_of_birth ?? '')
+    addRow(rows, 'worldFrame', props.card.world_frame)
+  }
   addListRow(rows, 'worldTopics', props.card.world_topics)
   addListRow(rows, 'subscribedCategories', props.card.subscribed_categories)
   addListRow(rows, 'excludedTopics', props.card.excluded_topics)
-  addRow(rows, 'disposition', dispositionLabel.value)
+  if (structural) {
+    addRow(rows, 'disposition', dispositionLabel.value)
+  }
   addRow(rows, 'personalityType', personalityTypeLabel.value)
-  addRow(rows, 'cadence', cadenceLabel.value)
+  if (structural) {
+    addRow(rows, 'cadence', cadenceLabel.value)
+  }
   addListRow(rows, 'companions', props.card.companions.map((c) => c.role ? `${c.name} (${c.role})` : c.name))
-  addListRow(rows, 'arcTitles', props.card.bundled_arc_titles)
-  addListRow(rows, 'arcSeriesTitles', props.card.bundled_arc_series_titles)
-  if (props.card.bundled_arc_series_member_count) {
-    addRow(
-      rows,
-      'arcSeriesMembers',
-      String(props.card.bundled_arc_series_member_count),
-    )
+  if (structural) {
+    addListRow(rows, 'arcTitles', props.card.bundled_arc_titles)
+    addListRow(rows, 'arcSeriesTitles', props.card.bundled_arc_series_titles)
+    if (props.card.bundled_arc_series_member_count) {
+      addRow(
+        rows,
+        'arcSeriesMembers',
+        String(props.card.bundled_arc_series_member_count),
+      )
+    }
   }
   addRow(rows, 'note', props.card.note)
   return rows
@@ -154,11 +171,18 @@ function markImageFailed() {
       </header>
 
       <div class="character-card-face__art">
-        <img
+        <!-- The card is capped at 320px; the art window gives back 7px of
+             foil padding and 12px of margin either side, so 282px is its
+             ceiling. `@error` still reaches `markImageFailed` — UiImage
+             re-emits it — and the `v-else` initial is the real fallback. -->
+        <UiImage
           v-if="showImage"
           class="character-card-face__image"
+          variant="content"
           :src="activeImage"
           :alt="title"
+          sizes="282px"
+          aspect-ratio="3 / 4"
           @error="markImageFailed"
         />
         <div v-else class="character-card-face__fallback" aria-hidden="true">

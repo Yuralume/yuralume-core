@@ -20,6 +20,7 @@ from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.contracts.story_arc import StoryArcPlannerPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import (
+    OPERATOR_POSITION_CENTRAL,
     StoryArc,
     StoryArcBeat,
     TENSION_SETUP,
@@ -49,6 +50,8 @@ class _FixedPlanner(StoryArcPlannerPort):
             scheduled_date=start_date,
             title="first", summary="the first beat",
             tension=TENSION_SETUP,
+            operator_position=OPERATOR_POSITION_CENTRAL,
+            operator_note="她要向你坦白",
         )
         return arc.with_beats([beat])
 
@@ -155,6 +158,11 @@ def test_start_arc_returns_201_and_body_shape() -> None:
     assert body["status"] == "active"
     assert body["character_id"] == "c1"
     assert len(body["beats"]) >= 1
+    # OP0-B: the player-facing arc DTO must carry the player-position
+    # pair through — dropping it here would mean the operator UI never
+    # sees a position the planner or wizard already judged.
+    assert body["beats"][0]["operator_position"] == "central"
+    assert body["beats"][0]["operator_note"] == "她要向你坦白"
 
 
 def test_start_arc_uses_owner_local_today() -> None:

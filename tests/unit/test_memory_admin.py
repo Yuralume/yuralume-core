@@ -7,6 +7,9 @@ Scope:
 - delete: removes single row, 404 on missing
 - search: with embedder surfaces hybrid-ranked results; without embedder
   falls back to recency-ordered similarity=0 list
+
+The list endpoint's pagination and vectorless projection (IV8) have their
+own file: ``test_memory_list_pagination``.
 """
 
 from __future__ import annotations
@@ -81,8 +84,10 @@ async def test_list_returns_items_filtered_by_kind() -> None:
         content="自我反思", salience=0.5,
     ))
 
-    semantic = await admin.list_for_character(character_id, kind="semantic")
-    reflection = await admin.list_for_character(character_id, kind="reflection")
+    semantic = await admin.list_page_for_character(character_id, kind="semantic")
+    reflection = await admin.list_page_for_character(
+        character_id, kind="reflection",
+    )
 
     assert [m.content for m in semantic] == ["物理事實"]
     assert [m.content for m in reflection] == ["自我反思"]
@@ -223,10 +228,26 @@ async def test_routes_list_patch_delete() -> None:
     ))
     client = _client(admin, character_service)
 
-    # List
+    # List — without any pagination parameter the legacy bare array survives
+    # on purpose (the rolling-deploy seam: cached pre-IV8 clients keep
+    # working while replicas and browser assets roll forward).
     resp = client.get(f"/api/v1/characters/{character_id}/memories")
     assert resp.status_code == 200
-    assert len(resp.json()) == 1
+    legacy_body = resp.json()
+    assert isinstance(legacy_body, list)
+    assert len(legacy_body) == 1
+
+    # ...while any pagination parameter opts into the page envelope
+    # (IV8 / plan D8). The single seeded row fits in one page, so this is
+    # the terminal page.
+    resp = client.get(
+        f"/api/v1/characters/{character_id}/memories", params={"limit": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["items"]) == 1
+    assert body["has_more"] is False
+    assert body["next_before"] is None
 
     # Patch
     resp = client.patch(

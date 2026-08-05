@@ -54,6 +54,37 @@ describe('FusionStoryExitHub (SSR render)', () => {
     expect(html).toContain(zhTW.fusionStory.viewer.exportFormats.epub)
   })
 
+  it('offers all three ways for the creator to enter the story', async () => {
+    // OP1-C / plan 拍板 #2 — the conversion never guesses whether the
+    // creator wants to be in their own story; it asks.
+    const html = await render()
+    expect(html).toContain(L.playerModeLabel)
+    expect(html).toContain(L.playerModeWriteIn)
+    expect(html).toContain(L.playerModeObserver)
+    expect(html).toContain(L.playerModeUnchanged)
+  })
+
+  it('pre-selects "write me in" and explains what it will do', async () => {
+    const html = await render()
+    expect(html).toContain('aria-checked="true"')
+    expect(html).toContain(L.playerModeWriteInHint)
+    // Only the selected option's consequence is spelled out, so the row
+    // stays a choice rather than a wall of copy.
+    expect(html).not.toContain(L.playerModeUnchangedHint)
+  })
+
+  it('gives only the selected mode a tab stop (roving tabindex)', async () => {
+    // Codex Low finding: the custom `role="radio"` chip group must behave
+    // like a native radiogroup for keyboard users — only the checked
+    // option is in the Tab order, the rest are reachable via arrow keys
+    // (branching covered by radioGroupKeyboard.test.ts), not Tab.
+    const html = await render()
+    const tabbableCount = (html.match(/tabindex="0"/g) ?? []).length
+    const skippedCount = (html.match(/tabindex="-1"/g) ?? []).length
+    expect(tabbableCount).toBe(1)
+    expect(skippedCount).toBe(2)
+  })
+
   it('hides the celebration banner by default', async () => {
     const html = await render()
     expect(html).not.toContain(L.celebrateTitle)

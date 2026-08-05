@@ -13,6 +13,7 @@ from kokoro_link.domain.entities.arc_series import (
     SERIES_STATUS_CONCLUDED,
 )
 from kokoro_link.domain.entities.arc_template import ArcTemplateBinding
+from kokoro_link.domain.services.story_tone_policy import fold_stored_tone
 
 
 class ArcSeriesNotFoundError(ValueError):
@@ -30,10 +31,18 @@ class ArcSeriesService:
         series_repository: ArcSeriesRepositoryPort,
         template_repository: ArcTemplateRepositoryPort,
         character_repository: CharacterRepositoryPort,
+        cloud_mode: bool = False,
     ) -> None:
         self._series_repository = series_repository
         self._template_repository = template_repository
         self._character_repository = character_repository
+        # GF6 — hosted tone policy. ``tone`` is a free-form string that
+        # rides into the season prompts (and into the continuation draft
+        # prompt via the series payload), so the write boundary has to
+        # fold it exactly like the template wizard and the card importer
+        # do. Default ``False`` keeps self-host byte-identical; see
+        # ``domain.services.story_tone_policy``.
+        self._cloud_mode = cloud_mode
 
     async def list_for_user(self, user_id: str) -> list[ArcSeries]:
         return await self._series_repository.list_for_user(user_id)
@@ -69,7 +78,7 @@ class ArcSeriesService:
             title=title,
             premise=premise,
             theme=theme,
-            tone=tone,
+            tone=self._fold_tone(tone, context="arc series create"),
             binding=ArcTemplateBinding(
                 world_frames=tuple(world_frames),
                 required_traits=tuple(required_traits),
@@ -107,7 +116,7 @@ class ArcSeriesService:
             title=title,
             premise=premise,
             theme=theme,
-            tone=tone,
+            tone=self._fold_tone(tone, context="arc series update"),
             binding=ArcTemplateBinding(
                 world_frames=tuple(world_frames),
                 required_traits=tuple(required_traits),
@@ -209,6 +218,17 @@ class ArcSeriesService:
             raise ArcSeriesNotFoundError(f"Character {character_id!r} not found")
         await self.get_for_user(series_id, user_id=user_id)
         return await self._series_repository.get_progress(character_id, series_id)
+
+    def _fold_tone(self, tone: str, *, context: str) -> str:
+        """Write boundary for the series' own tone (GF6).
+
+        Correction rather than refusal, matching the wizard save and the
+        card import: every write surface echoes the stored row back, so
+        the operator sees the substitution instead of being locked out of
+        editing their own series."""
+        return fold_stored_tone(
+            tone, cloud_mode=self._cloud_mode, context=context,
+        )
 
     async def _validate_member_templates(
         self,

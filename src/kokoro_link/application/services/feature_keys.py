@@ -70,6 +70,36 @@ that can land as a StoryEvent even when the user is not available.
 FEATURE_ARC_COMPLETION_MEMORY = "arc_completion_memory"
 """Relationship milestone memory writer when an arc completes."""
 
+FEATURE_STORY_SCENE_OPEN = "story_scene_open"
+"""Player-triggered story scene opening ("起幕").
+
+One call turns the chosen waterfall layer (due beat / forced new season /
+ad-hoc side story) into the scene's opening: narration, the character's
+first performed line, and the scene frame metadata (title, place, mood).
+Distinct from ``arc_scene_write`` — that key performs a beat *without*
+the player present, this one opens a scene the player is about to play
+inside. Foreground: it is the button the player pressed, and the hosted
+one-price charge is raised against it.
+"""
+
+FEATURE_STORY_SCENE_CLOSE = "story_scene_close"
+"""Story scene wrap-up: dramatic-question verdict plus closing narration.
+
+Shared by the manual "end scene" button and the idle-timeout closer, so
+the scene always lands as canon with the same voice. Never invents player
+actions — the closing narration takes the "after you left, she…"
+perspective (STORY_SCENE_PLAN §3.4 red line 1).
+"""
+
+FEATURE_STORY_SCENE_CHIPS = "story_scene_chips"
+"""Suggested in-scene action chips generated after each scene turn.
+
+A separate lightweight call rather than JSON riding along the prose
+stream: 2-3 short candidate moves for the player, semantic (never
+keyword-templated), fail-soft when it errors. Sibling of ``chat_assist``
+— a short UI aid for the player, not the character's canonical reply.
+"""
+
 FEATURE_STORY_EXPAND = "story_expand"
 """Daily gacha → first-person narrative expansion."""
 
@@ -308,6 +338,41 @@ other language transforms. The runtime expander already localizes
 generated output, so this only touches the management-side readability."""
 
 
+FEATURE_SHOWCASE_REVIEW = "showcase_review"
+"""Public-showcase pre-review of a character's own feed posts.
+
+Ops-time, never on a player path: before a post can appear on the public
+wall, this reads it and reports identifying details (city, real name, the
+owner's routine, quoted private exchanges) plus an optional
+*de-identification only* rewrite. It has no authority — the verdict is
+advice the owner acts on in the admin console, and a failed call degrades
+to "needs manual review", never to "assume it's fine". Routed on its own
+key so the owner can pin a careful, low-hallucination model to a job whose
+false negatives are published to strangers."""
+
+
+FEATURE_SHOWCASE_TRANSLATE = "showcase_translate"
+"""Public-showcase translator.
+
+Renders approved showcase posts and the character card / schedule strip
+into the wall's other locales, carrying the character's persona so a
+first-person post does not come back reading like a press release. Kept
+off ``card_translate`` because this is an ops-time batch over
+publication-bound prose, not a player-triggered import step."""
+
+
+FEATURE_OFFICIAL_CARD_TRANSLATE = "official_card_translate"
+"""官方角色卡預翻譯（後台 ops 觸發）。
+
+Batch-translates a Cloud-hosted official card's profile prose and catalog
+meta (title / description / tags / note) into the catalog's other locales
+when an admin re-translates a card from the Cloud console. Kept separate
+from ``card_translate`` because that key is the player's read-time import
+preview step over a shared ``.lumecard``, while this is an ops-time batch
+over publication-bound catalog content — same rationale as
+``showcase_translate``."""
+
+
 FEATURE_SILLYTAVERN_NORMALIZE = "sillytavern_normalize"
 """SillyTavern card import free-text normalizer.
 
@@ -504,6 +569,9 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_ARC_BEAT_RECHECK,
     FEATURE_ARC_SCENE_WRITE,
     FEATURE_ARC_COMPLETION_MEMORY,
+    FEATURE_STORY_SCENE_OPEN,
+    FEATURE_STORY_SCENE_CLOSE,
+    FEATURE_STORY_SCENE_CHIPS,
     FEATURE_STORY_EXPAND,
     FEATURE_MEMORY_CONSOLIDATE,
     FEATURE_DIALOGUE_SUMMARY,
@@ -531,6 +599,9 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_CARD_TRANSLATE,
     FEATURE_ARC_TEMPLATE_TRANSLATE,
     FEATURE_STORY_SEED_TRANSLATE,
+    FEATURE_SHOWCASE_REVIEW,
+    FEATURE_SHOWCASE_TRANSLATE,
+    FEATURE_OFFICIAL_CARD_TRANSLATE,
     FEATURE_SILLYTAVERN_NORMALIZE,
     FEATURE_MEMOIR_LOCALIZE,
     FEATURE_FUSION_STORY,
@@ -606,6 +677,9 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_ARC_BEAT_RECHECK: "劇情弧：重複嘗試判讀",
     FEATURE_ARC_SCENE_WRITE: "劇情弧：自主演出場景",
     FEATURE_ARC_COMPLETION_MEMORY: "劇情弧：完成里程碑記憶",
+    FEATURE_STORY_SCENE_OPEN: "起幕：場景開場",
+    FEATURE_STORY_SCENE_CLOSE: "起幕：場景收尾",
+    FEATURE_STORY_SCENE_CHIPS: "起幕：場內行動建議",
     FEATURE_STORY_EXPAND: "每日劇情展開",
     FEATURE_MEMORY_CONSOLIDATE: "記憶合併",
     FEATURE_DIALOGUE_SUMMARY: "對話摘要",
@@ -763,6 +837,8 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_STORY_EXPAND,
         FEATURE_ARC_SCENE_WRITE,
         FEATURE_ARC_COMPLETION_MEMORY,
+        FEATURE_STORY_SCENE_OPEN,
+        FEATURE_STORY_SCENE_CLOSE,
         FEATURE_PERSONA_PROJECTION,
         FEATURE_CHARACTER_ENCOUNTER_DIALOGUE,
     ),
@@ -785,6 +861,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_CHARACTER_ENCOUNTER_PLAN,
         FEATURE_CHARACTER_ENCOUNTER_BEATS,
         FEATURE_EXPERIMENT_ANALYSIS,
+        FEATURE_SHOWCASE_REVIEW,
     ),
     FEATURE_GROUP_CORE_STRUCTURED_MEMORY: (
         FEATURE_POST_TURN,
@@ -804,6 +881,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_CHAT_REPETITION_CHECK,
         FEATURE_ADDRESS_PREFERENCE_OBSERVER,
         FEATURE_CHAT_ASSIST,
+        FEATURE_STORY_SCENE_CHIPS,
         FEATURE_PROMPT_MATERIAL_DIGEST,
         FEATURE_REGISTER_PROFILE,
         FEATURE_SILLYTAVERN_NORMALIZE,
@@ -822,6 +900,8 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_CARD_TRANSLATE,
         FEATURE_ARC_TEMPLATE_TRANSLATE,
         FEATURE_STORY_SEED_TRANSLATE,
+        FEATURE_SHOWCASE_TRANSLATE,
+        FEATURE_OFFICIAL_CARD_TRANSLATE,
         FEATURE_MEMOIR_LOCALIZE,
         FEATURE_PROMPT_REWRITE,
     ),

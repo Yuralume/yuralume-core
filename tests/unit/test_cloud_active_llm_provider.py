@@ -228,7 +228,10 @@ async def test_cloud_active_llm_provider_uses_default_preset() -> None:
 
 
 def _routing_profile(
-    *, llm_presets: dict[str, str], strict: bool
+    *,
+    llm_presets: dict[str, str],
+    strict: bool,
+    vision: dict[str, bool] | None = None,
 ) -> CloudRoutingProfile:
     return CloudRoutingProfile(
         llm_feature_presets=llm_presets,
@@ -239,6 +242,7 @@ def _routing_profile(
         disabled_features=frozenset(),
         catalog_version=7,
         routing_policy_version=42,
+        llm_preset_vision=vision or {},
     )
 
 
@@ -342,3 +346,212 @@ async def test_profile_mode_hot_path_makes_no_sync_call_per_turn() -> None:
 
     # Warm cache: only the cold miss hit the client, not every turn.
     assert len(client.scopes) == 1
+
+
+# --- VP1: control-plane preset vision capability binding -------------------
+# Hosted routing picks a preset (= a concrete upstream model) per feature, but
+# the gateway adapter fronts every one of them and declares ``supports_vision =
+# True`` by construction. When the control plane says a preset is text-only,
+# the resolver must bind that onto the adapter it hands back, so ChatService's
+# image-recognition preflight fires instead of shipping images to a model that
+# cannot read them.
+
+
+@pytest.mark.asyncio
+async def test_profile_pinned_text_only_preset_binds_supports_vision_false() -> None:
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-text-mini"},
+            strict=True,
+            vision={"hosted-text-mini": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert model.supports_vision is False
+    assert await model.list_models() == ["hosted-text-mini"]
+
+
+@pytest.mark.asyncio
+async def test_profile_pinned_vision_preset_binds_supports_vision_true() -> None:
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-vision"},
+            strict=True,
+            vision={"hosted-vision": True},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert model.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_unpinned_preset_keeps_the_adapter_default() -> None:
+    """Rollout red line: a preset the control plane never pinned behaves
+    exactly as it did before VP1 (vision-capable), so shipping this change
+    with an unannotated catalog changes nothing."""
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-unannotated"},
+            strict=True,
+            vision={"some-other-preset": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert model.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_env_preset_path_without_profile_port_keeps_the_default() -> None:
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_operator())
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={FEATURE_CHAT: "preset-chat", "default": "preset-default"},
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert model.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_non_strict_env_fallback_still_honours_a_pin_on_that_preset() -> None:
+    """A non-strict profile miss falls back to the env preset map, but the
+    capability is a property of the preset, not of how it was chosen: if the
+    control plane pinned that same preset id, it still applies."""
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={},  # no control-plane route for chat
+            strict=False,
+            vision={"preset-chat": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={FEATURE_CHAT: "preset-chat", "default": "preset-default"},
+        routing_profile_port=port,
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert await model.list_models() == ["preset-chat"]
+    assert model.supports_vision is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_reads_the_profile_once_per_call() -> None:
+    """The preset and its vision pin are one control-plane fact: a second
+    fetch could observe a refreshed profile naming a different preset than
+    the adapter was just built for."""
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-text-mini"},
+            strict=True,
+            vision={"hosted-text-mini": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert len(port.scopes) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_model_id_is_unaffected_by_the_vision_map() -> None:
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-text-mini"},
+            strict=True,
+            vision={"hosted-text-mini": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=_model_factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    assert await provider.resolve_model_id(
+        FEATURE_CHAT, character=_character(),
+    ) == "hosted-text-mini"
+
+
+@pytest.mark.asyncio
+async def test_adapter_without_a_vision_binder_passes_through() -> None:
+    """Not every ChatModelPort implements the optional binder hook; a pin it
+    cannot accept must not break resolution."""
+
+    class _NoBinderModel(ChatModelPort):
+        provider_id = "yuralume_cloud"
+        supports_vision = True
+
+        async def generate(self, prompt: str, **kwargs: object) -> str:
+            return ""
+
+        async def list_models(self) -> list[str]:
+            return ["hosted-text-mini"]
+
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_demo_operator())
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_CHAT: "hosted-text-mini"},
+            strict=True,
+            vision={"hosted-text-mini": False},
+        )
+    )
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=lambda feature_key, identity, default_model: _NoBinderModel(),
+        model_presets={},
+        routing_profile_port=port,
+    )
+
+    model = await provider.resolve(FEATURE_CHAT, character=_character())
+
+    assert isinstance(model, _NoBinderModel)

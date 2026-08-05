@@ -20,7 +20,7 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 
 _LOGGER = logging.getLogger(__name__)
 
-_PROFILE_SCALAR_FIELDS = (
+PROFILE_SCALAR_FIELDS = (
     "name",
     "summary",
     "speaking_style",
@@ -29,7 +29,13 @@ _PROFILE_SCALAR_FIELDS = (
     "third_person_pronoun",
     "visual_gender_presentation",
 )
-_PROFILE_LIST_FIELDS = (
+"""The A-layer profile prose a translator may rewrite. Public because it is
+the *field policy* for card prose, not an implementation detail of this
+adapter — the Cloud official-card catalog translates the same set through
+its own ops endpoint, and two copies of this tuple would drift the moment
+someone adds a field to :class:`CharacterCardProfile`."""
+
+PROFILE_LIST_FIELDS = (
     "personality",
     "interests",
     "boundaries",
@@ -37,6 +43,9 @@ _PROFILE_LIST_FIELDS = (
     "world_topics",
     "excluded_topics",
 )
+"""Prose list fields. Same-length replacement only — see
+:func:`valid_translated_text_list`."""
+
 _COMPANION_SCALAR_FIELDS = (
     "name",
     "role",
@@ -80,7 +89,7 @@ class LLMCharacterCardTranslator(CharacterCardTranslatorPort):
                 "character card translator: LLM translation failed",
             )
             return profile
-        return _merge_profile(profile, parsed)
+        return merge_translated_profile(profile, parsed)
 
 
 class NullCharacterCardTranslator(CharacterCardTranslatorPort):
@@ -111,7 +120,7 @@ def _build_prompt(
 
 def _profile_payload(profile: CharacterCardProfile) -> dict[str, Any]:
     payload: dict[str, Any] = {}
-    for field in _PROFILE_SCALAR_FIELDS + _PROFILE_LIST_FIELDS:
+    for field in PROFILE_SCALAR_FIELDS + PROFILE_LIST_FIELDS:
         payload[field] = getattr(profile, field)
     payload["companions"] = [
         {
@@ -151,19 +160,27 @@ def _parse_json_object(raw: str) -> Mapping[str, Any]:
     return data if isinstance(data, Mapping) else {}
 
 
-def _merge_profile(
+def merge_translated_profile(
     profile: CharacterCardProfile,
     parsed: Mapping[str, Any],
 ) -> CharacterCardProfile:
+    """Lay a translated payload over a profile, field by field.
+
+    Public for the same reason the field tuples above are: this *is* the
+    merge policy for card prose — same-length lists or nothing, never blank
+    the source, never touch structure — and the official-card path applies
+    the very same policy to a payload Cloud translated ahead of time. A
+    second implementation there would drift on the first new profile field.
+    """
     if not parsed:
         return profile
     updates: dict[str, Any] = {}
-    for field in _PROFILE_SCALAR_FIELDS:
-        value = _valid_text(parsed.get(field))
+    for field in PROFILE_SCALAR_FIELDS:
+        value = valid_translated_text(parsed.get(field))
         if value is not None:
             updates[field] = value
-    for field in _PROFILE_LIST_FIELDS:
-        value = _valid_text_list(
+    for field in PROFILE_LIST_FIELDS:
+        value = valid_translated_text_list(
             parsed.get(field),
             expected_length=len(getattr(profile, field)),
         )
@@ -190,10 +207,10 @@ def _merge_personality_type(
     if not isinstance(parsed, Mapping) or not personality_type.code:
         return None
     updates: dict[str, Any] = {}
-    rationale = _valid_text(parsed.get("rationale"))
+    rationale = valid_translated_text(parsed.get("rationale"))
     if rationale is not None:
         updates["rationale"] = rationale
-    notes = _valid_text_list(
+    notes = valid_translated_text_list(
         parsed.get("consistency_notes"),
         expected_length=len(personality_type.consistency_notes),
     )
@@ -220,11 +237,11 @@ def _merge_companions(
         companion = companions[index]
         updates: dict[str, Any] = {}
         for field in _COMPANION_SCALAR_FIELDS:
-            value = _valid_text(raw_item.get(field))
+            value = valid_translated_text(raw_item.get(field))
             if value is not None:
                 updates[field] = value
         for field in _COMPANION_LIST_FIELDS:
-            value = _valid_text_list(
+            value = valid_translated_text_list(
                 raw_item.get(field),
                 expected_length=len(getattr(companion, field)),
             )
@@ -236,14 +253,27 @@ def _merge_companions(
     return merged if changed else None
 
 
-def _valid_text(value: object) -> str | None:
+def valid_translated_text(value: object) -> str | None:
+    """The model's replacement for one scalar field, or ``None``.
+
+    ``None`` means "keep the source text": a non-string or an empty answer
+    is a failed field, never an instruction to blank the original."""
     if not isinstance(value, str):
         return None
     text = value.strip()
     return text or None
 
 
-def _valid_text_list(value: object, *, expected_length: int) -> list[str] | None:
+def valid_translated_text_list(
+    value: object,
+    *,
+    expected_length: int,
+) -> list[str] | None:
+    """The model's replacement for one list field, or ``None``.
+
+    A list that came back the wrong length is rejected **whole**: pairing
+    item 2 with item 3's translation is worse than staying in the source
+    language, and there is no way to tell which item was dropped."""
     if not isinstance(value, list) or len(value) != expected_length:
         return None
     cleaned: list[str] = []
@@ -255,6 +285,11 @@ def _valid_text_list(value: object, *, expected_length: int) -> list[str] | None
 
 
 __all__ = [
+    "PROFILE_LIST_FIELDS",
+    "PROFILE_SCALAR_FIELDS",
     "LLMCharacterCardTranslator",
     "NullCharacterCardTranslator",
+    "merge_translated_profile",
+    "valid_translated_text",
+    "valid_translated_text_list",
 ]

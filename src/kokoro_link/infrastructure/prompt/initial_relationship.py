@@ -47,6 +47,40 @@ def render_initial_relationship_seed_lines(
     return lines
 
 
+def render_arc_planner_relationship_lines(
+    seed: CharacterOperatorRelationshipSeed | None,
+) -> list[str]:
+    """Facts a *planner* needs to place the player inside a story (OP1-A).
+
+    Deliberately a narrower projection than
+    :func:`render_initial_relationship_seed_lines`: the arc planner is
+    not conducting the relationship, it is deciding — per beat — whether
+    the player is absent, present or central, and what the player's
+    dramatic place in that scene is. For that it needs to know **how the
+    player is addressed** and **how close the two of them stand**;
+    everything the chat block adds on top (proactive authorisation,
+    schedule-involvement policy, invented-memory guards) belongs to a
+    conversation that is happening now, not to a plan for the next three
+    weeks.
+
+    Returns ``[]`` for a missing / empty seed *and* for a seed whose
+    every relevant field is blank — the caller renders no heading at all
+    in that case, because a heading over nothing is a hole the model
+    will feel obliged to fill.
+    """
+    if seed is None or seed.is_empty:
+        return []
+    lines: list[str] = []
+    _append(lines, "角色怎麼稱呼玩家", seed.user_address_name)
+    _append(lines, "玩家怎麼稱呼角色", seed.character_address_name)
+    _append(lines, "關係", seed.relationship_label)
+    _append(lines, "語氣距離", seed.tone_distance)
+    _append(lines, "熟悉度邊界", seed.familiarity_boundary)
+    _append(lines, "居住安排", seed.living_arrangement)
+    _append(lines, "可知道的背景", seed.known_context)
+    return lines
+
+
 def _append(lines: list[str], label: str, value: str) -> None:
     text = (value or "").strip()
     if text:

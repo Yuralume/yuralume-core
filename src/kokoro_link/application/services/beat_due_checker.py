@@ -21,6 +21,13 @@ Design choices:
 - **Scene realization is optional wiring**. If ``StoryBeatSceneService``
   is present, the checker lets it write an autonomous scene first; if
   that fails, the old notification-candidate behavior remains.
+- **Beats about the player are left for the player**. When the scene
+  service is wired the scan is *unattended* play, so a beat whose
+  ``operator_position`` is ``central`` is passed over
+  (ARC_PLAYER_POSITION_PLAN §5.1 OP2-B). Passing over costs the beat
+  nothing — no attempt, no failure, no backoff, no retirement — because
+  it did not fail; it is waiting. The player pulling the same beat
+  through 起幕 or chat plays it normally.
 - **Fail-soft everywhere**. A planner crash on one character must not
   stop the scheduler from sweeping the rest.
 """
@@ -29,13 +36,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, tzinfo
+from datetime import date as date_type, datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
 
 from kokoro_link.application.services.beat_retry_policy import (
     AUTONOMOUS_SCENE_RETRY_POLICY,
 )
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.story_arc import PLAY_RESULT_FAILED
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
 if TYPE_CHECKING:
@@ -114,6 +122,16 @@ class BeatDueChecker:
         # accidentally rolling daily gacha for users who just haven't
         # opened chat yet today.
         attempted_at = now or datetime.now(timezone.utc)
+
+        # Retire first, stage second. ``next_beat_due`` is a read path
+        # shared with chat, so the permanent skip lives here — on the one
+        # caller that applies the retry policy and already owns write
+        # side effects. Gated on the same condition as the policy itself:
+        # without an autonomous scene service no budget is being spent,
+        # so nothing may be declared dead for having spent it.
+        if self._scene_service is not None:
+            await self._retire_exhausted_beats(character, today=today)
+
         try:
             due = await self._arcs.next_beat_due(
                 character.id,
@@ -124,6 +142,14 @@ class BeatDueChecker:
                     else None
                 ),
                 retry_at=attempted_at,
+                # Only this configuration *plays* a beat with nobody in
+                # the room, so only it must pass over the beats that are
+                # about the player (OP2-B). Without a scene service the
+                # scan's whole output is a notification candidate — an
+                # invitation for the player to come — which is precisely
+                # what a ``central`` beat is waiting for, so suppressing
+                # it there would silence the one path that helps.
+                unattended=self._scene_service is not None,
             )
         except Exception:
             _LOGGER.exception(
@@ -154,15 +180,13 @@ class BeatDueChecker:
                     should_notify=False,
                     realized_event_id=event.id,
                 )
-            if not await self._scene_attempt_was_recorded(
-                character.id, beat,
-            ):
+            if not await self._scene_attempt_was_recorded(beat):
                 try:
                     await self._arcs.mark_beat_play_attempted(
                         beat_id=beat.id,
                         attempted_at=attempted_at,
                         source="scene_simulation",
-                        result="failed",
+                        result=PLAY_RESULT_FAILED,
                         push_intensity="autonomous_scene",
                     )
                 except Exception:
@@ -236,16 +260,44 @@ class BeatDueChecker:
         )
         return local_midnight.astimezone(timezone.utc)
 
+    async def _retire_exhausted_beats(
+        self,
+        character: Character,
+        *,
+        today: date_type,
+    ) -> None:
+        """Let the arc move past beats whose failure budget is spent.
+
+        Fail-soft: a retirement write that blows up must not cost this
+        character its scan.
+        """
+        try:
+            await self._arcs.retire_exhausted_beats(
+                character.id,
+                retry_policy=AUTONOMOUS_SCENE_RETRY_POLICY,
+                today=today,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "beat-due check: exhausted-beat retirement crashed "
+                "character=%s",
+                character.id,
+            )
+
     async def _scene_attempt_was_recorded(
         self,
-        character_id: str,
         previous: "StoryArcBeat",
     ) -> bool:
+        """Did the scene service already record its own failed attempt?
+
+        Reads the played beat by id rather than re-deriving it from
+        ``next_beat_due``: since the retry walk-down (§10 #4) the beat we
+        played is not necessarily the head of the due list any more, and
+        comparing against the head would record a duplicate failure —
+        charging the retry budget twice for one failure.
+        """
         try:
-            refreshed = await self._arcs.next_beat_due(
-                character_id,
-                today=previous.scheduled_date,
-            )
+            refreshed = await self._arcs.find_beat(previous.id)
         except Exception:
             _LOGGER.exception(
                 "beat-due check: failed to verify scene attempt beat=%s",
@@ -254,10 +306,7 @@ class BeatDueChecker:
             return False
         if refreshed is None:
             return True
-        _arc, beat = refreshed
-        return beat.id == previous.id and (
-            beat.play_attempt_count > previous.play_attempt_count
-        )
+        return refreshed.play_attempt_count > previous.play_attempt_count
 
     async def _today_for_character(self, character: Character, now: datetime | None):
         when = now or datetime.now(timezone.utc)

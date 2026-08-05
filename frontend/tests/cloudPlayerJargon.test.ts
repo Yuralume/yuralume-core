@@ -511,18 +511,50 @@ function flattenCatalog(
   )
 }
 
+/**
+ * Hosted-only copy that does not follow the `*Cloud` suffix convention.
+ *
+ * These keys render exclusively for hosted players (the composable behind
+ * them reports nothing on self-host), but their SSR tests only mount the
+ * happy path — a snapshot that says "blocked" or "disabled" is an error
+ * branch behind a failure, exactly what this catalogue pass exists for.
+ */
+const HOSTED_ONLY_KEY_PREFIXES = [
+  'playerSidebar.limits.',
+  'characterCreate.limits.',
+  'characterImagesPanel.generate.disabledNotice',
+  'chat.storyScene.quota.',
+] as const
+
+function isHostedOnlyKey(key: string): boolean {
+  return (
+    key.endsWith('Cloud')
+    || HOSTED_ONLY_KEY_PREFIXES.some(prefix => key.startsWith(prefix))
+  )
+}
+
 describe('hosted copy catalogue', () => {
-  it('has no denied term in any *Cloud variant', () => {
+  it('has no denied term in any hosted-only key', () => {
     // Catches hosted copy no test renders yet — a create form behind a
     // click, an error branch behind a failure — so the guard does not
     // silently shrink to whatever happens to be mounted today.
     const offenders = flattenCatalog(zhTW)
-      .filter(([key]) => key.endsWith('Cloud'))
+      .filter(([key]) => isHostedOnlyKey(key))
       .flatMap(([key, value]) => {
         const found = findJargon(value, allowlistForKey(key))
         return found.length > 0 ? [`${key}: ${found.join(', ')}`] : []
       })
 
     expect(offenders).toEqual([])
+  })
+
+  it('actually scans the runtime-limit keys (guards the prefix list)', () => {
+    const keys = flattenCatalog(zhTW).map(([key]) => key)
+    for (const prefix of HOSTED_ONLY_KEY_PREFIXES) {
+      expect(
+        keys.some(key => key.startsWith(prefix)),
+        `no catalogue key matches ${prefix} — prefix list is stale`,
+      ).toBe(true)
+    }
   })
 })

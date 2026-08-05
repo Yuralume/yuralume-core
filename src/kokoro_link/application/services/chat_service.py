@@ -10,9 +10,7 @@ the character's medium-term goals.
 """
 
 import asyncio
-import base64
 import logging
-import mimetypes
 import re
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass, replace
@@ -22,6 +20,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from kokoro_link.application.dto.chat import (
+    DEFAULT_CONVERSATION_PAGE_SIZE,
     ChatReplyResponse,
     ConversationResponse,
     SendChatMessageRequest,
@@ -115,6 +114,12 @@ from kokoro_link.application.services.turn_snapshot_codec import (
 )
 from kokoro_link.application.services.post_turn_runner import (
     PostTurnEnqueueOutcome,
+)
+from kokoro_link.application.services.vision_media import (
+    MAX_INLINE_IMAGE_BYTES as _MAX_INLINE_IMAGE_BYTES,
+    to_vision_url as _to_vision_url,
+    absolute_public_vision_url as _absolute_public_vision_url,
+    to_vision_url_with_storage as _to_vision_url_with_storage,
 )
 from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_event_service import StoryEventService
@@ -261,6 +266,11 @@ from kokoro_link.contracts.external_chat_execution import (
 )
 from kokoro_link.contracts.repositories import CharacterRepositoryPort, ConversationRepositoryPort
 from kokoro_link.contracts.state import StateEnginePort
+from kokoro_link.contracts.story_scene import (
+    StorySceneChipsContext,
+    StorySceneChipsWriterPort,
+    StorySceneSessionRepositoryPort,
+)
 from kokoro_link.contracts.tool import ToolRegistryPort
 from kokoro_link.domain.entities.behavioral_pattern import KIND_PHRASE_HABIT
 from kokoro_link.domain.entities.character import (
@@ -293,6 +303,7 @@ from kokoro_link.domain.entities.operator_profile import (
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
 from kokoro_link.domain.entities.story_event import StoryEvent
+from kokoro_link.domain.entities.story_scene_session import StorySceneSession
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_COMMUNITY,
@@ -395,6 +406,28 @@ land a final user-facing reply. The final hop always hides the tool
 block so the loop terminates with text even if the model would
 otherwise keep calling tools."""
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SceneTurnOutcome:
+    """What a 起幕 scene contributed to the reply this turn produced.
+
+    One object rather than three parallel returns because the three are
+    mutually constrained: a turn either offers next moves *or* ends the
+    scene, and it can only ever do the latter once. The all-empty
+    instance is also the answer for "this turn was not inside a scene",
+    so the call sites stay branch-free.
+    """
+
+    suggested_actions: tuple[str, ...] = ()
+    closed_session: "StorySceneSession | None" = None
+    """Set only on the turn whose verdict ended the scene (SC1-D)."""
+    closing_narration: "Message | None" = None
+    """The wrap-up appended to the thread; ``None`` when the writer
+    produced none — the close is the load-bearing half."""
+
+
+_NO_SCENE_TURN = SceneTurnOutcome()
 
 
 class ChatRuntimeLimitExceeded(RuntimeError):
@@ -827,6 +860,9 @@ class ChatService:
         tool_orchestrator: ToolOrchestrator | None = None,
         story_event_service: StoryEventService | None = None,
         story_arc_service: "StoryArcService | None" = None,
+        story_scene_sessions: "StorySceneSessionRepositoryPort | None" = None,
+        story_scene_chips_writer: "StorySceneChipsWriterPort | None" = None,
+        story_scene_service=None,  # noqa: ANN001 - StorySceneService (SC1-D)
         proactive_attempt_repository: ProactiveAttemptRepositoryPort | None = None,
         feed_post_repository: FeedPostRepositoryPort | None = None,
         journal_repository: TurnJournalRepositoryPort | None = None,
@@ -927,6 +963,18 @@ class ChatService:
         self._tool_orchestrator = tool_orchestrator
         self._story_event_service = story_event_service
         self._story_arc_service = story_arc_service
+        # 起幕 (SC1-C). Both optional: a chat turn outside a scene never
+        # touches either, and a deployment without them is exactly the
+        # pre-SC1 chat path — the scene frame is absent from the prompt
+        # and no chips are generated.
+        self._story_scene_sessions = story_scene_sessions
+        self._story_scene_chips_writer = story_scene_chips_writer
+        # SC1-D: the shared wrap-up. Held as the service rather than as a
+        # closer port because "is this scene over?" and "end it, land it as
+        # canon" is one decision with one owner, and a second copy of the
+        # close sequence living here is exactly how the red line would
+        # drift between the in-turn path and the timeout sweep.
+        self._story_scene_service = story_scene_service
         self._proactive_attempt_repository = proactive_attempt_repository
         self._feed_post_repository = feed_post_repository
         self._journal_repository = journal_repository
@@ -1862,6 +1910,10 @@ class ChatService:
         story_arc, upcoming_arc_beats = await self._ensure_story_arc(
             character, today=today_local,
         )
+        # 起幕 (SC1-C): is this turn being played inside a scene?
+        scene_session = await self._load_open_scene_session(
+            payload.character_id,
+        )
         recent_proactive_messages = await self._load_recent_proactive_messages(
             payload.character_id,
         )
@@ -1952,6 +2004,13 @@ class ChatService:
         )
         if defer is not None:
             _, defer_user_msg, defer_brief_msg, defer_state, _ = defer
+            # The player acted inside the scene even though the character
+            # only managed an ack, so the idle clock moves. No chips: the
+            # real reply arrives later through the follow-up dispatcher,
+            # and suggesting moves against an "I'm busy, later" ack would
+            # be offering the player a scene that has not resumed yet.
+            if scene_session is not None:
+                await self._touch_scene_activity(scene_session, now=now_utc)
             return ChatReplyResponse.build(
                 conversation_id=defer[0].id,
                 user_message=defer_user_msg,
@@ -1992,6 +2051,7 @@ class ChatService:
             story_events=story_events,
             story_arc=story_arc,
             upcoming_arc_beats=upcoming_arc_beats,
+            story_scene=scene_session,
             today_local=today_local,
             older_dialogue_summary=older_dialogue_summary,
             recent_proactive_messages=recent_proactive_messages,
@@ -2204,12 +2264,28 @@ class ChatService:
             forced_tool=generation.forced_fired,
         )
 
+        # Last, and only inside a scene: the chips describe what the
+        # player could do *next* and the verdict asks whether there is a
+        # next at all, so both are decided against the reply that just
+        # landed.
+        scene_turn = await self._finish_scene_turn(
+            character=character,
+            session=scene_session,
+            conversation=updated_conversation,
+            operator=operator,
+            content_mode=content_mode,
+            now=now,
+            chips=external_turn is None,
+        )
         return ChatReplyResponse.build(
             conversation_id=updated_conversation.id,
             user_message=user_message,
             assistant_message=assistant_message,
             state=final_state,
             assistant_turn_record_id=turn_record_id,
+            suggested_actions=scene_turn.suggested_actions,
+            story_scene_session=scene_turn.closed_session,
+            story_scene_closing=scene_turn.closing_narration,
         )
 
     async def send_message_stream(
@@ -2327,6 +2403,12 @@ class ChatService:
         story_arc, upcoming_arc_beats = await self._ensure_story_arc(
             character, today=today_local,
         )
+        # 起幕 (SC1-C). Read here and handed to the finalizer: the chips
+        # are generated after the assistant message lands, which on this
+        # path happens in ``StreamFinalizer.finish``.
+        scene_session = await self._load_open_scene_session(
+            payload.character_id,
+        )
         recent_proactive_messages = await self._load_recent_proactive_messages(
             payload.character_id,
         )
@@ -2393,6 +2475,10 @@ class ChatService:
         )
         if defer is not None:
             defer_conv, defer_user_msg, defer_brief_msg, defer_state, _ = defer
+            # Same reasoning as the non-streaming defer branch: stamp the
+            # scene's idle clock, offer no chips.
+            if scene_session is not None:
+                await self._touch_scene_activity(scene_session, now=now_utc)
             response = ChatReplyResponse.build(
                 conversation_id=defer_conv.id,
                 user_message=defer_user_msg,
@@ -2453,6 +2539,7 @@ class ChatService:
                 story_events=story_events,
                 story_arc=story_arc,
                 upcoming_arc_beats=upcoming_arc_beats,
+                story_scene=scene_session,
                 today_local=today_local,
                 older_dialogue_summary=older_dialogue_summary,
                 recent_proactive_messages=recent_proactive_messages,
@@ -2507,6 +2594,8 @@ class ChatService:
                 novelty_retry_count=generation.novelty_retry_count,
                 presence_frame=presence_frame,
                 content_mode=content_mode,
+                scene_session=scene_session,
+                operator=operator,
             )
             return token_stream, finalizer
 
@@ -2635,6 +2724,7 @@ class ChatService:
                 story_events=story_events,
                 story_arc=story_arc,
                 upcoming_arc_beats=upcoming_arc_beats,
+                story_scene=scene_session,
                 today_local=today_local,
                 older_dialogue_summary=older_dialogue_summary,
                 vision_markers=vision_markers,
@@ -2779,6 +2869,8 @@ class ChatService:
                 novelty_retry_count=novelty_retry_count,
                 presence_frame=presence_frame,
                 content_mode=content_mode,
+                scene_session=scene_session,
+                operator=operator,
             )
             return token_stream, finalizer
 
@@ -2817,6 +2909,8 @@ class ChatService:
             diversity_evidence=diversity_evidence,
             presence_frame=presence_frame,
             content_mode=content_mode,
+            scene_session=scene_session,
+            operator=operator,
         )
         return token_stream, finalizer
 
@@ -2901,11 +2995,34 @@ class ChatService:
         except Exception:
             _LOGGER.exception("journal: prune failed")
 
-    async def get_latest_conversation(self, character_id: str) -> ConversationResponse | None:
-        conversation = await self._conversation_repository.latest_for_character(character_id)
-        if conversation is None:
+    async def get_latest_conversation(
+        self,
+        character_id: str,
+        *,
+        limit: int | None = DEFAULT_CONVERSATION_PAGE_SIZE,
+        before_position: int | None = None,
+    ) -> ConversationResponse | None:
+        """The chat panel's thread read — one keyset page, newest last (IV10).
+
+        Which conversation is returned is unchanged; only how much of it is.
+        Opening a character used to ship the entire history to the browser and
+        render all of it, so every picture ever exchanged stayed decoded in
+        memory whether or not it was on screen.
+        """
+        if limit is None and before_position is None:
+            conversation = await self._conversation_repository.latest_for_character(
+                character_id,
+            )
+            if conversation is None:
+                return None
+            return ConversationResponse.from_domain(conversation)
+
+        page = await self._conversation_repository.latest_page_for_character(
+            character_id, limit=limit, before_position=before_position,
+        )
+        if page is None:
             return None
-        return ConversationResponse.from_domain(conversation)
+        return ConversationResponse.from_page(page)
 
     async def _load_character_with_recovery(self, character_id: str) -> Character:
         """Load a character and apply rest recovery based on idle time."""
@@ -3654,6 +3771,7 @@ class ChatService:
         story_events: list[StoryEvent] | None = None,
         story_arc: "StoryArc | None" = None,
         upcoming_arc_beats: "list[StoryArcBeat] | None" = None,
+        story_scene: "StorySceneSession | None" = None,
         today_local: "date | None" = None,
         older_dialogue_summary: str | None = None,
         recent_proactive_messages: tuple[ProactiveAttempt, ...] = (),
@@ -3833,6 +3951,7 @@ class ChatService:
                     story_events=story_events,
                     story_arc=story_arc,
                     upcoming_arc_beats=upcoming_arc_beats,
+                    story_scene=story_scene,
                     today_local=today_local,
                     older_dialogue_summary=older_dialogue_summary,
                     vision_markers=vision_markers,
@@ -4069,6 +4188,7 @@ class ChatService:
                 story_events=story_events,
                 story_arc=story_arc,
                 upcoming_arc_beats=upcoming_arc_beats,
+                story_scene=story_scene,
                 today_local=today_local,
                 older_dialogue_summary=older_dialogue_summary,
                 vision_markers=vision_markers,
@@ -4404,6 +4524,7 @@ class ChatService:
                 story_events=story_events,
                 story_arc=story_arc,
                 upcoming_arc_beats=upcoming_arc_beats,
+                story_scene=story_scene,
                 today_local=today_local,
                 older_dialogue_summary=older_dialogue_summary,
                 vision_markers=vision_markers,
@@ -4797,6 +4918,193 @@ class ChatService:
                 "story arc ensure_active_arc failed; continuing without",
             )
             return None, []
+
+    # ── 起幕 in-scene turns (SC1-C) ──────────────────────────────────
+
+    async def _load_open_scene_session(
+        self, character_id: str,
+    ) -> "StorySceneSession | None":
+        """The scene this turn is being played inside, if any.
+
+        Read from the database on every turn rather than cached: the
+        replica serving this turn is routinely not the one that opened
+        the scene, and a scene can be closed (manually, or by the timeout
+        job) between two turns of the same conversation.
+
+        Fail-soft — a storage hiccup degrades the turn to an ordinary
+        chat turn, which is the pre-SC1 behaviour, instead of failing a
+        reply the player is waiting for.
+        """
+        if self._story_scene_sessions is None:
+            return None
+        try:
+            return await self._story_scene_sessions.get_open_for_character(
+                character_id,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "story scene lookup failed; playing an ordinary turn "
+                "character=%s",
+                character_id,
+            )
+            return None
+
+    async def _finish_scene_turn(
+        self,
+        *,
+        character: Character,
+        session: "StorySceneSession | None",
+        conversation: Conversation,
+        operator: "OperatorProfile | None",
+        content_mode: MessageContentMode,
+        now: datetime,
+        chips: bool = True,
+    ) -> "SceneTurnOutcome":
+        """Stamp the scene's idle clock, then ask what happens next.
+
+        Three things, in this order for reasons:
+
+        1. **The activity stamp** is a fact about a turn that already
+           happened, so it is written first, and its answer ("is this
+           scene still open?") doubles as the liveness check for
+           everything below — the common path costs one write and no
+           extra read.
+        2. **The verdict and the chips run together.** Both are model
+           calls inside the conversation's turn lease, and they answer
+           two questions about the same moment ("is the scene over?" /
+           "what could the player do next?"), so running them serially
+           would double the tail latency of every in-scene turn to buy
+           nothing. The chips are simply discarded on the rare turn whose
+           verdict ends the scene.
+        3. **A resolved verdict wins.** The scene closed, so there is no
+           "next move" to suggest and the reply carries the wrap-up
+           instead of chips.
+
+        ``chips=False`` keeps the stamp and the verdict and skips the
+        suggestion: an external channel (LINE) plays the scene for real,
+        so its turns must keep the scene alive *and* must be able to end
+        it, but it has no chip surface and that call would be a model
+        round-trip nobody could ever tap.
+
+        Every part is fail-soft. :data:`_NO_SCENE_TURN` covers "not in a
+        scene at all", which is why callers need no branch of their own.
+        """
+        if session is None:
+            return _NO_SCENE_TURN
+        if not await self._touch_scene_activity(session, now=now):
+            return _NO_SCENE_TURN
+        suggestions, closing = await asyncio.gather(
+            self._suggest_scene_actions(
+                character=character,
+                session=session,
+                conversation=conversation,
+                operator=operator,
+                content_mode=content_mode,
+                enabled=chips,
+            ),
+            self._close_scene_if_resolved(
+                character=character,
+                session=session,
+                conversation=conversation,
+                now=now,
+            ),
+        )
+        if closing is None:
+            return SceneTurnOutcome(suggested_actions=suggestions)
+        return SceneTurnOutcome(
+            closed_session=closing.session,
+            closing_narration=closing.closing_narration,
+        )
+
+    async def _suggest_scene_actions(
+        self,
+        *,
+        character: Character,
+        session: "StorySceneSession",
+        conversation: Conversation,
+        operator: "OperatorProfile | None",
+        content_mode: MessageContentMode,
+        enabled: bool,
+    ) -> tuple[str, ...]:
+        if not enabled or self._story_scene_chips_writer is None:
+            return ()
+        try:
+            return await self._story_scene_chips_writer.suggest_actions(
+                StorySceneChipsContext(
+                    character=character,
+                    session=session,
+                    recent_lines=_render_scene_chip_lines(
+                        conversation,
+                        character=character,
+                        content_tolerance=_content_tolerance_for_content_mode(
+                            content_mode,
+                        ),
+                    ),
+                    operator_primary_language=(
+                        getattr(operator, "primary_language", "")
+                        or DEFAULT_PRIMARY_LANGUAGE
+                    ),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - chips never fail a turn
+            _LOGGER.exception(
+                "story scene chips failed scene=%s character=%s",
+                session.id,
+                character.id,
+            )
+            return ()
+
+    async def _close_scene_if_resolved(
+        self,
+        *,
+        character: Character,
+        session: "StorySceneSession",
+        conversation: Conversation,
+        now: datetime,
+    ):  # noqa: ANN202 - SceneClosing | None, imported lazily
+        """Ask the wrap-up whether this scene just ended (SC1-D).
+
+        ``None`` — the answer on nearly every turn — leaves the reply
+        exactly as it was before SC1-D, which is what lets an unfinished
+        scene stay indistinguishable from one that never had a verdict.
+        Fail-soft for the same reason the chips are: a wrap-up that
+        crashed must not turn into a failed reply the player is waiting
+        for, and the timeout sweep will collect the scene either way.
+        """
+        if self._story_scene_service is None:
+            return None
+        try:
+            return await self._story_scene_service.close_if_resolved(
+                character,
+                session=session,
+                conversation=conversation,
+                now=now,
+            )
+        except Exception:  # noqa: BLE001 - a verdict never fails a turn
+            _LOGGER.exception(
+                "story scene verdict failed scene=%s character=%s",
+                session.id,
+                character.id,
+            )
+            return None
+
+    async def _touch_scene_activity(
+        self, session: "StorySceneSession", *, now: datetime,
+    ) -> bool:
+        if self._story_scene_sessions is None:
+            return False
+        try:
+            return await self._story_scene_sessions.touch_activity(
+                session.id, at=now,
+            )
+        except Exception:  # noqa: BLE001
+            # The scene is almost certainly still live — a storage blip is
+            # not a reason to strip the player's chips, and the worst case
+            # is one skipped bump, which the next turn re-establishes.
+            _LOGGER.exception(
+                "story scene activity stamp failed scene=%s", session.id,
+            )
+            return True
 
     async def _embed_query(self, query_text: str | None) -> list[float] | None:
         if self._embedder is None or not query_text:
@@ -6635,14 +6943,55 @@ def _classify_assistant_kind(
     return MessageKind.CHAT
 
 
+_SCENE_CHIP_CONTEXT_TURNS = 6
+"""How much of the thread the chips writer reads.
+
+Small on purpose: chips are about *this moment* in the scene, and a long
+tail invites the model to suggest moves for something that already
+happened. The scene frame (place, mood, dramatic question) carries the
+standing context, so these lines only have to carry the last exchange."""
+
+_SCENE_CHIP_LINE_CHARS = 240
+
+
+def _render_scene_chip_lines(
+    conversation: Conversation,
+    *,
+    character: Character,
+    content_tolerance: str,
+) -> tuple[str, ...]:
+    """The tail of the thread, as prose, for the chips writer.
+
+    Narration is labelled rather than attributed to the character: it is
+    the scene's own voice, and a chip suggesting the player respond *to
+    the narrator* is the failure this label prevents.
+    """
+    messages = sanitize_messages_for_tolerance(
+        list(conversation.messages)[-_SCENE_CHIP_CONTEXT_TURNS:],
+        content_tolerance=content_tolerance,
+    )
+    lines: list[str] = []
+    for message in messages:
+        text = (message.content or "").strip()
+        if not text:
+            continue
+        if len(text) > _SCENE_CHIP_LINE_CHARS:
+            text = text[:_SCENE_CHIP_LINE_CHARS].rstrip() + "…"
+        if message.kind is MessageKind.SCENE_NARRATION:
+            speaker = "旁白"
+        elif message.role is MessageRole.USER:
+            speaker = "玩家"
+        else:
+            speaker = character.name
+        lines.append(f"{speaker}：{text}")
+    return tuple(lines)
+
+
 _FORCED_IMAGE_TOOL_NAME = "generate_image"
 _FORCED_IMAGE_TRIGGER_RE = re.compile(r"(?<!\S)/pic(?!\S)", re.IGNORECASE)
 
 _RECENT_DIALOGUE_TURN_LIMIT = 4
 _RECENT_DIALOGUE_CHAR_CAP = 800
-
-
-_MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def _parse_promise_datetime(
@@ -6702,123 +7051,6 @@ def _render_busy_interaction_lines(strength: object | None) -> list[str]:
     else:
         note = "互動量尚低，不要把忙碌變成冷落。"
     return [f"- 與使用者互動熱度：{label}；{note}"]
-
-
-def _to_vision_url(
-    url: str, *, uploads_dir: Path | None, public_base_url: str,
-) -> str | None:
-    """Convert a chat attachment URL into something the LLM can ingest.
-
-    Priority order:
-
-    1. ``data:image/...;base64,...`` already inlined → pass through.
-    2. URL points at our own ``/uploads/`` mount (relative OR absolute
-       under ``public_base_url``) → return the absolute public URL.
-       Container deployments inline those through Object Storage in
-       ``_to_vision_url_with_storage`` before this helper is reached.
-    3. External ``http(s)://`` URL we don't own (e.g. Telegram CDN) →
-       pass through. Models that accept HTTP (Anthropic, OpenAI cloud)
-       handle it; models that don't (LM Studio) will error — there's
-       no way around that without downloading first.
-    4. Otherwise → ``None`` so the caller downgrades to the text
-       placeholder.
-
-    The Object Storage data-URL path is ``_MAX_INLINE_IMAGE_BYTES``-
-    capped (default 10 MB) before this helper is reached.
-    """
-    _ = uploads_dir
-    if not url:
-        return None
-    # Already a data: URL (caller pre-encoded). Keep as-is.
-    if url.startswith("data:"):
-        return url
-    relative_url = url
-    if (
-        public_base_url
-        and url.startswith(public_base_url)
-        and url[len(public_base_url):].startswith("/uploads/")
-    ):
-        relative_url = url[len(public_base_url):]
-    if relative_url.startswith("/uploads/"):
-        if public_base_url:
-            return f"{public_base_url}{relative_url}"
-        return None
-    # External URL (CDN, third party). Nothing we can do but
-    # pass-through; the model adapter has to deal with it.
-    if url.startswith(("http://", "https://")):
-        return url
-    return None
-
-
-def _absolute_public_vision_url(
-    url: str,
-    *,
-    public_base_url: str,
-) -> str | None:
-    """Promote a trusted storage media ref to a provider-fetchable URL."""
-    if url.startswith(("http://", "https://")):
-        return url
-    if (
-        public_base_url
-        and url.startswith(("/v1/public/", "/uploads/"))
-    ):
-        return f"{public_base_url.rstrip('/')}{url}"
-    return None
-
-
-async def _to_vision_url_with_storage(
-    url: str,
-    *,
-    uploads_dir: Path | None,
-    public_base_url: str,
-    object_storage: ObjectStoragePort | None,
-    prefer_public_image_urls: bool = False,
-) -> str | None:
-    if object_storage is not None and url and not url.startswith("data:"):
-        object_key = object_storage.object_key_from_url(url)
-        if object_key is not None:
-            try:
-                metadata = await object_storage.stat(object_key=object_key)
-                if metadata is not None and metadata.size_bytes > _MAX_INLINE_IMAGE_BYTES:
-                    _LOGGER.warning(
-                        "skipping inline image object %s (%d bytes > cap)",
-                        object_key, metadata.size_bytes,
-                    )
-                    return None
-                if prefer_public_image_urls and metadata is not None:
-                    public_url = _absolute_public_vision_url(
-                        metadata.url,
-                        public_base_url=public_base_url,
-                    )
-                    if public_url is not None:
-                        return public_url
-                    _LOGGER.warning(
-                        "storage image object %s has no provider-fetchable "
-                        "public URL; falling back to bounded inline handling",
-                        object_key,
-                    )
-                data = await object_storage.get_bytes(object_key=object_key)
-                if len(data) > _MAX_INLINE_IMAGE_BYTES:
-                    _LOGGER.warning(
-                        "skipping inline image object %s (%d bytes > cap)",
-                        object_key, len(data),
-                    )
-                    return None
-                mime = (
-                    metadata.content_type if metadata is not None
-                    else mimetypes.guess_type(object_key)[0]
-                ) or "image/png"
-                b64 = base64.b64encode(data).decode("ascii")
-                return f"data:{mime};base64,{b64}"
-            except Exception:
-                _LOGGER.exception(
-                    "failed to read image object for inline encode key=%s",
-                    object_key,
-                )
-                return None
-    return _to_vision_url(
-        url, uploads_dir=uploads_dir, public_base_url=public_base_url,
-    )
 
 
 def _build_vision_inventory(
@@ -7328,6 +7560,8 @@ class StreamFinalizer:
         novelty_retry_count: int = 0,
         presence_frame: PresenceFrame | None = None,
         content_mode: MessageContentMode = MessageContentMode.NORMAL,
+        scene_session: "StorySceneSession | None" = None,
+        operator: "OperatorProfile | None" = None,
     ) -> None:
         self._service = service
         self._character = character
@@ -7357,6 +7591,11 @@ class StreamFinalizer:
         self._novelty_retry_count = novelty_retry_count
         self._presence_frame = presence_frame or PresenceFrame.web_stage()
         self._content_mode = content_mode
+        # 起幕 (SC1-C): the scene this turn is being played inside, read
+        # once when the stream started. ``None`` on every ordinary turn,
+        # and the only thing that makes ``_finish_turn`` do scene work.
+        self._scene_session = scene_session
+        self._operator = operator
         # When set, ``finish`` short-circuits and returns this response
         # without running state-update / post-turn / goal-review side
         # effects. Used by the busy-defer path: the brief ack has
@@ -7600,12 +7839,26 @@ class StreamFinalizer:
             forced_tool=self._forced_tool,
         )
 
+        # Rides back inside the SSE ``done`` frame's ``response`` object —
+        # the same model the non-streaming route returns, so the two
+        # transports expose one shape.
+        scene_turn = await self._service._finish_scene_turn(
+            character=self._character,
+            session=self._scene_session,
+            conversation=updated_conversation,
+            operator=self._operator,
+            content_mode=self._content_mode,
+            now=now,
+        )
         return ChatReplyResponse.build(
             conversation_id=updated_conversation.id,
             user_message=self._user_message,
             assistant_message=assistant_message,
             state=final_state,
             assistant_turn_record_id=turn_record_id,
+            suggested_actions=scene_turn.suggested_actions,
+            story_scene_session=scene_turn.closed_session,
+            story_scene_closing=scene_turn.closing_narration,
         )
 
 

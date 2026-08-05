@@ -31,6 +31,22 @@ from kokoro_link.infrastructure.persistence.models import Base
 _POSTGRES_IMAGE = "pgvector/pgvector:pg16"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _official_card_catalog_offline() -> Iterator[None]:
+    """No test may reach the public official-card catalog.
+
+    Its env default is the real ``app.yuralume.com`` endpoint — that is the
+    point of the feature — so an app built from the environment would fetch
+    it for real: five seconds of timeout per call offline, and a suite whose
+    assertions depend on what is published today when online. Tests that want
+    a catalog wire a fake transport or a stub port explicitly; everyone else
+    gets the same empty shelf a self-hoster who opted out gets.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("KOKORO_OFFICIAL_CARD_CATALOG_URL", "")
+        yield
+
+
 @pytest.fixture(scope="session")
 def postgres_container() -> Iterator[object]:
     """Session-scoped PostgreSQL container.

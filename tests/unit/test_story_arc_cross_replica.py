@@ -76,13 +76,15 @@ class _SlowPlanner(StoryArcPlannerPort):
         today: date | None = None,
         seed_candidates: tuple[object, ...] = (),
         arc_history: tuple[str, ...] = (),
+        operator_relationship_lines: tuple[str, ...] = (),
     ) -> StoryArc:
-        # ``today`` (CF1b absolute-date anchors) and the AE0 pair
-        # ``seed_candidates`` / ``arc_history`` are prompt-only context;
-        # this stub ignores them but must accept them, because the racing
-        # test wraps ``plan_arc`` in a ``**kwargs`` passthrough that
-        # defeats the service's signature-based kwarg filtering.
-        del today, seed_candidates, arc_history
+        # ``today`` (CF1b absolute-date anchors), the AE0 pair
+        # ``seed_candidates`` / ``arc_history`` and OP1-A's
+        # ``operator_relationship_lines`` are prompt-only context; this
+        # stub ignores them but must accept them, because the racing test
+        # wraps ``plan_arc`` in a ``**kwargs`` passthrough that defeats
+        # the service's signature-based kwarg filtering.
+        del today, seed_candidates, arc_history, operator_relationship_lines
         self.calls += 1
         await asyncio.sleep(0.05)
         arc = StoryArc.create(

@@ -186,7 +186,7 @@ class LLMCharacterDraftGenerator(CharacterDraftGeneratorPort):
                 "Draft generator: image recognition route resolved to non-vision model",
             )
             return ""
-        kwargs: dict[str, Any] = {"image_urls": (_image_data_url(image),)}
+        kwargs: dict[str, Any] = {"image_urls": (_image_ref(image, model),)}
         if model_id is not None:
             kwargs["model"] = model_id
         try:
@@ -209,12 +209,24 @@ class LLMCharacterDraftGenerator(CharacterDraftGeneratorPort):
         operator_id: str | None = None,
     ) -> str:
         if self._resolver is not None:
-            image_urls = [_image_data_url(image)] if image is not None else []
-            return await self._resolver.generate(
-                instruction,
-                image_urls=image_urls,
-                operator_id=operator_id,
-            )
+            if image is None:
+                return await self._resolver.generate(
+                    instruction,
+                    image_urls=[],
+                    operator_id=operator_id,
+                )
+            # The image carrier depends on the *resolved* model, which
+            # ``ModelResolver.generate`` picks internally and never exposes —
+            # so the image path resolves first and calls the model directly.
+            # ``operator_id`` is a resolve-time input only (the resolver
+            # doesn't forward it to ``generate`` either), so it stops here.
+            model, model_id = await self._resolver.resolve(operator_id=operator_id)
+            call_kwargs: dict[str, Any] = {
+                "image_urls": [_image_ref(image, model)],
+            }
+            if model_id is not None:
+                call_kwargs["model"] = model_id
+            return await model.generate(instruction, **call_kwargs)
         if not self._base_url or not self._model:
             raise RuntimeError("LLMCharacterDraftGenerator is not configured")
         messages = _build_messages(instruction, image)
@@ -282,6 +294,32 @@ def _image_context_block(
 def _image_data_url(image: ImageInput) -> str:
     encoded = base64.b64encode(image.data).decode("ascii")
     return f"data:{image.mime_type};base64,{encoded}"
+
+
+def _image_ref(image: ImageInput, model: object) -> str:
+    """Pick the carrier for one draft image.
+
+    Hosted Cloud routes through a gateway with a bounded serialized request
+    budget, so an inline base64 data URL blows the envelope; the Cloud adapter
+    advertises ``prefers_public_image_urls`` and we hand it the object-storage
+    URL instead. Self-host adapters (and any upload that never made it to
+    storage, i.e. ``public_url is None``) stay inline.
+
+    The warning below fires only where the requirement actually exists: a model
+    that asked for a URL and did not get one. Self-host never reaches it (the
+    flag is False), so a deployment with no object storage at all stays silent
+    — as it should, since inline is its normal, correct path."""
+    prefers_public_url = bool(getattr(model, "prefers_public_image_urls", False))
+    if prefers_public_url and not image.public_url:
+        _LOGGER.warning(
+            "draft image carrier: the resolved model prefers public image URLs "
+            "but this draft image has none — staging was skipped or failed. "
+            "Falling back to an inline data URL, which on hosted may exceed the "
+            "gateway request budget and degrade the draft to text-only",
+        )
+    if image.public_url and prefers_public_url:
+        return image.public_url
+    return _image_data_url(image)
 
 
 def _build_instruction(

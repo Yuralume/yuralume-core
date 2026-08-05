@@ -56,6 +56,7 @@ class AccountRuntimeUsageRepositoryPort(Protocol):
         event_type: str,
         since: datetime,
         until: datetime | None = None,
+        resource_id: str | None = None,
     ) -> int: ...
 
     async def claim_event_slot(
@@ -66,10 +67,15 @@ class AccountRuntimeUsageRepositoryPort(Protocol):
         occurred_at: datetime,
         since: datetime,
         limit: int,
+        resource_id: str | None = None,
+        resource_limit: int | None = None,
     ) -> str | None:
         """Take one of at most ``limit`` slots in the window, atomically.
 
-        Returns the recorded event's id, or ``None`` when the window is full.
+        Returns the recorded event's id, or ``None`` when the account window or
+        optional per-resource window is full. ``resource_limit`` is applied only
+        when ``resource_id`` is non-empty; callers use it to make a character's
+        reserved first slot single-flight without inventing another ledger.
 
         Counting first and recording afterwards cannot enforce a ceiling: two
         concurrent ticks (several characters of one operator, several hosted

@@ -35,7 +35,12 @@ class SceneContext:
     selection (daily / dramatic / mature / dark / lighthearted) so the
     same scene structure can read as gentle slice-of-life or grim
     drama. Unknown tones fall back to ``daily`` framing in the
-    expander."""
+    expander.
+
+    Hosted (cloud mode) the expander runs this through
+    ``domain.services.story_tone_policy.resolve_prompt_tone`` first —
+    ``mature`` renders as ``dramatic`` and off-catalogue labels as
+    ``daily`` (GF6). Self-host: unchanged."""
 
     today: date | None = None
     """Operator-local civil day this scene is being played on.
@@ -46,17 +51,38 @@ class SceneContext:
     persisted as a StoryEvent and re-read for days, so a relative time
     word frozen into it never resolves (CF1b)."""
 
+    operator_position: str | None = None
+    """Where the player stands in this scene (OP0-A's closed vocabulary),
+    or ``None`` for *unjudged* — carried through from the beat so the
+    expander frames the player the same way the autonomous beat scene
+    writer would for the same beat (OP2-C). Not re-validated here: the
+    beat entity already rejected anything outside the vocabulary, and
+    the renderer degrades an unexpected value to *unjudged* rather than
+    failing a realization."""
+
+    operator_note: str | None = None
+    """Optional free-text note about the player's dramatic position."""
+
     def is_meaningful(self) -> bool:
         """``True`` when at least one structured field is populated.
 
         Lets the expander cheaply decide whether to switch prompt
         modes — purely-empty contexts are treated identically to
         ``scene=None``.
+
+        The player-position fields count as structure (OP2-C): a beat
+        that says the scene is *about the player* but names no location,
+        cast or question is exactly a beat whose framing must not be
+        dropped, and falling through to the seed-style journal prompt
+        would drop it. ``today`` still does not count — it is plumbing,
+        not structure.
         """
         return bool(
             self.location
             or self.scene_characters
             or self.dramatic_question
+            or self.operator_position
+            or self.operator_note
         )
 
 

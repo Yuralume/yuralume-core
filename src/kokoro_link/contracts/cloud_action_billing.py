@@ -58,6 +58,15 @@ ACTION_FEED_POST_OVERAGE = "feed_post_overage"
 ACTION_FUSION_STORY = "fusion_story"
 ACTION_FUSION_STORY_ITERATE = "fusion_story_iterate"
 
+#: 起幕 (STORY_SCENE_PLAN §3.3). One press, one price, covering the scene's
+#: *opening* only — the narration, the character's first performed line and
+#: the scene frame. What happens inside the scene afterwards is ordinary
+#: chat, charged turn by turn under :data:`ACTION_CHAT`, so a long scene is
+#: never a second, invisible bill. The wrap-up (``story_scene_close``) and
+#: the action chips (``story_scene_chips``) are background feature keys, not
+#: actions: their cost is already inside this one price.
+ACTION_STORY_SCENE_OPEN = "story_scene_open"
+
 
 #: Actions already paid for by an *enclosing* charge, keyed by the action key
 #: their entry point would otherwise raise. AP4's quota overage is the only

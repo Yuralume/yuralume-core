@@ -3,11 +3,32 @@ import axios from 'axios'
 import type { AlbumListResponse } from '@/types/album'
 import type { Character } from '@/types/character'
 
-export async function listAlbum(characterId: string): Promise<AlbumListResponse> {
+export interface ListAlbumParams {
+  limit?: number
+  /** Keyset cursor — pass the previous page's `next_before` to page forward. */
+  before?: string | null
+}
+
+export const ALBUM_PAGE_SIZE = 40
+
+export async function listAlbum(
+  characterId: string,
+  params: ListAlbumParams = {},
+): Promise<AlbumListResponse> {
   const res = await axios.get<AlbumListResponse>(
     `/api/v1/characters/${characterId}/album`,
+    {
+      params: {
+        limit: params.limit ?? ALBUM_PAGE_SIZE,
+        before: params.before ?? undefined,
+      },
+    },
   )
-  return res.data
+  return {
+    ...res.data,
+    has_more: res.data.has_more ?? false,
+    next_before: res.data.next_before ?? null,
+  }
 }
 
 /**

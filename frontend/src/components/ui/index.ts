@@ -4,6 +4,15 @@ export { default as UiTextarea } from './UiTextarea.vue'
 export { default as UiSelect } from './UiSelect.vue'
 export type { UiSelectOption } from './UiSelect.vue'
 export { default as UiCombobox } from './UiCombobox.vue'
+export { default as UiImage } from './UiImage.vue'
+export type { UiImageVariant, UiImageSizeKey } from './UiImage.vue'
+export {
+  UI_IMAGE_VARIANT_QUERY,
+  imageSrcset,
+  imageVariantUrl,
+  supportsSizeVariants,
+  uiImageVariantPlan,
+} from './UiImage.vue'
 export { default as UiCard } from './UiCard.vue'
 export { default as UiSection } from './UiSection.vue'
 export { default as UiBadge } from './UiBadge.vue'

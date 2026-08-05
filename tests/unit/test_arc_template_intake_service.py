@@ -18,6 +18,8 @@ from kokoro_link.application.services.arc_template_intake_service import (
     BeatDraft,
     MetaSuggestions,
     TemplateDraft,
+    _build_beat_summary_prompt,
+    _build_full_draft_prompt,
 )
 from kokoro_link.infrastructure.repositories.in_memory_arc_templates import (
     InMemoryArcTemplateRepository,
@@ -256,6 +258,10 @@ async def test_suggest_beat_options_fallback_includes_tension(
 
 @pytest.mark.asyncio
 async def test_generate_beat_summary_returns_text(tmp_path: Path) -> None:
+    """Model ignores the JSON envelope and returns plain prose (the
+    pre-OP1-B contract) — the whole response still becomes the summary,
+    and the position proposal is simply absent (stays unjudged) rather
+    than the call failing."""
     svc = _service(tmp_path, _FakeModel(
         "鏡子裡只剩自己，呼吸卻還是不夠穩。"
         "老師站在門邊看了一會，沒說話就走開了。"
@@ -273,8 +279,68 @@ async def test_generate_beat_summary_returns_text(tmp_path: Path) -> None:
         tension="rising",
     )
     result = await svc.generate_beat_summary(beat=beat, context=ctx)
-    assert "鏡子" in result
-    assert len(result) <= 250
+    assert "鏡子" in result.summary
+    assert len(result.summary) <= 250
+    assert result.operator_position is None
+    assert result.operator_note is None
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_parses_position_proposal(
+    tmp_path: Path,
+) -> None:
+    """OP1-B: the model proposes a player-position pair alongside the
+    summary; both land on the returned suggestion so the wizard can
+    pre-fill the draft's two OP0 columns."""
+    payload = json.dumps({
+        "summary": (
+            "鏡子裡只剩自己，呼吸卻還是不夠穩。"
+            "她抬頭看見你就站在門邊，一句話也說不出口。"
+        ),
+        "operator_position": "central",
+        "operator_note": "她要向你坦白練得不夠的事實",
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    beat = BeatDraft(
+        sequence=1, day_offset=5, title="第一次撞牆",
+        summary="", tension="rising", scene_type="conflict",
+        location="音樂教室", scene_characters=("指導老師",),
+        dramatic_question="她要向你承認嗎？", required=True,
+    )
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="dramatic", duration_days=14, world_frames=(),
+        beat_position=1, total_beats=6, day_offset=5,
+        tension="rising",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert "鏡子" in result.summary
+    assert result.operator_position == "central"
+    assert result.operator_note == "她要向你坦白練得不夠的事實"
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_off_vocabulary_position_degrades_to_unjudged(
+    tmp_path: Path,
+) -> None:
+    """A hallucinated position must not fail the whole summary call —
+    it's a review-step suggestion the operator can still edit."""
+    payload = json.dumps({
+        "summary": "一段普通的摘要文字，長度足夠通過檢查。",
+        "operator_position": "protagonist",
+        "operator_note": "",
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    beat = BeatDraft(sequence=0, day_offset=0, title="t")
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="daily", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="setup",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert result.summary == "一段普通的摘要文字，長度足夠通過檢查。"
+    assert result.operator_position is None
 
 
 @pytest.mark.asyncio
@@ -297,9 +363,186 @@ async def test_generate_beat_summary_fallback_assembles_skeleton(
     result = await svc.generate_beat_summary(beat=beat, context=ctx)
     # Fallback stitches the structured fields into a usable sentence
     # so the operator can edit rather than start blank.
-    assert "公告欄" in result
-    assert "凜" in result
-    assert "她敢報名嗎？" in result
+    assert "公告欄" in result.summary
+    assert "凜" in result.summary
+    assert "她敢報名嗎？" in result.summary
+    # No semantic judgement available in the static fallback — position
+    # stays unjudged rather than a heuristic guessing it (LLM-first).
+    assert result.operator_position is None
+    assert result.operator_note is None
+
+
+def test_beat_summary_prompt_retires_blanket_exclusion_rule() -> None:
+    """OP1-B. Characterized before flipping: the beat-summary prompt
+    used to carry a flat 「不要把使用者寫進場景。」 rule that a beat with
+    a player-centred dramatic_question would directly contradict.
+    Retired in favour of guidance that asks the model to judge the
+    player's position honestly (absent/present/central) and propose
+    it in the JSON envelope."""
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="daily", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="setup",
+    )
+    prompt = _build_beat_summary_prompt(
+        beat=BeatDraft(sequence=0, day_offset=0, title="t"),
+        context=ctx,
+    )
+    assert "不要把使用者寫進場景" not in prompt
+    assert "operator_position" in prompt
+    assert "central" in prompt
+
+
+# ---------- generate_beat_summary: anchoring an existing decision ---
+# (Codex review, M1 — "regenerate summary" used to unconditionally
+# overwrite operator_position/operator_note, so an LLM crash, an
+# off-vocabulary hallucination, or a model simply judging differently
+# on rerun could silently wipe an operator's `central` call back to
+# unjudged. `generate_beat_summary` now anchors every return path
+# against the beat's own already-decided fields.)
+
+
+def test_beat_summary_prompt_states_decided_position_as_fixed_fact() -> None:
+    """Once decided, the prompt stops asking the model to (re-)judge
+    the position from scratch — it states the value as a fixed fact
+    the summary should be written around."""
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="dramatic", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="climax",
+    )
+    prompt = _build_beat_summary_prompt(
+        beat=BeatDraft(
+            sequence=0, day_offset=0, title="t",
+            operator_position="central",
+            operator_note="她要向你坦白",
+        ),
+        context=ctx,
+    )
+    assert "central" in prompt
+    assert "她要向你坦白" in prompt
+    assert "既定事實" in prompt
+    # The open three-way judgement instruction is for the still-unjudged
+    # case only.
+    assert "使用者的位置請依劇情誠實判斷" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_preserves_decided_position_against_llm_override(
+    tmp_path: Path,
+) -> None:
+    """The LLM answers with a *different* valid position on this
+    regenerate call — the operator's own prior `central` call still
+    wins; the model cannot silently overrule it."""
+    payload = json.dumps({
+        "summary": "一段新的摘要文字，長度足夠通過檢查用於測試案例。",
+        "operator_position": "absent",
+        "operator_note": "他完全不在場",
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    beat = BeatDraft(
+        sequence=0, day_offset=0, title="攤牌",
+        operator_position="central",
+        operator_note="她要向你坦白練得不夠的事實",
+    )
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="dramatic", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="climax",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert "新的摘要" in result.summary
+    assert result.operator_position == "central"
+    assert result.operator_note == "她要向你坦白練得不夠的事實"
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_llm_crash_preserves_decided_position(
+    tmp_path: Path,
+) -> None:
+    """M1 regression: before this fix, an LLM crash during 'regenerate
+    summary' fell back to the static skeleton stitcher, which always
+    returned operator_position=None — silently clearing an operator's
+    `central` call. The static fallback still has no semantic
+    judgement to offer (LLM-first: it must not guess a *fresh* value),
+    but it must not erase a judgement that already exists either."""
+    svc = _service(tmp_path, _CrashingModel())
+    beat = BeatDraft(
+        sequence=0, day_offset=0, title="攤牌",
+        location="頂樓", scene_characters=("同學",),
+        dramatic_question="她敢說嗎？",
+        operator_position="central",
+        operator_note="她要向你坦白",
+    )
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="dramatic", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="climax",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert result.operator_position == "central"
+    assert result.operator_note == "她要向你坦白"
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_preserves_note_but_still_accepts_new_position(
+    tmp_path: Path,
+) -> None:
+    """Gating is per field, independently: the operator only wrote a
+    note by hand (position is still unjudged) — regenerating still
+    lets the model propose a position, but must not blow away the
+    manually-written note."""
+    payload = json.dumps({
+        "summary": "一段摘要文字，長度足夠通過檢查。",
+        "operator_position": "present",
+        "operator_note": "模型自己想的 note",
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    beat = BeatDraft(
+        sequence=0, day_offset=0, title="t",
+        operator_note="操作者手寫的 note，不該被蓋掉",
+    )
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="daily", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="setup",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert result.operator_position == "present"
+    assert result.operator_note == "操作者手寫的 note，不該被蓋掉"
+
+
+@pytest.mark.asyncio
+async def test_generate_beat_summary_clips_overlong_operator_note(
+    tmp_path: Path,
+) -> None:
+    """Bonus (Codex review, same family as M1/M2): every other optional
+    string this file's LLM-response parsers accept is length-bounded;
+    operator_note wasn't. Clamped to the same 120-char bound the
+    planner ingest path already enforces
+    (OP1-A, ``llm_arc_planner._MAX_OPERATOR_NOTE_CHARS``)."""
+    long_note = "她" * 400
+    payload = json.dumps({
+        "summary": "一段摘要文字，長度足夠通過檢查用於測試。",
+        "operator_position": "present",
+        "operator_note": long_note,
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    beat = BeatDraft(sequence=0, day_offset=0, title="t")
+    ctx = BeatContext(
+        template_title="t", premise="p", theme="ambition",
+        tone="daily", duration_days=14, world_frames=(),
+        beat_position=0, total_beats=4, day_offset=0,
+        tension="setup",
+    )
+    result = await svc.generate_beat_summary(beat=beat, context=ctx)
+    assert result.operator_note is not None
+    assert len(result.operator_note) <= 120
 
 
 # ---------- generate_full_draft ------------------------------------
@@ -336,6 +579,8 @@ async def test_generate_full_draft_returns_complete_template(
                 "scene_characters": ["指導老師"],
                 "dramatic_question": "她要承認嗎？",
                 "required": True,
+                "operator_position": "present",
+                "operator_note": "你在一旁看著她練習",
             },
             {
                 "sequence": 2, "day_offset": 14,
@@ -358,6 +603,15 @@ async def test_generate_full_draft_returns_complete_template(
     assert len(draft.beats) == 3
     assert draft.beats[1].location == "音樂教室"
     assert draft.beats[1].scene_characters == ("指導老師",)
+    # OP0-B: the full-draft LLM parse must carry the player-position
+    # pair the same as every other beat field. A beat that omits it
+    # (beat 0 here) still degrades to unjudged rather than failing —
+    # some model responses will skip it even though the prompt asks
+    # (M2, below, is what makes the prompt ask in the first place).
+    assert draft.beats[1].operator_position == "present"
+    assert draft.beats[1].operator_note == "你在一旁看著她練習"
+    assert draft.beats[0].operator_position is None
+    assert draft.beats[0].operator_note is None
 
 
 @pytest.mark.asyncio
@@ -366,6 +620,130 @@ async def test_generate_full_draft_garbage_returns_none(
 ) -> None:
     svc = _service(tmp_path, _FakeModel("不知道"))
     assert await svc.generate_full_draft(pitch="任意") is None
+
+
+@pytest.mark.asyncio
+async def test_generate_full_draft_off_vocabulary_position_degrades_to_unjudged(
+    tmp_path: Path,
+) -> None:
+    """A hallucinated position must not fail the whole draft — it's a
+    review-step suggestion the operator can still edit, not a save."""
+    payload = json.dumps({
+        "id": "test_bad_position",
+        "title": "標題",
+        "premise": "一段測試 premise。" * 5,
+        "theme": "ambition",
+        "beats": [
+            {
+                "sequence": 0, "day_offset": 0,
+                "title": "起點", "summary": "場景摘要。" * 5,
+                "operator_position": "protagonist",
+            },
+        ],
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    draft = await svc.generate_full_draft(pitch="任意")
+    assert draft is not None
+    assert draft.beats[0].operator_position is None
+
+
+# ---------- generate_full_draft: fast-path asks for player position -
+# (Codex review, M2 — the one-shot "全部交給 AI" prompt never asked
+# the model for operator_position/operator_note at all, so every beat
+# it produced landed unjudged even though the parse side (OP0-B) has
+# supported both columns since day one.)
+
+
+def test_full_draft_prompt_asks_for_player_position_schema() -> None:
+    prompt = _build_full_draft_prompt(
+        pitch="p", hint="", operator_primary_language="zh-TW",
+    )
+    assert "operator_position" in prompt
+    assert "operator_note" in prompt
+    assert "absent" in prompt and "present" in prompt and "central" in prompt
+
+
+def test_full_draft_prompt_gives_mixed_guidance_not_a_fixed_ratio() -> None:
+    """LLM-first (紅線 1): the guidance must read as a semantic
+    instruction the model judges per beat, not a hardcoded ratio or a
+    keyword rule."""
+    prompt = _build_full_draft_prompt(
+        pitch="p", hint="", operator_primary_language="zh-TW",
+    )
+    assert "不要按固定比例分配" in prompt
+    assert "climax" in prompt or "resolution" in prompt  # tension cue present
+
+
+@pytest.mark.asyncio
+async def test_generate_full_draft_fast_path_round_trips_player_position(
+    tmp_path: Path,
+) -> None:
+    """End-to-end fast-path test: a model that answers the (now-asked)
+    player-position pair for every beat round-trips cleanly through
+    ``generate_full_draft`` — and the prompt it was sent actually asked
+    for it."""
+    payload = json.dumps({
+        "id": "full_draft_with_positions",
+        "title": "測試 arc",
+        "premise": "一段測試 premise。" * 3,
+        "theme": "ambition",
+        "beats": [
+            {
+                "sequence": 0, "day_offset": 0,
+                "title": "日常", "summary": "一段摘要文字。" * 5,
+                "operator_position": "absent", "operator_note": "",
+            },
+            {
+                "sequence": 1, "day_offset": 7,
+                "title": "攤牌", "summary": "一段摘要文字。" * 5,
+                "operator_position": "central",
+                "operator_note": "她要在這裡把話說開",
+            },
+        ],
+    }, ensure_ascii=False)
+    model = _FakeModel(payload)
+    svc = _service(tmp_path, model)
+
+    draft = await svc.generate_full_draft(pitch="任意 pitch")
+
+    assert model.last_prompt is not None
+    assert "operator_position" in model.last_prompt
+    assert "central" in model.last_prompt
+    assert draft is not None
+    assert draft.beats[0].operator_position == "absent"
+    assert draft.beats[1].operator_position == "central"
+    assert draft.beats[1].operator_note == "她要在這裡把話說開"
+
+
+@pytest.mark.asyncio
+async def test_generate_full_draft_clips_overlong_operator_note(
+    tmp_path: Path,
+) -> None:
+    """Bonus (Codex review, same family as M1/M2): ``operator_note``
+    wasn't length-clamped in the full-draft parser while every other
+    optional string was. Clamped to the same 120-char bound the
+    planner ingest path already enforces
+    (OP1-A, ``llm_arc_planner._MAX_OPERATOR_NOTE_CHARS``)."""
+    long_note = "她" * 400
+    payload = json.dumps({
+        "id": "clip_test",
+        "title": "標題",
+        "premise": "一段測試 premise。" * 5,
+        "theme": "ambition",
+        "beats": [
+            {
+                "sequence": 0, "day_offset": 0,
+                "title": "起點", "summary": "場景摘要。" * 5,
+                "operator_position": "present",
+                "operator_note": long_note,
+            },
+        ],
+    }, ensure_ascii=False)
+    svc = _service(tmp_path, _FakeModel(payload))
+    draft = await svc.generate_full_draft(pitch="任意")
+    assert draft is not None
+    assert draft.beats[0].operator_note is not None
+    assert len(draft.beats[0].operator_note) <= 120
 
 
 # ---------- save_template ------------------------------------------
@@ -403,6 +781,35 @@ async def test_save_template_writes_via_repository(tmp_path: Path) -> None:
     )
     assert template is not None
     assert template.title == "儲存測試"
+
+
+@pytest.mark.asyncio
+async def test_save_template_round_trips_the_player_position_pair(
+    tmp_path: Path,
+) -> None:
+    svc = _service(tmp_path, _FakeModel("ignored"))
+    draft = TemplateDraft(
+        id="saved_with_position",
+        title="玩家位置測試",
+        premise="一段測試 premise，要夠長才能驗證通過。",
+        theme="ambition",
+        beats=(
+            BeatDraft(
+                sequence=0, day_offset=0, title="t1",
+                summary="場景 1 的摘要。",
+                operator_position="central",
+                operator_note="她要向你坦白",
+            ),
+        ),
+    )
+    await svc.save_template(draft, user_id=_TEST_USER_ID)
+
+    template = await svc._repository.get_for_user(
+        "saved_with_position", user_id=_TEST_USER_ID,
+    )
+    assert template is not None
+    assert template.beats[0].operator_position == "central"
+    assert template.beats[0].operator_note == "她要向你坦白"
 
 
 @pytest.mark.asyncio

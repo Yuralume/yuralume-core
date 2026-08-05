@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Sequence
 
 import pytest
@@ -24,9 +25,11 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplate,
     ArcTemplateBeat,
 )
+from kokoro_link.domain.entities.story_arc import OPERATOR_POSITION_CENTRAL
 from kokoro_link.infrastructure.story.llm_arc_template_translator import (
     LLMArcTemplateTranslator,
     NullArcTemplateTranslator,
+    _template_payload,
 )
 
 
@@ -249,3 +252,74 @@ async def test_fence_wrapped_json_is_parsed() -> None:
         tpl, target_language="en-US",
     )
     assert out.title == "Fenced Title"
+
+
+# ---------- OP0-B: operator_note is prose, operator_position is not ----
+
+
+def _template_with_operator_pair() -> ArcTemplate:
+    """``_template()`` plus a player-position pair on the first beat —
+    kept separate from the shared fixture so the ~10 tests above that
+    build on ``_template()`` don't have to account for the new fields."""
+    tpl = _template()
+    first_beat = replace(
+        tpl.beats[0],
+        operator_position=OPERATOR_POSITION_CENTRAL,
+        operator_note="她要向你坦白",
+    )
+    return tpl.with_beats((first_beat, tpl.beats[1]))
+
+
+def test_template_payload_sends_operator_note_but_not_operator_position() -> None:
+    """The structural flag must never even reach the model — this is
+    the strongest guarantee against it being reinterpreted, stronger
+    than trusting the merge step to ignore an echoed value."""
+    tpl = _template_with_operator_pair()
+
+    payload = _template_payload(tpl)
+
+    assert payload["beats"][0]["operator_note"] == "她要向你坦白"
+    assert "operator_position" not in payload["beats"][0]
+
+
+@pytest.mark.asyncio
+async def test_operator_note_translates_operator_position_stays_structural() -> None:
+    tpl = _template_with_operator_pair()
+    payload = {
+        "beats": [
+            {
+                "title": "Sunday Breakfast",
+                "summary": "s",
+                "operator_note": "She is about to confess to you.",
+            },
+            {"title": "Msg", "summary": "s2"},
+        ],
+    }
+    out = await _make(json.dumps(payload)).translate_template(
+        tpl, target_language="en-US",
+    )
+    assert out.beats[0].operator_note == "She is about to confess to you."
+    # Structural — preserved byte-for-byte regardless of what the model
+    # (or a malicious/buggy response) might have echoed back.
+    assert out.beats[0].operator_position == OPERATOR_POSITION_CENTRAL
+
+
+@pytest.mark.asyncio
+async def test_operator_note_absent_upstream_is_never_fabricated() -> None:
+    """Same "never invent an empty optional field" rule as location /
+    dramatic_question — the second beat has no operator_note upstream."""
+    tpl = _template_with_operator_pair()
+    assert tpl.beats[1].operator_note is None
+    payload = {
+        "beats": [
+            {"title": "Sunday Breakfast", "summary": "s"},
+            {
+                "title": "Msg", "summary": "s2",
+                "operator_note": "A note nobody asked for.",
+            },
+        ],
+    }
+    out = await _make(json.dumps(payload)).translate_template(
+        tpl, target_language="en-US",
+    )
+    assert out.beats[1].operator_note is None

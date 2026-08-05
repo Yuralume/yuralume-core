@@ -23,7 +23,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import date as date_type, datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -136,6 +136,12 @@ from kokoro_link.domain.entities.operator_profile import (
 )
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
+from kokoro_link.domain.entities.story_arc import (
+    BEAT_PENDING,
+    OPERATOR_POSITION_CENTRAL,
+    StoryArc,
+    StoryArcBeat,
+)
 from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.value_objects.goal_status import GoalStatus
 from kokoro_link.domain.value_objects.platform import Platform
@@ -184,6 +190,9 @@ if TYPE_CHECKING:
     from kokoro_link.contracts.persona_curiosity import (
         PersonaCuriosityPlan,
         PersonaCuriosityPlannerPort,
+    )
+    from kokoro_link.contracts.story_scene import (
+        StorySceneSessionRepositoryPort,
     )
 
 _LOGGER = logging.getLogger(__name__)
@@ -270,6 +279,7 @@ class ProactiveDispatcher:
         hosted_identity_resolver: (
             Callable[[str], Awaitable["tuple[str, str] | None"]] | None
         ) = None,
+        story_scene_sessions: "StorySceneSessionRepositoryPort | None" = None,
     ) -> None:
         self._characters = character_repository
         self._conversations = conversation_repository
@@ -375,6 +385,13 @@ class ProactiveDispatcher:
         # local) keeps the external gate single-path — behaviour byte-identical
         # to before, so no existing proactive test changes.
         self._hosted_identity_resolver = hosted_identity_resolver
+        # SC1-E — while a character is inside a 起幕 scene, it does not also
+        # message the player from outside it (STORY_SCENE_PLAN §3.2). Read
+        # straight from the session repository rather than through the scene
+        # service: this is one indexed lookup in the cheap-gate band, and
+        # depending on the whole scene runtime here would make the proactive
+        # path import the opener, the waterfall and the quota guard.
+        self._story_scene_sessions = story_scene_sessions
         # M8: shared idempotent line-history recorder — the dispatcher records
         # right after acceptance; the retry worker re-records accepted rows whose
         # append never landed. One implementation keeps them in step.
@@ -420,6 +437,23 @@ class ProactiveDispatcher:
                 trigger=trigger,
                 outcome=ProactiveOutcome.DISABLED,
                 reason="proactive_enabled is False",
+                now=when,
+            )
+
+        # SC1-E — paused, not cancelled. A character playing a scene must
+        # not also send a message from outside it (§3.2); the moment the
+        # scene closes the very next tick evaluates exactly as before,
+        # because nothing about this gate is remembered anywhere. Sits in
+        # the cheap band (one indexed read) so a paused character costs no
+        # schedule resolution and no model call, and it is GATE_BLOCKED
+        # rather than DISABLED so the cooldown anchor — which only advances
+        # on attempts that passed the gate — is untouched by the pause.
+        if await self._is_playing_a_scene(character_id):
+            return await self._log(
+                character_id=character_id,
+                trigger=trigger,
+                outcome=ProactiveOutcome.GATE_BLOCKED,
+                reason="story scene in progress",
                 now=when,
             )
 
@@ -551,8 +585,8 @@ class ProactiveDispatcher:
             persona_curiosity_plan,
             surface="proactive",
         )
-        active_arc, upcoming_beats = await self._ensure_active_arc(
-            character, when, operator_tz,
+        active_arc, upcoming_beats, beat_awaiting_player = (
+            await self._ensure_active_arc(character, when, operator_tz)
         )
         seed_title, seed_summary, seed_source, seed_locale, seed_item_id = (
             await self._claim_event_seed(character)
@@ -617,6 +651,7 @@ class ProactiveDispatcher:
             recent_dialogue_summary=recent_dialogue_summary,
             active_arc=active_arc,
             upcoming_beats=upcoming_beats,
+            beat_awaiting_player=beat_awaiting_player,
             recent_sent_attempts=recent_sent_attempts,
             unanswered_streak=unanswered_streak,
             world_event_seed_title=seed_title,
@@ -1828,10 +1863,11 @@ class ProactiveDispatcher:
         summary, and newly created characters had no arc at all — leading
         to openers that ignored whatever arc the user was mid-way through.
 
-        Returns ``(arc, upcoming_beats)``; empty on any failure — arcs
-        are colour, never worth aborting a proactive push over."""
+        Returns ``(arc, upcoming_beats, beat_awaiting_player)``; empty on
+        any failure — arcs are colour, never worth aborting a proactive
+        push over."""
         if self._story_arc_service is None:
-            return None, ()
+            return None, (), None
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
         today = when.astimezone(local_tz).date()
@@ -1844,9 +1880,9 @@ class ProactiveDispatcher:
                 "proactive: arc ensure_active_arc crashed character=%s",
                 character.id,
             )
-            return None, ()
+            return None, (), None
         if arc is None:
-            return None, ()
+            return None, (), None
         try:
             forward = arc.forward_beats(
                 after=today, limit=2, include_today=True,
@@ -1854,17 +1890,26 @@ class ProactiveDispatcher:
         except Exception:
             _LOGGER.exception("proactive: arc.forward_beats crashed")
             forward = []
-        return arc, tuple(forward)
+        return arc, tuple(forward), _beat_awaiting_the_player(arc, today=today)
 
     async def _load_story_events(
         self, character: Character, when: datetime,
     ) -> tuple[StoryEvent, ...]:
-        """Today's story events (idempotent ensure). Empty on failure."""
+        """Today's story events (idempotent ensure). Empty on failure.
+
+        ``unattended=True``: this runs on a background tick with no
+        player in the room, so a due beat whose ``operator_position`` is
+        ``central`` must be left waiting rather than attempted and
+        (past the recheck threshold) written into canon unseen
+        (ARC_PLAYER_POSITION_PLAN §2 #5). The invitation this dispatcher
+        may go on to send is what that beat is waiting for — playing it
+        here would answer the invitation before it was made.
+        """
         if self._story_event_service is None:
             return ()
         try:
             report = await self._story_event_service.ensure_today(
-                character, now=when,
+                character, now=when, unattended=True,
             )
             return tuple(report.events)
         except Exception:
@@ -1986,6 +2031,40 @@ class ProactiveDispatcher:
             _LOGGER.exception("proactive: recent-sent query failed")
             return ()
         return tuple(sent)
+
+    async def _is_playing_a_scene(self, character_id: str) -> bool:
+        """Is this character inside a live 起幕 scene right now?
+
+        **Fails open.** An unreadable session table means an unknown
+        answer, and the two ways to be wrong are not symmetric: pausing on
+        error would silence every proactive message on the deployment for
+        as long as the read kept failing, while proceeding costs at most
+        one message that arrives during a scene. The pause is narrative
+        polish (§3.2), not a safety or billing wall — the walls in this
+        method's neighbourhood fail closed precisely because they are.
+
+        Deliberately NOT applied to :meth:`deliver_pre_composed`: that
+        path releases a busy-defer follow-up or a scheduled promise the
+        player is already owed, and its caller turns any non-``sent``
+        outcome into a terminal ``failed`` row. Blocking there would not
+        postpone the message, it would delete it — trading a small framing
+        break for a broken promise. Deferring instead of dropping belongs
+        in the follow-up dispatcher's own release decision, where "not
+        now" already has a meaning.
+        """
+        if self._story_scene_sessions is None:
+            return False
+        try:
+            session = await self._story_scene_sessions.get_open_for_character(
+                character_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive: story scene lookup failed character_id=%s",
+                character_id,
+            )
+            return False
+        return session is not None
 
     async def _load_active_goals_text(
         self,
@@ -2309,6 +2388,41 @@ class ProactiveDispatcher:
                 else datetime.now(timezone.utc)
             ),
         )
+
+
+def _beat_awaiting_the_player(
+    arc: StoryArc, *, today: date_type,
+) -> StoryArcBeat | None:
+    """Earliest due beat whose scene is *about* the player, if any.
+
+    ARC_PLAYER_POSITION_PLAN §3.4 (OP3). ``central`` means the scene has
+    no content without the player, so the autonomous scan walks past it
+    (OP2-B) and it simply sits there — this is the beat the character
+    might reach out about.
+
+    Why "due" (``scheduled_date <= today``) rather than the forward feed
+    the arc block already carries: ``forward_beats`` is anchored at
+    ``>= today`` and therefore *drops* a beat the day after it comes due
+    — precisely when it has been waiting longest and an invitation
+    matters most. The due window mirrors ``StoryArcService.
+    _due_pending_beats`` so "waiting" means the same thing here as it
+    does to the code that plays beats.
+
+    ``BEAT_PENDING`` only, again matching the play-eligibility filter:
+    ``active`` would mean the scene is already running, and inviting
+    someone into a scene they are mid-way through is not an invitation.
+    """
+    due = [
+        beat
+        for beat in arc.beats
+        if beat.status == BEAT_PENDING
+        and beat.scheduled_date <= today
+        and beat.operator_position == OPERATOR_POSITION_CENTRAL
+    ]
+    if not due:
+        return None
+    due.sort(key=lambda beat: (beat.scheduled_date, beat.sequence))
+    return due[0]
 
 
 def _compute_idle_minutes(

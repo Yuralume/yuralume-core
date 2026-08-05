@@ -43,6 +43,8 @@ function tpl(
         scene_characters: [],
         dramatic_question: null,
         required: true,
+        operator_position: null,
+        operator_note: null,
       },
     ],
     ...overrides,

@@ -13,6 +13,7 @@ from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
 from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
 from kokoro_link.domain.entities.story_event import StoryEvent
+from kokoro_link.domain.entities.story_scene_session import StorySceneSession
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.content_flow import CONTENT_TOLERANCE_FRONTIER
 from kokoro_link.domain.value_objects.presence_frame import PresenceFrame
@@ -70,6 +71,7 @@ class PromptContextBuilderPort(Protocol):
         story_events: list[StoryEvent] | None = None,
         story_arc: StoryArc | None = None,
         upcoming_arc_beats: list[StoryArcBeat] | None = None,
+        story_scene: StorySceneSession | None = None,
         today_local: date_type | None = None,
         older_dialogue_summary: str | None = None,
         vision_markers: Mapping[int, list[int]] | None = None,
@@ -110,6 +112,16 @@ class PromptContextBuilderPort(Protocol):
 
         ``weather_context`` is the same pre-rendered current-weather
         block used by schedule/proactive/feed.
+
+        ``story_scene`` is the character's live 起幕 scene, when there is
+        one. Present = this turn is being played *inside* a framed scene,
+        so the builder renders the frame (title / place / mood / scene
+        type / dramatic question) as a directive and suppresses the
+        ordinary 「今日場景指引」 block — two directives about the same
+        beat, one saying "let this scene happen naturally" and one saying
+        "you are already in it", pull the model in opposite directions.
+        ``None`` (every non-scene turn, every caller that never opened a
+        scene) leaves the prompt byte-identical to before SC1-C.
 
         ``world_event_context`` is an optional read-only RSS fact block
         for chat. It may include source locale and operator location;

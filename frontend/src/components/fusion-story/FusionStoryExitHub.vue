@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { UiButton, UiBadge } from '@/components/ui'
 import type { FusionStoryExportFormat } from '@/utils/api/fusionStory'
 import {
+  FUSION_TO_ARC_OPERATOR_MODES,
+  type FusionToArcOperatorMode,
+} from '@/types/fusionStory'
+import {
   isExitHubCoachmarkDismissed,
   rememberExitHubCoachmarkDismissed,
 } from '@/utils/arcDiscovery'
+import { nextRovingRadioIndex } from '@/utils/radioGroupKeyboard'
 
 /**
  * Completion-page exit hub. Rendered by the viewer once a fusion story is
@@ -30,7 +35,7 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{
-  (e: 'adapt'): void
+  (e: 'adapt', mode: FusionToArcOperatorMode): void
   (e: 'continue'): void
   (e: 'branch'): void
   (e: 'export', format: FusionStoryExportFormat): void
@@ -40,6 +45,66 @@ const emit = defineEmits<{
 const { t } = useI18n()
 
 const exportFormats: FusionStoryExportFormat[] = ['markdown', 'txt', 'epub']
+
+/**
+ * Where the creator stands in the arc this story is about to become
+ * (OP1-C / plan 拍板 #2). Pre-selected as "write me in" because that is
+ * the whole point of turning prose into something you then live through
+ * — but it is shown, not assumed: the other two are one click away and
+ * the copy under the row says what each one will do. (The server's
+ * default for a caller that sends nothing is the opposite, `unchanged`;
+ * silence is not a choice, whereas this row is.)
+ */
+const playerMode = ref<FusionToArcOperatorMode>('write_in')
+
+const playerModeLabels: Record<FusionToArcOperatorMode, string> = {
+  write_in: 'playerModeWriteIn',
+  observer: 'playerModeObserver',
+  unchanged: 'playerModeUnchanged',
+}
+const playerModeHints: Record<FusionToArcOperatorMode, string> = {
+  write_in: 'playerModeWriteInHint',
+  observer: 'playerModeObserverHint',
+  unchanged: 'playerModeUnchangedHint',
+}
+
+const playerModeHint = computed(
+  () => t(`fusionStory.exitHub.${playerModeHints[playerMode.value]}`),
+)
+
+/**
+ * Roving tabindex + arrow-key selection for the custom `role="radio"` chip
+ * group above (ARIA APG radiogroup pattern — the native `<input
+ * type="radio">` behaviour a screen reader announces is arrow keys move
+ * focus *and* the selection together, wrapping past either end; Tab only
+ * stops once on the group, at whichever option is selected). The branching
+ * lives in a pure, unit-tested helper (`nextRovingRadioIndex`) — this
+ * component only wires the DOM effects (select + move focus) it decides on.
+ */
+const modeOptionRefs = ref<ComponentPublicInstance[]>([])
+
+function selectPlayerMode(mode: FusionToArcOperatorMode) {
+  playerMode.value = mode
+}
+
+async function focusPlayerModeOption(index: number) {
+  await nextTick()
+  const el = modeOptionRefs.value[index]?.$el as HTMLElement | undefined
+  el?.focus()
+}
+
+function handlePlayerModeKeydown(event: KeyboardEvent) {
+  const currentIndex = FUSION_TO_ARC_OPERATOR_MODES.indexOf(playerMode.value)
+  const nextIndex = nextRovingRadioIndex(
+    event.key,
+    currentIndex,
+    FUSION_TO_ARC_OPERATOR_MODES.length,
+  )
+  if (nextIndex === null) return
+  event.preventDefault()
+  selectPlayerMode(FUSION_TO_ARC_OPERATOR_MODES[nextIndex])
+  void focusPlayerModeOption(nextIndex)
+}
 
 /** Guarded so SSR / privacy-mode never throws at setup. */
 function getExitHubStorage(): Storage | null {
@@ -96,6 +161,36 @@ function dismissCoachmark() {
       </button>
     </div>
 
+    <div
+      class="exit-hub__mode"
+      role="radiogroup"
+      :aria-label="t('fusionStory.exitHub.playerModeLabel')"
+      @keydown="handlePlayerModeKeydown"
+    >
+      <p class="exit-hub__mode-label">
+        {{ t('fusionStory.exitHub.playerModeLabel') }}
+      </p>
+      <div class="exit-hub__mode-options">
+        <UiButton
+          v-for="mode in FUSION_TO_ARC_OPERATOR_MODES"
+          :key="mode"
+          ref="modeOptionRefs"
+          class="exit-hub__mode-option"
+          variant="chip"
+          size="sm"
+          role="radio"
+          :aria-checked="playerMode === mode"
+          :active="playerMode === mode"
+          :tabindex="playerMode === mode ? 0 : -1"
+          :disabled="props.adaptingToArc"
+          @click="selectPlayerMode(mode)"
+        >
+          {{ t(`fusionStory.exitHub.${playerModeLabels[mode]}`) }}
+        </UiButton>
+      </div>
+      <p class="exit-hub__mode-hint">{{ playerModeHint }}</p>
+    </div>
+
     <div class="exit-hub__primary">
       <UiButton
         variant="hero"
@@ -103,7 +198,7 @@ function dismissCoachmark() {
         block
         :loading="props.adaptingToArc"
         :disabled="props.adaptingToArc"
-        @click="emit('adapt')"
+        @click="emit('adapt', playerMode)"
       >
         {{ props.adaptingToArc
           ? t('fusionStory.exitHub.adapting')
@@ -256,6 +351,28 @@ function dismissCoachmark() {
 .exit-hub__coachmark-close:hover {
   background: rgba(255, 255, 255, 0.1);
   color: #fff;
+}
+
+.exit-hub__mode {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.exit-hub__mode-label {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.72);
+}
+.exit-hub__mode-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.exit-hub__mode-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.55);
 }
 
 .exit-hub__primary {

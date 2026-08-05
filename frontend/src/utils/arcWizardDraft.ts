@@ -11,7 +11,11 @@
  * component mount — the wizard itself has no mount-test harness.
  */
 
-import type { TemplateDraftPayload } from '@/types/arcTemplateIntake'
+import type {
+  BeatDraftPayload,
+  GenerateSummaryResponse,
+  TemplateDraftPayload,
+} from '@/types/arcTemplateIntake'
 
 export const WIZARD_DRAFT_STORAGE_KEY = 'yuralume.arcTemplateWizard.draft'
 
@@ -84,5 +88,39 @@ export function clearWizardDraft(
     storage.removeItem(WIZARD_DRAFT_STORAGE_KEY)
   } catch {
     // ignore — nothing we can do if storage is unavailable.
+  }
+}
+
+/**
+ * Merge a `generate-summary` response into a beat draft in place
+ * (OP1-B "regenerate summary" also proposes a player position).
+ *
+ * The summary text is always safe to overwrite — that's the whole
+ * point of "regenerate". The player-position proposal is not: once the
+ * operator has actually decided a position (or typed a note), that
+ * decision is a fixed fact, not a placeholder. A crashed LLM call, a
+ * stale-format response, or a model that simply judges differently on
+ * a rerun must never silently revert an already-decided `central` back
+ * to unjudged (Codex review fix, M1). The backend's own
+ * `generate_beat_summary` anchors its response the same way, but the
+ * wizard must not rely solely on that — this is the frontend half of
+ * the same rule, applied per field independently so an operator who
+ * only wrote a note (position still unjudged) doesn't lose it either.
+ *
+ * Kept as a pure function (mutates the passed-in `beat`, mirroring the
+ * wizard's existing in-place draft mutations) so the merge rule is
+ * unit-testable without a component mount — the wizard itself has no
+ * mount-test harness (see module docstring above).
+ */
+export function applyBeatSummaryResult(
+  beat: BeatDraftPayload,
+  result: GenerateSummaryResponse,
+): void {
+  beat.summary = result.summary
+  if (beat.operator_position === null) {
+    beat.operator_position = result.operator_position
+  }
+  if (!beat.operator_note || !beat.operator_note.trim()) {
+    beat.operator_note = result.operator_note
   }
 }

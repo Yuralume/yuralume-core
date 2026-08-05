@@ -1,16 +1,18 @@
-"""Filesystem catalogue of bundled ``.lumecard`` packs.
+"""Filesystem catalogue of local ``.lumecard`` packs.
 
-The character-card "marketplace" MVP ships demo characters as
-``.lumecard`` files under ``src/kokoro_link/data/character_cards/``
-(see ``docs/CHARACTER_CARD_PLAN.md`` §8). Unlike arc-template packs,
-these are **not** synced into a shared DB table — installing one runs
-the import path to create a brand-new character *owned by the
-installer*. So this catalogue is a thin read-only directory index: it
-maps a stable ``pack_id`` (the filename stem) to the blob on disk.
+A thin read-only directory index: it maps a stable ``pack_id`` (the
+filename stem) to the blob on disk. Unlike arc-template packs these are
+**not** synced into a shared DB table — installing one runs the import path
+to create a brand-new character *owned by the installer* (see
+``docs/CHARACTER_CARD_PLAN.md`` §8).
 
-A ``CHARACTER_CARD_PACK_DIR`` env override lets a deployment point at an
-external pack directory (e.g. a mounted volume) without rebuilding the
-image; otherwise the bundled directory is used. Mirrors the
+``src/kokoro_link/data/character_cards/`` **ships empty** since the official
+cards moved to the Cloud catalog (``OFFICIAL_CARD_CLOUD_CATALOG_PLAN`` D5).
+The mechanism stayed because it is the offline answer: a
+``CHARACTER_CARD_PACK_DIR`` env override points a deployment at its own pack
+directory (e.g. a mounted volume) without rebuilding the image, and with the
+Cloud catalog switched off that directory is the *only* card source — an
+air-gapped install with a full shelf and no outbound connection. Mirrors the
 ``PROMPTS_DIR`` override convention used by the prompt loader.
 """
 
@@ -27,8 +29,8 @@ CARD_EXTENSION = ".lumecard"
 
 
 def default_card_pack_dirs() -> list[Path]:
-    """Resolve the pack directory: env override first, then the bundled
-    ``data/character_cards/`` shipped with the repo."""
+    """Resolve the pack directory: env override first, then the in-repo
+    ``data/character_cards/`` (which ships empty)."""
     override = os.environ.get(_PACK_DIR_ENV, "").strip()
     if override:
         path = Path(override).expanduser()

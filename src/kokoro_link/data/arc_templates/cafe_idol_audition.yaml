@@ -28,6 +28,14 @@ beats:
     scene_characters: []
     dramatic_question: 她會真的把表單送出去嗎？
     required: true
+    # This whole arc is a solo ambition journey — no beat casts the
+    # player, so every beat is explicitly labeled unjudged→absent rather
+    # than left None, per the OP0-B shipped-pack labeling pass. No beat
+    # carries an `operator_note`, and if one ever does it follows the rule
+    # spelled out at the top of `quiet_breakup.yaml`: the note states the
+    # character's motive or the line she has not said yet — never something
+    # the player has already said, decided or done. Same for `summary`.
+    operator_position: absent
 
   - sequence: 1
     day_offset: 1
@@ -41,6 +49,7 @@ beats:
     scene_characters: []
     dramatic_question: 她願意對自己承認這件事嗎？
     required: true
+    operator_position: absent
 
   - sequence: 2
     day_offset: 3
@@ -54,6 +63,7 @@ beats:
     scene_characters: []
     dramatic_question: 她會被自己嚇退嗎？
     required: true
+    operator_position: absent
 
   - sequence: 3
     day_offset: 5
@@ -67,6 +77,7 @@ beats:
     scene_characters: [指導老師]
     dramatic_question: 她要承認自己練得不夠嗎？
     required: true
+    operator_position: absent
 
   - sequence: 4
     day_offset: 6
@@ -80,6 +91,7 @@ beats:
     scene_characters: []
     dramatic_question: 她要不要乾脆放棄？
     required: false
+    operator_position: absent
 
   - sequence: 5
     day_offset: 8
@@ -94,6 +106,7 @@ beats:
     scene_characters: [指導老師]
     dramatic_question: 她真正想唱給誰聽？
     required: true
+    operator_position: absent
 
   - sequence: 6
     day_offset: 10
@@ -107,6 +120,7 @@ beats:
     scene_characters: []
     dramatic_question: 她找到自己的版本了嗎？
     required: false
+    operator_position: absent
 
   - sequence: 7
     day_offset: 12
@@ -120,6 +134,7 @@ beats:
     scene_characters: []
     dramatic_question: 她準備好接受結果了嗎？
     required: true
+    operator_position: absent
 
   - sequence: 8
     day_offset: 13
@@ -133,6 +148,7 @@ beats:
     scene_characters: [評審, 其他考生]
     dramatic_question: 她能在燈光下守住自己嗎？
     required: true
+    operator_position: absent
 
   - sequence: 9
     day_offset: 14
@@ -146,3 +162,4 @@ beats:
     scene_characters: []
     dramatic_question: 她要怎麼告訴自己這個結果？
     required: true
+    operator_position: absent

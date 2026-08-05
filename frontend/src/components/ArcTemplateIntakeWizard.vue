@@ -40,6 +40,7 @@ import {
 } from '@/utils/api/arcTemplates'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import {
+  applyBeatSummaryResult,
   clearWizardDraft,
   draftHasWizardContent,
   loadWizardDraft,
@@ -403,16 +404,29 @@ async function regenSummary(idx: number) {
   errorMsg.value = null
   beatBusy.value = true
   try {
-    const summary = await generateBeatSummary(
+    const result = await generateBeatSummary(
       draft.value.beats[idx],
       buildBeatContext(idx),
     )
-    draft.value.beats[idx].summary = summary
+    // The same call that writes the summary also proposes the
+    // operator's place in the scene (OP1-B). The summary text is
+    // always safe to overwrite; the position/note proposal is merged
+    // through a pure helper that never reopens a field the operator
+    // already decided (Codex review fix, M1 — this used to overwrite
+    // both columns unconditionally, so a click here could silently
+    // clear a manually-picked `central` back to unjudged).
+    applyBeatSummaryResult(draft.value.beats[idx], result)
   } catch (err) {
     errorMsg.value = t('story.arcTemplateIntake.errors.summaryFailed', { reason: formatErr(err) })
   } finally {
     beatBusy.value = false
   }
+}
+
+/** Clear the beat's player-note back to "unjudged" (`null`), not `''`. */
+function updateOperatorNote(idx: number, value: string) {
+  const trimmed = value.trim()
+  draft.value.beats[idx].operator_note = trimmed ? value : null
 }
 
 function addBeat() {
@@ -576,6 +590,12 @@ function cloneDraft(source: TemplateDraftPayload): TemplateDraftPayload {
     beats: source.beats.map(beat => ({
       ...beat,
       scene_characters: [...beat.scene_characters],
+      // A draft saved before OP0 (autosaved localStorage copy, or an
+      // `initialDraft` from an older backend) may not carry these keys
+      // at all -> `undefined`, not `null`. Normalise so the beat form's
+      // select shows "unjudged" instead of a blank/unmatched option.
+      operator_position: beat.operator_position ?? null,
+      operator_note: beat.operator_note ?? null,
     })),
   }
 }
@@ -1038,6 +1058,27 @@ function sceneTypeLabel(s: string): string {
                         @click="applyBeatOption('dramatic_question', q)"
                       >{{ q }}</button>
                     </div>
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.operatorPosition') }}</span>
+                    <select v-model="beat.operator_position" class="field-select">
+                      <option :value="null">{{ t('story.arcTemplateIntake.operatorPosition.unjudged') }}</option>
+                      <option value="absent">{{ t('story.arcTemplateIntake.operatorPosition.absent') }}</option>
+                      <option value="present">{{ t('story.arcTemplateIntake.operatorPosition.present') }}</option>
+                      <option value="central">{{ t('story.arcTemplateIntake.operatorPosition.central') }}</option>
+                    </select>
+                    <div class="hint-small">{{ pt('story.arcTemplateIntake.operatorPosition.hint') }}</div>
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">{{ pt('story.arcTemplateIntake.fields.operatorNote') }}</span>
+                    <input
+                      :value="beat.operator_note ?? ''"
+                      class="field-input"
+                      :placeholder="t('story.arcTemplateIntake.beats.operatorNotePlaceholder')"
+                      @input="updateOperatorNote(idx, ($event.target as HTMLInputElement).value)"
+                    />
                   </label>
 
                   <label class="field">

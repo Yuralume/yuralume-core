@@ -7,6 +7,7 @@ items before handing them to the prompt builder.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Protocol, Union
 
 from kokoro_link.domain.entities.memory_item import MemoryItem
@@ -39,6 +40,66 @@ class ScoredMemory:
 
     item: MemoryItem
     similarity: float
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySummary:
+    """Read-model for the memory-browsing UI — every field it renders,
+    and deliberately nothing else.
+
+    Why this exists instead of reusing ``MemoryItem``: the entity carries
+    two ``Vector(1024)`` columns, and the browse response emits neither.
+    It reports only *whether* the content vector exists. Hydrating the
+    entity to answer that meant Postgres shipping — and Python
+    ``float()``-coercing, element by element — millions of floats per
+    listing that were then dropped on the floor. ``has_embedding`` is
+    resolved by the storage engine instead, so the vectors never leave
+    the database (plan D9).
+
+    A projection type rather than a flag on ``list_all_for_character``:
+    the seven consolidation / reflection / coherence callers of that
+    method genuinely need the vectors, and a boolean parameter that
+    silently changes the return type is how those callers would break.
+    """
+
+    id: str
+    character_id: str
+    conversation_id: str | None
+    kind: MemoryKind
+    content: str
+    salience: float
+    tags: tuple[str, ...]
+    created_at: datetime
+    last_accessed_at: datetime | None
+    access_count: int
+    has_embedding: bool
+    """``True`` when the *content* vector is present. The auxiliary tag
+    vector does not count — it is a recall booster, not the thing whose
+    absence makes semantic search skip the row."""
+
+    @classmethod
+    def from_item(cls, item: MemoryItem) -> "MemorySummary":
+        """Project an already-hydrated entity.
+
+        For adapters that hold ``MemoryItem`` objects anyway (the
+        in-process repository). The SQL adapter never takes this path —
+        materialising the entity is precisely the cost it avoids — but
+        both must agree on what ``has_embedding`` means, so the rule
+        lives here once.
+        """
+        return cls(
+            id=item.id,
+            character_id=item.character_id,
+            conversation_id=item.conversation_id,
+            kind=item.kind,
+            content=item.content,
+            salience=item.salience,
+            tags=tuple(item.tags),
+            created_at=item.created_at,
+            last_accessed_at=item.last_accessed_at,
+            access_count=item.access_count,
+            has_embedding=item.embedding is not None,
+        )
 
 
 class MemoryRepositoryPort(Protocol):
@@ -97,6 +158,31 @@ class MemoryRepositoryPort(Protocol):
 
         Intended for consolidation / decay passes that need to reason
         about the whole pool at once. Not for use in the hot chat path.
+
+        Unbounded by design — every caller here needs the full pool.
+        The operator-facing browse path does **not**; it uses
+        :meth:`list_page_for_character`.
+        """
+
+    async def list_page_for_character(
+        self,
+        character_id: str,
+        *,
+        kinds: Sequence[MemoryKind] | None = None,
+        world_scope: WorldScope = "all",
+        limit: int = 50,
+        before: datetime | None = None,
+    ) -> list["MemorySummary"]:
+        """Return one keyset page of the browse projection (newest first).
+
+        Same filtering and ordering rules as
+        :meth:`list_all_for_character` — only the bound and the returned
+        shape differ. ``before`` is the ``created_at`` of the last item
+        the caller already has; rows are matched strictly older than it,
+        matching the feed's cursor convention (plan D8).
+
+        Implementations must resolve ``has_embedding`` without
+        materialising the vector columns — see :class:`MemorySummary`.
         """
 
     async def count_for_character(self, character_id: str) -> int:

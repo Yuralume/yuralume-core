@@ -8,6 +8,14 @@ Covers Phase 1 of ``docs/SCENE_BEAT_PLAN.md``:
   scene_type may be off-list, ``required`` may be missing entirely.
   Each fallback is verified explicitly so a smaller / older LLM still
   produces usable beats instead of validation crashes.
+
+Plus OP1-A of ``ARC_PLAYER_POSITION_PLAN`` (bottom section): every
+planned beat now carries where the *player* stands
+(``operator_position`` / ``operator_note``), the prompt teaches that
+closed vocabulary and the high-tension/everyday mix, and the planner
+finally learns who the player is to this character. Same fuzz rules
+apply: a model that omits the fields, or answers outside the vocabulary,
+leaves the beat *unjudged* rather than breaking the arc.
 """
 
 from __future__ import annotations
@@ -19,6 +27,9 @@ import pytest
 
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import (
+    OPERATOR_POSITION_ABSENT,
+    OPERATOR_POSITION_CENTRAL,
+    OPERATOR_POSITION_PRESENT,
     SCENE_CONFLICT,
     SCENE_ENCOUNTER,
     SCENE_REVELATION,
@@ -658,3 +669,208 @@ async def test_legacy_call_without_new_kwargs_is_unchanged() -> None:
     # Nothing was offered, so nothing can be claimed.
     assert arc.beats
     assert arc.source_seed_ids == ()
+
+
+# --- OP1-A: the player has a place in every planned beat ---------------
+#
+# ARC_PLAYER_POSITION_PLAN §1: the planner was one of three generation
+# paths that structurally excluded the player. Its cast field was defined
+# as "everyone in this scene *except the protagonist*", its examples were
+# all third-party NPCs, and its only knowledge of the player was the
+# continuity constraint "promises already made must hold" — it could not
+# even name them. Beats therefore came back with no slot for the player
+# at all, and every consumer downstream had to invent one from prose.
+
+
+@pytest.mark.asyncio
+async def test_parses_operator_position_and_note() -> None:
+    payload = _build_payload([
+        {
+            "day_offset": 0, "title": "申請表", "summary": "一段。" * 6,
+            "tension": "setup", "operator_position": "absent",
+            "operator_note": "",
+        },
+        {
+            "day_offset": 6, "title": "第一次試做", "summary": "一段。" * 6,
+            "tension": "rising", "operator_position": "present",
+            "operator_note": "你被找來當第一個試吃的人",
+        },
+        {
+            "day_offset": 12, "title": "收燈之後", "summary": "一段。" * 6,
+            "tension": "resolution", "operator_position": "CENTRAL",
+            "operator_note": "她要把那句話說給你聽",
+        },
+    ])
+    planner = LLMStoryArcPlanner(model=_FakeModel(payload))
+    arc = await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+    )
+    first, second, third = arc.beats
+    assert first.operator_position == OPERATOR_POSITION_ABSENT
+    # An empty note is "nothing to say", not an empty string to store.
+    assert first.operator_note is None
+    assert second.operator_position == OPERATOR_POSITION_PRESENT
+    assert second.operator_note == "你被找來當第一個試吃的人"
+    # Casing is the model's, the vocabulary is ours.
+    assert third.operator_position == OPERATOR_POSITION_CENTRAL
+
+
+@pytest.mark.asyncio
+async def test_missing_operator_fields_degrade_to_unjudged() -> None:
+    # An older model (or an older prompt pack) returns neither field.
+    # That must produce a usable arc whose beats read as *unjudged*,
+    # which is exactly what every pre-OP0 beat already reads as.
+    payload = _build_payload([
+        {
+            "day_offset": 0, "title": "起點", "summary": "一段。" * 6,
+            "tension": "setup",
+        },
+        {
+            "day_offset": 7, "title": "中段", "summary": "一段。" * 6,
+            "tension": "rising",
+        },
+        {
+            "day_offset": 14, "title": "結束", "summary": "一段。" * 6,
+            "tension": "resolution",
+        },
+    ])
+    planner = LLMStoryArcPlanner(model=_FakeModel(payload))
+    arc = await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+    )
+    assert len(arc.beats) == 3
+    for beat in arc.beats:
+        assert beat.operator_position is None
+        assert beat.operator_note is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_position",
+    [
+        "spectator",       # a shade the model invented
+        "主角",             # answered in prose instead of the vocabulary
+        "",                # explicitly declined
+        None,              # explicit null
+        42,                # wrong type entirely
+        ["central"],       # wrapped in a list
+    ],
+    ids=["off-list", "prose", "blank", "null", "number", "list"],
+)
+async def test_off_vocabulary_operator_position_is_unjudged_not_guessed(
+    raw_position: object,
+) -> None:
+    # The closed vocabulary is taught in the prompt, never repaired by a
+    # synonym table here: a model that answered outside it has not
+    # judged, and mapping "spectator" onto ``present`` would be this
+    # path choosing a position the model never chose.
+    payload = _build_payload([
+        {
+            "day_offset": 0, "title": "x", "summary": "一段。" * 6,
+            "tension": "setup", "operator_position": raw_position,
+        },
+    ])
+    planner = LLMStoryArcPlanner(model=_FakeModel(payload))
+    arc = await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+    )
+    assert arc.beats[0].operator_position is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_teaches_the_position_vocabulary_and_the_mix() -> None:
+    fake = _FakeModel(_one_beat_payload())
+    planner = LLMStoryArcPlanner(model=fake)
+    await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+    )
+    prompt = fake.last_prompt
+    assert prompt is not None
+    # The structured slot and its three values reach the model.
+    for token in ("operator_position", "operator_note", "absent", "present", "central"):
+        assert token in prompt, f"missing {token!r} from prompt"
+    # Decision #3: high-tension beats lean toward the player being there;
+    # everyday beats may be played solo. A *tendency*, expressed
+    # semantically — no ratio, no per-tension rule the code could enforce.
+    assert "climax" in prompt and "resolution" in prompt
+    assert "不要按固定比例分配" in prompt
+    assert "角色要有自己的生活" in prompt
+    # The cast field no longer defines the player away.
+    assert "這場戲會出現的人物名稱（除主角自己外）" not in prompt
+    assert "不含玩家" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_renders_the_player_relationship_material() -> None:
+    fake = _FakeModel(_one_beat_payload())
+    planner = LLMStoryArcPlanner(model=fake)
+    await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+        operator_relationship_lines=(
+            "- 角色怎麼稱呼玩家：小北",
+            "- 關係：住在一起兩年的戀人",
+        ),
+    )
+    prompt = fake.last_prompt
+    assert prompt is not None
+    assert "玩家（使用者本人）與這個角色的關係" in prompt
+    assert "- 角色怎麼稱呼玩家：小北" in prompt
+    assert "- 關係：住在一起兩年的戀人" in prompt
+    # The caption ties the facts to the decision they exist to serve.
+    assert "operator_position" in prompt
+    # …and keeps the seed's own boundary: no invented shared history.
+    assert "不得當成已經發生過" in prompt
+
+
+@pytest.mark.asyncio
+async def test_no_relationship_material_leaves_no_empty_slot() -> None:
+    # A heading with nothing under it is worse than silence — the model
+    # fills the hole. Absent material must render byte-identically to a
+    # call that never knew about the input.
+    common = dict(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+        hint="她想換一個城市。",
+        recent_dialogue_summary="她提到最近睡不好。",
+        today=date(2026, 4, 28),
+    )
+    legacy = _build_prompt(**common)
+    for empty in ((), ("", "   ")):
+        rendered = _build_prompt(**common, operator_relationship_lines=empty)
+        assert rendered == legacy
+        assert "玩家（使用者本人）與這個角色的關係" not in rendered
+        assert "${" not in rendered
+        assert "\n\n\n" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_null_planner_accepts_and_ignores_relationship_lines() -> None:
+    planner = NullStoryArcPlanner()
+    arc = await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=5,
+        operator_relationship_lines=("- 關係：住在一起兩年的戀人",),
+    )
+    # The model-free fallback judges nothing: its beats stay unjudged
+    # rather than inventing a position no model ever chose.
+    assert arc.beats
+    assert all(beat.operator_position is None for beat in arc.beats)

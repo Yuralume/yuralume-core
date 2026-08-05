@@ -542,6 +542,15 @@ export interface CharacterCardPreview {
   bundled_arc_series_member_count: number
   stage_image_count: number
   image_urls: string[]
+  /** 'local' for a pack this deployment holds, 'cloud' for an official card
+   *  read from the Yuralume Cloud catalog. A cloud entry carries prose and
+   *  images only — disposition / cadence / world frame / arc counts stay at
+   *  their defaults because the catalog does not publish them, so they must
+   *  not be rendered as facts about the card. */
+  source?: 'local' | 'cloud'
+  /** Whether this text is already in the operator's own language. Only the
+   *  Cloud catalog claims it; a local pack always reports false. */
+  localized?: boolean
   /** 'lumecard' for the native path (and bundled packs), 'sillytavern' when
    *  the upload was a converted SillyTavern card. */
   source_format?: string
@@ -574,10 +583,22 @@ export async function previewCharacterCard(
   return withCharacterCardImageAccess(data)
 }
 
-/** 列出隨 repo 出貨的角色卡市集 packs（`src/kokoro_link/data/character_cards/`）。 */
-export async function listCharacterCards(): Promise<CharacterCardPackSummary[]> {
-  const { data } = await axios.get<CharacterCardPackSummary[]>('/api/v1/character-cards')
-  return data.map(withCharacterCardImageAccess)
+export interface CharacterCardCatalog {
+  cards: CharacterCardPackSummary[]
+  /** Cloud 官方卡暫時讀不到（本地 pack 與已安裝角色不受影響）。 */
+  official_cards_unavailable: boolean
+}
+
+/**
+ * 列出可安裝的角色卡：Cloud 官方卡目錄 ∪ 本地 `.lumecard` 目錄
+ * （`CHARACTER_CARD_PACK_DIR`，預設為空）。
+ */
+export async function listCharacterCards(): Promise<CharacterCardCatalog> {
+  const { data } = await axios.get<CharacterCardCatalog>('/api/v1/character-cards')
+  return {
+    cards: (data.cards ?? []).map(withCharacterCardImageAccess),
+    official_cards_unavailable: Boolean(data.official_cards_unavailable),
+  }
 }
 
 export async function previewCharacterCardPack(

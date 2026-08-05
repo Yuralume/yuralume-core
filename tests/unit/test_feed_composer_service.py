@@ -52,11 +52,15 @@ from kokoro_link.contracts.account_runtime_usage import (
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.feed_post import FeedPost
 from kokoro_link.domain.value_objects.account_runtime_profile import (
+    AccountRuntimeProfile,
     DEMO_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
 from kokoro_link.domain.value_objects.feed_source import FeedSource
+from kokoro_link.infrastructure.repositories.in_memory_characters import (
+    InMemoryCharacterRepository,
+)
 from kokoro_link.infrastructure.repositories.in_memory_feed_posts import (
     InMemoryFeedPostRepository,
 )
@@ -289,7 +293,7 @@ async def test_daily_limit_blocks_when_today_count_is_at_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_demo_runtime_profile_blocks_second_auto_feed_post_within_24h() -> None:
+async def test_demo_runtime_profile_resets_auto_feed_quota_on_utc_civil_day() -> None:
     repo = InMemoryFeedPostRepository()
     usage = InMemoryAccountRuntimeUsageRepository()
     collector = _SequentialCollector([
@@ -309,11 +313,11 @@ async def test_demo_runtime_profile_blocks_second_auto_feed_post_within_24h() ->
         account_runtime_usage_repository=usage,
     )
     character = replace(_make_character(), id="aiko")
-    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 4, 29, 22, 0, tzinfo=timezone.utc)
 
     first = await service.tick(character, now=base)
-    second = await service.tick(character, now=base + timedelta(hours=2))
-    third = await service.tick(character, now=base + timedelta(days=1, seconds=1))
+    second = await service.tick(character, now=base + timedelta(hours=1))
+    third = await service.tick(character, now=base + timedelta(hours=2, seconds=1))
 
     assert first is not None
     assert second is None
@@ -326,6 +330,149 @@ async def test_demo_runtime_profile_blocks_second_auto_feed_post_within_24h() ->
         since=base - timedelta(minutes=1),
         until=base + timedelta(days=2),
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_feed_quota_uses_operator_local_civil_day() -> None:
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    collector = _SequentialCollector([
+        [_candidate(source=FeedSource.beat("local-1"))],
+        [_candidate(source=FeedSource.beat("local-2"))],
+    ])
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=_ScriptedComposer([
+            FeedComposerOutput(content_text="睡前。"),
+            FeedComposerOutput(content_text="新的一天。"),
+        ]),
+        cooldown=timedelta(0),
+        operator_profile_service=_FakeOperatorProfileService(
+            "zh-TW", timezone_id="Asia/Taipei",
+        ),
+        account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
+        account_runtime_usage_repository=usage,
+    )
+    character = replace(_make_character(), id="aiko")
+    before_midnight = datetime(
+        2026, 4, 29, 15, 30, tzinfo=timezone.utc,
+    )
+    after_midnight = before_midnight + timedelta(hours=1)
+
+    first = await service.tick(character, now=before_midnight)
+    second = await service.tick(character, now=after_midnight)
+
+    assert first is not None
+    assert second is not None
+    assert after_midnight - before_midnight < timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_account_feed_quota_reserves_one_daily_slot_per_active_character() -> None:
+    class _HostedProfileResolver:
+        async def resolve_for_operator(self, operator_id: str):
+            return AccountRuntimeProfile(
+                name="hosted-test",
+                max_characters=2,
+                daily_feed_post_limit=2,
+            )
+
+    posts = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    characters = InMemoryCharacterRepository()
+    aiko = replace(_make_character(), id="aiko")
+    yumi = replace(_make_character(), id="yumi", name="Yumi")
+    await characters.save(aiko)
+    await characters.save(yumi)
+    collector = _SequentialCollector([
+        [_candidate(source=FeedSource.beat("aiko-first"))],
+        [_candidate(source=FeedSource.beat("yumi-first"))],
+    ])
+    service = FeedComposerService(
+        repository=posts,
+        candidates=collector,
+        composer=_ScriptedComposer([
+            FeedComposerOutput(content_text="Aiko 今天的第一篇。"),
+            FeedComposerOutput(content_text="Yumi 今天的第一篇。"),
+        ]),
+        cooldown=timedelta(0),
+        account_runtime_profile_resolver=_HostedProfileResolver(),
+        account_runtime_usage_repository=usage,
+        character_repository=characters,
+    )
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    assert await service.needs_daily_floor_retry(aiko, now=base) is True
+    assert await service.needs_daily_floor_retry(yumi, now=base) is True
+
+    aiko_first = await service.tick(aiko, now=base)
+    aiko_second = await service.tick(aiko, now=base + timedelta(hours=2))
+    yumi_first = await service.tick(yumi, now=base + timedelta(hours=2))
+
+    assert aiko_first is not None
+    assert aiko_second is None
+    assert yumi_first is not None
+    assert collector.calls == 2
+    events = await usage.list_events(
+        event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
+    )
+    assert [event.resource_id for event in events] == ["aiko", "yumi"]
+    assert await service.needs_daily_floor_retry(aiko, now=base) is False
+    assert await service.needs_daily_floor_retry(yumi, now=base) is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_unattributed_quota_event_keeps_midday_reservation_fair() -> None:
+    class _HostedProfileResolver:
+        async def resolve_for_operator(self, operator_id: str):
+            return AccountRuntimeProfile(
+                name="hosted-test",
+                max_characters=2,
+                daily_feed_post_limit=2,
+            )
+
+    posts = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    characters = InMemoryCharacterRepository()
+    aiko = replace(_make_character(), id="aiko")
+    yumi = replace(_make_character(), id="yumi", name="Yumi")
+    await characters.save(aiko)
+    await characters.save(yumi)
+    base = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    await posts.add(FeedPost.create(
+        character_id=aiko.id,
+        kind=FeedKind.MOOD,
+        content_text="舊版已發出的第一篇。",
+        source=FeedSource.beat("legacy-aiko"),
+        created_at=base,
+    ))
+    await usage.record_event(
+        operator_id=aiko.user_id,
+        event_type=ACCOUNT_RUNTIME_EVENT_FEED_POST,
+        occurred_at=base,
+    )
+    collector = _FakeCollector([
+        _candidate(source=FeedSource.beat("yumi-first")),
+    ])
+    service = FeedComposerService(
+        repository=posts,
+        candidates=collector,
+        composer=_ScriptedComposer([
+            FeedComposerOutput(content_text="Yumi 今天的第一篇。"),
+        ]),
+        cooldown=timedelta(0),
+        account_runtime_profile_resolver=_HostedProfileResolver(),
+        account_runtime_usage_repository=usage,
+        character_repository=characters,
+    )
+    now = base + timedelta(hours=2)
+
+    aiko_second = await service.tick(aiko, now=now)
+    yumi_first = await service.tick(yumi, now=now)
+
+    assert aiko_second is None
+    assert yumi_first is not None
+    assert collector.calls == 1
 
 
 class _StubFeedOverage:
@@ -529,13 +676,13 @@ async def test_demo_runtime_profile_blocks_auto_feed_when_ledger_missing() -> No
 
 
 @pytest.mark.asyncio
-async def test_demo_runtime_profile_rolls_back_post_when_feed_ledger_record_fails() -> None:
-    class _RecordFailingRuntimeUsageRepository:
+async def test_demo_runtime_profile_fails_closed_when_feed_quota_claim_fails() -> None:
+    class _ClaimFailingRuntimeUsageRepository:
         async def count_events(self, **_: Any) -> int:
             return 0
 
-        async def record_event(self, **_: Any) -> None:
-            raise RuntimeError("ledger write failed")
+        async def claim_event_slot(self, **_: Any) -> str | None:
+            raise RuntimeError("ledger claim failed")
 
     repo = InMemoryFeedPostRepository()
     collector = _FakeCollector([_candidate(source=FeedSource.beat("b1"))])
@@ -546,7 +693,7 @@ async def test_demo_runtime_profile_rolls_back_post_when_feed_ledger_record_fail
         composer=composer,
         cooldown=timedelta(0),
         account_runtime_profile_resolver=_StaticDemoRuntimeProfileResolver(),
-        account_runtime_usage_repository=_RecordFailingRuntimeUsageRepository(),
+        account_runtime_usage_repository=_ClaimFailingRuntimeUsageRepository(),
     )
     character = replace(_make_character(), id="aiko")
 
@@ -556,8 +703,8 @@ async def test_demo_runtime_profile_rolls_back_post_when_feed_ledger_record_fail
     )
 
     assert result is None
-    assert collector.calls == 1
-    assert len(composer.inputs) == 1
+    assert collector.calls == 0
+    assert composer.inputs == []
     assert await repo.list_for_character("aiko") == []
 
 
@@ -1118,9 +1265,11 @@ def _has_kana(text: str) -> bool:
 
 
 class _FakeOperatorProfile:
-    def __init__(self, primary_language: str) -> None:
+    def __init__(
+        self, primary_language: str, *, timezone_id: str = "UTC",
+    ) -> None:
         self.primary_language = primary_language
-        self.timezone_id = "UTC"
+        self.timezone_id = timezone_id
         self.location_label = ""
         self.latitude = None
         self.longitude = None
@@ -1128,11 +1277,16 @@ class _FakeOperatorProfile:
 
 
 class _FakeOperatorProfileService:
-    def __init__(self, primary_language: str) -> None:
+    def __init__(
+        self, primary_language: str, *, timezone_id: str = "UTC",
+    ) -> None:
         self._primary_language = primary_language
+        self._timezone_id = timezone_id
 
     async def get_for_user(self, user_id: str):  # noqa: ARG002
-        return _FakeOperatorProfile(self._primary_language)
+        return _FakeOperatorProfile(
+            self._primary_language, timezone_id=self._timezone_id,
+        )
 
 
 @pytest.mark.asyncio

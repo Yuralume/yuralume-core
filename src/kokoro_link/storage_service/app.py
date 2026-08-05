@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import mimetypes
 import os
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,8 +24,34 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from kokoro_link.contracts.object_storage import ObjectStorageError
+from kokoro_link.contracts.object_storage import (
+    EPHEMERAL_OBJECT_KEY_PREFIXES,
+    ObjectStorageError,
+)
 from kokoro_link.infrastructure.storage.keys import validate_object_key
+
+_LOGGER = logging.getLogger(__name__)
+
+# Object keys under these prefixes are staging scratch space, not durable
+# storage: a create-character draft's reference image lands as
+# ``draft-uploads/{user_id}/{uuid}`` and the caller deletes it best-effort once
+# the draft is finalised. A crashed process or a failed delete leaves an
+# orphan behind, and nothing under these prefixes should ever outlive a few
+# minutes — so the service sweeps them on a TTL as a backstop. The set itself
+# is the port's, shared with the writer that builds these keys and the variant
+# decorator that skips them; a sweeper with its own copy of the list is a
+# sweeper that can end up deleting a prefix nothing writes (or worse, not
+# sweeping one that does).
+EPHEMERAL_PREFIXES: tuple[str, ...] = EPHEMERAL_OBJECT_KEY_PREFIXES
+EPHEMERAL_TTL_ENV = "YURALUME_STORAGE_EPHEMERAL_TTL_SECONDS"
+DEFAULT_EPHEMERAL_TTL_SECONDS = 3600
+# A staged object must outlive any in-flight call that is still relying on it:
+# the cloud gateway's own read timeout is 300s, so an upstream provider can
+# legitimately still be fetching the URL that long after the write. Two times
+# that is the floor — a TTL under it turns the backstop into a sweeper that
+# deletes reference images out from under live requests.
+MIN_EPHEMERAL_TTL_SECONDS = 600
+MIN_SWEEP_INTERVAL_SECONDS = 300
 
 
 class CopyRequest(BaseModel):
@@ -35,6 +66,7 @@ class LocalStorageSettings(BaseModel):
     public_base_url: str
     max_object_bytes: int
     cache_control: str
+    ephemeral_ttl_seconds: int = DEFAULT_EPHEMERAL_TTL_SECONDS
 
     @classmethod
     def from_env(cls) -> "LocalStorageSettings":
@@ -59,13 +91,49 @@ class LocalStorageSettings(BaseModel):
                 "YURALUME_STORAGE_CACHE_CONTROL",
                 "public, max-age=31536000, immutable",
             ),
+            ephemeral_ttl_seconds=resolve_ephemeral_ttl_seconds(
+                os.getenv(EPHEMERAL_TTL_ENV),
+            ),
         )
 
 
 def create_app() -> FastAPI:
     settings = LocalStorageSettings.from_env()
     store = _LocalVolumeStore(settings)
-    app = FastAPI(title="Yuralume Local Object Storage", version="0.1.0")
+
+    async def sweep_once() -> None:
+        # ``sweep_ephemeral`` already swallows per-file failures and never
+        # raises, so this guard only covers the genuinely unexpected. It has to
+        # exist anyway: an exception escaping into the loop below would kill the
+        # task and silently disable the backstop for the process' lifetime.
+        try:
+            await asyncio.to_thread(store.sweep_ephemeral)
+        except Exception:  # noqa: BLE001 - backstop must outlive any one round
+            _LOGGER.warning("ephemeral sweep round failed", exc_info=True)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await sweep_once()
+        interval = sweep_interval_seconds(settings.ephemeral_ttl_seconds)
+
+        async def sweep_loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                await sweep_once()
+
+        task = asyncio.create_task(sweep_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(
+        title="Yuralume Local Object Storage",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -231,6 +299,13 @@ class _LocalVolumeStore:
             except OSError:
                 pass
 
+    def sweep_ephemeral(self) -> int:
+        """Drop expired objects under the ephemeral prefixes. Never raises."""
+        return sweep_ephemeral_objects(
+            root=self._settings.root,
+            ttl_seconds=self._settings.ephemeral_ttl_seconds,
+        )
+
     def metadata_for(self, object_key: str) -> dict:
         key = _safe_key(object_key)
         meta_path = self.metadata_path(key)
@@ -292,6 +367,156 @@ class _LocalVolumeStore:
         except ValueError:
             raise _error(status.HTTP_400_BAD_REQUEST, "unsafe_key", "unsafe object key")
         return path
+
+
+def resolve_ephemeral_ttl_seconds(raw: str | None) -> int:
+    """Parse the ephemeral TTL env value, falling back to the default.
+
+    An unparseable or non-positive value is a misconfiguration, not a request
+    to disable the sweep: the prefixes hold user-uploaded images that nothing
+    else is guaranteed to clean up, so we warn and keep the default TTL.
+
+    A positive but *too small* value is the more dangerous misconfiguration,
+    because it looks like it works: the sweep runs, and every so often it
+    deletes a reference image an upstream provider is still fetching, turning a
+    charged action into an inexplicable intermittent failure. Anything under
+    :data:`MIN_EPHEMERAL_TTL_SECONDS` is clamped up to it.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return DEFAULT_EPHEMERAL_TTL_SECONDS
+    try:
+        value = int(text)
+    except ValueError:
+        _LOGGER.warning(
+            "%s=%r is not an integer; using default %ds",
+            EPHEMERAL_TTL_ENV,
+            raw,
+            DEFAULT_EPHEMERAL_TTL_SECONDS,
+        )
+        return DEFAULT_EPHEMERAL_TTL_SECONDS
+    if value <= 0:
+        _LOGGER.warning(
+            "%s=%r must be positive; using default %ds",
+            EPHEMERAL_TTL_ENV,
+            raw,
+            DEFAULT_EPHEMERAL_TTL_SECONDS,
+        )
+        return DEFAULT_EPHEMERAL_TTL_SECONDS
+    if value < MIN_EPHEMERAL_TTL_SECONDS:
+        _LOGGER.warning(
+            "%s=%r is below the %ds floor (a staged object must outlive any "
+            "in-flight upstream fetch of its URL); using %ds",
+            EPHEMERAL_TTL_ENV,
+            raw,
+            MIN_EPHEMERAL_TTL_SECONDS,
+            MIN_EPHEMERAL_TTL_SECONDS,
+        )
+        return MIN_EPHEMERAL_TTL_SECONDS
+    return value
+
+
+def sweep_interval_seconds(ttl_seconds: int) -> float:
+    """How often the background sweep runs, floored so a tiny TTL can't spin."""
+    return float(max(ttl_seconds / 2, MIN_SWEEP_INTERVAL_SECONDS))
+
+
+def sweep_ephemeral_objects(
+    *,
+    root: Path,
+    ttl_seconds: int,
+    prefixes: tuple[str, ...] = EPHEMERAL_PREFIXES,
+    now: float | None = None,
+) -> int:
+    """Delete files older than ``ttl_seconds`` under the ephemeral prefixes.
+
+    Walks both the object and the metadata tree, and touches nothing outside
+    ``prefixes``. Best-effort throughout and never raises — a sweep that
+    propagates an error takes the whole backstop down with it, which is a worse
+    failure than one file surviving until the next round.
+
+    Returns the number of files removed.
+    """
+    cutoff = (time.time() if now is None else now) - ttl_seconds
+    removed = 0
+    for base_name in ("objects", "metadata"):
+        for prefix in prefixes:
+            try:
+                target = _resolve_prefix_dir(root / base_name, prefix)
+                if target is None:
+                    continue
+                removed += _sweep_expired_files(target, cutoff)
+            except Exception:  # noqa: BLE001 - see docstring
+                _LOGGER.warning(
+                    "ephemeral sweep failed for prefix %r under %s",
+                    prefix,
+                    base_name,
+                    exc_info=True,
+                )
+    if removed:
+        _LOGGER.info(
+            "ephemeral sweep removed %d expired file(s) under %s (ttl=%ds)",
+            removed,
+            ", ".join(prefixes),
+            ttl_seconds,
+        )
+    return removed
+
+
+def _resolve_prefix_dir(base: Path, prefix: str) -> Path | None:
+    """Resolve ``base/prefix``, or ``None`` when it is absent or escapes base.
+
+    Same containment discipline as ``_LocalVolumeStore._safe_path``: the sweep
+    deletes files, so it must never be able to walk out of the prefix even if
+    someone adds a malformed entry to ``EPHEMERAL_PREFIXES``.
+    """
+    relative = prefix.strip("/")
+    if not relative:
+        return None
+    try:
+        base_resolved = base.resolve()
+        target = (base_resolved / relative).resolve()
+        target.relative_to(base_resolved)
+    except (OSError, ValueError):
+        _LOGGER.warning("ephemeral prefix %r is not inside %s", prefix, base)
+        return None
+    if target == base_resolved or not target.is_dir():
+        return None
+    return target
+
+
+def _sweep_expired_files(target: Path, cutoff: float) -> int:
+    removed = 0
+    try:
+        walked = list(os.walk(target, topdown=False, followlinks=False))
+    except OSError as exc:
+        _LOGGER.warning("ephemeral sweep could not walk %s: %r", target, exc)
+        return 0
+    for dirpath, _dirnames, filenames in walked:
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                # lstat, not stat: a dangling symlink still deserves removal and
+                # we must not follow one out of the prefix to read its mtime.
+                mtime = path.lstat().st_mtime
+            except OSError:
+                continue
+            if mtime > cutoff:
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                _LOGGER.warning(
+                    "ephemeral sweep could not delete %s: %r", path, exc,
+                )
+                continue
+            removed += 1
+        if Path(dirpath) != target:
+            # Best-effort tidy-up. rmdir only succeeds on an already-empty
+            # directory, so a still-populated or racing one is simply left.
+            with suppress(OSError):
+                os.rmdir(dirpath)
+    return removed
 
 
 def _safe_key(raw: str) -> str:

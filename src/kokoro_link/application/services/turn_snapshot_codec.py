@@ -173,6 +173,13 @@ def _beat_to_dict(beat: StoryArcBeat) -> dict[str, Any]:
         "last_play_attempt_source": beat.last_play_attempt_source,
         "last_play_attempt_result": beat.last_play_attempt_result,
         "last_play_push_intensity": beat.last_play_push_intensity,
+        "play_failure_count": beat.play_failure_count,
+        "last_play_failure_at": (
+            beat.last_play_failure_at.isoformat()
+            if beat.last_play_failure_at is not None else None
+        ),
+        "operator_position": beat.operator_position,
+        "operator_note": beat.operator_note,
     }
 
 
@@ -200,6 +207,19 @@ def _beat_from_dict(payload: dict[str, Any]) -> StoryArcBeat:
         last_play_attempt_source=payload.get("last_play_attempt_source"),
         last_play_attempt_result=payload.get("last_play_attempt_result"),
         last_play_push_intensity=payload.get("last_play_push_intensity"),
+        # Snapshots written before SC0 carry no failure counters; the
+        # defaults hand the beat a fresh budget, matching the migration's
+        # "one provable failure at most" stance rather than inventing one.
+        play_failure_count=int(payload.get("play_failure_count") or 0),
+        last_play_failure_at=(
+            datetime.fromisoformat(str(payload["last_play_failure_at"]))
+            if payload.get("last_play_failure_at") else None
+        ),
+        # Snapshots written before OP0 carry no player-position pair;
+        # the domain's own default (``None`` = unjudged) is exactly the
+        # right fallback, same stance as the failure counters above.
+        operator_position=payload.get("operator_position"),
+        operator_note=payload.get("operator_note"),
     )
 
 

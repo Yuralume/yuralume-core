@@ -17,5 +17,12 @@ export interface AlbumItem {
 
 export interface AlbumListResponse {
   items: AlbumItem[]
+  /** Total row count for the character — independent of page size. */
   total: number
+  has_more: boolean
+  /**
+   * `created_at` of the oldest item in this page; pass back as `before`
+   * to fetch the next page. `null` once `has_more` is false.
+   */
+  next_before: string | null
 }

@@ -66,6 +66,7 @@ class _Recorder:
 def _executor_with_recorder(
     rec: _Recorder, *, crash_step: str | None = None, drift=None,  # noqa: ANN001
     goal_review=None,  # noqa: ANN001
+    scene_timeout=None,  # noqa: ANN001
 ):
     """Build an executor whose every dependency records its call into ``rec``."""
 
@@ -111,6 +112,7 @@ def _executor_with_recorder(
         schedule_memorializer=_stub("memorialize"),
         schedule_weather_drift=drift,
         goal_review_service=goal_review,
+        story_scene_timeout_closer=scene_timeout,
         feed_composer=_stub("feed_compose"),
         feed_comment_reply=_stub("feed_comment_reply"),
         dispatcher=_stub("proactive_dispatch"),
@@ -609,3 +611,104 @@ async def test_step_goal_review_is_fail_soft() -> None:
         goal_review_service=_GoalReviewRecorder(crash=True), dispatcher=object(),
     )
     await executor.step_goal_review(_Character(), now=NOW)  # must not raise
+
+
+class _SceneTimeoutRecorder:
+    """Stands in for ``StorySceneTimeoutCloser`` at its one step seam."""
+
+    def __init__(self, *, crash: bool = False) -> None:
+        self.calls: list[tuple[str, datetime]] = []
+        self._crash = crash
+
+    async def close_if_idle(self, character, *, now=None) -> bool:  # noqa: ANN001
+        self.calls.append((character.id, now))
+        if self._crash:
+            raise RuntimeError("scene close blew up")
+        return True
+
+
+@pytest.mark.asyncio
+async def test_scene_timeout_runs_in_the_embedded_tick() -> None:
+    # SC1-E red line: the per-kind registry is distributed-only, so hanging the
+    # wrap-up on that chain alone would mean a self-host player who walked away
+    # mid-scene never gets out of it. The embedded tick must run it too.
+    rec = _Recorder()
+    closer = _SceneTimeoutRecorder()
+    executor = _executor_with_recorder(rec, scene_timeout=closer)
+    steps: list[str] = []
+
+    async def step_timer(name, coro):  # noqa: ANN001
+        steps.append(name)
+        return await coro
+
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+        step_timer=step_timer,
+    )
+    assert closer.calls == [("char-1", NOW)]
+    # Before the visible feed / proactive steps, so a scene closed this tick
+    # immediately un-pauses the character's proactive delivery.
+    assert steps.index("story_scene_timeout") < steps.index("feed_compose")
+    assert steps.index("story_scene_timeout") < steps.index("proactive_dispatch")
+
+
+@pytest.mark.asyncio
+async def test_scene_timeout_crash_does_not_stop_the_tick() -> None:
+    rec = _Recorder()
+    executor = _executor_with_recorder(
+        rec, scene_timeout=_SceneTimeoutRecorder(crash=True),
+    )
+    await executor.run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+    )
+    assert "proactive_dispatch" in rec.order
+
+
+@pytest.mark.asyncio
+async def test_unwired_scene_timeout_leaves_the_tick_untouched() -> None:
+    rec = _Recorder()
+    steps: list[str] = []
+
+    async def step_timer(name, coro):  # noqa: ANN001
+        steps.append(name)
+        return await coro
+
+    await _executor_with_recorder(rec).run(
+        _Character(),
+        now=NOW,
+        gate=_AllowGate(),
+        beat_sink=lambda cid, bid: None,
+        allow_dispatch=True,
+        step_timer=step_timer,
+    )
+    assert "story_scene_timeout" not in steps
+
+
+@pytest.mark.asyncio
+async def test_both_scheduling_lines_share_one_step() -> None:
+    # The distributed entry point is the same private step the tick runs —
+    # one implementation, so the red line inside the shared close cannot be
+    # bypassed by whichever line happens to fire first.
+    closer = _SceneTimeoutRecorder()
+    executor = CharacterTickExecutor(
+        story_scene_timeout_closer=closer, dispatcher=object(),
+    )
+    await executor.step_scene_timeout(_Character(), now=NOW)
+    assert closer.calls == [("char-1", NOW)]
+
+
+@pytest.mark.asyncio
+async def test_step_scene_timeout_is_fail_soft() -> None:
+    executor = CharacterTickExecutor(
+        story_scene_timeout_closer=_SceneTimeoutRecorder(crash=True),
+        dispatcher=object(),
+    )
+    await executor.step_scene_timeout(_Character(), now=NOW)  # must not raise

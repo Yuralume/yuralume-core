@@ -130,6 +130,25 @@ async def test_writer_parses_scene_json_and_renders_prompt_facts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_involvement_policy_is_retired() -> None:
+    """OP2-C. Characterized before flipping: this prompt used to carry a
+    「使用者參與政策：」 section whose hard rule was 「只有當政策明確允許時
+    才把使用者寫進已發生場景」 — i.e. the player was excluded unless
+    something else vouched for them. Retired: the beat's own
+    ``operator_position`` decides, so neither the section header nor the
+    permission-gated rule may survive.
+    """
+    model = _ScriptedModel(
+        '{"narrative": "我站在門口。", "cast_strategy": "npc_dialogue"}',
+    )
+    await LLMStoryBeatSceneWriter(model=model).write_scene(_context())
+    prompt = model.prompts[0]
+    assert "使用者參與政策：" not in prompt
+    assert "只有當政策明確允許時才把使用者寫進已發生場景" not in prompt
+    assert "玩家在這場戲的位置：" in prompt
+
+
+@pytest.mark.asyncio
 async def test_writer_falls_back_on_malformed_json() -> None:
     writer = LLMStoryBeatSceneWriter(model=_ScriptedModel("not json"))
 

@@ -180,27 +180,34 @@ def _build_service_with_translator(
     return service, character_service, char_repo, arc_repo, relationship_repo
 
 
-def test_list_available_projects_manifest(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_list_available_projects_manifest(tmp_path: Path) -> None:
     _write_demo_pack(tmp_path)
     service, *_ = _build_service(tmp_path)
 
-    summaries = service.list_available()
+    catalogue = await service.list_available()
 
-    assert len(summaries) == 1
-    summary = summaries[0]
+    assert len(catalogue.cards) == 1
+    summary = catalogue.cards[0]
     assert summary.pack_id == "demo_mio"
     assert summary.title == "美緒 — 示範角色"
     assert summary.author == "Tester"
     assert summary.tags == ["現代", "示範"]
     assert summary.bundled_arc_template_count == 1
     assert summary.stage_image_count == 0
+    # A local pack says where it came from and makes no claim about the
+    # reader's language — the translate toggle stays available for it.
+    assert summary.source == "local"
+    assert summary.localized is False
+    assert catalogue.official_cards_unavailable is False
 
 
-def test_list_available_includes_preview_image_urls(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_list_available_includes_preview_image_urls(tmp_path: Path) -> None:
     _write_demo_pack(tmp_path, with_stage_image=True)
     service, *_ = _build_service(tmp_path)
 
-    previews = service.list_available()
+    previews = (await service.list_available()).cards
 
     assert len(previews) == 1
     preview = previews[0]
@@ -262,12 +269,13 @@ def test_get_pack_image_unknown_or_out_of_range_raises_not_found(
         service.get_image("demo_mio", 1)
 
 
-def test_list_available_skips_unreadable_pack(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_list_available_skips_unreadable_pack(tmp_path: Path) -> None:
     _write_demo_pack(tmp_path, pack_id="good")
     (tmp_path / "broken.lumecard").write_bytes(b"not a zip")
     service, *_ = _build_service(tmp_path)
 
-    summaries = service.list_available()
+    summaries = (await service.list_available()).cards
 
     # The junk file is skipped (fail-soft), the good one survives.
     assert [s.pack_id for s in summaries] == ["good"]
@@ -351,15 +359,18 @@ async def test_install_unknown_pack_raises_not_found(tmp_path: Path) -> None:
         await service.install("ghost", user_id=_INSTALLER)
 
 
-def test_shipped_demo_packs_load() -> None:
-    """Every repo-shipped card must parse.
+def test_bundled_pack_directory_is_empty_and_still_works() -> None:
+    """The repo ships no cards any more, and that is not a failure.
 
-    Bundled card filenames are content, not API fixtures: maintainers
-    can add, remove, or rename packs without changing this test.
+    Official cards moved to the Cloud catalog (OFFICIAL_CARD_CLOUD_CATALOG
+    D5), so the bundled directory is empty by design — this test used to
+    assert the opposite, which is exactly why it is rewritten rather than
+    deleted. What still has to hold is the mechanism: the catalogue reads an
+    empty directory without complaint, and whatever a deployment *does* drop
+    in there must parse.
     """
     catalog = CharacterCardPackCatalog()
     pack_ids = set(catalog.list_pack_files())
-    assert pack_ids
     for pack_id in pack_ids:
         blob = catalog.read_blob(pack_id)
         assert blob is not None

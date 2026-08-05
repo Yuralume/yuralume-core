@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { LeftOutlined, RightOutlined } from '@ant-design/icons-vue'
+import { UiImage } from '@/components/ui'
 import type { CharacterCardPreview } from '@/utils/api/characters'
 
 // 瀏覽舞台左右兩側的「上一張 / 下一張」迷你卡，點擊即切換到該卡。
@@ -39,11 +40,19 @@ watch(() => props.card, () => {
       <RightOutlined v-else />
     </span>
     <span class="character-card-thumb__art">
-      <img
+      <!-- The art window is the card's clamp(92px, 13vw, 132px) minus
+           5px of padding either side, so it never exceeds 122px — say so,
+           or the default `100vw` assumption picks w768 for a side peek.
+           `@error` still reaches `failed`: UiImage re-emits it, and this
+           component's own `v-else` letter is what actually renders. -->
+      <UiImage
         v-if="showImage"
         class="character-card-thumb__image"
+        variant="thumb"
         :src="image"
         :alt="title"
+        sizes="122px"
+        aspect-ratio="3 / 4"
         @error="failed = true"
       />
       <span v-else class="character-card-thumb__fallback" aria-hidden="true">

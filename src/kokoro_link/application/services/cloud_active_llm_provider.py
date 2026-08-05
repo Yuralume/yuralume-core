@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from kokoro_link.application.services.account_runtime_profile import (
@@ -18,11 +19,16 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudResourceContext,
 )
-from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfilePort
+from kokoro_link.contracts.cloud_routing_profile import (
+    CloudRoutingProfile,
+    CloudRoutingProfilePort,
+)
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.character import Character
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _PROVIDER_ID = "yuralume_cloud"
 _DEFAULT_MODEL_PRESET = "yuralume-default"
@@ -75,13 +81,20 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             character=character,
             operator_id=operator_id,
         )
-        preset = await self._resolve_preset(
+        preset, supports_vision = await self._resolve_preset_and_vision(
             resolved_feature_key,
             identity=identity,
             character=character,
             operator_id=operator_id,
         )
-        return self._model_factory(resolved_feature_key, identity, preset)
+        model = self._model_factory(resolved_feature_key, identity, preset)
+        if supports_vision is None:
+            return model
+        return _bind_vision(
+            model,
+            supports_vision,
+            feature_key=resolved_feature_key,
+        )
 
     async def resolve_model_id(
         self,
@@ -102,21 +115,31 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             if self._routing_profile_port is not None
             else None
         )
-        return await self._resolve_preset(
+        preset, _ = await self._resolve_preset_and_vision(
             resolved_feature_key,
             identity=identity,
             character=character,
             operator_id=operator_id,
         )
+        return preset
 
-    async def _resolve_preset(
+    async def _resolve_preset_and_vision(
         self,
         feature_key: str,
         *,
         identity: CloudGatewayIdentity | None,
         character: Character | None,
         operator_id: str | None,
-    ) -> str:
+    ) -> tuple[str, bool | None]:
+        """Resolve the preset and, from that same profile read, whether the
+        control plane pinned its vision capability (``None`` = unpinned).
+
+        Both answers come out of one ``get_profile`` call on purpose: which
+        preset a feature routes to and what that preset can do are a single
+        control-plane fact, and a second fetch could observe a refreshed
+        profile naming a different preset than the adapter was built for.
+        """
+        profile: CloudRoutingProfile | None = None
         if self._routing_profile_port is not None and identity is not None:
             profile = await self._routing_profile_port.get_profile(
                 tenant_id=identity.tenant_id,
@@ -134,7 +157,7 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
                 )
             preset = profile.preset_for(_CAPABILITY, feature_key)
             if preset:
-                return preset
+                return preset, profile.supports_vision_for(preset)
             if profile.strict_no_fallback:
                 raise RuntimeError(
                     "cloud LLM strict no-fallback requires an explicit preset "
@@ -145,7 +168,17 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             character=character,
             operator_id=operator_id,
         )
-        return self._preset_for(feature_key, strict_no_fallback=strict_no_fallback)
+        preset = self._preset_for(
+            feature_key,
+            strict_no_fallback=strict_no_fallback,
+        )
+        # A capability belongs to the preset, not to how the preset was
+        # chosen: an env-map fallback that lands on a preset the control
+        # plane did annotate still honours that pin. With no profile at all
+        # (env-only deployments) nothing is pinned.
+        if profile is None:
+            return preset, None
+        return preset, profile.supports_vision_for(preset)
 
     async def is_fake(
         self,
@@ -233,3 +266,30 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
                 f"for feature {feature_key!r}",
             )
         return self._model_presets.get("default") or _DEFAULT_MODEL_PRESET
+
+
+def _bind_vision(
+    model: ChatModelPort,
+    supports_vision: bool,
+    *,
+    feature_key: str,
+) -> ChatModelPort:
+    """Bind a control-plane vision pin onto the resolved adapter.
+
+    Adapters without the optional ``with_supports_vision`` hook pass through
+    unchanged, and a binder that raises must not cost the caller its turn:
+    the unpinned adapter still answers, it just keeps its own default (the
+    same fail-soft posture as the self-host resolver).
+    """
+    binder = getattr(model, "with_supports_vision", None)
+    if binder is None:
+        return model
+    try:
+        return binder(supports_vision)
+    except Exception:
+        _LOGGER.exception(
+            "cloud LLM resolve: vision pin binding failed (feature=%s); "
+            "using the adapter default",
+            feature_key,
+        )
+        return model

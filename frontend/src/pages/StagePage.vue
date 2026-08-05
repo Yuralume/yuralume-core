@@ -50,6 +50,15 @@ const selectedCharacter = ref<Character | null>(null)
 const conversationId = ref<string | null>(null)
 const messages = ref<ChatMessage[]>([])
 const historyLoading = ref(false)
+/**
+ * Where the loaded page sits in the thread (IV10) — handed to `ChatPanel` as
+ * the seed for its "load older" cursor. See `loadHistoryFor` for why this is
+ * one object rather than two scalars.
+ */
+const historyPage = ref<{ hasMore: boolean, nextBefore: number | null }>({
+  hasMore: false,
+  nextBefore: null,
+})
 
 function getStageLocalStorage(): Storage | null {
   if (typeof window === 'undefined') return null
@@ -486,6 +495,19 @@ onBeforeUnmount(() => {
   }
 })
 
+/**
+ * Load the *newest page* of a character's thread (IV10).
+ *
+ * Opening a character used to pull the whole history — 316 messages in the
+ * reported case — and render every one of it, which is what kept 228 MB of
+ * decoded pictures resident for images that were never on screen. Older
+ * messages are fetched by `ChatPanel` as the reader scrolls up.
+ *
+ * `historyPage` is reassigned as a fresh object on every load, and `ChatPanel`
+ * treats that new identity as "the parent reseeded the thread, start the
+ * cursor over". A plain pair of props could not say that: a send also replaces
+ * `messages`, and the cursor must survive one.
+ */
 async function loadHistoryFor(characterId: string) {
   historyLoading.value = true
   try {
@@ -493,13 +515,19 @@ async function loadHistoryFor(characterId: string) {
     if (snapshot) {
       conversationId.value = snapshot.id
       messages.value = snapshot.messages
+      historyPage.value = {
+        hasMore: snapshot.has_more ?? false,
+        nextBefore: snapshot.next_before ?? null,
+      }
     } else {
       conversationId.value = null
       messages.value = []
+      historyPage.value = { hasMore: false, nextBefore: null }
     }
   } catch {
     conversationId.value = null
     messages.value = []
+    historyPage.value = { hasMore: false, nextBefore: null }
   } finally {
     historyLoading.value = false
   }
@@ -560,6 +588,7 @@ async function handleDeleteCharacter(char: Character) {
     selectedCharacter.value = null
     conversationId.value = null
     messages.value = []
+    historyPage.value = { hasMore: false, nextBefore: null }
     localStorage.removeItem('kokoro.selectedCharacterId')
   }
 }
@@ -713,6 +742,7 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
           :character="selectedCharacter"
           :conversation-id="conversationId"
           :messages="messages"
+          :history-page="historyPage"
           :loading-history="historyLoading"
           :show-layout-toggle="!isPortrait"
           :stage-layout-mode="stageLayoutMode"

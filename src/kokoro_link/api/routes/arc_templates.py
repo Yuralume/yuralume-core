@@ -17,11 +17,16 @@ from this surface — admins manage packs via the YAML files in source.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from kokoro_link.api.dependencies import get_container, get_current_user_id
+from kokoro_link.api.dependencies import (
+    get_container,
+    get_current_user_id,
+    is_cloud_mode,
+)
 from kokoro_link.api.operator_language import resolve_operator_primary_language
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.arc_template import (
@@ -30,6 +35,7 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplateBeat,
     ArcTemplateBinding,
 )
+from kokoro_link.domain.services.story_tone_policy import fold_stored_tone
 
 router = APIRouter(tags=["arc-templates"])
 
@@ -47,6 +53,9 @@ class ArcTemplateBeatSummary(BaseModel):
     scene_characters: list[str]
     dramatic_question: str | None
     required: bool
+    # --- Player's place in this scene (OP0) --------------------------
+    operator_position: str | None = None
+    operator_note: str | None = None
 
 
 class ArcTemplateBindingSummary(BaseModel):
@@ -100,6 +109,8 @@ class ArcTemplateResponse(BaseModel):
                     scene_characters=list(b.scene_characters),
                     dramatic_question=b.dramatic_question,
                     required=b.required,
+                    operator_position=b.operator_position,
+                    operator_note=b.operator_note,
                 )
                 for b in template.beats
             ],
@@ -122,6 +133,18 @@ class ArcTemplateBeatPayload(BaseModel):
     scene_characters: list[str] = Field(default_factory=list)
     dramatic_question: str | None = None
     required: bool = True
+    # --- Player's place in this scene (OP0) --------------------------
+    # ``None`` = unjudged. Restricted to the domain's closed vocabulary
+    # (``story_arc.VALID_OPERATOR_POSITIONS``) so FastAPI rejects an
+    # off-vocabulary value at request-validation time (422) instead of
+    # letting it reach ``ArcTemplateBeat.create`` inside
+    # ``_request_to_template`` below, which raises ``ValueError`` and —
+    # prior to this fix — was built *outside* the route's existing 400
+    # mapping, surfacing as an unhandled 500. The domain construction is
+    # now also wrapped in that mapping as a second line of defence for
+    # any other validation failure this Literal doesn't cover.
+    operator_position: Literal["absent", "present", "central"] | None = None
+    operator_note: str | None = None
 
 
 class UpdateArcTemplateRequest(BaseModel):
@@ -161,7 +184,11 @@ def _require_repository(container: ServiceContainer):
 
 
 def _request_to_template(
-    *, template_id: str, payload: UpdateArcTemplateRequest, language: str,
+    *,
+    template_id: str,
+    payload: UpdateArcTemplateRequest,
+    language: str,
+    cloud_mode: bool = False,
 ) -> ArcTemplate:
     beats = [
         ArcTemplateBeat.create(
@@ -175,6 +202,8 @@ def _request_to_template(
             scene_characters=b.scene_characters,
             dramatic_question=b.dramatic_question,
             required=b.required,
+            operator_position=b.operator_position,
+            operator_note=b.operator_note,
         )
         for b in payload.beats
     ]
@@ -184,7 +213,15 @@ def _request_to_template(
         premise=payload.premise,
         theme=payload.theme,
         language=language,
-        tone=payload.tone,
+        # GF6: hosted deployments must not store a tone their AUP
+        # forbids. Correcting instead of refusing keeps an operator who
+        # inherited a legacy ``mature`` row able to edit it at all, and
+        # the response echoes the corrected value back.
+        tone=fold_stored_tone(
+            payload.tone,
+            cloud_mode=cloud_mode,
+            context="arc template PATCH",
+        ),
         duration_days=payload.duration_days,
         beats=beats,
         binding=ArcTemplateBinding(
@@ -362,10 +399,18 @@ async def update_arc_template(
         resolved_language = await resolve_operator_primary_language(
             container, current_user_id,
         )
-    template = _request_to_template(
-        template_id=template_id, payload=payload, language=resolved_language,
-    )
     try:
+        # Domain construction lives inside this try too: an off-vocabulary
+        # ``operator_position`` the Literal DTO field doesn't catch (or
+        # any other entity-level validation failure) must map to the same
+        # 400/409 the save step below already produces, not bubble up as
+        # an unhandled 500.
+        template = _request_to_template(
+            template_id=template_id,
+            payload=payload,
+            language=resolved_language,
+            cloud_mode=is_cloud_mode(container),
+        )
         await repo.save_for_user(
             template, user_id=current_user_id, overwrite=True,
         )

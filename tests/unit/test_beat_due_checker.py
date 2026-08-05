@@ -9,7 +9,7 @@ behavior.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +19,9 @@ import pytest
 from kokoro_link.application.services.beat_due_checker import (
     BeatDueChecker,
     BeatScanResult,
+)
+from kokoro_link.application.services.beat_retry_policy import (
+    AUTONOMOUS_SCENE_RETRY_POLICY,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
@@ -35,27 +38,65 @@ UTC = timezone.utc
 @dataclass
 class _StubArcService:
     next_beat_due_response: tuple[StoryArc, StoryArcBeat] | None = None
+    find_beat_response: StoryArcBeat | None = None
     crash_on_next_beat_due: bool = False
     crash_on_mark_attempt: bool = False
+    crash_on_retire: bool = False
     next_beat_due_calls: int = 0
     mark_attempt_calls: int = 0
+    retire_calls: int = 0
+    call_order: list[str] = field(default_factory=list)
     last_today: date | None = None
+    last_retire_today: date | None = None
+    last_retire_policy: Any = None
     last_marked_beat_id: str | None = None
     last_mark_kwargs: dict | None = None
+    last_find_beat_id: str | None = None
+    last_retry_policy: Any = None
+    last_unattended: bool | None = None
 
     async def next_beat_due(
         self,
         character_id: str,
         *,
         today: date,  # noqa: ARG002
-        retry_policy=None,  # noqa: ANN001, ARG002
+        retry_policy=None,  # noqa: ANN001
         retry_at=None,  # noqa: ANN001, ARG002
+        unattended: bool = False,
     ) -> tuple[StoryArc, StoryArcBeat] | None:
         self.next_beat_due_calls += 1
+        self.call_order.append("next_beat_due")
         self.last_today = today
+        self.last_retry_policy = retry_policy
+        self.last_unattended = unattended
         if self.crash_on_next_beat_due:
             raise RuntimeError("planner exploded")
         return self.next_beat_due_response
+
+    async def retire_exhausted_beats(
+        self,
+        character_id: str,  # noqa: ARG002
+        *,
+        retry_policy,  # noqa: ANN001
+        today: date,
+    ):
+        self.retire_calls += 1
+        self.call_order.append("retire_exhausted_beats")
+        self.last_retire_today = today
+        self.last_retire_policy = retry_policy
+        if self.crash_on_retire:
+            raise RuntimeError("retirement write exploded")
+        return None
+
+    async def find_beat(self, beat_id: str) -> StoryArcBeat | None:
+        self.last_find_beat_id = beat_id
+        if self.find_beat_response is not None:
+            return self.find_beat_response
+        response = self.next_beat_due_response
+        if response is None:
+            return None
+        _arc, beat = response
+        return beat if beat.id == beat_id else None
 
     async def mark_beat_play_attempted(self, **kwargs):
         self.mark_attempt_calls += 1
@@ -315,6 +356,144 @@ async def test_mark_attempt_crash_is_fail_soft() -> None:
 
     assert result == BeatScanResult.empty()
     assert arc_service.mark_attempt_calls == 1
+
+
+# --- SC0: exhausted-beat retirement (§10 #2) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_scan_retires_exhausted_beats_before_staging() -> None:
+    beat = _beat(required=True)
+    arc_service = _StubArcService(next_beat_due_response=(_arc(beat), beat))
+    checker = _checker(
+        arc_service,
+        _UnusedEventService(),
+        scene_service=_StubSceneService(event_id="event-1"),
+    )
+
+    await checker.scan(_character(), now=datetime(2026, 5, 1, tzinfo=UTC))
+
+    assert arc_service.retire_calls == 1
+    # Retirement must run first, or the scan stages a beat the policy is
+    # about to declare dead.
+    assert arc_service.call_order[0] == "retire_exhausted_beats"
+    assert arc_service.last_retire_today == date(2026, 5, 1)
+    # Same budget the staging gate uses — retiring on a policy the scan
+    # does not apply would kill live beats.
+    assert arc_service.last_retire_policy is AUTONOMOUS_SCENE_RETRY_POLICY
+
+
+@pytest.mark.asyncio
+async def test_scan_without_scene_service_never_retires() -> None:
+    beat = _beat(required=True)
+    arc_service = _StubArcService(next_beat_due_response=(_arc(beat), beat))
+    checker = _checker(arc_service, _UnusedEventService())
+
+    await checker.scan(_character(), now=datetime(2026, 5, 1, tzinfo=UTC))
+
+    # No autonomous scene service → no retry policy is applied → no beat
+    # may be retired on the strength of one.
+    assert arc_service.retire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retirement_crash_does_not_stop_the_scan() -> None:
+    beat = _beat(required=True)
+    arc_service = _StubArcService(
+        next_beat_due_response=(_arc(beat), beat),
+        crash_on_retire=True,
+    )
+    scene_service = _StubSceneService(event_id="event-1")
+    checker = _checker(
+        arc_service, _UnusedEventService(), scene_service=scene_service,
+    )
+
+    result = await checker.scan(
+        _character(), now=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+
+    assert scene_service.calls == 1
+    assert result.realized_event_id == "event-1"
+
+
+@pytest.mark.asyncio
+async def test_scene_failure_verification_reads_the_played_beat() -> None:
+    """§10 #4 fallout: the played beat is no longer always the due head.
+
+    With the walk-down, ``next_beat_due`` can hand back ``candidates[1]``.
+    Verifying "did the scene service already record its failure?" by
+    re-reading the head would compare the wrong beat and double-charge
+    the retry budget, which is the very over-suppression SC0 removes.
+    """
+    played = _beat(beat_id="beat-2")
+    arc_service = _StubArcService(
+        next_beat_due_response=(_arc(played), played),
+        # The scene service already recorded the failed attempt.
+        find_beat_response=played.with_play_attempt(
+            attempted_at=datetime(2026, 5, 1, tzinfo=UTC),
+            source="scene_simulation",
+            result="writer_crashed",
+            push_intensity="autonomous_scene",
+        ),
+    )
+    checker = _checker(
+        arc_service,
+        _UnusedEventService(),
+        scene_service=_StubSceneService(event_id=None),
+    )
+
+    result = await checker.scan(
+        _character(), now=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+
+    assert arc_service.last_find_beat_id == played.id
+    assert arc_service.mark_attempt_calls == 0
+    assert result.attempted_beat_id == played.id
+
+
+# --- OP2-B: the scan declares whether anyone is in the room -----------
+
+
+@pytest.mark.asyncio
+async def test_scan_that_can_play_a_scene_asks_for_unattended_candidates(
+) -> None:
+    """With a scene service the scan performs; ``central`` beats cannot.
+
+    The flag and the retry policy ride the same gate on purpose: both
+    only make sense for the configuration that actually plays a beat
+    with nobody watching.
+    """
+    beat = _beat(required=True)
+    arc_service = _StubArcService(next_beat_due_response=(_arc(beat), beat))
+    checker = _checker(
+        arc_service,
+        _UnusedEventService(),
+        scene_service=_StubSceneService(event_id="event-1"),
+    )
+
+    await checker.scan(_character(), now=datetime(2026, 5, 1, tzinfo=UTC))
+
+    assert arc_service.last_unattended is True
+    assert arc_service.last_retry_policy is AUTONOMOUS_SCENE_RETRY_POLICY
+
+
+@pytest.mark.asyncio
+async def test_scan_without_a_scene_service_still_wants_central_beats() -> None:
+    """Nothing is performed here — the output is an invitation.
+
+    Without the scene service the scan's entire product is a
+    notification candidate asking the player to come, which is exactly
+    what a ``central`` beat is waiting for. Suppressing it would silence
+    the one path that helps.
+    """
+    beat = _beat(required=True)
+    arc_service = _StubArcService(next_beat_due_response=(_arc(beat), beat))
+    checker = _checker(arc_service, _UnusedEventService())
+
+    await checker.scan(_character(), now=datetime(2026, 5, 1, tzinfo=UTC))
+
+    assert arc_service.last_unattended is False
+    assert arc_service.last_retry_policy is None
 
 
 @pytest.mark.asyncio

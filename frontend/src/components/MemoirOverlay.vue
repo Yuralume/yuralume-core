@@ -7,16 +7,24 @@
  * 是窄條（max-width 480px）的 feed，回憶錄是寬版的三欄沉浸式 layout，
  * 所以 frame 寬度放到 1200px，垂直滾動由內部 content 處理。
  */
-import { onBeforeUnmount, onMounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import MemoirContent from '@/components/memoir/MemoirContent.vue'
+import { imageVariantUrl } from '@/components/ui'
 import type { Character } from '@/types/character'
 
 const props = defineProps<{
   open: boolean
   character: Character | null
 }>()
+
+// 32px 圓形頭像不需要 1024x1536 原圖——CSS background-image 沒有
+// UiImage 可用，改用它組 ?v= URL 的同一支 helper 拿最小變體。
+const avatarUrl = computed(() => {
+  const original = props.character?.image_urls?.[0] ?? null
+  return original ? imageVariantUrl(original, 'w320') : null
+})
 
 const emit = defineEmits<{
   (e: 'close'): void
@@ -66,9 +74,9 @@ onBeforeUnmount(() => {
             <h2 class="mo-title">{{ t('memoir.title') }}</h2>
             <div v-if="character" class="mo-character">
               <span
-                v-if="character.image_urls?.[0]"
+                v-if="avatarUrl"
                 class="mo-avatar"
-                :style="{ backgroundImage: `url(${character.image_urls[0]})` }"
+                :style="{ backgroundImage: `url(${avatarUrl})` }"
                 aria-hidden="true"
               />
               <span class="mo-character-name">{{ character.name }}</span>

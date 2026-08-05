@@ -30,8 +30,9 @@ import type {
   FusionStory,
   FusionStorySummary,
   FusionStoryStatus,
+  FusionToArcOperatorMode,
 } from '@/types/fusionStory'
-import { UiButton } from '@/components/ui'
+import { UiButton, UiImage } from '@/components/ui'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import { ACTION_FUSION_STORY } from '@/composables/useActionPricing'
@@ -327,12 +328,17 @@ async function handleDelete(summary: FusionStorySummary) {
   }
 }
 
-async function handleAdaptToArc() {
+async function handleAdaptToArc(mode: FusionToArcOperatorMode) {
   if (!selectedStory.value || selectedStory.value.status !== 'ready') return
   errorMessage.value = ''
   adaptingToArc.value = true
   try {
-    adaptedDraft.value = await adaptFusionStoryToArc(selectedStory.value.id)
+    // The creator's answer to "how do I enter this story" (OP1-C). Always
+    // sent explicitly — the exit hub showed them the three options — so
+    // the server's "nobody chose" default never applies to this path.
+    adaptedDraft.value = await adaptFusionStoryToArc(selectedStory.value.id, {
+      operator_mode: mode,
+    })
   } catch (err: unknown) {
     errorMessage.value =
       err instanceof Error ? err.message : t('fusionStory.page.errors.adaptToArcFailed')
@@ -549,11 +555,12 @@ onBeforeUnmount(stopPolling)
           >
             <button class="fusion-page__story-btn" @click="selectStory(story)">
               <div class="fusion-page__story-cover">
-                <img
+                <UiImage
                   v-if="coverImage(story)"
-                  :src="coverImage(story)!"
+                  :src="coverImage(story)"
                   alt=""
-                  loading="lazy"
+                  variant="thumb"
+                  sizes="44px"
                 />
                 <span v-else class="fusion-page__story-cover-fallback">📖</span>
               </div>

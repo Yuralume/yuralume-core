@@ -347,3 +347,50 @@ def test_invalid_overage_knobs_fall_back_to_the_safe_defaults() -> None:
 def test_demo_profile_is_not_action_priced() -> None:
     assert DEMO_ACCOUNT_RUNTIME_PROFILE.uses_action_pricing is False
     assert DEMO_ACCOUNT_RUNTIME_PROFILE.overage_enabled is False
+
+
+# --- story_scene_daily_limit (SC3-B) ---------------------------------------
+
+
+def test_story_scene_daily_limit_defaults_to_unlimited() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {})
+
+    assert profile.story_scene_daily_limit is None
+
+
+def test_story_scene_daily_limit_parsed_from_control_plane() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "story_scene_daily_limit": 3,
+    })
+
+    assert profile.story_scene_daily_limit == 3
+
+
+def test_story_scene_daily_limit_rejects_zero_and_negative() -> None:
+    """0 is not a second spelling of "unlimited" -- unlike overage_daily_limit
+    this knob's CHECK runs the other way (NULL allowed, 0 is not), so an
+    invalid 0/negative value falls back to the default (None) exactly like any
+    other out-of-range knob, not to some other sentinel."""
+    zero = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "story_scene_daily_limit": 0,
+    })
+    assert zero.story_scene_daily_limit is None
+
+    negative = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "story_scene_daily_limit": -1,
+    })
+    assert negative.story_scene_daily_limit is None
+
+
+def test_story_scene_daily_limit_explicit_null_stays_unlimited() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "story_scene_daily_limit": None,
+    })
+
+    assert profile.story_scene_daily_limit is None
+
+
+def test_story_scene_daily_limit_missing_key_is_zero_impact_for_self_host() -> None:
+    """self-host never sends this knob at all -- confirms the fail-open default
+    stays unlimited with no payload change required."""
+    assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.story_scene_daily_limit is None

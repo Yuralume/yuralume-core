@@ -31,14 +31,13 @@ ${companion_block}
 推進嘗試事實：
 ${attempt_block}
 
-使用者參與政策：
-${user_involvement_policy}
+${operator_position_block}
 
 硬性要求：
-- 以「劇情完整、不卡著」為優先。即使使用者不在場，也要讓這個 beat 有自然收尾。
+- 以「劇情完整、不卡著」為優先：這個 beat 要在這段敘事裡有自然收尾。
 - 不要等待使用者回覆，不要把「等你來」寫成未完成狀態。
 - 可用角色內心、scene_characters、companion 或 NPC label 自己把戲演完。
-- 只有當政策明確允許時才把使用者寫進已發生場景；否則不要讓使用者成為必要角色。
+- 玩家在這場戲裡的份量以上方「玩家在這場戲的位置」為準，不要自己另外假設。
 - 寫成第一人稱、角色已經經歷過的短場景，不是大綱、不是待辦、不是系統說明。
 - 可以含簡短對話，但不要寫劇本格式，不要列 speaker 名單。
 - 玩家可見文字必須跟隨主要語言提示。
@@ -59,5 +58,5 @@ ${user_involvement_policy}
   "narrative": "第一人稱短場景",
   "emotional_tone": "peaceful|happy|melancholy|lonely|curious|excited|anxious|nostalgic|tired|content|restless|hopeful|tense|bittersweet|null",
   "cast_strategy": "inner_monologue|npc_dialogue|companion_dialogue|user_present|autonomous",
-  "participation_note": "一句內部備註，說明如何避免卡住或為何需要/不需要使用者"
+  "participation_note": "一句內部備註，說明你把玩家放在這場戲的什麼位置、以及這場戲如何不卡住"
 }

@@ -95,6 +95,7 @@ FEED_COMMENT_REPLY_KIND = "feed_comment_reply"
 PROACTIVE_EVALUATE_KIND = "proactive_evaluate"
 CHARACTER_UPKEEP_KIND = "character_upkeep"
 GOAL_REVIEW_KIND = "goal_review"
+STORY_SCENE_TIMEOUT_KIND = "story_scene_timeout"
 
 
 # -- social (cross-character) kinds — the social_tick split (§13) ------------ #
@@ -235,6 +236,30 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         base_interval_seconds=86_400.0,
         handler="goal_review",
         knob_gate=KnobGate.BACKGROUND,
+    ),
+    STORY_SCENE_TIMEOUT_KIND: KindSpec(
+        kind=STORY_SCENE_TIMEOUT_KIND,
+        # Priority 2 — the "precisely-timed" tier, alongside beat_due, and
+        # for the same reason: an idle scene's deadline is known exactly
+        # (last activity + the configured window), so the chain carries an
+        # ``explicit_next_due`` rather than drifting on rechecks. It also
+        # produces player-visible output the player already paid for
+        # (STORY_SCENE_PLAN §3.4 #2), which puts it above the deferrable
+        # feed / upkeep tiers.
+        priority=2,
+        # The wrap-up is a model call (narration + the canon summary), so
+        # it counts against the §5 background LLM ceiling like beat_due.
+        capability=JobCapability.LLM,
+        # Fallback recheck only, for the overwhelmingly common case of a
+        # character with no live scene: one indexed read per hour. When a
+        # scene IS open the explicit due time takes over entirely.
+        base_interval_seconds=3_600.0,
+        handler="story_scene_timeout",
+        # NOT background-gated. The idle window is the promise that a paid
+        # opening always produces something; letting a down-shifted idle
+        # account stretch that window would leave 起幕 blocked for the one
+        # player most likely to come back and press it.
+        knob_gate=KnobGate.NONE,
     ),
     CHARACTER_UPKEEP_KIND: KindSpec(
         kind=CHARACTER_UPKEEP_KIND,

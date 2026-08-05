@@ -13,6 +13,7 @@ from kokoro_link.api.dependencies import (
     require_admin,
 )
 from kokoro_link.api.routes._cloud_errors import insufficient_credits_guard
+from kokoro_link.api.routes._uploads import ensure_allowed_upload_content_type
 from kokoro_link.api.character_runtime import (
     ensure_character_primary_image,
     enqueue_character_runtime_initialization,
@@ -314,13 +315,17 @@ async def draft_character(
 
     image_input: ImageInput | None = None
     if image is not None:
+        # The declared type is stored with the object and echoed back from the
+        # app's own origin, so it is validated, never defaulted — see
+        # ``_uploads``. A whitelisted type is by definition non-empty, which is
+        # what retires the old ``or "image/png"`` fallback.
+        mime = ensure_allowed_upload_content_type(image.content_type)
         data = await image.read()
         if len(data) > _MAX_IMAGE_BYTES:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail="Image exceeds 8 MB limit",
             )
-        mime = image.content_type or "image/png"
         image_input = ImageInput(data=data, mime_type=mime)
 
     # The draft is an action-priced entry point, so both billing refusals are

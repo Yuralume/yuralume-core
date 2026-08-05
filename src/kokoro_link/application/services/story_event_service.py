@@ -12,7 +12,9 @@ first checks whether the character's active arc has a beat due today.
 If yes, the beat wins the daily slot but is **not** immediately expanded
 into a diary entry. Instead it records a play attempt so prompt builders
 can stage the scene and post-turn can later persist the actual performed
-moment as a ``StoryEvent``.
+moment as a ``StoryEvent``. Background callers pass ``unattended=True``
+so a beat that is *about the player* is left waiting instead of being
+performed with nobody in the room (see :meth:`ensure_today`).
 """
 
 from __future__ import annotations
@@ -58,6 +60,8 @@ from kokoro_link.domain.entities.memory_item import (
 )
 from kokoro_link.domain.entities.story_arc import (
     ARC_COMPLETED,
+    OPERATOR_POSITION_CENTRAL,
+    OPERATOR_POSITION_PRESENT,
     TENSION_CLIMAX,
     TENSION_FALLING,
     TENSION_RESOLUTION,
@@ -68,6 +72,7 @@ from kokoro_link.domain.entities.story_arc import (
 )
 from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.entities.story_seed import StorySeed
+from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
@@ -167,6 +172,7 @@ class StoryEventService:
         character: Character,
         *,
         now: datetime | None = None,
+        unattended: bool = False,
     ) -> EnsureReport:
         """Roll + expand + persist today's event if not already done.
 
@@ -179,6 +185,26 @@ class StoryEventService:
         2. Otherwise fall back to the gacha. A day with no arc beat is
            free narrative territory — the gacha fills the gap so the
            character still has **something** happening.
+
+        ``unattended`` says **who is asking**, and it exists because this
+        method has two kinds of caller. The chat turn is *attended*: a
+        player is in the room, the due beat is about to be handed to the
+        prompt builder as today's scene directive, and recording that it
+        was surfaced is a true fact. A background tick (the proactive
+        dispatcher, character warm-up) is *unattended*: nothing it does
+        here reaches a player, so a beat whose ``operator_position`` is
+        ``central`` is passed over — no play attempt, no recheck, and
+        therefore no ``mark_realized`` (ARC_PLAYER_POSITION_PLAN §2 #5,
+        red line 4). Without the flag, background ticks alone push such a
+        beat past the recheck threshold and the rechecker quietly writes
+        the scene into canon — a scene that only exists *because* the
+        player is in it, performed while they were away.
+
+        Same vocabulary and same default as
+        ``StoryArcService.next_beat_due(unattended=...)``: the player
+        surfaces never pass it, so opting *out* of the fix is impossible
+        by omission, and a caller that forgets it keeps today's
+        behaviour rather than inheriting a silently different one.
         """
         today = await self._today_for_character(character, now)
         existing = await self._events.get_for_day(character.id, today.isoformat())
@@ -219,13 +245,17 @@ class StoryEventService:
                 )
                 if len(existing) >= self._daily_count:
                     return EnsureReport(events=tuple(existing), newly_rolled=0)
-                return await self._do_ensure_today(character, today, existing)
+                return await self._do_ensure_today(
+                    character, today, existing, unattended=unattended,
+                )
 
     async def _do_ensure_today(
         self,
         character: Character,
         today: date_type,
         existing: list[StoryEvent] | tuple[StoryEvent, ...],
+        *,
+        unattended: bool = False,
     ) -> EnsureReport:
         """Inner worker — caller holds the per-day lock."""
         newly_added: list[StoryEvent] = []
@@ -236,6 +266,48 @@ class StoryEventService:
             due = await self._arc_service.next_beat_due(character.id, today=today)
             if due is not None:
                 _arc, beat = due
+                if (
+                    unattended
+                    and beat.operator_position == OPERATOR_POSITION_CENTRAL
+                ):
+                    # The scene is about the player and has no content
+                    # without them, and nobody is here to receive it. Do
+                    # not touch it: an attempt would be a false fact
+                    # ("we surfaced this to someone"), and attempts are
+                    # what unlock the rechecker's ``mark_realized`` — the
+                    # exact path that would perform this scene into canon
+                    # behind the player's back (plan §2 #5, red line 4).
+                    #
+                    # It still *holds* the day's slot instead of falling
+                    # through to gacha, which is the one thing that keeps
+                    # the attended path intact. A diary entry rolled here
+                    # would fill the day, and ``ensure_today`` returns at
+                    # the very top once the day is full — so the chat
+                    # turn would never reach this branch, never record
+                    # its (legitimate) attempt, and the beat could never
+                    # reach the rechecker even with the player present.
+                    # Declining to play a beat must not also disable the
+                    # only mechanism that ever retires it.
+                    #
+                    # Accepted consequence: while the beat waits and
+                    # nobody chats, no gacha rolls for that day. That is
+                    # the standing "a due beat owns the day" rule, not a
+                    # new one; what is new is that only the player can
+                    # release it — which is the point, and what OP3's
+                    # invitation exists to ask for.
+                    #
+                    # DEBUG, not INFO: this repeats on every tick for as
+                    # long as the beat waits, and an arc waiting for its
+                    # player is a resting state, not an incident.
+                    _LOGGER.debug(
+                        "story event: due beat is about the player — "
+                        "unattended ensure_today leaves it waiting "
+                        "character=%s beat=%s", character.id, beat.id,
+                    )
+                    return EnsureReport(
+                        events=tuple(existing),
+                        newly_rolled=0,
+                    )
                 adjustment = None
                 try:
                     await self._arc_service.mark_beat_play_attempted(
@@ -432,6 +504,12 @@ class StoryEventService:
             # CF1b: gives the expander absolute-date anchors so the beat
             # narrative it writes does not freeze a relative time word.
             today=today,
+            # OP2-C: the same two slots the autonomous writer reads. Both
+            # paths turn one beat into one StoryEvent, so both have to
+            # frame the player from the same facts — otherwise the beat
+            # reads differently depending on which one got to it.
+            operator_position=beat.operator_position,
+            operator_note=beat.operator_note,
         )
         try:
             narrative, tone = await self._expand_with_language(
@@ -598,11 +676,21 @@ class StoryEventService:
             kind = MemoryKind.EPISODIC
             salience = 0.45
             tags = ["story_event"]
+            participants: tuple[ParticipantRef, ...] = ()
             if event.arc_beat_id and self._arc_service is not None:
                 arc = await self._arc_service.get_arc_by_beat(event.arc_beat_id)
                 beat = arc.find_beat(event.arc_beat_id) if arc is not None else None
                 if beat is not None:
                     kind, salience, tags = _arc_memory_shape(beat)
+                    # OP2-E: the beat's dramatic position becomes the
+                    # memory's participant provenance. Both realize paths
+                    # (autonomous scene writer, expander) route through
+                    # this single method, so they inherit the same
+                    # translation for free — there is no second copy to
+                    # keep in sync.
+                    participants = _operator_participants_for_position(
+                        beat.operator_position,
+                    )
             item = MemoryItem.create(
                 character_id=event.character_id,
                 kind=kind,
@@ -610,6 +698,7 @@ class StoryEventService:
                 salience=salience,
                 tags=tags,
                 created_at=event.created_at,
+                participants=participants,
             )
             embedded = await attach_embeddings([item], self._embedder)
             await self._memories.add_many(embedded)
@@ -712,6 +801,55 @@ def _arc_memory_shape(beat: StoryArcBeat) -> tuple[MemoryKind, float, list[str]]
         MemoryKind.EPISODIC,
         salience_by_tension.get(beat.tension, 0.55),
         tags,
+    )
+
+
+def _operator_participants_for_position(
+    position: str | None,
+) -> tuple[ParticipantRef, ...]:
+    """Project a beat's ``operator_position`` into the participant tuple
+    a realized memory carries (OP2-E).
+
+    Pure and total over the four states a beat can be in:
+
+    - ``absent`` and the unjudged ``None`` both return ``()``. A memory's
+      ``participants`` answers "who was actually in this scene" — the
+      correct representation of "not in it" is *no ref*, not a
+      placeholder tagged "absent". Treating unjudged the same as absent
+      is deliberate: this function must never fabricate a participant
+      for a beat nobody has classified yet (plan red line — no
+      guessing where evidence is missing).
+    - ``present`` / ``central`` return a single operator
+      :class:`ParticipantRef`, reusing the position string itself as
+      ``role``. The beat's own OP0-A vocabulary already names the
+      distinction the memory needs, so inventing a second label for
+      the same fact would be a translation with nothing to translate.
+      ``actor_id=None`` / ``display_name="使用者"`` mirrors the existing
+      operator-ParticipantRef convention used for schedule involvement
+      (``schedule_service._with_operator_involvement``) and social
+      knowledge (``llm_planner._operator_participant_refs``) — this is
+      a single-operator system, so there is no id to carry.
+
+    Deliberately blind to ``operator_note``: that field is prose for
+    writer prompts, not a structural fact, and folding free text into
+    stored provenance here would let narrative material silently steer
+    what a memory claims about who was present.
+
+    This is a one-way projection only (plan red line 3): it reads
+    ``StoryArcBeat.operator_position`` and never touches
+    ``ScheduleActivity``/``ParticipantRef`` roles that carry schedule's
+    own invitation-lifecycle vocabulary (``operator_confirmed_shared``
+    et al.) — different semantics, so they stay on their own values.
+    """
+    if position not in (OPERATOR_POSITION_PRESENT, OPERATOR_POSITION_CENTRAL):
+        return ()
+    return (
+        ParticipantRef(
+            actor_kind="operator",
+            actor_id=None,
+            display_name="使用者",
+            role=position,
+        ),
     )
 
 

@@ -16,6 +16,7 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.story import SceneContext, StoryEventExpanderPort
+from kokoro_link.domain.services.story_tone_policy import resolve_prompt_tone
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_seed import StorySeed
 from kokoro_link.infrastructure.prompt.character_identity import (
@@ -25,6 +26,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.infrastructure.story.beat_operator_position import (
+    render_beat_operator_position_block,
+)
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
@@ -75,10 +79,15 @@ class LLMStoryEventExpander(StoryEventExpanderPort):
         model: ChatModelPort | None = None,
         provider: ActiveLLMProviderPort | None = None,
         feature_key: str | None = None,
+        cloud_mode: bool = False,
     ) -> None:
         self._resolver = ModelResolver(
             provider=provider, model=model, feature_key=feature_key,
         )
+        # GF6 — hosted deployments must not render the ``mature`` tone's
+        # explicit directives. Default ``False`` keeps self-host prompts
+        # byte-identical. See ``domain.services.story_tone_policy``.
+        self._cloud_mode = cloud_mode
 
     async def expand(
         self,
@@ -118,6 +127,7 @@ class LLMStoryEventExpander(StoryEventExpanderPort):
             scene=scene,
             character=character,
             operator_primary_language=operator_primary_language,
+            cloud_mode=self._cloud_mode,
         )
         try:
             raw = await self._resolver.generate(prompt, character=character)
@@ -155,6 +165,7 @@ def _build_prompt(
     scene: SceneContext | None,
     character: Character | None = None,
     operator_primary_language: str = "zh-TW",
+    cloud_mode: bool = False,
 ) -> str:
     if scene is not None and scene.is_meaningful():
         return _build_scene_prompt(
@@ -166,6 +177,7 @@ def _build_prompt(
             scene=scene,
             character=character,
             operator_primary_language=operator_primary_language,
+            cloud_mode=cloud_mode,
         )
     # Tags only exist on real StorySeed objects; arc beats wrapped
     # via ``_BeatAsSeed`` don't carry them, so we tolerate the absence.
@@ -213,6 +225,11 @@ _TONE_PROFILES: dict[str, tuple[str, list[str]]] = {
             "- 戲劇問題的張力要明確浮上來，不要用「終於」「命運」這類抽象詞偷渡。",
         ],
     ),
+    # SELF-HOST ONLY in effect: hosted deployments never reach this
+    # entry — ``resolve_prompt_tone`` folds ``mature`` to ``dramatic``
+    # before the lookup below (GF6). Keep it that way: the AUP the
+    # hosted service ships under promises no sexually explicit content,
+    # and this block instructs the opposite.
     "mature": (
         "用第一人稱寫 3–5 句話演出這場戲，**不要迴避**戲劇的真實重量——"
         "暴力、肉體、權力支配、酒精、性、創傷的細節都可以據實寫，"
@@ -256,6 +273,7 @@ def _build_scene_prompt(
     scene: SceneContext,
     character: Character | None = None,
     operator_primary_language: str = "zh-TW",
+    cloud_mode: bool = False,
 ) -> str:
     """Prompt the expander to *play* a scripted beat instead of
     paraphrasing a seed."""
@@ -280,18 +298,30 @@ def _build_scene_prompt(
         if scene.required
         else "- 重要性：這是輔助場景，可以寫得克制、留白多一點。"
     )
+    # GF6: hosted, ``mature`` collapses to ``dramatic`` (and any
+    # off-catalogue label to ``daily``) *before* the profile lookup, so
+    # neither the explicit directives nor the raw label reach the model.
+    # Self-host this is the identity function.
+    prompt_tone = resolve_prompt_tone(
+        scene.tone, cloud_mode=cloud_mode, context="story expander scene",
+    )
     # Tone profile picks the framing line + extra style constraints.
     # Unknown tones fall through to "daily" so a wizard-authored
     # template using a brand-new tone label still works (just reads
     # as default daily framing until we add a profile for it).
     tone_header, tone_extras = _TONE_PROFILES.get(
-        scene.tone, _TONE_PROFILES["daily"],
+        prompt_tone, _TONE_PROFILES["daily"],
     )
     base_constraints = [
         "- 場景在哪裡、出場人物在做什麼、角色感受到什麼。",
         "- 若有戲劇問題，要讓問題的張力浮現，但不必在此 beat 立刻解答。",
         "- 維持角色的說話風格與世界觀，不要塞入與所在世界不符的物件。",
-        "- 不要把使用者寫進這場戲；這是角色自己正在經歷的瞬間。",
+        # OP2-C: "never write the user into this scene" retired. It was
+        # the only answer available while a beat had nowhere to say where
+        # the player stands; now the beat says so and the block above
+        # carries the framing — including the red line that survives in
+        # every branch.
+        "- 玩家在這場戲裡的位置以上方那段為準，並遵守其中的紅線。",
         "- 不要把骨架文字逐句照抄，要用角色語氣重寫。",
         "- 總長不超過 160 字。",
     ]
@@ -310,7 +340,7 @@ def _build_scene_prompt(
         identity_block=_identity_block(character),
         speaking_style=speaking_style or "自然",
         world_frame=world_frame,
-        tone=scene.tone,
+        tone=prompt_tone,
         scene_type=scene.scene_type,
         scene_hint=scene_hint,
         location_line=location_line,
@@ -320,6 +350,11 @@ def _build_scene_prompt(
         seed_text=seed.seed_text,
         tone_header=tone_header,
         constraint_block=constraint_block,
+        # OP2-C: same renderer the autonomous beat scene writer uses, so
+        # one beat gets one framing no matter which writer realizes it.
+        operator_position_block=render_beat_operator_position_block(
+            scene.operator_position, scene.operator_note,
+        ),
     )
     language_hint = render_operator_language_hint(operator_primary_language)
     return f"{language_hint}\n\n{body}" if language_hint else body

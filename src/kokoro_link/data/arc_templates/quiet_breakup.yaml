@@ -14,25 +14,42 @@ duration_days: 10
 binding:
   world_frames: [modern]
   required_traits: []
+
+# --- operator_position / operator_note labeling rule (OP0-B) ----------------
+# `operator_note` is rendered verbatim into the scene opener/closer prompt
+# *before* the beat is played, and a played beat can be canonised as history.
+# So a note describes **the character's** motive, or the line she has not said
+# yet ("她想問你這是不是最後一次") — never something the player has already
+# said, decided or done ("你先開口說…"). Pre-writing the player's turn is the
+# same fabrication SC1-D's 「收尾不得虛構玩家行動」 forbids, only smuggled in
+# through shipped material instead of through the writer.
+# The rule governs `summary` too: the player may be who the character reaches
+# toward, never an actor whose line is already spent. `operator_position`
+# already states that the player is in the scene — the prose does not need to
+# spend the player's turn to prove it.
 beats:
   - sequence: 0
     day_offset: 0
     title: 週日的早餐
     summary: |
-      週日早上兩個人一起吃早餐，沒有吵也沒有特別溫柔。
+      週日早上，她把兩份早餐端上桌。沒有吵，也沒有特別溫柔。
       她突然意識到，這樣的早晨已經連續好幾週了。
     tension: setup
     scene_type: revelation
     location: 共同的家
-    scene_characters: [伴侶]
+    scene_characters: []
     dramatic_question: 這算還在一起嗎？
     required: true
+    # "伴侶" is the player, not an NPC — OP0-B renames the cast to the
+    # structured player-position slot instead of a scene_characters label.
+    operator_position: central
+    operator_note: 她想在這頓早餐裡找回平常該有的溫度，卻不知道第一句話該說什麼
 
   - sequence: 1
     day_offset: 1
     title: 加班回家的夜
     summary: |
-      晚上十一點半才到家，伴侶已經睡了。
+      晚上十一點半才到家，屋子裡一片安靜。
       她坐在沙發上沒開燈，吃完冷掉的便當。
     tension: rising
     scene_type: interlude
@@ -40,6 +57,9 @@ beats:
     scene_characters: []
     dramatic_question: 為什麼回家比留在公司更累？
     required: false
+    # A solo beat — and the prose says nothing about where the player is or
+    # what the player is doing, per the labeling rule above.
+    operator_position: absent
 
   - sequence: 2
     day_offset: 3
@@ -53,6 +73,7 @@ beats:
     scene_characters: [老朋友]
     dramatic_question: 為什麼真話比客套更難說出口？
     required: true
+    operator_position: absent
 
   - sequence: 3
     day_offset: 4
@@ -66,6 +87,7 @@ beats:
     scene_characters: []
     dramatic_question: 她在期待自己變回什麼樣子？
     required: false
+    operator_position: absent
 
   - sequence: 4
     day_offset: 6
@@ -79,25 +101,28 @@ beats:
     scene_characters: []
     dramatic_question: 那時候的自己，現在還在嗎？
     required: true
+    operator_position: absent
 
   - sequence: 5
     day_offset: 7
     title: 餐桌前的沉默
     summary: |
-      晚餐時兩個人都在滑手機，碗筷的聲音比說話還多。
+      晚餐時說話比碗筷的聲音還少。
       她突然想開口說一件白天的小事，又把話吞了回去。
     tension: climax
     scene_type: conflict
     location: 共同的家
-    scene_characters: [伴侶]
+    scene_characters: []
     dramatic_question: 是什麼讓那句話卡在喉嚨？
     required: true
+    operator_position: central
+    operator_note: 她想跟你說一件白天的小事，話到嘴邊又吞了回去，還在等一個開口的時機
 
   - sequence: 6
     day_offset: 9
     title: 一個人的早餐
     summary: |
-      週六早上比平常早醒，伴侶還在睡。
+      週六早上比平常早醒，屋裡還很安靜。
       她替自己泡了咖啡，坐在窗邊吃完一片吐司。
       陽光照在桌面上，第一次覺得這個畫面也可以。
     tension: falling
@@ -106,17 +131,22 @@ beats:
     scene_characters: []
     dramatic_question: 一個人的早餐其實沒那麼難？
     required: true
+    # Mirrors beat 0's shared breakfast with a solo one. Same as beat 1:
+    # the beat is hers alone and the prose does not spend the player's turn.
+    operator_position: absent
 
   - sequence: 7
     day_offset: 10
     title: 晚上的對話
     summary: |
-      晚上兩個人坐在客廳，沒開電視。
-      她開口前，伴侶先說了：「我們好像很久沒聊天了。」
-      她點點頭，知道接下來要說的話會把這段日子收起來。
+      晚上客廳沒開電視，安靜得聽得見冰箱的聲音。
+      她心裡有一句話排了很久：這段日子該好好收起來了。
+      只是先開口需要一點勇氣，她還在等那個時機。
     tension: resolution
     scene_type: resolution
     location: 自家的客廳
-    scene_characters: [伴侶]
+    scene_characters: []
     dramatic_question: 她準備好把這段關係好好放下了嗎？
     required: true
+    operator_position: central
+    operator_note: 她想把這段關係好好收起來，卻不想由她一個人決定怎麼結束

@@ -12,6 +12,10 @@ from kokoro_link.contracts.story_arc import (
     StoryBeatSceneWriterPort,
 )
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.story_arc import (
+    PLAY_RESULT_EMPTY_SCENE,
+    PLAY_RESULT_WRITER_CRASHED,
+)
 from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
@@ -65,15 +69,18 @@ class StoryBeatSceneService:
 
         today = await self._today_for_character(character, now)
         language = await self._resolve_operator_language(character)
+        # OP2-C: no default policy any more. The old one ("the user is
+        # not guaranteed to be around, prefer NPCs, make the beat
+        # completable without them") was the strategy for a world where
+        # a beat had nowhere to record the player's place; OP0-A gave it
+        # one, and the writer now reads it off the beat. What is left
+        # here is strictly an opt-in override — the simulate route lets
+        # an operator steer a single playthrough — so an absent one
+        # means "no extra instruction", not "assume the worst".
         policy = (
             user_involvement_policy.strip()
             if isinstance(user_involvement_policy, str)
-            and user_involvement_policy.strip()
-            else (
-                "使用者目前不保證在場；若場景需要對手戲，"
-                "請優先使用 scene_characters、companion 或 NPC label，"
-                "讓 beat 不依賴使用者也能完成。"
-            )
+            else ""
         )
         context = StoryBeatSceneContext(
             character=character,
@@ -91,12 +98,14 @@ class StoryBeatSceneService:
                 "story beat scene writer crashed beat=%s character=%s",
                 beat_id, character.id,
             )
-            await self._record_failed_attempt(beat_id, now, "writer_crashed")
+            await self._record_failed_attempt(
+                beat_id, now, PLAY_RESULT_WRITER_CRASHED,
+            )
             return None
 
         narrative = draft.narrative.strip()
         if not narrative:
-            await self._record_failed_attempt(beat_id, now, "empty_scene")
+            await self._record_failed_attempt(beat_id, now, PLAY_RESULT_EMPTY_SCENE)
             return None
 
         try:

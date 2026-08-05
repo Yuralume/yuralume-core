@@ -62,6 +62,8 @@ def _template(
                 location="學校公告欄",
                 scene_characters=["凜"],
                 dramatic_question="她敢報名嗎？",
+                operator_position="central",
+                operator_note="她要向你坦白",
             ),
         ],
         binding=ArcTemplateBinding(
@@ -141,6 +143,10 @@ def test_get_single_template_returns_full_payload() -> None:
     assert beat["location"] == "學校公告欄"
     assert beat["scene_characters"] == ["凜"]
     assert beat["dramatic_question"] == "她敢報名嗎？"
+    # OP0-B: the management API's beat summary must carry the
+    # player-position pair through, not just the NPC-facing fields.
+    assert beat["operator_position"] == "central"
+    assert beat["operator_note"] == "她要向你坦白"
 
 
 def test_get_unknown_template_returns_404() -> None:

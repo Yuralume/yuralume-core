@@ -10,6 +10,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import { UiImage } from '@/components/ui'
 import type {
   FeedComment,
   FeedPost,
@@ -282,11 +283,16 @@ function formatRelative(iso: string): string {
       @keydown.space.prevent="openProfile"
     >
       <span class="feed-card-avatar">
-        <img
+        <!-- 32x32 inside a 2px gradient ring. `avatar` ships a single
+             `?v=w320` with no candidate list — a 28px circle has no use
+             for one, and w320 is the smallest rendition that exists. -->
+        <UiImage
           v-if="characterAvatar"
+          variant="avatar"
           :src="characterAvatar"
           :alt="headerName"
-          loading="lazy"
+          :width="32"
+          :height="32"
         />
         <span v-else class="feed-card-avatar-fallback">
           {{ headerInitial }}
@@ -318,10 +324,19 @@ function formatRelative(iso: string): string {
       rel="noopener noreferrer"
       class="feed-card-image-link"
     >
-      <img
+      <!-- The post picture fills a 1:1 well that is as wide as the
+           LumeGram frame: `.kg-frame` caps at 480px and `.kg-body` takes
+           14px of padding either side, so 452px on desktop and the
+           viewport minus the same 28px once the frame goes full-bleed at
+           520px. Stating it is the whole point — an absent `sizes` means
+           `100vw`, which would pull w768 for a 452px well on every
+           desktop card. -->
+      <UiImage
+        variant="content"
         :src="post.image_url"
         :alt="post.content_text.slice(0, 40)"
-        loading="lazy"
+        sizes="(max-width: 520px) calc(100vw - 28px), 452px"
+        aspect-ratio="1 / 1"
       />
     </a>
     <div class="feed-card-body">

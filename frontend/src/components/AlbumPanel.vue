@@ -2,20 +2,21 @@
 /**
  * 角色相簿面板。
  *
- * 顯示該角色所有相簿圖片（工具生成 + 從舞台轉來），支援：
+ * 顯示該角色相簿圖片（工具生成 + 從舞台轉來），支援：
  * - 點圖預覽（新分頁開啟原圖）
  * - 刪除（檔案一起刪）
  * - 晉升為舞台圖（加回 image_urls）
+ * - 往下捲載入更多（keyset 分頁，見 IMAGE_DELIVERY_AND_PAGINATION_PLAN.md D8/IV9）
  *
  * 跟 CharacterImagesPanel 分開：此面板處理的是「長期收藏」，
  * 舞台面板處理的是「目前輪播中」。兩邊互相移動資料。
  */
-import { ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type { AlbumItem } from '@/types/album'
-import { UiButton } from '@/components/ui'
+import { UiButton, UiImage } from '@/components/ui'
 import {
   deleteAlbumItem,
   listAlbum,
@@ -40,13 +41,22 @@ const { timeZone } = useTimezone()
 const confirmDialog = useConfirmDialog()
 
 const items = ref<AlbumItem[]>([])
+const total = ref(0)
+const hasMore = ref(false)
+const nextBefore = ref<string | null>(null)
 const loading = ref(false)
+const loadingMore = ref(false)
 const busyItemId = ref<string | null>(null)
 const errorMsg = ref<string | null>(null)
+const sentinel = ref<HTMLElement | null>(null)
 
+/** 換角色即重抓第一頁，捨棄先前的分頁狀態。 */
 async function reload() {
+  hasMore.value = false
+  nextBefore.value = null
   if (!props.characterId) {
     items.value = []
+    total.value = 0
     return
   }
   loading.value = true
@@ -54,10 +64,32 @@ async function reload() {
   try {
     const res = await listAlbum(props.characterId)
     items.value = res.items
+    total.value = res.total
+    hasMore.value = res.has_more
+    nextBefore.value = res.next_before
   } catch (err) {
     errorMsg.value = extractError(err) ?? t('albumPanel.errors.loadFailed')
   } finally {
     loading.value = false
+  }
+}
+
+/** 捲到底時載入下一頁（keyset：帶上前一頁最舊一張的 created_at）。 */
+async function loadMore() {
+  if (!props.characterId || !hasMore.value) return
+  if (loading.value || loadingMore.value) return
+  loadingMore.value = true
+  errorMsg.value = null
+  try {
+    const res = await listAlbum(props.characterId, { before: nextBefore.value })
+    items.value = [...items.value, ...res.items]
+    total.value = res.total
+    hasMore.value = res.has_more
+    nextBefore.value = res.next_before
+  } catch (err) {
+    errorMsg.value = extractError(err) ?? t('albumPanel.errors.loadFailed')
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -72,6 +104,7 @@ async function handleDelete(item: AlbumItem) {
   try {
     await deleteAlbumItem(item.id)
     items.value = items.value.filter(i => i.id !== item.id)
+    total.value = Math.max(0, total.value - 1)
   } catch (err) {
     errorMsg.value = extractError(err) ?? t('albumPanel.errors.deleteFailed')
   } finally {
@@ -88,6 +121,7 @@ async function handlePromote(item: AlbumItem) {
   try {
     await promoteAlbumToStage(item.id)
     items.value = items.value.filter(i => i.id !== item.id)
+    total.value = Math.max(0, total.value - 1)
     emit('characterUpdated', item.character_id)
   } catch (err) {
     errorMsg.value = extractError(err) ?? t('albumPanel.errors.promoteFailed')
@@ -131,6 +165,36 @@ function sourceLabel(source: string): string {
 // Reload on character change
 watch(() => props.characterId, reload, { immediate: true })
 
+// 往下捲載入更多：sentinel 進入視窗（含 200px 預載邊界）就取下一頁。
+// sentinel 只在 v-if="items.length > 0" 時掛載（換角色清空列表時會被
+// v-unmount 又重新掛回），故用 watch(sentinel) 動態重新 observe，而不
+// 只在 onMounted 觀察一次。loadMore() 內部自己判斷 hasMore，所以就算
+// 已無下一頁、sentinel 仍在畫面上也不會多打 API。
+let observer: IntersectionObserver | null = null
+
+function observeSentinel(el: Element | null) {
+  if (!observer) return
+  observer.disconnect()
+  if (el) observer.observe(el)
+}
+
+onMounted(() => {
+  if (typeof IntersectionObserver === 'undefined') return
+  observer = new IntersectionObserver((entries) => {
+    if (entries.some(entry => entry.isIntersecting)) {
+      void loadMore()
+    }
+  }, { rootMargin: '200px' })
+  observeSentinel(sentinel.value)
+})
+
+watch(sentinel, (el) => observeSentinel(el))
+
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  observer = null
+})
+
 defineExpose({ reload })
 </script>
 
@@ -163,10 +227,11 @@ defineExpose({ reload })
           class="album-image-link"
           :title="item.caption ?? ''"
         >
-          <img
+          <UiImage
             :src="item.url"
             :alt="item.caption ?? t('albumPanel.imageAlt')"
-            loading="lazy"
+            variant="thumb"
+            sizes="140px"
           />
         </a>
         <div class="album-meta">
@@ -199,6 +264,16 @@ defineExpose({ reload })
           </div>
         </div>
       </div>
+    </div>
+
+    <div v-if="items.length > 0" ref="sentinel" class="album-sentinel" aria-hidden="true" />
+    <div v-if="loadingMore" class="album-status">
+      {{ t('albumPanel.pagination.loadingMore') }}
+    </div>
+    <div v-else-if="items.length > 0" class="album-status">
+      {{ hasMore
+        ? t('albumPanel.pagination.countSummary', { loaded: items.length, total })
+        : t('albumPanel.pagination.allLoaded', { total }) }}
     </div>
 
     <div v-if="errorMsg" class="album-error">{{ errorMsg }}</div>
@@ -318,6 +393,17 @@ defineExpose({ reload })
 
 .album-action-btn {
   flex: 1;
+}
+
+.album-sentinel {
+  height: 1px;
+}
+
+.album-status {
+  text-align: center;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  padding: 4px 0;
 }
 
 .album-error {

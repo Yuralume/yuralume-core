@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 
 from kokoro_link.contracts.object_storage import (
+    DEFAULT_STREAM_CHUNK_BYTES,
     ObjectMetadata,
     ObjectNotFoundError,
     StoredObject,
@@ -56,6 +57,18 @@ class InMemoryObjectStorage:
             return self._objects[key]
         except KeyError as exc:
             raise ObjectNotFoundError(key) from exc
+
+    async def iter_bytes(
+        self,
+        *,
+        object_key: str,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+    ) -> AsyncIterator[bytes]:
+        """Chunked read, so tests exercise the same seam as the HTTP adapter."""
+        data = await self.get_bytes(object_key=object_key)
+        step = max(1, int(chunk_size))
+        for start in range(0, len(data), step):
+            yield data[start:start + step]
 
     async def stat(self, *, object_key: str) -> ObjectMetadata | None:
         return self._metadata.get(validate_object_key(object_key))

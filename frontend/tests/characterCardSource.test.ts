@@ -1,0 +1,139 @@
+/**
+ * Pure presentation decisions the character-card gallery makes about a
+ * cloud (Yuralume Cloud official-card catalog) vs. local (`.lumecard`)
+ * preview — OC6g, OFFICIAL_CARD_CLOUD_CATALOG_PLAN §3.5.
+ *
+ * `CharacterCardGalleryModal.vue` and `CharacterCardFace.vue` have no DOM
+ * mounting infra to test against (this repo runs no jsdom / @vue/test-utils
+ * — see `uiImage.test.ts`), so the decisions those components render off
+ * of are extracted into `characterCardSource.ts` and pinned here directly.
+ */
+
+import { describe, expect, it } from 'vitest'
+
+import { readFileSync } from 'node:fs'
+
+import {
+  isCloudCard,
+  shouldHideTranslateToggle,
+  shouldOfferInstallTranslateToggle,
+  shouldShowOfficialCardsUnavailableNotice,
+} from '@/utils/characterCardSource'
+
+describe('isCloudCard', () => {
+  it('is true only for a card whose source is the Cloud catalog', () => {
+    expect(isCloudCard({ source: 'cloud' })).toBe(true)
+    expect(isCloudCard({ source: 'local' })).toBe(false)
+  })
+
+  it('treats a missing source as local — the backend DTO default', () => {
+    expect(isCloudCard({ source: undefined })).toBe(false)
+    expect(isCloudCard(null)).toBe(false)
+    expect(isCloudCard(undefined)).toBe(false)
+  })
+})
+
+describe('shouldHideTranslateToggle', () => {
+  it('hides the toggle for a cloud card the catalog already answered in the operator language', () => {
+    expect(shouldHideTranslateToggle({ source: 'cloud', localized: true })).toBe(true)
+  })
+
+  it('hides it for a cloud card that fell back to another language too', () => {
+    // The toggle used to survive here, and it was the worst of both: preview
+    // ignored it (the catalog's fallback text came back either way) while
+    // install acted on it and paid for an LLM pass. A control that changes
+    // nothing on screen but bills on click is not a preference.
+    expect(shouldHideTranslateToggle({ source: 'cloud', localized: false })).toBe(true)
+  })
+
+  it('hides it for a cloud card with no localized flag at all', () => {
+    expect(shouldHideTranslateToggle({ source: 'cloud' })).toBe(true)
+  })
+
+  it('never hides the toggle for a local pack, even if localized were somehow true', () => {
+    // A local `.lumecard` cannot claim localized=true — only the Cloud
+    // catalog resolves a locale chain — but the toggle's visibility must
+    // stay pinned to `source`, not to `localized` alone.
+    expect(shouldHideTranslateToggle({ source: 'local', localized: true })).toBe(false)
+    expect(shouldHideTranslateToggle({ source: 'local', localized: false })).toBe(false)
+  })
+
+  it('keeps the toggle when there is no source at all (uploaded-file preview)', () => {
+    expect(shouldHideTranslateToggle({})).toBe(false)
+    expect(shouldHideTranslateToggle(null)).toBe(false)
+  })
+})
+
+describe('shouldOfferInstallTranslateToggle', () => {
+  it('drops the toggle when every card on the shelf is an official one', () => {
+    // The admin marketplace's checkbox is one control for the whole grid, and
+    // a cloud card's install takes no `translate` parameter at all — so on an
+    // all-official shelf it promised an LLM translation nothing downstream
+    // could deliver.
+    expect(shouldOfferInstallTranslateToggle([
+      { source: 'cloud' }, { source: 'cloud' },
+    ])).toBe(false)
+  })
+
+  it('keeps it as soon as one local pack is there to use it', () => {
+    expect(shouldOfferInstallTranslateToggle([
+      { source: 'cloud' }, { source: 'local' },
+    ])).toBe(true)
+    expect(shouldOfferInstallTranslateToggle([{ source: undefined }])).toBe(true)
+  })
+
+  it('drops it on an empty shelf — nothing to install, nothing to offer', () => {
+    expect(shouldOfferInstallTranslateToggle([])).toBe(false)
+  })
+})
+
+describe('CharacterCardMarketplace wiring', () => {
+  // The component mounts an ant-design notification API and fetches on
+  // `onMounted`, neither of which this repo's SSR-only harness reaches (see
+  // `uiImage.test.ts`), so the wiring is pinned by reading the source — the
+  // same convention `memoirAvatarImage.test.ts` uses for `MemoirPage`.
+  const source = readFileSync(
+    new URL('../src/components/admin/CharacterCardMarketplace.vue', import.meta.url),
+    'utf8',
+  )
+
+  it('gates the translate checkbox on the shared predicate rather than its own comparison', () => {
+    expect(source).toContain('shouldOfferInstallTranslateToggle')
+    expect(source).toContain('v-if="offersTranslateToggle"')
+    // One definition of "this card is from the Cloud catalog". A literal
+    // `source === 'cloud'` here is how the player gallery and the console
+    // start disagreeing about the same card.
+    expect(source).not.toContain("=== 'cloud'")
+  })
+
+  it('says why the option does not apply on the official rows', () => {
+    expect(source).toContain('isCloudCard(pack)')
+    expect(source).toContain('marketplace.officialTranslated')
+  })
+})
+
+describe('shouldShowOfficialCardsUnavailableNotice', () => {
+  it('shows the notice once the catalog fetch settled unavailable', () => {
+    expect(shouldShowOfficialCardsUnavailableNotice({
+      officialCardsUnavailable: true, loading: false, error: null,
+    })).toBe(true)
+  })
+
+  it('stays quiet while the shelf loads — no bad news yet', () => {
+    expect(shouldShowOfficialCardsUnavailableNotice({
+      officialCardsUnavailable: true, loading: true, error: null,
+    })).toBe(false)
+  })
+
+  it('yields to a hard fetch error — that message slot already covers it', () => {
+    expect(shouldShowOfficialCardsUnavailableNotice({
+      officialCardsUnavailable: true, loading: false, error: 'network down',
+    })).toBe(false)
+  })
+
+  it('stays quiet when the catalog is simply not unavailable', () => {
+    expect(shouldShowOfficialCardsUnavailableNotice({
+      officialCardsUnavailable: false, loading: false, error: null,
+    })).toBe(false)
+  })
+})

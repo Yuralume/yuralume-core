@@ -9,6 +9,7 @@ wired up; the orchestrator degrades to the existing gacha path.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 
@@ -48,6 +49,13 @@ class StoryArcRepositoryPort(ABC):
     for the scales we care about (3–7 beats per arc, <20 arcs per
     character over the product's lifetime).
 
+    That convenience has one cost: ``save`` is last-writer-wins over the
+    *whole* aggregate, so anything that landed since the caller read the
+    arc is silently overwritten. Writers that must not do that use the
+    narrow conditional operations (``skip_beats_if_pending``,
+    ``complete_arc_if_all_terminal``) instead of loading, editing and
+    saving the aggregate.
+
     At most ONE arc per character may be ``active``. DB-backed
     implementations enforce it with a partial unique index and surface a
     violation as :class:`ActiveArcConflict`.
@@ -79,6 +87,48 @@ class StoryArcRepositoryPort(ABC):
 
         Raises :class:`ActiveArcConflict` when the write would make this a
         second active arc for the character."""
+
+    @abstractmethod
+    async def skip_beats_if_pending(
+        self,
+        arc_id: str,
+        beat_ids: Sequence[str],
+        *,
+        play_result: str,
+    ) -> int:
+        """Flip the named beats ``pending`` → ``skipped``. Returns how many moved.
+
+        The narrow escape hatch from the read-modify-``save`` cycle above:
+        ``save`` rebuilds every beat row from the caller's snapshot, so a
+        writer that landed since the snapshot was taken is overwritten.
+        For the retirement path that meant a beat whose scene had already
+        been performed *and charged* could be reverted to ``pending`` —
+        canon loss, and the beat is playable (and payable) again.
+
+        Implementations must apply this as ONE conditional statement: the
+        ``pending`` predicate is the fence, not a check the caller did
+        earlier. Beats already ``realized`` / ``skipped`` are left exactly
+        as they are and simply don't count towards the return value, which
+        is what makes a return of ``0`` mean "another writer got there
+        first" rather than "nothing to do".
+
+        ``play_result`` is written to ``last_play_attempt_result`` on the
+        rows that move (e.g. ``retry_exhausted``); no other column, and no
+        other beat, is touched."""
+
+    @abstractmethod
+    async def complete_arc_if_all_terminal(self, arc_id: str) -> bool:
+        """Flip an ``active`` arc to ``completed`` iff every beat is terminal.
+
+        Companion to ``skip_beats_if_pending``: closing the arc through
+        ``save`` would reintroduce the very whole-aggregate overwrite that
+        method exists to avoid. Evaluated server-side in one statement, so
+        a beat realized between the caller's read and this call keeps the
+        arc open instead of being erased by a stale snapshot.
+
+        ``True`` only when this call performed the transition. An arc that
+        is already terminal, still has a ``pending`` / ``active`` beat, has
+        no beats at all, or does not exist returns ``False``."""
 
     @abstractmethod
     async def delete(self, arc_id: str) -> None: ...
@@ -113,6 +163,7 @@ class StoryArcPlannerPort(ABC):
         today: date | None = None,
         seed_candidates: tuple[StorySeed, ...] = (),
         arc_history: tuple[str, ...] = (),
+        operator_relationship_lines: tuple[str, ...] = (),
     ) -> StoryArc:
         """Return a fresh ``StoryArc`` with beats scheduled between
         ``start_date`` and ``start_date + duration_days``. ``hint`` is
@@ -145,6 +196,17 @@ class StoryArcPlannerPort(ABC):
         planner must keep the new arc's core conflict clearly distinct
         from every entry. Semantic judgement only — no keyword or
         similarity matching anywhere in this path.
+
+        ``operator_relationship_lines`` are pre-rendered facts about the
+        *player*: how the character addresses them, how they address the
+        character, the relationship label and how close the two stand
+        (OP1-A). Until this existed the planner knew the player only as
+        a continuity constraint and could not even name them, which is
+        why beats came back with the player structurally missing. Empty
+        tuple = no relationship material recorded, and the prompt then
+        omits the section entirely rather than rendering an empty
+        heading — an unfilled slot is something a model will try to
+        fill.
 
         The planner must always return a valid arc (at least one beat).
         On LLM failure, fall back to a sparse synthetic arc — the
@@ -241,11 +303,18 @@ class StoryBeatSceneContext:
     """Facts for turning one due arc beat into an autonomous scene.
 
     Direction C keeps the semantic decision inside the LLM prompt: the
-    service passes structured beat facts, attempt history, and the user
-    availability policy; the writer decides whether the scene is best
-    handled as inner monologue, NPC/companion dialogue, or an implied
-    off-screen user-adjacent moment. It must never wait for the user to
-    be present in order to finish the beat.
+    service passes structured beat facts and attempt history, and the
+    writer decides whether the scene is best handled as inner monologue,
+    NPC/companion dialogue, or a moment the player is present for. It
+    must never wait for the user to be present in order to finish the
+    beat.
+
+    Where the player stands comes from ``beat.operator_position`` /
+    ``beat.operator_note`` (OP0-A) — the writer reads them off the beat
+    it is already given, so there is no separate context field to keep
+    in sync. OP2-C retired the blanket involvement policy that used to
+    live here; ``user_involvement_policy`` survives only as the *opt-in*
+    override the simulate route accepts, empty by default.
     """
 
     character: Character
@@ -253,10 +322,13 @@ class StoryBeatSceneContext:
     beat: StoryArcBeat
     today: date
     operator_primary_language: str = "zh-TW"
-    user_involvement_policy: str = (
-        "使用者不一定在場；若不適合把使用者寫進場景，"
-        "請用角色自己、scene_characters、companion 或 NPC label 完成。"
-    )
+    user_involvement_policy: str = ""
+    """Caller-supplied extra directive, or ``""`` for none.
+
+    Deliberately *not* a default policy any more: a default here is a
+    guess about the player's place in a beat that the beat itself now
+    answers. Rendered as an additional instruction that cannot loosen
+    the no-invented-player-lines red line."""
 
 
 @dataclass(frozen=True, slots=True)

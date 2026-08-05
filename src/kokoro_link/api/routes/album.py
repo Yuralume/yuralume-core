@@ -7,7 +7,9 @@ in the service; keep status-code mapping in the route.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from kokoro_link.api.dependencies import (
     ensure_character_id_owned_by_user,
@@ -31,6 +33,12 @@ from kokoro_link.bootstrap.container import ServiceContainer
 
 router = APIRouter(tags=["album"])
 
+_DEFAULT_LIMIT = 40
+"""Grid view fits more tiles per screen than the feed's list rows, so
+the default page is larger than the feed's 20 — still comfortably
+smaller than the 500-item sanity cap."""
+_MAX_LIMIT = 100
+
 
 @router.get(
     "/characters/{character_id}/album",
@@ -38,11 +46,23 @@ router = APIRouter(tags=["album"])
 )
 async def list_album(
     character_id: str,
+    limit: int | None = Query(default=None, ge=1, le=_MAX_LIMIT),
+    before: datetime | None = Query(default=None),
     container: ServiceContainer = Depends(get_container),
     _owned_character_id: str = Depends(ensure_owned_character_id),
 ) -> AlbumListResponse:
-    items = await container.album_service.list_for_character(character_id)
-    return AlbumListResponse.from_domain(items)
+    if limit is None and before is None:
+        items = await container.album_service.list_for_character(character_id)
+        total = await container.album_service.count_for_character(character_id)
+        return AlbumListResponse.from_domain(
+            items, total=total, limit=max(len(items) + 1, 1),
+        )
+    page_limit = limit or _DEFAULT_LIMIT
+    items = await container.album_service.list_for_character(
+        character_id, limit=page_limit, before=before,
+    )
+    total = await container.album_service.count_for_character(character_id)
+    return AlbumListResponse.from_domain(items, total=total, limit=page_limit)
 
 
 @router.post(

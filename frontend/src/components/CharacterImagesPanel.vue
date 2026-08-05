@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from 'vue'
+import { computed, ref, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { Character } from '@/types/character'
 import {
@@ -15,7 +15,7 @@ import {
   billingRefusalKind,
   refreshQuotedPrices,
 } from '@/utils/api/billingRefusal'
-import { UiButton } from '@/components/ui'
+import { UiButton, UiImage } from '@/components/ui'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import {
@@ -27,6 +27,7 @@ import {
   useActionPricing,
 } from '@/composables/useActionPricing'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { useRuntimeLimits } from '@/composables/useRuntimeLimits'
 
 const props = withDefaults(defineProps<{
   character: Character
@@ -69,6 +70,26 @@ const creditsRequiredCr = ref<number | null>(null)
 
 const cloudCredits = useCloudCredits()
 const actionPricing = useActionPricing()
+const runtimeLimits = useRuntimeLimits()
+
+/**
+ * This plan does not include generating new pictures (U2: hosted
+ * `album_generation_enabled = false`, the demo tier being the reason it
+ * exists). Uploading is untouched — the server only gates the *generated*
+ * path, so taking the upload button away would remove something the player
+ * still has.
+ *
+ * True only when a loaded hosted snapshot says so: unknown, unreadable and
+ * self-host all read as enabled, so nothing here can withhold a feature on
+ * a failed request.
+ */
+const albumGenerationBlocked = computed(
+  () => !runtimeLimits.albumGenerationEnabled.value,
+)
+
+onMounted(() => {
+  void runtimeLimits.ensureLoaded()
+})
 
 const generating = ref(false)
 const committing = ref(false)
@@ -358,7 +379,12 @@ if (typeof window !== 'undefined') {
         :key="url"
         class="image-tile"
       >
-        <img :src="url" :alt="t('characterImagesPanel.imageAlt', { name: character.name, index: index + 1 })" />
+        <UiImage
+          :src="url"
+          :alt="t('characterImagesPanel.imageAlt', { name: character.name, index: index + 1 })"
+          variant="thumb"
+          sizes="90px"
+        />
         <div class="image-actions">
           <button
             class="tile-btn"
@@ -405,6 +431,13 @@ if (typeof window !== 'undefined') {
       <div class="generate-hint">
         {{ generateHint }}
       </div>
+      <!-- 此方案沒有 AI 生成：說在按下去之前。只有在確定讀到 hosted
+           快照且明說關閉時才輸出，自架與讀不到時零節點。上傳不受影響。 -->
+      <p
+        v-if="albumGenerationBlocked"
+        class="generate-disabled-note"
+        role="status"
+      >{{ t('characterImagesPanel.generate.disabledNotice') }}</p>
       <textarea
         v-model="generatePrompt"
         class="field-textarea"
@@ -436,7 +469,12 @@ if (typeof window !== 'undefined') {
         <UiButton
           variant="primary"
           :loading="generating"
-          :disabled="committing || !generatePrompt.trim() || candidateUrls.length > 0"
+          :disabled="
+            committing
+              || !generatePrompt.trim()
+              || candidateUrls.length > 0
+              || albumGenerationBlocked
+          "
           @click="handleGenerate"
         >{{ generating ? t('characterImagesPanel.generate.generating') : t('characterImagesPanel.generate.action') }}</UiButton>
       </div>
@@ -495,7 +533,12 @@ if (typeof window !== 'undefined') {
                 ]"
                 @click="cycleCandidate(url)"
               >
-                <img :src="url" :alt="t('characterImagesPanel.candidates.imageAlt')" />
+                <UiImage
+                  :src="url"
+                  :alt="t('characterImagesPanel.candidates.imageAlt')"
+                  variant="thumb"
+                  sizes="(max-width: 640px) 140px, 260px"
+                />
                 <span class="candidate-target-badge">
                   {{ candidateBadgeLabel(candidateTargets.get(url) ?? 'discard') }}
                 </span>
@@ -697,6 +740,17 @@ if (typeof window !== 'undefined') {
 .generate-hint {
   font-size: 11px;
   color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.generate-disabled-note {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(var(--color-spark-rgb), 0.26);
+  border-radius: 6px;
+  background: rgba(var(--color-spark-rgb), 0.07);
+  color: var(--color-text-secondary);
+  font-size: 12px;
   line-height: 1.5;
 }
 

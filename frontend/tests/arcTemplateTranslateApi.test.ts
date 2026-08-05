@@ -43,6 +43,8 @@ function template(overrides: Partial<ArcTemplate> = {}): ArcTemplate {
         scene_characters: ['伴侶'],
         dramatic_question: '這算還在一起嗎？',
         required: true,
+        operator_position: null,
+        operator_note: null,
       },
     ],
     ...overrides,

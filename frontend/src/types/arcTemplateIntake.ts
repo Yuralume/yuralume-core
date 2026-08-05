@@ -6,7 +6,9 @@
  * draft back; the client owns the canonical draft.
  */
 
-import type { ArcTemplate, ArcTemplateBeat } from './arcTemplate'
+import type { ArcTemplate, ArcTemplateBeat, OperatorPosition } from './arcTemplate'
+
+export type { OperatorPosition }
 
 export interface SuggestMetaResponse {
   titles: string[]
@@ -55,6 +57,21 @@ export interface BeatDraftPayload {
   scene_characters: string[]
   dramatic_question: string | null
   required: boolean
+  /** Player's place in this scene (OP0). `null` = unjudged. */
+  operator_position: OperatorPosition | null
+  operator_note: string | null
+}
+
+/**
+ * Response shape of `POST /arc-templates/intake/generate-summary`
+ * (OP1-B): the summary prose plus the model's proposal for the
+ * player's place in the scene. The wizard pre-fills both into the
+ * beat draft; the operator can still edit or clear them.
+ */
+export interface GenerateSummaryResponse {
+  summary: string
+  operator_position: OperatorPosition | null
+  operator_note: string | null
 }
 
 export interface TemplateDraftPayload {
@@ -117,6 +134,8 @@ export function blankBeatDraft(sequence: number, day_offset: number): BeatDraftP
     scene_characters: [],
     dramatic_question: null,
     required: true,
+    operator_position: null,
+    operator_note: null,
   }
 }
 
@@ -133,5 +152,10 @@ export function beatDraftFromTemplate(beat: ArcTemplateBeat): BeatDraftPayload {
     scene_characters: [...beat.scene_characters],
     dramatic_question: beat.dramatic_question,
     required: beat.required,
+    // `?? null` so a template row saved before OP0 (or served by an
+    // older backend) degrades to unjudged rather than `undefined`
+    // leaking into the wizard's select binding.
+    operator_position: beat.operator_position ?? null,
+    operator_note: beat.operator_note ?? null,
   }
 }

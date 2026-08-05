@@ -103,14 +103,18 @@ class _RecordingExecutor:
     async def step_goal_review(self, character, *, now=None):  # noqa: ANN001
         self.calls.append(("goal_review", character.id))
 
-    async def step_feed_compose(self, character):  # noqa: ANN001
+    async def step_feed_compose(self, character, *, now=None):  # noqa: ANN001
         self.calls.append(("feed_compose", character.id))
+        return False
 
     async def step_feed_comment_reply(self, character, *, logical_slot):  # noqa: ANN001
         self.calls.append(("feed_comment_reply", character.id))
 
     async def step_proactive(self, character, *, now, logical_slot, allow_dispatch=True):  # noqa: ANN001
         self.calls.append(("proactive_evaluate", character.id)); return True
+
+    async def step_scene_timeout(self, character, *, now):  # noqa: ANN001
+        self.calls.append(("story_scene_timeout", character.id))
 
     async def step_upkeep(self, character, *, now):  # noqa: ANN001
         self.calls.append(("character_upkeep", character.id))

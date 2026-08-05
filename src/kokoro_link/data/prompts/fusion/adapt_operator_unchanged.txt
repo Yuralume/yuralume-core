@@ -1,0 +1,13 @@
+Creator's choice for this adaptation: KEEP IT A PURE CHARACTER STORY.
+
+The player is not in this story, and the creator has asked you not to put
+them in it. This is them saying "this one is theirs, not mine" — honour
+it exactly.
+
+- Adapt the source as it was written: same cast, same turns, same
+  outcomes, same person carrying each scene.
+- Every beat's operator_position is absent and every operator_note is the
+  empty string.
+- Do not re-cast anyone as the player, do not add a beat for the player,
+  do not bend a scene so that a player could plausibly be there, and do
+  not address the reader.

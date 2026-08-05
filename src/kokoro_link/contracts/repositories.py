@@ -25,6 +25,31 @@ class AppendResult:
     positions: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ConversationMessagePage:
+    """One keyset page of a conversation's message tail (IV10).
+
+    Deliberately **not** a :class:`Conversation`. A truncated snapshot handed
+    to :meth:`ConversationRepositoryPort.save` would rewrite the whole row from
+    a partial history and delete everything the page left out; making the page
+    its own type means that mistake cannot be typed. Read paths that need the
+    entire thread (prompt building, proactive delivery, story scenes) keep
+    calling :meth:`ConversationRepositoryPort.latest_for_character`.
+
+    ``messages`` is oldest-first *within the page*, matching the order a full
+    conversation returns. ``next_before`` is the ``position`` of the page's
+    oldest message — pass it back as ``before_position`` to fetch the page
+    before it — and is ``None`` whenever ``has_more`` is false, so a client can
+    short-circuit exactly like the feed's cursor does.
+    """
+
+    conversation_id: str
+    character_id: str
+    messages: tuple[Message, ...]
+    has_more: bool
+    next_before: int | None = None
+
+
 class CharacterRepositoryPort(Protocol):
     async def list(self) -> list[Character]:
         """List stored characters (unfiltered).
@@ -145,6 +170,38 @@ class ConversationRepositoryPort(Protocol):
         ``recent_messages_for_character`` instead — the character is a
         single person across every channel and their prompt history
         must be a unified timeline.
+        """
+
+    async def latest_page_for_character(
+        self,
+        character_id: str,
+        *,
+        source: str | None = "web",
+        limit: int,
+        before_position: int | None = None,
+    ) -> ConversationMessagePage | None:
+        """The newest ``limit`` messages of the same conversation
+        :meth:`latest_for_character` would return (IV10).
+
+        **Which conversation counts as "latest" is identical** — implementations
+        must share one selection query with :meth:`latest_for_character` rather
+        than re-deriving it. Only the message layer is truncated: the chat panel
+        used to render an entire thread (316 messages in the reported case) into
+        the DOM on open, and every picture in it stayed decoded in memory
+        whether or not it was on screen.
+
+        Pagination follows the feed's keyset shape (plan D8): ``limit`` +
+        ``before_position`` in, ``has_more`` / ``next_before`` out. The cursor is
+        ``MessageRow.position`` — the in-conversation ordering column the thread
+        is already sorted by, unique per conversation, and stable under
+        concurrent appends because appends only ever extend the tail.
+        ``before_position`` is exclusive: only messages strictly older are
+        returned.
+
+        Returns ``None`` only when there is no such conversation at all — a
+        conversation with no messages answers with an empty page. ``limit <= 0``
+        yields an empty page, mirroring
+        :meth:`recent_messages_for_character`.
         """
 
     async def recent_messages_for_character(

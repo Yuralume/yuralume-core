@@ -46,8 +46,15 @@ from kokoro_link.domain.entities.schedule import (
 )
 from kokoro_link.domain.entities.operator_persona import OperatorPersona
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
-from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
+from kokoro_link.domain.entities.story_arc import (
+    OPERATOR_POSITION_ABSENT,
+    OPERATOR_POSITION_CENTRAL,
+    OPERATOR_POSITION_PRESENT,
+    StoryArc,
+    StoryArcBeat,
+)
 from kokoro_link.domain.entities.story_event import StoryEvent
+from kokoro_link.domain.entities.story_scene_session import StorySceneSession
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_FRONTIER,
@@ -309,6 +316,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         story_events: list[StoryEvent] | None = None,
         story_arc: "StoryArc | None" = None,
         upcoming_arc_beats: "list[StoryArcBeat] | None" = None,
+        story_scene: "StorySceneSession | None" = None,
         today_local: "date_type | None" = None,
         older_dialogue_summary: str | None = None,
         vision_markers: "Mapping[int, list[int]] | None" = None,
@@ -444,6 +452,12 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         today_scene_block = _render_today_scene_directive_block(
             arc=story_arc, today=today_local,
         )
+        # 起幕 (SC1-C): the player is inside a framed scene right now.
+        # Its frame *replaces* the scripted-beat directive rather than
+        # joining it — see ``_render_story_scene_block``.
+        story_scene_block = _render_story_scene_block(story_scene)
+        if story_scene_block:
+            today_scene_block = []
         story_arc_block = _render_story_arc_block(
             arc=story_arc,
             upcoming=upcoming_arc_beats or [],
@@ -646,6 +660,10 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
                 # Today's scripted scene goes above timing/schedule so
                 # the directive lands while the model is still reading
                 # high-priority guidance, not buried beneath logistics.
+                # A live 起幕 scene occupies the same slot — it is the
+                # same kind of instruction, only stronger, and exactly one
+                # of the two ever renders.
+                *story_scene_block,
                 *today_scene_block,
                 *timing_block,
                 *calendar_block,
@@ -2468,6 +2486,135 @@ _SCENE_TYPE_LABELS = {
 }
 
 
+# --- Operator position framing (OP2-A of ARC_PLAYER_POSITION_PLAN) ----
+# ``StoryArcBeat.operator_position`` (OP0) tells a scene consumer where
+# the player stands in a beat; before this slot existed, every consumer
+# had to assume one — a static "the player is right here" assertion or a
+# forced "make the player interrupt this" instruction. Both retired in
+# favour of a framing sentence derived from the enum, with ``None``
+# (*unjudged*) degrading to a semantic-derivation instruction rather
+# than a guess.
+#
+# There are **two** tables below, not one, because the same enum value
+# means two different instructions depending on whether the curtain has
+# gone up:
+#
+# * 尚未開幕 (``_render_today_directive_operator_position_lines``) — the
+#   player is chatting, the beat is still waiting to be played. ``absent``
+#   here genuinely means "this scene has no player in it".
+# * 已開幕 (``_render_live_scene_operator_position_lines``) — the player
+#   pressed 起幕 and the opener already narrated them walking in (see
+#   ``operator_scene_position._OPENER_FRAMING``). ``absent`` here means
+#   "this scene was *not originally* about the player, and he has walked
+#   into it anyway". Rendering the pending wording in an open scene told
+#   the model 「不要假裝玩家在場」 one turn after the opening narration put
+#   him on stage — a flat contradiction, and the shipped
+#   ``cafe_idol_audition`` template is absent end to end, so every beat of
+#   it hit that contradiction.
+#
+# Only the enum and the note formatting are shared; the prose is
+# deliberately per-situation (same reason the opener/closer keep their own
+# in ``operator_scene_position.py``).
+_TODAY_DIRECTIVE_OPERATOR_POSITION_FRAMES = {
+    OPERATOR_POSITION_CENTRAL: (
+        "玩家是這場戲的核心——沒有玩家的參與，這場戲演不下去。"
+        "順著對話把玩家拉進戲的中心，讓戲圍繞玩家展開；"
+        "玩家帶開話題時，找機會把他引回戲的核心，而不是繞著他演下去。"
+    ),
+    OPERATOR_POSITION_PRESENT: (
+        "玩家在這場戲裡，但戲的重心不在玩家身上——"
+        "讓玩家自然地在場、陪伴、旁觀或參與，戲仍照自己的節奏推進，"
+        "不必刻意把每一步都繞回玩家。"
+    ),
+    OPERATOR_POSITION_ABSENT: (
+        "這場戲裡沒有玩家的位置——這是你自己的戲，可以獨自演到底。"
+        "可以事後講給玩家聽、或帶著這份心情跟玩家互動，"
+        "但不要假裝玩家在場見證整個過程。"
+    ),
+}
+
+_TODAY_DIRECTIVE_OPERATOR_POSITION_UNJUDGED = (
+    "玩家在這場戲的位置尚未判定，請依下面的出場人物與戲劇問題自行判斷："
+    "若明顯不含玩家，用旁觀或自然引入的角度帶出這場戲；"
+    "若描述中出現可能暗示玩家的詞（例如「伴侶」「對方」等），"
+    "由你自行判斷是否即指玩家、以及玩家該站在戲裡的什麼位置。"
+)
+
+# The 已開幕 half. Every branch takes 「玩家此刻人就在這場戲裡」 as a given —
+# the opening narration is a message in the very conversation being
+# rendered below, so it is not a judgement call the model gets to redo.
+# What the enum still decides is whose story this is.
+_LIVE_SCENE_OPERATOR_POSITION_FRAMES = {
+    OPERATOR_POSITION_CENTRAL: (
+        "玩家是這場戲的核心——這場戲本來就是關於玩家的，沒有他演不下去。"
+        "把每一步都接在玩家剛剛的反應上，讓戲繞著他往前推；"
+        "玩家帶開話題時，找機會把他引回戲的核心。"
+    ),
+    OPERATOR_POSITION_PRESENT: (
+        "玩家在這場戲裡，但戲的重心不在玩家身上——他此刻在場（陪伴、旁觀，"
+        "或剛好被捲入），戲仍照你自己的處境往前走，不必把每一步都繞回玩家。"
+    ),
+    OPERATOR_POSITION_ABSENT: (
+        "這場戲原本不是關於玩家的——它本來是你自己的一段戲，玩家不在計畫內。"
+        "但戲已經開演，玩家已經走進來了，此刻人就在現場：把他當成半路加入的人"
+        "來演（你可以意外、可以需要重新調整、可以還沒準備好被他看見），"
+        "但不要把整場戲改寫成關於玩家的。"
+        "**不要**寫得像玩家不在場、也不要把這段戲說成事後才要講給他聽。"
+    ),
+}
+
+_LIVE_SCENE_OPERATOR_POSITION_UNJUDGED = (
+    "玩家在這場戲的位置沒有人標記過，但有一件事是確定的：戲已經開演，"
+    "玩家此刻人就在這場戲裡。請依上面的場景資訊與下方對話自行判斷，"
+    "他比較像是這場戲的核心、在場的陪伴，還是原本不在計畫內、這次剛好走了進來——"
+    "並據此決定這一回合把鏡頭擺在誰身上。"
+)
+
+
+def _render_today_directive_operator_position_lines(
+    position: str | None, note: str | None,
+) -> list[str]:
+    """Player framing for a beat that is **still waiting to be played**."""
+    return _render_operator_position_lines(
+        _TODAY_DIRECTIVE_OPERATOR_POSITION_FRAMES,
+        _TODAY_DIRECTIVE_OPERATOR_POSITION_UNJUDGED,
+        position,
+        note,
+    )
+
+
+def _render_live_scene_operator_position_lines(
+    position: str | None, note: str | None,
+) -> list[str]:
+    """Player framing for a beat whose scene is **already open**."""
+    return _render_operator_position_lines(
+        _LIVE_SCENE_OPERATOR_POSITION_FRAMES,
+        _LIVE_SCENE_OPERATOR_POSITION_UNJUDGED,
+        position,
+        note,
+    )
+
+
+def _render_operator_position_lines(
+    frames: dict[str, str],
+    unjudged: str,
+    position: str | None,
+    note: str | None,
+) -> list[str]:
+    """Look up one framing sentence and append the free-text note.
+
+    Never a keyword table branching on scene content — the three known
+    positions map to a fixed framing sentence about *how to write the
+    player*, and the one open-ended judgement call (does this beat's
+    prose actually mean the player?) is left to the model via the
+    caller's ``unjudged`` guidance when the beat carries no verdict yet.
+    """
+    lines = [frames.get(position or "", unjudged)]
+    if note:
+        lines.append(f"- 玩家在這場戲的位置備註：{note}")
+    return lines
+
+
 def _today_scene_beat(
     arc: "StoryArc | None", today: date_type | None,
 ) -> "StoryArcBeat | None":
@@ -2552,9 +2699,76 @@ def _render_today_scene_directive_block(
     # Title gives the LLM a one-phrase anchor; useful when the realized
     # event narrative is in a different angle than the beat title.
     lines.append(f"- 場景標題：{beat.title}")
+    # OP2-A: the old instruction here forced "at least one of
+    # atmosphere/NPC-presence/tension must surface", which only ever
+    # gave the player one identity in this block — someone who might
+    # digress and need steering back. Retired in favour of framing
+    # derived from where the player actually stands in this beat.
+    lines.append("在合適時機讓這場戲自然發生（不要逐句念骨架）：")
+    lines.extend(
+        _render_today_directive_operator_position_lines(
+            beat.operator_position, beat.operator_note,
+        ),
+    )
+    return lines
+
+
+def _render_story_scene_block(
+    scene: "StorySceneSession | None",
+) -> list[str]:
+    """The frame around a turn played inside a live 起幕 scene.
+
+    Why this *replaces* ``_render_today_scene_directive_block`` instead of
+    sitting beside it: when the player pulled the scene from today's due
+    beat, both blocks describe the same beat, and they give opposite
+    instructions — 「在合適時機讓這場戲自然發生」 (find an opening) versus
+    「你已經在這場戲裡」 (you are mid-performance). A model handed both
+    tends to re-open a scene it is already playing. The frame wins because
+    it is the one describing what is actually happening.
+
+    The scene's established facts are not repeated here: the opening
+    narration is a message in the very conversation being rendered below,
+    so restating it would double-feed the model its own text.
+    """
+    if scene is None or not scene.is_open:
+        return []
+    lines: list[str] = [
+        "【劇情場景進行中】",
+        "你正在跟玩家演一段「劇情場景」——這不是普通聊天，是一場已經拉開序幕的戲。"
+        "下方對話中的旁白已經交代了這場戲的既定事實。",
+    ]
+    if scene.title:
+        lines.append(f"- 場景標題：{scene.title}")
+    if scene.location:
+        lines.append(f"- 場景地點：{scene.location}")
+    if scene.mood:
+        lines.append(f"- 氛圍：{scene.mood}")
+    if scene.scene_type:
+        lines.append(
+            "- 場景類型："
+            f"{_SCENE_TYPE_LABELS.get(scene.scene_type, scene.scene_type)}",
+        )
+    if scene.dramatic_question:
+        lines.append(f"- 戲劇問題：{scene.dramatic_question}")
+    # OP2-A: "玩家人就在戲裡" used to be an unconditional assertion here
+    # regardless of what kind of beat pulled this scene open. Replaced
+    # with position-derived framing — read off the **session**, which
+    # snapshotted both fields at open time (OP2-D) exactly like
+    # ``scene_type`` / ``dramatic_question``. Re-resolving the beat
+    # instead would let an edit, a retire, or a realize mid-performance
+    # silently downgrade a judged scene to "unjudged" halfway through
+    # the very scene it opened, and the closer (SC1-D) already reads the
+    # session — two readers of the same fact must not disagree.
+    lines.extend(
+        _render_live_scene_operator_position_lines(
+            scene.operator_position, scene.operator_note,
+        ),
+    )
     lines.append(
-        "在合適時機讓這場戲自然發生 —— 場景的氣氛、出場人物的存在、戲劇問題的張力，"
-        "至少要在本回合的回覆中**浮現一個**。如果使用者岔題，你可以自然地把話題引回來。"
+        "本回合就在這場戲裡演下去：延續現場的地點與氛圍、承接玩家剛剛的行動，"
+        "讓戲劇問題往前推一點——但不要急著替這場戲收尾或下結論。"
+        "玩家岔題時可以自然地把戲拉回來；玩家想離開這場戲時不要硬留。"
+        "不要替玩家決定他做了什麼、說了什麼；也不要寫系統說明或選項清單。",
     )
     return lines
 

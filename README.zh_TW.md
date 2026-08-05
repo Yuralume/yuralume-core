@@ -57,7 +57,7 @@ Yuralume 反過來做：角色 **有自己的日子** — 每天有 LLM 規劃�
 - **跨通道同一個人** — 把角色綁到 Telegram、LINE、Discord bot 或部署內建 WhatsApp gateway；每個介面共用同一份記憶 / 狀態 / 行程。
 - **LumeGram 角色社群動態** — 每角色一條 IG 風時間流，scheduler 從六種訊號（行程 / 劇情 beat / 記憶 / 外界事件 / 沉默 / 狀態變化）自動發文，並尊重睡眠等高 busy 行程時段；留言回覆走 tick 不即時。
 - **真實世界事實注入** — 節日（`holidays`）、天氣（Open-Meteo 免 key）、外界 RSS 新聞以「事實段」形式進入 prompt，**由 LLM 自行判斷要不要反應**，不寫死「下雨一定提到」。
-- **故事工具** — 角色故事弧、多角色融合短篇小說、分歧劇場（VN 風選擇分支）；已演出的 arc beat 會保留成歷程，完成 arc 會留下里程碑記憶。
+- **故事工具** — 角色故事弧、多角色融合短篇小說、分歧劇場（VN 風選擇分支）；已演出的 arc beat 會保留成歷程，完成 arc 會留下里程碑記憶。**「起幕」**讓玩家自己把劇情拉出來，不必等排程：按一次就在原本的聊天串裡開一段場景框（旁白開場＋角色第一句＋標題／地點／氛圍），玩家照常自由輸入，每輪附 2–3 個可選的行動建議；不論是角色把戲劇問題演完、玩家自己結束，還是閒置超時（預設 24 小時，`YURALUME_STORY_SCENE_IDLE_TIMEOUT_SECONDS`）自動收尾，演過的都會落成正史。收尾旁白絕不虛構玩家沒做過的行動。
 - **模型群組 × per-feature × per-character LLM 路由** — Admin 路由設定會寫入全站預設，先用群組配置常見模型層級，再針對聊天、記憶抽取、純文字聊天 / 創角草稿模型的圖片識別等例外單獨 pin；必要時可針對單一角色覆寫。BYOK provider key 從 Admin UI 設定、加密存放。
 - **生成用量帳本** — Admin Observability 可追蹤聊天、背景 / 輔助 LLM、圖片、影片、TTS 的生成用量，不存 prompt 或生成內容；可依功能 / provider / model 比較成本、快取命中、estimated / actual 標記，以及 hosted routing 時的 Cloud Gateway request id。
 - **self-host NSFW mode 基礎** — 使用者可手動開啟 per-user 暫時模式，期間所有 LLM / 圖片呼叫路由到 Admin 指定社群模型 / profile，閒置 TTL 自動過期；寫入 turn 會帶 `content_mode` 與 optional `safe_summary`，長期記憶以 born-safe 的關係 / 情緒層級保存。後端已補 frontier prompt summary 替換 / fail-closed、pending follow-up safe summary、不可替換標記 queued text 的 Rule B 社群路由、TTS 停用與 Core eval 排除骨架；Admin 在 Models 統一設定 NSFW LLM / image 目標，玩家頁保留側欄開關，啟用後以全頁氣氛效果取代聊天上方 badge，Core observability 可回報模式使用量與抽樣 NSFW turn ratio；cloud mode 目前鎖定。
@@ -162,9 +162,12 @@ uv run python scripts/llm_capacity_probe.py core-chat --core-url http://127.0.0.
 | `STORAGE_URL` / `STORAGE_KEY` | Object Storage endpoint，自架可走附帶的 `storage-local`。 |
 | `APP_BASE_URL` / `STORAGE_PUBLIC_URL` | 瀏覽器面向的 app origin fallback。DB 媒體 ref 預設是 `/v1/public/...`；Telegram 生成圖片發送直接讀 object storage，不需要公網圖片 URL；仍以 URL 推圖的平台優先使用 Admin **通道站台設定 → 公網 Base URL**，留空才用 `APP_BASE_URL`。`STORAGE_PUBLIC_URL` 只保留給相容外部 storage/CDN URL 反查。 |
 | `CALENDAR_REGION`、`WEATHER_LATITUDE/LONGITUDE` | 選填，啟用真實世界事實注入。 |
+| `KOKORO_OFFICIAL_CARD_CATALOG_URL` | 官方角色卡的來源。官方卡不再隨 repo 出貨，所有部署（雲端版與自架皆同）都從公開目錄讀取，預設 `https://app.yuralume.com/api/user/v1/public/official-cards`。**送出去的東西**：一個匿名 HTTP `GET`，只在有人第一次打開角色卡藝廊時發出、開機不發——沒有帳號、沒有 token、沒有部署識別碼、沒有版本號、沒有任何 telemetry，也是本程式唯一一個為自己發出的對外請求。**要關掉**：把這個變數設為空值。官方卡區會消失，你自己的 `.lumecard`（`CHARACTER_CARD_PACK_DIR`）照常可用，已安裝的角色完全不受影響（安裝後角色完全本地，不會再連目錄），整個過程不會連任何外部服務。 |
+| `CHARACTER_CARD_PACK_DIR` | 選填，本機 `.lumecard` 目錄，預設為內建的 `src/kokoro_link/data/character_cards/`（現在出貨即為空）。放進去的卡會與官方卡並列顯示；把上面的目錄關掉時，就只剩這裡的卡。 |
 | `YURALUME_PROMPT_PACK_DIR` | 選填，外部 prompt pack overlay 目錄；同路徑 `.txt` 會覆蓋 `src/kokoro_link/data/prompts/`，每筆 `TurnRecord` 會記錄對應 `prompt_pack_hash` 供 eval 歸因。 |
 | `KOKORO_USAGE_PRICE_CATALOG_PATH` | 選填，generation usage ledger 使用的本機 JSON 價格目錄；內建 `usage-prices.openai.json` 覆蓋 OpenAI Standard LLM token 價格，以及 provider 回傳 image usage tokens 時的 GPT Image token-detail 價格。未設定時仍會記錄用量，但成本為 zero / unknown estimated。 |
 | `PERSONA_CURIOSITY_ENABLED` / `PERSONA_CURIOSITY_PROACTIVE_ENABLED` | 選填，控制 Conversational Persona Discovery rollout；只讓 LLM curiosity planner 對 chat / proactive prompt 提供低壓探索提示，不新增玩家個資表單，也不繞過既有 persona extraction 管線。 |
+| `YURALUME_STORY_SCENE_IDLE_TIMEOUT_SECONDS` | 選填，被棄置的「起幕」劇情場景自動收尾並落正史的閒置窗口，預設 `86400`（24 小時）。這是本功能唯一可配置的數字——節奏沒有任何硬編碼上限。 |
 | `NSFW_MODE_TTL_SECONDS` / `KOKORO_NSFW_MODE_TTL_SECONDS` | 選填，self-host NSFW mode 閒置 TTL，預設 `1800` 秒。模式由 user 手動開啟，使用 Admin 統一指定的社群 LLM / image 目標；hosted cloud mode 目前鎖定。 |
 | `TAVILY_API_KEY` | 選填，啟用 `web_search` 工具。 |
 

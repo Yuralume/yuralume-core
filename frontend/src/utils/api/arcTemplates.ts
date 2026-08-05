@@ -13,6 +13,7 @@ import type {
   BeatContextPayload,
   BeatDraftPayload,
   CondensePremisePayload,
+  GenerateSummaryResponse,
   SaveTemplateResponse,
   ScaffoldsResponse,
   SuggestBeatOptionsResponse,
@@ -94,15 +95,20 @@ export async function suggestBeatOptions(
   return data
 }
 
+/**
+ * Stage 4 per-beat summary generation (OP1-B). The response carries a
+ * proposal for the operator's place in the scene alongside the prose —
+ * the caller decides whether/how to apply the proposal to the draft.
+ */
 export async function generateBeatSummary(
   beat: BeatDraftPayload,
   context: BeatContextPayload,
-): Promise<string> {
-  const { data } = await axios.post<{ summary: string }>(
+): Promise<GenerateSummaryResponse> {
+  const { data } = await axios.post<GenerateSummaryResponse>(
     `${BASE}/intake/generate-summary`,
     { beat, context },
   )
-  return data.summary
+  return data
 }
 
 export async function generateFullDraft(

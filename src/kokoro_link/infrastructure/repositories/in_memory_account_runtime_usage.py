@@ -47,9 +47,11 @@ class InMemoryAccountRuntimeUsageRepository:
         event_type: str,
         since: datetime,
         until: datetime | None = None,
+        resource_id: str | None = None,
     ) -> int:
         since_utc = ensure_utc(since)
         until_utc = ensure_utc(until) if until is not None else None
+        resource = _normalise_resource_id(resource_id)
         return sum(
             1
             for event in self._events
@@ -57,6 +59,7 @@ class InMemoryAccountRuntimeUsageRepository:
             and event.event_type == event_type
             and event.occurred_at >= since_utc
             and (until_utc is None or event.occurred_at <= until_utc)
+            and (resource is None or event.resource_id == resource)
         )
 
     async def claim_event_slot(
@@ -67,16 +70,20 @@ class InMemoryAccountRuntimeUsageRepository:
         occurred_at: datetime,
         since: datetime,
         limit: int,
+        resource_id: str | None = None,
+        resource_limit: int | None = None,
     ) -> str | None:
         """Same claim-then-verify contract as the SQL repository."""
         if limit <= 0:
             return None
         stamp = ensure_utc(occurred_at)
         since_utc = ensure_utc(since)
+        resource = _normalise_resource_id(resource_id)
         claim = _AccountRuntimeEvent(
             operator_id=operator_id,
             event_type=event_type,
             occurred_at=stamp,
+            resource_id=resource,
         )
         self._events.append(claim)
         used = sum(
@@ -89,6 +96,18 @@ class InMemoryAccountRuntimeUsageRepository:
         if used > limit:
             self._events.remove(claim)
             return None
+        if resource is not None and resource_limit is not None:
+            resource_used = sum(
+                1
+                for event in self._events
+                if event.operator_id == operator_id
+                and event.event_type == event_type
+                and event.occurred_at >= since_utc
+                and event.resource_id == resource
+            )
+            if resource_used > resource_limit:
+                self._events.remove(claim)
+                return None
         return claim.event_id
 
     async def discard_event(self, *, event_id: str) -> None:

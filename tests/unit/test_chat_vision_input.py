@@ -25,6 +25,12 @@ from kokoro_link.application.dto.chat import SendChatMessageRequest
 from kokoro_link.application.services.active_llm_provider import (
     PreferenceBackedActiveLLMProvider,
 )
+from kokoro_link.application.services.cloud_active_llm_provider import (
+    CloudActiveLLMProvider,
+)
+from kokoro_link.application.services.cloud_identity_resolver import (
+    CloudOperatorIdentityResolver,
+)
 from kokoro_link.application.services.feature_keys import (
     FEATURE_CHAT,
     FEATURE_GROUP_MULTIMODAL_PERCEPTION,
@@ -36,10 +42,15 @@ from kokoro_link.application.services.chat_service import (
     _content_tolerance_for_content_mode,
 )
 from kokoro_link.application.services.nsfw_mode import NsfwModeService
+from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
+from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfile
 from kokoro_link.contracts.llm import ChatModelPort, ImageInputRejectedError
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import MessageContentMode
-from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
+from kokoro_link.domain.entities.operator_profile import (
+    DEFAULT_OPERATOR_ID,
+    OperatorProfile,
+)
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.llm.registry import InMemoryChatModelRegistry
 from kokoro_link.infrastructure.memory.in_memory import InMemoryMemoryRepository
@@ -59,6 +70,9 @@ from kokoro_link.infrastructure.repositories.in_memory_turn_records import (
 )
 from kokoro_link.infrastructure.repositories.in_memory_preferences import (
     InMemoryPreferencesRepository,
+)
+from kokoro_link.infrastructure.repositories.in_memory_operator_profile import (
+    InMemoryOperatorProfileRepository,
 )
 from kokoro_link.infrastructure.state.simple import SimpleStateEngine
 from kokoro_link.infrastructure.storage.in_memory import InMemoryObjectStorage
@@ -1264,4 +1278,190 @@ async def test_chat_feature_vision_false_drops_images_and_recognizes() -> None:
     assert any(
         "圖片識別摘要" in c["prompt"] and "多模態群組路由" in c["prompt"]
         for c in h.text_main.calls
+    )
+
+
+# --- Hosted (cloud) seam: control-plane vision pin -> recognition preflight ---
+# The self-host suites above prove the preflight works once the main model
+# admits it is text-only. In cloud mode every call goes through one gateway
+# adapter that declares itself vision-capable by construction, so the pin has
+# to travel: control-plane preset metadata -> CloudRoutingProfile ->
+# CloudActiveLLMProvider -> the adapter ChatService inspects. This wires the
+# real provider so the whole chain runs, not a hand-set flag.
+
+
+class _StaticCloudProfilePort:
+    def __init__(self, profile: CloudRoutingProfile) -> None:
+        self._profile = profile
+        self.calls = 0
+
+    async def get_profile(
+        self, *, tenant_id: str, account_id: str, tier: str, user_id: str = "",
+    ) -> CloudRoutingProfile:
+        _ = tenant_id, account_id, tier, user_id
+        self.calls += 1
+        return self._profile
+
+
+class _CloudModelFactory:
+    """Stand in for the container's gateway-adapter factory.
+
+    Like the real ``CloudGatewayChatModel``, every model it builds declares
+    ``supports_vision=True``; only the provider binding can change that.
+    """
+
+    def __init__(
+        self, *, chat: _CapturingModel, recognition: _CapturingModel,
+    ) -> None:
+        self._by_feature = {
+            FEATURE_CHAT: chat,
+            FEATURE_IMAGE_RECOGNITION: recognition,
+        }
+        self.built: list[tuple[str, str]] = []
+
+    def __call__(
+        self,
+        feature_key: str,
+        identity: CloudGatewayIdentity | None,
+        default_model: str,
+    ) -> _CapturingModel:
+        _ = identity
+        self.built.append((feature_key, default_model))
+        return self._by_feature[feature_key]
+
+
+async def _hosted_operators() -> InMemoryOperatorProfileRepository:
+    operators = InMemoryOperatorProfileRepository()
+    await operators.save(
+        OperatorProfile(
+            id=DEFAULT_OPERATOR_ID,
+            display_name="Hosted Player",
+            cloud_account_id="acct_1",
+            cloud_tenant_id="tenant_1",
+            cloud_tenant_tier="standard",
+            auth_provider="cloud",
+        ),
+    )
+    return operators
+
+
+async def _build_hosted_cloud_chat(
+    *,
+    vision_pins: dict[str, bool],
+) -> tuple[
+    ChatService,
+    CharacterService,
+    _CapturingModel,
+    _CapturingModel,
+    _CloudModelFactory,
+]:
+    """Wire ChatService with the REAL ``CloudActiveLLMProvider`` in front of
+    gateway-shaped models, routed by a control-plane profile whose preset
+    vision pins are the only thing the caller varies."""
+    text_main = _CapturingModel(
+        provider_id="yuralume_cloud",
+        supports_vision=True,  # the adapter construction-time default
+        prefers_public_image_urls=True,
+        reply="main model reply",
+    )
+    recognition = _CapturingModel(
+        provider_id="yuralume_cloud",
+        supports_vision=True,
+        prefers_public_image_urls=True,
+        reply="[image 1] a black cat by the window.",
+    )
+    factory = _CloudModelFactory(chat=text_main, recognition=recognition)
+
+    profile = CloudRoutingProfile.from_payload({
+        "llm_feature_presets": {
+            FEATURE_CHAT: "hosted-text-mini",
+            FEATURE_IMAGE_RECOGNITION: "hosted-vision",
+        },
+        "llm_preset_vision": vision_pins,
+        "strict_no_fallback": True,
+        "catalog_version": 7,
+        "routing_policy_version": 42,
+    })
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(
+            repository=await _hosted_operators(),
+        ),
+        model_factory=factory,
+        model_presets={},
+        routing_profile_port=_StaticCloudProfilePort(profile),
+    )
+
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    await storage.put_bytes(
+        object_key="chat-uploads/cat.png",
+        content=_PNG_BYTES,
+        content_type="image/png",
+    )
+    chars_repo = InMemoryCharacterRepository()
+    registry = InMemoryChatModelRegistry(default_provider_id="yuralume_cloud")
+    registry.register(text_main)
+    chat = ChatService(
+        character_repository=chars_repo,
+        conversation_repository=InMemoryConversationRepository(),
+        memory_repository=InMemoryMemoryRepository(),
+        post_turn_processor=NullPostTurnProcessor(),
+        prompt_context_builder=DefaultPromptContextBuilder(),
+        model_registry=registry,
+        state_engine=SimpleStateEngine(),
+        active_llm_provider=provider,
+        public_base_url="https://core.example",
+        object_storage=storage,
+    )
+    return chat, CharacterService(chars_repo), text_main, recognition, factory
+
+
+@pytest.mark.asyncio
+async def test_hosted_text_only_preset_pin_triggers_recognition_preflight() -> None:
+    chat, chars, text_main, recognition, factory = await _build_hosted_cloud_chat(
+        # Only the chat preset is pinned; the vision preset stays unannotated
+        # on purpose, so this also covers "unpinned = adapter default".
+        vision_pins={"hosted-text-mini": False},
+    )
+    created = await chars.create_character(CreateCharacterRequest(name="Yuki"))
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=created.id,
+        message="what is this?",
+        attachment_urls=["/uploads/chat-uploads/cat.png"],
+    ))
+
+    # The preflight ran: the image went to the image_recognition route.
+    assert (FEATURE_IMAGE_RECOGNITION, "hosted-vision") in factory.built
+    assert recognition.last_image_urls == (
+        "https://core.example/uploads/chat-uploads/cat.png",
+    )
+    # The pinned text-only main model got the caption as text, no images.
+    # ``with_supports_vision`` hands back a clone sharing ``calls``.
+    main_call = text_main.calls[-1]
+    assert main_call["image_urls"] == ()
+    assert "[image 1] a black cat by the window." in main_call["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_hosted_unpinned_preset_keeps_sending_images_to_the_main_model() -> None:
+    """Rollout red line: with nothing pinned the hosted path behaves exactly
+    as it did before VP1 - images go straight to the main model and the
+    recognition route is never built."""
+    chat, chars, text_main, recognition, factory = await _build_hosted_cloud_chat(
+        vision_pins={},
+    )
+    created = await chars.create_character(CreateCharacterRequest(name="Yuki"))
+
+    await chat.send_message(SendChatMessageRequest(
+        character_id=created.id,
+        message="what is this?",
+        attachment_urls=["/uploads/chat-uploads/cat.png"],
+    ))
+
+    assert recognition.calls == []
+    assert all(
+        feature != FEATURE_IMAGE_RECOGNITION for feature, _ in factory.built
+    )
+    assert text_main.last_image_urls == (
+        "https://core.example/uploads/chat-uploads/cat.png",
     )

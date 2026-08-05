@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
@@ -16,13 +17,43 @@ from fastapi.testclient import TestClient
 
 from kokoro_link.api.app import create_app
 from kokoro_link.application.dto.character import CreateCharacterRequest
+from kokoro_link.application.dto.character_card import (
+    CharacterCardManifest,
+    CharacterCardMeta,
+    CharacterCardProfile,
+)
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
+from kokoro_link.infrastructure.character_card.packager import pack_character_card
+
+
+def _write_demo_pack(directory: Path) -> None:
+    """One local ``.lumecard`` for the marketplace ownership test.
+
+    The repo used to ship official cards and this fixture leaned on them;
+    they live in the Cloud catalog now (OFFICIAL_CARD_CLOUD_CATALOG D5), and
+    an ownership test must not depend on a network service anyway. A pack
+    written here exercises the same install path.
+    """
+    manifest = CharacterCardManifest(
+        card=CharacterCardMeta(title="示範角色", author="Tester"),
+        character=CharacterCardProfile(name="美緒", summary="咖啡廳打工女大生"),
+    )
+    (directory / "demo_mio.lumecard").write_bytes(
+        pack_character_card(
+            manifest_json=manifest.model_dump_json(indent=2),
+            stage_images=[],
+            arc_templates=[],
+        ),
+    )
 
 
 @pytest.fixture
 def app_with_two_users(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[TestClient, str, str, str, str]]:
+    _write_demo_pack(tmp_path)
+    monkeypatch.setenv("CHARACTER_CARD_PACK_DIR", str(tmp_path))
     monkeypatch.setenv("KOKORO_AUTH_ENABLED", "true")
     monkeypatch.setenv("KOKORO_DATABASE_URL", "")
     monkeypatch.setenv("KOKORO_DEFAULT_PROVIDER_ID", "fake")
@@ -251,14 +282,14 @@ def test_import_rejects_non_card_upload(
 def test_character_card_marketplace_list_and_install(
     app_with_two_users: tuple[TestClient, str, str, str, str],
 ) -> None:
-    """The bundled demo packs list, and installing one creates a new
-    character owned by the caller."""
+    """The local packs list, and installing one creates a new character
+    owned by the caller."""
     client, _alice_token, bob_token, _a, _b = app_with_two_users
     client.app.state.container.character_runtime_initializer = None
 
     listing = client.get("/api/v1/character-cards", headers=_auth(bob_token))
     assert listing.status_code == 200
-    packs = listing.json()
+    packs = listing.json()["cards"]
     assert packs
     selected_pack = packs[0]
     pack_id = quote(selected_pack["pack_id"], safe="")

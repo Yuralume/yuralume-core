@@ -8,7 +8,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 
 import MemoirContent from '@/components/memoir/MemoirContent.vue'
-import { UiButton } from '@/components/ui'
+import { UiButton, imageVariantUrl } from '@/components/ui'
 import { getCharacter } from '@/utils/api/characters'
 import type { Character } from '@/types/character'
 
@@ -38,7 +38,12 @@ const loadCharacter = async () => {
 
 onMounted(loadCharacter)
 
-const portraitUrl = computed(() => character.value?.image_urls?.[0] ?? null)
+// 36px 圓形頭像不需要 1024x1536 原圖——CSS background-image 沒有
+// UiImage 可用，改用它組 ?v= URL 的同一支 helper 拿最小變體。
+const portraitUrl = computed(() => {
+  const original = character.value?.image_urls?.[0] ?? null
+  return original ? imageVariantUrl(original, 'w320') : null
+})
 </script>
 
 <template>

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import (
-    APIRouter, Depends, File, HTTPException, UploadFile, status,
+    APIRouter, Depends, File, HTTPException, Query, UploadFile, status,
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -21,8 +21,11 @@ from kokoro_link.api.routes._cloud_errors import (
     insufficient_credits_detail,
     insufficient_credits_guard,
 )
+from kokoro_link.api.routes._uploads import ensure_allowed_upload_content_type
 from kokoro_link.application.dto.character import CharacterResponse
 from kokoro_link.application.dto.chat import (
+    DEFAULT_CONVERSATION_PAGE_SIZE,
+    MAX_CONVERSATION_PAGE_SIZE,
     ChatReplyResponse,
     ConversationResponse,
     SendChatMessageRequest,
@@ -42,6 +45,7 @@ from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayRequestTooLargeError,
 )
+from kokoro_link.infrastructure.storage.keys import safe_key_segment
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,10 +73,34 @@ router = APIRouter(tags=["chat"])
 )
 async def get_latest_conversation(
     character_id: str,
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=MAX_CONVERSATION_PAGE_SIZE,
+    ),
+    before: int | None = Query(default=None, ge=0),
     container: ServiceContainer = Depends(get_container),
     _owned_character_id: str = Depends(ensure_owned_character_id),
 ) -> ConversationResponse | None:
-    return await container.chat_service.get_latest_conversation(character_id)
+    """The newest page of the character's latest thread (IV10).
+
+    Which thread is "latest" is exactly what it always was; ``limit`` /
+    ``before`` only decide how much of its message tail comes back. ``before``
+    is a message ``position`` (exclusive) — the feed's keyset shape (plan D8),
+    not a page number: this codebase has no ``page`` / ``page_size`` anywhere
+    and a second convention would be one more thing to get wrong.
+
+    The IV10 panel sends ``limit`` explicitly.  Omitting both parameters keeps
+    the whole-thread response used by cached pre-IV10 clients; this is the
+    compatibility seam that makes a mixed-replica rollout safe.
+    """
+    return await container.chat_service.get_latest_conversation(
+        character_id,
+        limit=limit if limit is not None else (
+            DEFAULT_CONVERSATION_PAGE_SIZE if before is not None else None
+        ),
+        before_position=before,
+    )
 
 
 @router.post(
@@ -149,6 +177,11 @@ async def upload_chat_attachments(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
                 detail=f"unsupported file type: {suffix or '(missing)'}",
             )
+        # The suffix check above cannot stand in for this one. The stored object
+        # is served back from the app's own origin *with this content type*, so
+        # a part named ``a.png`` but declared ``text/html`` becomes same-origin
+        # HTML at a URL the app minted — the extension never entered into it.
+        content_type = ensure_allowed_upload_content_type(upload.content_type)
         data = await upload.read()
         if len(data) > _CHAT_UPLOAD_MAX_BYTES:
             raise HTTPException(
@@ -163,7 +196,9 @@ async def upload_chat_attachments(
         stored = await object_storage.put_bytes(
             object_key=f"users/{safe_user_dir}/{_CHAT_UPLOAD_SUBDIR}/{out_name}",
             content=data,
-            content_type=upload.content_type or "application/octet-stream",
+            # The validated (and normalised) type, not the raw header: this is
+            # the value the public media route will serve it back with.
+            content_type=content_type,
             metadata={"user_id": safe_user_dir, "kind": "chat-upload"},
         )
         saved.append(stored.url)
@@ -172,17 +207,20 @@ async def upload_chat_attachments(
 
 
 def _safe_user_dir(user_id: str) -> str:
-    """Restrict ``user_id`` to a filesystem-safe subdirectory name.
+    """Restrict ``user_id`` to a single key-safe subdirectory name.
 
-    Keeps alnum / dash / underscore / dot (id schemes used by the auth
-    layer are UUIDs or short string handles) and falls back to a fixed
-    ``unknown`` bucket when the input contains anything else. Drops the
-    risk of a path-traversal payload reaching ``mkdir``.
+    Thin wrapper over the shared
+    :func:`~kokoro_link.infrastructure.storage.keys.safe_key_segment`, which
+    documents the allow-list and the two traps it closes.
+
+    That helper reads alnum as **ASCII** alnum, where this used to accept
+    anything ``str.isalnum`` liked — a tightening with no effect on real
+    traffic (auth mints UUIDs; every id that reaches here is ASCII) and a
+    correction where it does bite: a CJK id previously produced a segment the
+    downstream key validator rejects, i.e. a "sanitised" name that only ever
+    turned into a failed write.
     """
-    cleaned = "".join(
-        ch for ch in (user_id or "") if ch.isalnum() or ch in ("-", "_", ".")
-    )
-    return cleaned or "unknown"
+    return safe_key_segment(user_id, fallback="unknown")
 
 
 class UndoTurnResponse(BaseModel):

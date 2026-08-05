@@ -16,6 +16,9 @@ from kokoro_link.domain.entities.arc_template import (
 from kokoro_link.domain.entities.story_arc import (
     ARC_ACTIVE,
     BEAT_PENDING,
+    OPERATOR_POSITION_ABSENT,
+    OPERATOR_POSITION_CENTRAL,
+    OPERATOR_POSITION_PRESENT,
     SCENE_CONFLICT,
     SCENE_ENCOUNTER,
     TENSION_RISING,
@@ -234,3 +237,81 @@ class TestApplicability:
                 id="t1", title="t", premise="p", beats=[_beat()],
                 applicability_scope="private",
             )
+
+
+class TestOperatorPositionSymmetry:
+    """OP0-A — the blueprint beat carries the same player slot, under the
+    same rules, as the runtime beat. Asymmetry here would mean a template
+    author and a planner author face two different conventions."""
+
+    def test_defaults_to_unjudged(self) -> None:
+        beat = _beat()
+        assert beat.operator_position is None
+        assert beat.operator_note is None
+
+    def test_accepts_each_legal_position(self) -> None:
+        for value in (
+            OPERATOR_POSITION_ABSENT,
+            OPERATOR_POSITION_PRESENT,
+            OPERATOR_POSITION_CENTRAL,
+        ):
+            assert _beat(operator_position=value).operator_position == value
+
+    def test_position_is_stripped_and_lowercased(self) -> None:
+        assert (
+            _beat(operator_position="  Central ").operator_position
+            == OPERATOR_POSITION_CENTRAL
+        )
+
+    def test_blank_position_is_unjudged(self) -> None:
+        assert _beat(operator_position="  ").operator_position is None
+
+    def test_unknown_position_rejected_in_create(self) -> None:
+        with pytest.raises(ValueError, match="operator_position"):
+            _beat(operator_position="protagonist")
+
+    def test_unknown_position_rejected_at_the_constructor(self) -> None:
+        with pytest.raises(ValueError, match="operator_position"):
+            ArcTemplateBeat(
+                sequence=0,
+                day_offset=0,
+                title="t",
+                summary="s",
+                operator_position="lead",
+            )
+
+    def test_note_is_stripped_prose(self) -> None:
+        beat = _beat(operator_note="  她要向你坦白  ")
+        assert beat.operator_note == "她要向你坦白"
+
+    def test_blank_note_is_none(self) -> None:
+        assert _beat(operator_note="   ").operator_note is None
+
+
+class TestMaterialisePlayerPosition:
+    def test_materialise_carries_the_pair_into_the_runtime_beat(self) -> None:
+        tpl = ArcTemplate.create(
+            id="quiet_breakup",
+            title="安靜的分手",
+            premise="一段關係走到了盡頭。",
+            duration_days=7,
+            beats=[
+                _beat(
+                    sequence=0,
+                    day_offset=0,
+                    title="她開口",
+                    operator_position=OPERATOR_POSITION_CENTRAL,
+                    operator_note="她要向你坦白",
+                ),
+                _beat(sequence=1, day_offset=2, title="她獨自走回家"),
+            ],
+        )
+
+        arc = tpl.materialise(character_id="char-1", start_date=date(2026, 5, 1))
+
+        assert arc.beats[0].operator_position == OPERATOR_POSITION_CENTRAL
+        assert arc.beats[0].operator_note == "她要向你坦白"
+        # An unauthored beat stays unjudged — materialise never invents
+        # a position the template did not declare.
+        assert arc.beats[1].operator_position is None
+        assert arc.beats[1].operator_note is None

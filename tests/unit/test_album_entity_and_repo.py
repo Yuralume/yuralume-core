@@ -136,6 +136,40 @@ async def test_list_with_limit_and_offset(
 
 
 @pytest.mark.asyncio
+async def test_list_with_before_cursor(
+    repo: InMemoryAlbumRepository,
+) -> None:
+    """Keyset pagination (D8): ``before`` excludes everything at or
+    after that timestamp, independent of ``offset``."""
+    base = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+    for idx in range(5):
+        await repo.add(AlbumItem.create(
+            character_id="c",
+            url=f"/u/{idx}.png",
+            source=SOURCE_TOOL,
+            created_at=base + timedelta(minutes=idx),
+        ))
+    # newest-first: 4, 3, 2, 1, 0
+    page = await repo.list_for_character(
+        "c", limit=2, before=base + timedelta(minutes=3),
+    )
+    assert [i.url for i in page] == ["/u/2.png", "/u/1.png"]
+
+
+@pytest.mark.asyncio
+async def test_list_with_before_cursor_at_oldest_returns_empty(
+    repo: InMemoryAlbumRepository,
+) -> None:
+    base = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+    await repo.add(AlbumItem.create(
+        character_id="c", url="/u/only.png", source=SOURCE_TOOL,
+        created_at=base,
+    ))
+    page = await repo.list_for_character("c", before=base)
+    assert page == []
+
+
+@pytest.mark.asyncio
 async def test_count(repo: InMemoryAlbumRepository) -> None:
     for idx in range(3):
         await repo.add(AlbumItem.create(

@@ -61,13 +61,45 @@ export class ChatStreamProtocolError extends Error {
 }
 
 /**
- * Fetch the most recently active conversation for a character.
+ * How many messages one thread page carries (IV10).
+ *
+ * Mirrors the server's own default; sent explicitly anyway so the number the
+ * panel reasons about is the number it asked for, not whatever the deployed
+ * backend happens to default to.
+ */
+export const CONVERSATION_PAGE_SIZE = 50
+
+export interface ConversationPageQuery {
+  /** Messages per page; omitted means `CONVERSATION_PAGE_SIZE`. */
+  limit?: number
+  /**
+   * Fetch the page immediately older than this message `position`
+   * (exclusive) — the `next_before` of the page you already hold. Omitted
+   * means the newest page.
+   */
+  before?: number | null
+}
+
+/**
+ * Fetch one page of the most recently active conversation for a character.
  * Returns null when the character has no prior conversations.
+ *
+ * Which conversation is "most recent" is a server-side decision and is not
+ * affected by these parameters — they only move the window over its messages.
  */
 export async function getLatestConversation(
   characterId: string,
+  query: ConversationPageQuery = {},
 ): Promise<ConversationSnapshot | null> {
-  const res = await authedFetch(`/api/v1/characters/${characterId}/conversations/latest`)
+  const params = new URLSearchParams({
+    limit: String(query.limit ?? CONVERSATION_PAGE_SIZE),
+  })
+  if (query.before !== undefined && query.before !== null) {
+    params.set('before', String(query.before))
+  }
+  const res = await authedFetch(
+    `/api/v1/characters/${characterId}/conversations/latest?${params.toString()}`,
+  )
   if (!res.ok) {
     throw new Error(`Failed to load conversation history: ${res.status}`)
   }

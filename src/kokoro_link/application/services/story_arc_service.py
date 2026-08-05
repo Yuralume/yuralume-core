@@ -9,6 +9,9 @@ exposes the operations the chat / REST / post-turn pipelines need:
   without the operator having to click anything.
 - ``start_new_arc`` — explicit creation (UI button / post-turn), takes
   optional ``hint`` text the operator provides.
+- ``force_open_season`` — ``ensure_active_arc`` minus the season
+  decider's timing judgement, for the 起幕 button (STORY_SCENE_PLAN
+  §3.1 layer 2). Series-aware, unlike ``start_new_arc``.
 - ``abandon_arc`` — mark an arc abandoned + mark all its pending beats
   skipped. Idempotent.
 - ``realize_beat`` — called after a beat is performed and becomes a
@@ -48,6 +51,9 @@ from kokoro_link.contracts.arc_template_translator import (
 )
 from kokoro_link.contracts.arc_series import ArcSeriesRepositoryPort
 from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
+from kokoro_link.contracts.initial_relationship import (
+    CharacterOperatorRelationshipSeedRepositoryPort,
+)
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story import StoryEventRepositoryPort
 from kokoro_link.contracts.story_arc import (
@@ -78,6 +84,8 @@ from kokoro_link.domain.entities.story_arc import (
     BEAT_PENDING,
     BEAT_REALIZED,
     BEAT_SKIPPED,
+    OPERATOR_POSITION_CENTRAL,
+    PLAY_RESULT_RETRY_EXHAUSTED,
     StoryArc,
     StoryArcBeat,
     TENSION_RISING,
@@ -86,8 +94,12 @@ from kokoro_link.domain.entities.story_seed import (
     SEED_TIER_DRAMATIC,
     StorySeed,
 )
+from kokoro_link.infrastructure.prompt.initial_relationship import (
+    render_arc_planner_relationship_lines,
+)
 
 _LOGGER = logging.getLogger(__name__)
+_DEFAULT_PRIMARY_LANGUAGE = "zh-TW"
 _DEFAULT_DURATION_DAYS = 21
 _DEFAULT_BEAT_COUNT = 5
 _DEFAULT_RECHECK_ATTEMPT_THRESHOLD = 2
@@ -175,6 +187,9 @@ class StoryArcService:
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         gacha_service: StoryGachaService | None = None,
         template_translator: "ArcTemplateTranslatorPort | None" = None,
+        relationship_seed_repository: (
+            CharacterOperatorRelationshipSeedRepositoryPort | None
+        ) = None,
         execution_lease: StudioExecutionLease | None = None,
         lease_heartbeat_interval_seconds: float | None = None,
     ) -> None:
@@ -209,6 +224,13 @@ class StoryArcService:
         # doesn't inherit a wall of zh-TW prose into a runtime StoryArc.
         # Fail-soft: any translation problem falls back to the original.
         self._template_translator = template_translator
+        # Optional — when wired, the LLM planning path is told who the
+        # player *is* to this character (address terms, relationship,
+        # distance) so it can decide, per beat, whether the player is
+        # absent / present / central (OP1-A). ``None`` — and an operator
+        # with no confirmed seed — render exactly the pre-OP1-A prompt:
+        # the planner then judges from the character material alone.
+        self._relationship_seed_repository = relationship_seed_repository
         # Per (template_id + lang) cache of the *translated template* so a
         # given template only pays the LLM cost once per target language;
         # bind is low-frequency but a cache keeps repeat binds free and
@@ -302,12 +324,79 @@ class StoryArcService:
                     open_new_season=open_new_season,
                 )
 
+    async def force_open_season(
+        self,
+        character: Character,
+        *,
+        today: date_type | None = None,
+    ) -> StoryArc | None:
+        """Open the character's next season **now**, skipping the decider.
+
+        The 起幕 button means "我現在就要劇情" (STORY_SCENE_PLAN §2 #2), and
+        the season decider's job is precisely the judgement a player has
+        just overruled: *when* the dormant gap should end. So this is
+        ``ensure_active_arc`` with that one gate removed — same lock, same
+        cross-replica lease, same planner chain, same continuation context
+        from the finished season, same series bookkeeping. Everything the
+        scheduled path would eventually have produced, produced today.
+
+        The decider is **not called at all** rather than called-and-ignored.
+        Its only other output is ``hint``, which its own contract defines as
+        an empty string whenever ``should_start`` is false — i.e. exactly
+        the case this method exists to override — so keeping the call would
+        buy a usually-empty hint at the price of an extra LLM round trip on
+        a foreground, player-paid action. The planner is handed the same
+        facts the decider would have read (continuation summary, recent
+        dialogue, seed candidates, arc history) either way.
+
+        Returns ``None`` when no season can be opened: a series that has
+        run out of members, a planner that failed, or — deliberately — a
+        season that is still *live*. A running arc with no playable beat is
+        a job for the ad-hoc side story layer, not a reason to abandon a
+        story mid-flight; 起幕 layer 1 has already had first refusal on its
+        beats by the time this is reached.
+        """
+        target_today = today or self._today()
+        if await self._has_live_season(character.id, target_today):
+            return None
+        lock = self._plan_locks.setdefault(character.id, asyncio.Lock())
+        async with lock:
+            if await self._has_live_season(character.id, target_today):
+                return None
+            async with self._plan_lease_session(character.id) as lease:
+                if not lease.acquired:
+                    # Another replica is planning this character right now.
+                    # Adopt whatever it has persisted rather than waiting:
+                    # the caller is a player-facing request, and a second
+                    # planner run would just race it.
+                    _LOGGER.info(
+                        "story arc force-open: claimed by another replica "
+                        "character=%s", character.id,
+                    )
+                    return await self._repository.get_active_for_character(
+                        character.id,
+                    )
+                return await self._plan_under_claim(
+                    character=character,
+                    today=target_today,
+                    open_new_season=True,
+                    skip_season_decider=True,
+                )
+
+    async def _has_live_season(
+        self, character_id: str, today: date_type,
+    ) -> bool:
+        """True when an active arc exists and still has story left in it."""
+        existing = await self._repository.get_active_for_character(character_id)
+        return existing is not None and not self._is_arc_stale(existing, today)
+
     async def _plan_under_claim(
         self,
         *,
         character: Character,
         today: date_type,
         open_new_season: bool,
+        skip_season_decider: bool = False,
     ) -> StoryArc | None:
         """Inner worker — caller holds the per-character lock AND lease."""
         completed_now: StoryArc | None = None
@@ -328,12 +417,14 @@ class StoryArcService:
                     today=today,
                     completed_arc=completed_arc,
                     open_new_season=open_new_season,
+                    skip_season_decider=skip_season_decider,
                 )
             return await self._ensure_non_series_arc(
                 character=character,
                 today=today,
                 completed_arc=completed_arc,
                 open_new_season=open_new_season,
+                skip_season_decider=skip_season_decider,
             )
         except ActiveArcConflict:
             # Last-resort backstop: the DB refused a second active arc (a
@@ -353,22 +444,31 @@ class StoryArcService:
         today: date_type,
         completed_arc: StoryArc | None,
         open_new_season: bool,
+        skip_season_decider: bool = False,
     ) -> StoryArc | None:
         if completed_arc is not None:
-            if not open_new_season or self._season_decider is None:
+            if not open_new_season:
+                return None
+            # A missing decider means "nobody can say yes", which is only a
+            # refusal while the decision is still being asked for. Under
+            # ``force_open_season`` the answer is already given.
+            if self._season_decider is None and not skip_season_decider:
                 return None
             season_context = await self._build_next_season_context(
                 character=character,
                 today=today,
                 completed_arc=completed_arc,
             )
-            decision = await self._decide_next_season(season_context)
-            if not decision.should_start:
-                return None
+            hint: str | None = None
+            if not skip_season_decider:
+                decision = await self._decide_next_season(season_context)
+                if not decision.should_start:
+                    return None
+                hint = decision.hint
             return await self.start_new_arc(
                 character,
                 today=today,
-                hint=decision.hint,
+                hint=hint,
                 force_llm=True,
                 recent_dialogue_summary=(
                     season_context.recent_dialogue_summary
@@ -386,6 +486,7 @@ class StoryArcService:
         today: date_type,
         completed_arc: StoryArc | None,
         open_new_season: bool,
+        skip_season_decider: bool = False,
     ) -> StoryArc | None:
         """Start or continue a bound ArcSeries without LLM free-planning."""
         if self._series_repository is None or self._template_repository is None:
@@ -399,6 +500,7 @@ class StoryArcService:
                 today=today,
                 completed_arc=completed_arc,
                 open_new_season=open_new_season,
+                skip_season_decider=skip_season_decider,
             )
         series = await self._series_repository.get_for_user(
             character.arc_series_id,
@@ -416,6 +518,7 @@ class StoryArcService:
                 today=today,
                 completed_arc=completed_arc,
                 open_new_season=open_new_season,
+                skip_season_decider=skip_season_decider,
             )
         if not series.members:
             _LOGGER.warning(
@@ -429,6 +532,7 @@ class StoryArcService:
                 today=today,
                 completed_arc=completed_arc,
                 open_new_season=open_new_season,
+                skip_season_decider=skip_season_decider,
             )
         progress = await self._series_repository.get_progress(
             character.id,
@@ -455,27 +559,36 @@ class StoryArcService:
             if next_index >= len(series.members):
                 await self._series_repository.save_progress(progress.concluded())
                 return None
-            if not open_new_season or self._season_decider is None:
+            if not open_new_season:
                 return None
-            next_template = await self._template_repository.get_for_user(
-                series.members[next_index].template_id,
-                user_id=character.user_id,
-            )
-            season_context = await self._build_next_season_context(
-                character=character,
-                today=today,
-                completed_arc=completed_arc,
-            )
-            season_context = replace(
-                season_context,
-                series_id=series.id,
-                series_title=series.title,
-                next_template_id=series.members[next_index].template_id,
-                next_template_title=next_template.title if next_template else None,
-            )
-            decision = await self._decide_next_season(season_context)
-            if not decision.should_start:
-                return None
+            # Skipping the decider here skips the whole context build with
+            # it: in series mode the decision is timing-only (the next book
+            # is the author's, not the model's), so ``hint`` is never read
+            # and every input to it would be assembled for nothing.
+            if not skip_season_decider:
+                if self._season_decider is None:
+                    return None
+                next_template = await self._template_repository.get_for_user(
+                    series.members[next_index].template_id,
+                    user_id=character.user_id,
+                )
+                season_context = await self._build_next_season_context(
+                    character=character,
+                    today=today,
+                    completed_arc=completed_arc,
+                )
+                season_context = replace(
+                    season_context,
+                    series_id=series.id,
+                    series_title=series.title,
+                    next_template_id=series.members[next_index].template_id,
+                    next_template_title=(
+                        next_template.title if next_template else None
+                    ),
+                )
+                decision = await self._decide_next_season(season_context)
+                if not decision.should_start:
+                    return None
 
         if next_index >= len(series.members):
             await self._series_repository.save_progress(progress.concluded())
@@ -851,20 +964,30 @@ class StoryArcService:
         ``StoryArcPlannerPort`` has grown optional context kwargs over
         time (``operator_primary_language``, then ``today`` for the
         absolute-date anchors in the planner prompt, then ``seed_candidates``
-        / ``arc_history`` for AE0's material and anti-repetition inputs).
+        / ``arc_history`` for AE0's material and anti-repetition inputs,
+        then ``operator_relationship_lines`` for OP1-A's player facts).
         Implementations pinned to an older signature must not break arc
         creation, so unsupported kwargs are filtered out *before* the call
         — not retried after a ``TypeError``. Planners are allowed to have
         side effects (they persist nothing themselves, but wrappers around
         them do), and a retry would run those twice.
+
+        Every LLM-planned arc funnels through here — first arc, next
+        season, ``force_open_season``'s 起幕 path, and ``regenerate_beats``
+        — so the player facts reach all of them by construction rather
+        than by four call sites remembering to pass them.
         """
+        operator = await self._load_operator_profile(character)
         optional: dict[str, object] = {
-            "operator_primary_language": (
-                await self._resolve_operator_language(character)
-            ),
+            "operator_primary_language": _operator_primary_language(operator),
             "today": self._today(),
             "seed_candidates": seed_candidates,
             "arc_history": arc_history,
+            "operator_relationship_lines": (
+                await self._load_operator_relationship_lines(
+                    character_id=character.id, operator=operator,
+                )
+            ),
         }
         return await self._planner.plan_arc(
             character=character,
@@ -917,20 +1040,60 @@ class StoryArcService:
         self._translation_cache[cache_key] = localized
         return localized
 
-    async def _resolve_operator_language(self, character) -> str:  # noqa: ANN001
-        default = "zh-TW"
+    async def _load_operator_profile(self, character):  # noqa: ANN001, ANN201
+        """The character's operator profile, or ``None``.
+
+        Fail-soft: no profile service wired, an unknown user, or a
+        repository that raises all degrade to ``None``. Callers must
+        treat that as "we know nothing about this operator", never as
+        an error — arc planning has to survive it.
+        """
         service = self._operator_profile_service
         if service is None:
-            return default
+            return None
         user_id = getattr(character, "user_id", None) or "default"
         try:
-            operator = await service.get_for_user(user_id)
+            return await service.get_for_user(user_id)
         except Exception:  # pragma: no cover - defensive
-            return default
-        if operator is None:
-            return default
-        lang = getattr(operator, "primary_language", "") or ""
-        return lang.strip() or default
+            return None
+
+    async def _resolve_operator_language(self, character) -> str:  # noqa: ANN001
+        return _operator_primary_language(
+            await self._load_operator_profile(character),
+        )
+
+    async def _load_operator_relationship_lines(
+        self, *, character_id: str, operator,  # noqa: ANN001
+    ) -> tuple[str, ...]:
+        """Pre-render the player facts the arc planner needs (OP1-A).
+
+        The planner is the one narrative planner that never knew who the
+        player was — not even how the character addresses them — so it
+        had no basis on which to put them in a scene. The seed the user
+        confirmed at creation time is the material that already exists
+        for exactly this; it is rendered here (application layer owns
+        *which* facts go out) and captioned there (the planner owns what
+        they are for).
+
+        Fail-soft to ``()`` at every step — no repository, no operator,
+        no seed, a repository that raises. An empty tuple renders the
+        prompt exactly as it did before this input existed, which is the
+        right degradation: a missing relationship must cost a nuance in
+        one arc, never the arc itself.
+        """
+        repository = self._relationship_seed_repository
+        operator_id = getattr(operator, "id", None) if operator else None
+        if repository is None or not operator_id:
+            return ()
+        try:
+            seed = await repository.get(character_id, operator_id)
+        except Exception:
+            _LOGGER.exception(
+                "arc planner relationship material unavailable character=%s; "
+                "planning without it", character_id,
+            )
+            return ()
+        return tuple(render_arc_planner_relationship_lines(seed))
 
     async def abandon_arc(self, arc_id: str) -> StoryArc | None:
         arc = await self._repository.get(arc_id)
@@ -1088,30 +1251,163 @@ class StoryArcService:
         today: date_type | None = None,
         retry_policy: BeatRetryPolicy | None = None,
         retry_at: datetime | None = None,
+        unattended: bool = False,
     ) -> tuple[StoryArc, StoryArcBeat] | None:
         """Return today's (or earliest overdue) pending arc beat.
 
         Catching overdue beats handles the case where the server was
         offline on the beat's scheduled date — the beat fires on the
         next chat turn so the arc doesn't silently skip.
+
+        With a ``retry_policy`` the scan walks *down* the due candidates
+        and returns the first one the policy allows. Returning ``None``
+        at the first blocked candidate used to let one beat in backoff
+        (or one with a spent budget) freeze every later beat of the arc
+        — head-of-line blocking, BACKGROUND_COST_CONTROL_PLAN §10 #4.
+
+        ``unattended=True`` means *nobody is watching*: the caller is
+        about to play this beat with no player in the room. A beat whose
+        ``operator_position`` is ``central`` cannot be played that way —
+        the scene is about the player and has no content without them —
+        so it is walked past, and the same walk-down hands back the next
+        candidate instead (ARC_PLAYER_POSITION_PLAN §5.1 OP2-B). The
+        skip is a *pass*, not a failure: no attempt, no failure count,
+        no backoff, no retirement. That beat is not broken, it is
+        waiting, and the player-facing exits (起幕, chat) are what it is
+        waiting for — which is exactly why **they never pass this flag**.
+
+        Read-only: nothing here retires a beat, so the policy-free chat
+        path can never lose a beat to a scan.
         """
         arc = await self._repository.get_active_for_character(character_id)
         if arc is None:
             return None
+        candidates = self._due_pending_beats(arc, today)
+        if not candidates:
+            return None
+        if retry_policy is None and not unattended:
+            return arc, candidates[0]
+        now = retry_at or datetime.now(timezone.utc)
+        for beat in candidates:
+            if unattended and _awaits_the_player(beat):
+                # DEBUG, not INFO: this fires on every tick for as long as
+                # the beat waits, and "an arc is waiting for its player" is
+                # a normal resting state, not an incident.
+                _LOGGER.debug(
+                    "story beat waits for the player — unattended scan "
+                    "passes character=%s arc=%s beat=%s",
+                    character_id, arc.id, beat.id,
+                )
+                continue
+            if retry_policy is not None and not retry_policy.allows(beat, now=now):
+                continue
+            return arc, beat
+        return None
+
+    async def retire_exhausted_beats(
+        self,
+        character_id: str,
+        *,
+        retry_policy: BeatRetryPolicy,
+        today: date_type | None = None,
+    ) -> StoryArc | None:
+        """Retire due beats whose failure budget is spent (§10 #2).
+
+        A beat that failed ``max_attempts`` times used to sit ``pending``
+        forever: invisible to the autonomous scanner, still first in line
+        for the chat path, and recorded nowhere as dead. It is flipped to
+        ``skipped`` with ``retry_exhausted`` as its play result so the arc
+        moves on — "劇情不卡住" is the point (STORY_SCENE_PLAN §2 #6) —
+        and a warning carries the ids, Core having no alert service.
+
+        Deliberately *not* folded into ``next_beat_due``: that is a read
+        path shared with chat, and a permanent status flip must only
+        happen where the caller already owns write side effects. Returns
+        the updated arc, or ``None`` when there was nothing to retire —
+        which makes repeat calls no-ops rather than repeat writes.
+
+        The write is beat-level and conditional, never ``save``. This runs
+        on the background scanner while chat and the scene service are
+        writing to the same arc, and ``save`` rebuilds every beat row from
+        the snapshot loaded above: a scene that finished (and was charged)
+        between the load and the write would be reverted to ``pending``,
+        losing the canon and leaving the beat playable — and payable —
+        again. ``skip_beats_if_pending`` lets the DB decide which rows may
+        still move, so a beat someone else realized is simply not ours to
+        retire.
+        """
+        arc = await self._repository.get_active_for_character(character_id)
+        if arc is None:
+            return None
+        exhausted = [
+            beat
+            for beat in self._due_pending_beats(arc, today)
+            if retry_policy.is_exhausted(beat)
+        ]
+        if not exhausted:
+            return None
+        for beat in exhausted:
+            _LOGGER.warning(
+                "story beat retry budget exhausted — auto-skipping "
+                "character=%s arc=%s beat=%s failures=%s "
+                "last_failure_at=%s last_result=%s",
+                character_id,
+                arc.id,
+                beat.id,
+                beat.play_failure_count,
+                beat.last_play_failure_at,
+                beat.last_play_attempt_result,
+            )
+        moved = await self._repository.skip_beats_if_pending(
+            arc.id,
+            [beat.id for beat in exhausted],
+            play_result=PLAY_RESULT_RETRY_EXHAUSTED,
+        )
+        if not moved:
+            # Every candidate was claimed by another writer between the
+            # load and here (realized, or already retired by a peer
+            # replica). Nothing of ours landed, so report no write.
+            _LOGGER.info(
+                "story beat retirement found nothing left to retire "
+                "character=%s arc=%s beats=%s",
+                character_id, arc.id, [beat.id for beat in exhausted],
+            )
+            return None
+        # Re-read rather than reasoning from the stale snapshot: the
+        # conditional update may have moved fewer beats than we asked for,
+        # and the completion check below must see the real board.
+        updated = await self._repository.get(arc.id)
+        if updated is None:
+            return None
+        if _all_terminal(updated.beats) and updated.status == ARC_ACTIVE:
+            if await self._repository.complete_arc_if_all_terminal(arc.id):
+                updated = updated.with_status(ARC_COMPLETED)
+        return updated
+
+    def _due_pending_beats(
+        self, arc: StoryArc, today: date_type | None,
+    ) -> list[StoryArcBeat]:
+        """Pending beats scheduled on/before ``today``, in play order."""
         target = today or self._today()
         candidates = [
             b for b in arc.beats
             if b.status == BEAT_PENDING and b.scheduled_date <= target
         ]
-        if not candidates:
-            return None
         candidates.sort(key=lambda b: (b.scheduled_date, b.sequence))
-        beat = candidates[0]
-        if retry_policy is not None:
-            now = retry_at or datetime.now(timezone.utc)
-            if not retry_policy.allows(beat, now=now):
-                return None
-        return arc, beat
+        return candidates
+
+    async def find_beat(self, beat_id: str) -> StoryArcBeat | None:
+        """Look a beat up by id, whatever its status or arc.
+
+        Callers verifying what a play attempt did to a specific beat must
+        not re-derive it from ``next_beat_due`` — with the §10 #4 walk-down
+        the beat that was played is no longer necessarily the head of the
+        due list.
+        """
+        arc = await self._find_arc_by_beat(beat_id)
+        if arc is None:
+            return None
+        return arc.find_beat(beat_id)
 
     async def next_future_beat_date(
         self,
@@ -1509,6 +1805,18 @@ class StoryArcService:
 # --- free helpers ----------------------------------------------------
 
 
+def _awaits_the_player(beat: StoryArcBeat) -> bool:
+    """Is this scene about the player, and thus unplayable without them?
+
+    The negative cases are all three of the *other* states, ``None``
+    (unjudged) included: an unjudged beat is what every beat written
+    before OP0 reads back as, and treating "nobody has said" as "the
+    player is essential" would freeze every existing arc's autonomous
+    progress on the day this shipped.
+    """
+    return beat.operator_position == OPERATOR_POSITION_CENTRAL
+
+
 def _all_terminal(beats: Iterable[StoryArcBeat]) -> bool:
     beats_list = list(beats)
     if not beats_list:
@@ -1526,6 +1834,14 @@ def _merge_planner_context(
         if part and part.strip()
     ]
     return "\n\n".join(parts)
+
+
+def _operator_primary_language(operator) -> str:  # noqa: ANN001
+    """BCP-47 tag for player-visible prose, or the shipped default."""
+    if operator is None:
+        return _DEFAULT_PRIMARY_LANGUAGE
+    lang = getattr(operator, "primary_language", "") or ""
+    return lang.strip() or _DEFAULT_PRIMARY_LANGUAGE
 
 
 def _format_arc_history_entry(arc: StoryArc) -> str:

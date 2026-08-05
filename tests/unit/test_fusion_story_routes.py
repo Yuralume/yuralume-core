@@ -137,6 +137,44 @@ def test_adapt_to_arc_returns_template_draft_payload() -> None:
     assert adapter.calls[0]["instruction"] == "Keep it quiet."
 
 
+def test_adapt_to_arc_forwards_the_creators_chosen_mode() -> None:
+    adapter = _AdaptServiceStub(draft=_draft())
+    client = _client(_Container(_FusionStoryServiceStub(_ready_story()), adapter))
+
+    response = client.post(
+        "/api/v1/fusion-stories/fusion-1/adapt-to-arc",
+        json={"operator_mode": "write_in"},
+    )
+
+    assert response.status_code == 200
+    assert adapter.calls[0]["operator_mode"] == "write_in"
+
+
+def test_adapt_to_arc_without_a_body_leaves_the_mode_unstated() -> None:
+    # An omitted body is a caller who never saw the choice; the service
+    # (not the route) owns what that resolves to — see §3.2.
+    adapter = _AdaptServiceStub(draft=_draft())
+    client = _client(_Container(_FusionStoryServiceStub(_ready_story()), adapter))
+
+    response = client.post("/api/v1/fusion-stories/fusion-1/adapt-to-arc")
+
+    assert response.status_code == 200
+    assert adapter.calls[0]["operator_mode"] is None
+
+
+def test_adapt_to_arc_rejects_an_unknown_mode() -> None:
+    adapter = _AdaptServiceStub(draft=_draft())
+    client = _client(_Container(_FusionStoryServiceStub(_ready_story()), adapter))
+
+    response = client.post(
+        "/api/v1/fusion-stories/fusion-1/adapt-to-arc",
+        json={"operator_mode": "spectator"},
+    )
+
+    assert response.status_code == 422
+    assert adapter.calls == []
+
+
 def test_adapt_to_arc_maps_not_ready_to_409() -> None:
     adapter = _AdaptServiceStub(error=ValueError("Fusion story is not ready"))
     client = _client(_Container(_FusionStoryServiceStub(_ready_story()), adapter))

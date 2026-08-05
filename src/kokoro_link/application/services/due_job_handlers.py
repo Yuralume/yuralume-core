@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from kokoro_link.application.services.character_tick_executor import (
@@ -50,6 +50,7 @@ from kokoro_link.contracts.due_jobs import (
     PROACTIVE_EVALUATE_KIND,
     SCHEDULE_MAINTENANCE_KIND,
     SCHEDULE_WEATHER_VET_KIND,
+    STORY_SCENE_TIMEOUT_KIND,
     kind_spec,
 )
 from kokoro_link.contracts.operator_profile import OperatorProfileRepositoryPort
@@ -63,6 +64,18 @@ _LOGGER = logging.getLogger(__name__)
 #: Wired to :meth:`BeatDueChecker.next_due_at`; eliminates the 300s recheck drift
 #: for a beat scheduled days out (§ beat_due precision).
 BeatNextDueProvider = Callable[["Character", datetime], Awaitable["datetime | None"]]
+
+#: ``(character, now) -> scene_timeout_instant | None``. When the character is
+#: inside a 起幕 scene, the exact instant that scene becomes idle-due
+#: (``last_activity_at`` + the configured window); ``None`` when there is no
+#: live scene, so the chain falls back to its hourly recheck. Wired to
+#: :meth:`StorySceneTimeoutCloser.next_timeout_at`. Same shape as
+#: :data:`BeatNextDueProvider` on purpose — both answer "when is this chain's
+#: next precisely-known moment", and sharing the shape is what lets one
+#: ``explicit_next_due`` hook serve both.
+SceneTimeoutDueProvider = Callable[
+    ["Character", datetime], Awaitable["datetime | None"],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +101,7 @@ class CharacterKindHandler:
         operator_profile_repository: OperatorProfileRepositoryPort | None = None,
         deferral_check: DeferralCheck | None = None,
         beat_next_due_provider: BeatNextDueProvider | None = None,
+        scene_timeout_due_provider: SceneTimeoutDueProvider | None = None,
         clock: ClockPort | None = None,
     ) -> None:
         self._executor = executor
@@ -97,6 +111,7 @@ class CharacterKindHandler:
         self._operator_profiles = operator_profile_repository
         self._deferral_check = deferral_check
         self._beat_next_due_provider = beat_next_due_provider
+        self._scene_timeout_due_provider = scene_timeout_due_provider
         self._clock = clock
 
     async def handle(
@@ -121,16 +136,19 @@ class CharacterKindHandler:
         if not await self._executor.subscription_allows(character):
             return HandlerResult(kind, executed=False, chain_stopped=True)
 
-        await self._run_step(character, kind, resolved, logical_slot, allow_dispatch)
+        needs_floor_retry = await self._run_step(
+            character, kind, resolved, logical_slot, allow_dispatch,
+        )
         chained = await self._advance_chain(
             character, kind, resolved, last_due, fencing_epoch,
+            needs_floor_retry=needs_floor_retry,
         )
         return HandlerResult(kind, executed=True, next_enqueued=chained)
 
     async def _run_step(
         self, character: Character, kind: str, now: datetime,
         logical_slot: str, allow_dispatch: bool,
-    ) -> None:
+    ) -> bool:
         if kind == BEAT_DUE_KIND:
             await self._executor.step_beat_due(
                 character, now=now, logical_slot=logical_slot,
@@ -144,8 +162,12 @@ class CharacterKindHandler:
             await self._executor.step_memorialize(character, now=now)
         elif kind == GOAL_REVIEW_KIND:
             await self._executor.step_goal_review(character, now=now)
+        elif kind == STORY_SCENE_TIMEOUT_KIND:
+            await self._executor.step_scene_timeout(character, now=now)
         elif kind == FEED_COMPOSE_KIND:
-            await self._executor.step_feed_compose(character)
+            return await self._executor.step_feed_compose(
+                character, now=now,
+            )
         elif kind == FEED_COMMENT_REPLY_KIND:
             await self._executor.step_feed_comment_reply(
                 character, logical_slot=logical_slot,
@@ -159,10 +181,12 @@ class CharacterKindHandler:
             await self._executor.step_upkeep(character, now=now)
         else:  # pragma: no cover — registry / dispatch kept in lockstep
             raise ValueError(f"no step bound for kind: {kind!r}")
+        return False
 
     async def _advance_chain(
         self, character: Character, kind: str, now: datetime,
         last_due: datetime | None, fencing_epoch: int | None = None,
+        *, needs_floor_retry: bool = False,
     ) -> bool:
         # Cross-process correctness: the worker is (in a dedicated deployment) a
         # different process than the coordinator and does not hold its lease, so
@@ -177,10 +201,20 @@ class CharacterKindHandler:
         if epoch is None:
             # Not the leader / passive — the coordinator's reconcile owns reseeding.
             return False
-        # beat_due precision (§): if the next beat's exact instant is known, pass
-        # it as ``explicit_next_due`` so the chain jumps straight to that instant
-        # instead of drifting on 300s rechecks; fall back to the base cadence.
-        explicit_next_due = await self._beat_explicit_due(character, kind, now)
+        # A feed character without today first post retries at the 90-minute
+        # base cadence even when the account background multiplier is larger.
+        # Service gates remain authoritative, so these retries are DB-only
+        # while busy, capped, cooling down, or lacking a viable candidate.
+        if kind == FEED_COMPOSE_KIND and needs_floor_retry:
+            spec = kind_spec(kind)
+            assert spec is not None  # validated by handle
+            explicit_next_due = now + timedelta(
+                seconds=spec.base_interval_seconds,
+            )
+        else:
+            # Precision chains: beats and open-scene idle deadlines can expose
+            # an exact next instant; otherwise fall back to base cadence.
+            explicit_next_due = await self._explicit_due(character, kind, now)
         next_due = await self._calculator.compute(
             character, kind, now=now, last_due=last_due,
             explicit_next_due=explicit_next_due,
@@ -210,21 +244,35 @@ class CharacterKindHandler:
             return False
         return job_id is not None
 
-    async def _beat_explicit_due(
+    async def _explicit_due(
         self, character: Character, kind: str, now: datetime,
     ) -> datetime | None:
-        """Next beat instant for the beat chain; ``None`` otherwise / on error."""
-        if kind != BEAT_DUE_KIND or self._beat_next_due_provider is None:
+        """This kind's precisely-known next instant, when it has one.
+
+        ``None`` for every kind without a provider, and on any provider
+        failure: a chain that cannot learn its exact moment falls back to
+        its base cadence, which is late but never wrong."""
+        provider = self._due_provider_for(kind)
+        if provider is None:
             return None
         try:
-            instant = await self._beat_next_due_provider(character, now)
+            instant = await provider(character, now)
         except Exception:
             _LOGGER.exception(
-                "due-job chain: beat next-due provider failed character=%s",
-                character.id,
+                "due-job chain: next-due provider failed kind=%s character=%s",
+                kind, character.id,
             )
             return None
         return ensure_utc(instant) if instant is not None else None
+
+    def _due_provider_for(
+        self, kind: str,
+    ) -> BeatNextDueProvider | SceneTimeoutDueProvider | None:
+        if kind == BEAT_DUE_KIND:
+            return self._beat_next_due_provider
+        if kind == STORY_SCENE_TIMEOUT_KIND:
+            return self._scene_timeout_due_provider
+        return None
 
     async def _resolve_tenant(self, operator_id: str | None) -> str | None:
         if self._operator_profiles is None or operator_id is None:

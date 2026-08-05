@@ -5,7 +5,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, sessionmaker
 
-from kokoro_link.contracts.repositories import AppendResult, ConversationRepositoryPort
+from kokoro_link.contracts.repositories import (
+    AppendResult,
+    ConversationMessagePage,
+    ConversationRepositoryPort,
+)
 from kokoro_link.domain.entities.conversation import (
     Conversation,
     Message,
@@ -17,6 +21,38 @@ from kokoro_link.domain.entities.conversation import (
 from kokoro_link.infrastructure.persistence.models import ConversationRow, MessageRow
 
 _LOG = logging.getLogger(__name__)
+
+
+def _latest_conversation_stmt(character_id: str, source: str | None):
+    """Which conversation is "the latest" for this character.
+
+    The single source of that answer: both the full-thread read and the
+    paginated one build on this, so adding pagination could not quietly change
+    *which* thread the chat panel opens (IV10 red line). Recency proxy is
+    ``MAX(MessageRow.id)`` (autoincrement); a conversation with no messages at
+    all sorts last and then by descending id.
+
+    Returns the statement without any message loading — the caller decides
+    whether it wants the whole tail eagerly or one keyset page.
+    """
+    latest_msg_subq = (
+        select(
+            MessageRow.conversation_id.label("conv_id"),
+            func.max(MessageRow.id).label("last_msg_id"),
+        )
+        .group_by(MessageRow.conversation_id)
+        .subquery()
+    )
+    stmt = (
+        select(ConversationRow)
+        .outerjoin(latest_msg_subq, latest_msg_subq.c.conv_id == ConversationRow.id)
+        .where(ConversationRow.character_id == character_id)
+        .order_by(latest_msg_subq.c.last_msg_id.desc().nullslast(), ConversationRow.id.desc())
+        .limit(1)
+    )
+    if source is not None:
+        stmt = stmt.where(ConversationRow.source == source)
+    return stmt
 
 
 class SAConversationRepository(ConversationRepositoryPort):
@@ -44,31 +80,76 @@ class SAConversationRepository(ConversationRepositoryPort):
         Uses ``MAX(MessageRow.id)`` as the recency proxy (MessageRow.id is
         autoincrement). Conversations without any message fall back to the
         one saved most recently per id ordering.
+
+        Loads the **whole** thread; every caller here (prompt building,
+        proactive delivery, story scenes, the replay CLI) needs it, and the
+        returned snapshot is save()-able. The paginated read the chat panel
+        uses is :meth:`latest_page_for_character`.
         """
         async with self._session_factory() as session:
-            latest_msg_subq = (
-                select(
-                    MessageRow.conversation_id.label("conv_id"),
-                    func.max(MessageRow.id).label("last_msg_id"),
-                )
-                .group_by(MessageRow.conversation_id)
-                .subquery()
+            stmt = _latest_conversation_stmt(character_id, source).options(
+                selectinload(ConversationRow.messages),
             )
-            stmt = (
-                select(ConversationRow)
-                .outerjoin(latest_msg_subq, latest_msg_subq.c.conv_id == ConversationRow.id)
-                .where(ConversationRow.character_id == character_id)
-                .order_by(latest_msg_subq.c.last_msg_id.desc().nullslast(), ConversationRow.id.desc())
-                .options(selectinload(ConversationRow.messages))
-                .limit(1)
-            )
-            if source is not None:
-                stmt = stmt.where(ConversationRow.source == source)
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
             if row is None:
                 return None
             return _row_to_domain(row)
+
+    async def latest_page_for_character(
+        self,
+        character_id: str,
+        *,
+        source: str | None = "web",
+        limit: int,
+        before_position: int | None = None,
+    ) -> ConversationMessagePage | None:
+        """Keyset page over the message layer of the latest conversation (IV10).
+
+        Two queries rather than one: the conversation is picked by the *same*
+        statement :meth:`latest_for_character` uses (shared helper — the
+        selection is not re-derived here), then its messages are fetched with
+        their own ``ORDER BY position DESC LIMIT``. ``selectinload`` cannot be
+        limited, which is precisely why the whole thread used to come back.
+
+        Reads ``limit + 1`` rows so ``has_more`` is answered without a second
+        ``COUNT`` — the same trick as the feed, one row cheaper than a count.
+        """
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    _latest_conversation_stmt(character_id, source),
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if limit <= 0:
+                return ConversationMessagePage(
+                    conversation_id=row.id,
+                    character_id=row.character_id,
+                    messages=(),
+                    has_more=False,
+                    next_before=None,
+                )
+            stmt = (
+                select(MessageRow)
+                .where(MessageRow.conversation_id == row.id)
+                .order_by(MessageRow.position.desc())
+                .limit(limit + 1)
+            )
+            if before_position is not None:
+                stmt = stmt.where(MessageRow.position < before_position)
+            rows = list((await session.execute(stmt)).scalars().all())
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            page.reverse()
+            return ConversationMessagePage(
+                conversation_id=row.id,
+                character_id=row.character_id,
+                messages=tuple(_message_row_to_domain(r) for r in page),
+                has_more=has_more,
+                next_before=page[0].position if has_more and page else None,
+            )
 
     async def recent_messages_for_character(
         self,

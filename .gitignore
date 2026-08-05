@@ -68,9 +68,5 @@ tts/*.wav
 /docs/x-devlog/
 
 /.env.demo
-/docs/x-posts/
-/docs/zenn-posts/
-/docs/note-posts/
-/docs/fanbox-posts/
 /custom-tts-kokoro/
 /.claude/

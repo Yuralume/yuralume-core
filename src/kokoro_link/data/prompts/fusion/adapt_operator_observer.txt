@@ -1,0 +1,17 @@
+Creator's choice for this adaptation: THE PLAYER WATCHES THIS STORY.
+
+The story stays the cast's own. The creator wants to be there for it, not
+to be in it — so adapt the source into beats exactly as you would if
+nobody were watching, then say where the watcher stands.
+
+- Every beat's operator_position is present. The player is in the room or
+  close enough to see it happen, and no beat is ever about them.
+- Do not re-cast anyone as the player, do not add a scene for the player,
+  and do not change what happens in a beat to account for their presence.
+  Being watched changes nothing about the events themselves.
+- Do not add the player to scene_characters — being a witness is not
+  being cast.
+- Use operator_note for one sentence on how the player is positioned as a
+  witness in that beat ("you are the one she keeps glancing at while she
+  says it"). It describes their vantage point, never their actions or
+  their lines.

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from kokoro_link.application.services.proactive_dispatcher import ProactiveDispatcher
+from kokoro_link.application.services.story_event_service import EnsureReport
 from kokoro_link.contracts.proactive import (
     ProactiveContext,
     ProactiveDecision,
@@ -62,6 +63,24 @@ class _FakeArcService:
         self.calls += 1
         self.last_today = today
         return self.arc
+
+
+class _RecordingStoryEventService:
+    """Captures how the dispatcher asks for today's story events.
+
+    The dispatcher runs with nobody in the room, so it must declare
+    itself unattended — that is what stops ``ensure_today`` from
+    recording a play attempt on a beat whose ``operator_position`` is
+    ``central`` and, past the recheck threshold, performing the
+    player's own scene without them (ARC_PLAYER_POSITION_PLAN §2 #5).
+    """
+
+    def __init__(self) -> None:
+        self.unattended_flags: list[bool] = []
+
+    async def ensure_today(self, character, *, now=None, unattended=False):
+        self.unattended_flags.append(unattended)
+        return EnsureReport(events=(), newly_rolled=0)
 
 
 class _OperatorProfileService:
@@ -128,7 +147,12 @@ async def _prepare_harness():
 
 
 def _dispatcher(
-    harness, *, decider, story_arc_service, operator_profile_service=None,
+    harness,
+    *,
+    decider,
+    story_arc_service,
+    operator_profile_service=None,
+    story_event_service=None,
 ):
     return ProactiveDispatcher(
         character_repository=harness.character_repository,
@@ -146,6 +170,7 @@ def _dispatcher(
         },
         story_arc_service=story_arc_service,
         operator_profile_service=operator_profile_service,
+        story_event_service=story_event_service,
     )
 
 
@@ -171,6 +196,26 @@ async def test_dispatcher_threads_active_arc_into_context() -> None:
     # Two beats exist (today + tomorrow); forward_beats(limit=2, include_today=True) returns both.
     assert len(ctx.upcoming_beats) == 2
     assert ctx.upcoming_beats[0].title == "起點"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_ensures_story_events_as_an_unattended_caller() -> None:
+    harness, character = await _prepare_harness()
+    today = datetime.now(timezone.utc).date()
+    arc_service = _FakeArcService(arc=_build_arc(character.id, today))
+    story_events = _RecordingStoryEventService()
+
+    dispatcher = _dispatcher(
+        harness,
+        decider=_CapturingDecider(),
+        story_arc_service=arc_service,
+        story_event_service=story_events,
+    )
+    await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+
+    assert story_events.unattended_flags == [True]
 
 
 @pytest.mark.asyncio

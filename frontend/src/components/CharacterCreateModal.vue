@@ -10,7 +10,7 @@
  * 完成後在編輯模式調整，避免建立表單太長、也讓新手聚焦必填的
  * 人格描述。
  */
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type {
   Character,
@@ -39,8 +39,10 @@ import {
 } from '@/utils/characterCreationIntake'
 import { UiButton } from '@/components/ui'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
+import CharacterLimitAdvisory from '@/components/CharacterLimitAdvisory.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import { ACTION_CHARACTER_DRAFT } from '@/composables/useActionPricing'
+import { useRuntimeLimits } from '@/composables/useRuntimeLimits'
 import {
   billingRefusalKind,
   refreshQuotedPrices,
@@ -53,6 +55,13 @@ import {
 } from '@/composables/useInitialRelationshipForm'
 
 const { t, locale } = useI18n()
+
+// 這個 modal 是 v-if 掛載的，mount 就等於「玩家打開了建立視窗」——在他填完
+// 整份表單前先把 hosted 上限讀回來，才有機會事前提示而不是送出後才報錯。
+const runtimeLimits = useRuntimeLimits()
+onMounted(() => {
+  void runtimeLimits.ensureLoaded()
+})
 
 const PERSONALITY_TYPE_CODES: CharacterPersonalityTypeCode[] = [
   'INTJ', 'INTP', 'ENTJ', 'ENTP',
@@ -667,6 +676,9 @@ function cancel() {
       </div>
 
       <div class="modal-body">
+        <!-- 事前提示，不擋送出：伺服端才是強制點（advisory 紅線）。 -->
+        <CharacterLimitAdvisory variant="banner" />
+
         <button
           type="button"
           class="btn-ai-draft"

@@ -86,7 +86,17 @@ class CharacterRuntimeInitializer:
 
         if self._story_event_service is not None:
             try:
-                report = await self._story_event_service.ensure_today(character)
+                # Warm-up, not a performance: nothing produced here is
+                # shown to anyone, so a due beat that is *about the
+                # player* must not be recorded as surfaced to them
+                # (ARC_PLAYER_POSITION_PLAN §2 #5). One phantom attempt
+                # is not harmless — the recheck threshold is small, so it
+                # buys the rechecker the right to declare the scene
+                # performed on the player's very first turn, instead of
+                # letting them play it.
+                report = await self._story_event_service.ensure_today(
+                    character, unattended=True,
+                )
                 story_events_prepared = int(
                     getattr(report, "newly_rolled", 0) or 0,
                 )

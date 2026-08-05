@@ -130,6 +130,9 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_SCHEDULE_PLAN,
     FEATURE_SCHEDULE_WEATHER_DRIFT,
     FEATURE_STORY_EXPAND,
+    FEATURE_STORY_SCENE_CHIPS,
+    FEATURE_STORY_SCENE_CLOSE,
+    FEATURE_STORY_SCENE_OPEN,
     FEATURE_TTS_TRANSLATE,
 )
 from kokoro_link.application.services.character_service import CharacterService
@@ -148,8 +151,15 @@ from kokoro_link.application.services.character_card_import_service import (
 from kokoro_link.application.services.character_card_pack_service import (
     CharacterCardPackService,
 )
+from kokoro_link.application.services.official_card_pack_source import (
+    OfficialCardPackSource,
+)
 from kokoro_link.infrastructure.character_card.pack_catalog import (
     CharacterCardPackCatalog,
+)
+from kokoro_link.infrastructure.cloud.official_card_catalog_client import (
+    CachedOfficialCardCatalog,
+    OfficialCardCatalogClient,
 )
 from kokoro_link.infrastructure.character_card.llm_translator import (
     LLMCharacterCardTranslator,
@@ -289,6 +299,9 @@ from kokoro_link.application.services.cloud_announcement_service import (
 )
 from kokoro_link.application.services.quota_overage_service import (
     QuotaOverageService,
+)
+from kokoro_link.application.services.player_runtime_limits import (
+    PlayerRuntimeLimitsService,
 )
 from kokoro_link.application.services.player_locale_service import (
     LOCALE_CLAIM_PREFIX,
@@ -432,6 +445,23 @@ from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_beat_scene_service import (
     StoryBeatSceneService,
 )
+from kokoro_link.application.services.story_scene_material import (
+    ForcedSeasonSceneMaterialProvider,
+    PendingBeatSceneMaterialProvider,
+)
+from kokoro_link.application.services.story_scene_quota import (
+    StorySceneQuotaGuard,
+)
+from kokoro_link.application.services.story_scene_service import (
+    StorySceneService,
+)
+from kokoro_link.application.services.story_scene_side_story import (
+    SideStorySceneMaterialProvider,
+)
+from kokoro_link.application.services.story_scene_timeout import (
+    DEFAULT_STORY_SCENE_IDLE_TIMEOUT_SECONDS,
+    StorySceneTimeoutCloser,
+)
 from kokoro_link.application.services.story_event_service import StoryEventService
 from kokoro_link.application.services.story_gacha import StoryGachaService
 from kokoro_link.application.services.schedule_memorializer import ScheduleMemorializer
@@ -492,6 +522,9 @@ from kokoro_link.contracts.studio_jobs import StudioJobRepositoryPort
 from kokoro_link.contracts.story_arc import (
     StoryArcPlannerPort,
     StoryArcRepositoryPort,
+)
+from kokoro_link.contracts.story_scene import (
+    StorySceneSessionRepositoryPort,
 )
 from kokoro_link.contracts.arc_series import ArcSeriesRepositoryPort
 from kokoro_link.contracts.post_turn import PostTurnProcessorPort
@@ -653,6 +686,9 @@ from kokoro_link.infrastructure.repositories.in_memory_stories import (
 from kokoro_link.infrastructure.repositories.in_memory_story_arcs import (
     InMemoryStoryArcRepository,
 )
+from kokoro_link.infrastructure.repositories.in_memory_story_scene_sessions import (
+    InMemoryStorySceneSessionRepository,
+)
 from kokoro_link.infrastructure.repositories.in_memory_fusion_stories import (
     InMemoryFusionStoryRepository,
 )
@@ -662,6 +698,15 @@ from kokoro_link.infrastructure.story.llm_expander import (
 )
 from kokoro_link.infrastructure.story.llm_beat_scene_writer import (
     LLMStoryBeatSceneWriter,
+)
+from kokoro_link.infrastructure.story.llm_scene_chips import (
+    LLMStorySceneChipsWriter,
+)
+from kokoro_link.infrastructure.story.llm_scene_closer import (
+    LLMStorySceneCloser,
+)
+from kokoro_link.infrastructure.story.llm_scene_opener import (
+    LLMStorySceneOpener,
 )
 from kokoro_link.infrastructure.story.fusion_to_arc_adapter import (
     LLMFusionToArcAdapter,
@@ -890,6 +935,9 @@ from kokoro_link.infrastructure.schedule.stub_planner import StubSchedulePlanner
 from kokoro_link.infrastructure.state.simple import SimpleStateEngine
 from kokoro_link.infrastructure.storage.http import HttpObjectStorage
 from kokoro_link.infrastructure.storage.in_memory import InMemoryObjectStorage
+from kokoro_link.infrastructure.storage.variant_aware import (
+    VariantAwareObjectStorage,
+)
 from kokoro_link.infrastructure.security.provider_secret_cipher import (
     ProviderSecretCipher,
 )
@@ -970,6 +1018,8 @@ class ServiceContainer:
     story_event_service: StoryEventService | None = None
     story_beat_scene_service: StoryBeatSceneService | None = None
     story_arc_repository: StoryArcRepositoryPort | None = None
+    story_scene_service: StorySceneService | None = None
+    story_scene_session_repository: StorySceneSessionRepositoryPort | None = None
     story_arc_service: StoryArcService | None = None
     arc_template_repository: ArcTemplateRepositoryPort | None = None
     arc_template_translator: ArcTemplateTranslatorPort | None = None
@@ -1068,6 +1118,12 @@ class ServiceContainer:
     # Player-authorised quota overage (AP4). Always wired; the settings routes
     # that read it still 404 outside cloud mode.
     quota_overage_service: "QuotaOverageService | None" = None
+    # Display-only mirror of the runtime ceilings the services already enforce
+    # (character slots, daily creates, daily 起幕, session cap, capability
+    # flags). Always wired — the profile it reads is permissive in self-host,
+    # so it reports "no limits" there — and the route that exposes it is
+    # mounted in cloud mode only.
+    player_runtime_limits_service: "PlayerRuntimeLimitsService | None" = None
     # Hosted player locale / location lifecycle (G2). Cloud mode only — ``None``
     # in self-host, where the locale routes 404 by construction.
     player_locale_service: "PlayerLocaleService | None" = None
@@ -1420,6 +1476,7 @@ def _build_story_expander(
     registry: ChatModelRegistryPort,
     default_provider_id: str,
     active_provider: ActiveLLMProviderPort | None = None,
+    cloud_mode: bool = False,
 ):
     """Pick an expander based on available providers.
 
@@ -1430,7 +1487,9 @@ def _build_story_expander(
     if active_provider is None:
         return NullStoryEventExpander()
     return LLMStoryEventExpander(
-        provider=active_provider, feature_key=FEATURE_STORY_EXPAND,
+        provider=active_provider,
+        feature_key=FEATURE_STORY_EXPAND,
+        cloud_mode=cloud_mode,
     )
 
 
@@ -1731,6 +1790,18 @@ def _build_video_profile_registry(
 
 
 def _build_object_storage(settings: AppSettings) -> ObjectStoragePort:
+    """The process's object-storage port, with image variants wired in.
+
+    Every producer and deleter of image bytes receives this one instance,
+    so wrapping the adapter here — and only here — is what makes WebP
+    variant generation unskippable across all of them (plan D3). No call
+    site changes, and no knob: a deployment either has variants for its
+    images or falls back to originals per-request, both of which work.
+    """
+    return VariantAwareObjectStorage(_build_storage_adapter(settings))
+
+
+def _build_storage_adapter(settings: AppSettings) -> ObjectStoragePort:
     provider = settings.storage.provider
     if provider == "http":
         return HttpObjectStorage(
@@ -2401,6 +2472,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         series_repository=arc_series_repository,
         template_repository=arc_template_repository,
         character_repository=character_repository,
+        # GF6 — hosted tone policy (domain/services/story_tone_policy).
+        cloud_mode=app_settings.cloud.active,
     )
 
     operator_profile_service = OperatorProfileService(
@@ -2919,6 +2992,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # chat turns. Fail-soft end to end; an empty pool changes nothing.
         gacha_service=story_gacha,
         template_translator=arc_template_translator,
+        # OP1-A — the planner learns who the player is to this character
+        # (address terms, relationship, distance) so it can place them in
+        # each beat instead of leaving every beat player-less. Fail-soft:
+        # no confirmed seed renders the pre-OP1-A prompt.
+        relationship_seed_repository=relationship_seed_repository,
         execution_lease=studio_execution_lease,
     )
     # Both follow the live site-settings holder rather than the boot snapshot
@@ -3156,6 +3234,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             active_provider=active_llm_provider,
         ),
         action_billing=action_billing_service,
+        # VP4: stage the reference image so a vision model can fetch it by URL
+        # instead of receiving it inline; the object is deleted once the draft
+        # returns. Both are needed — without a public base URL the stored ref
+        # is app-relative and no provider could fetch it.
+        object_storage=object_storage,
+        public_base_url=app_settings.public_base_url,
     )
     character_personality_type_analyzer = LLMCharacterPersonalityTypeAnalyzer(
         provider=active_llm_provider,
@@ -3289,6 +3373,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         registry=model_registry,
         default_provider_id=app_settings.default_provider_id,
         active_provider=active_llm_provider,
+        # GF6 — hosted tone policy (domain/services/story_tone_policy).
+        cloud_mode=app_settings.cloud.active,
     )
     # Phase 2.7 — wizard backend. Stateless service, single shared
     # instance is fine. Routes through the per-feature LLM resolver
@@ -3297,6 +3383,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     arc_template_intake_service = ArcTemplateIntakeService(
         repository=arc_template_repository,
         provider=active_llm_provider,
+        cloud_mode=app_settings.cloud.active,
     )
     arc_completion_memory_writer = _build_arc_completion_memory_writer(
         active_provider=active_llm_provider,
@@ -3319,9 +3406,97 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         writer=LLMStoryBeatSceneWriter(
             provider=active_llm_provider,
             feature_key=FEATURE_ARC_SCENE_WRITE,
+            cloud_mode=app_settings.cloud.active,
         ),
         local_tz=local_tz,
         operator_profile_service=operator_profile_service,
+    )
+
+    # 起幕 (SC1) — the player-pulled scene runtime. The session row is the
+    # cross-replica state: the api replica that opens a scene is routinely
+    # not the one that serves its next turn or closes it on timeout, so it
+    # must never be a process attribute.
+    story_scene_session_repository: StorySceneSessionRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_story_scene_session_repository import (
+            SAStorySceneSessionRepository,
+        )
+        story_scene_session_repository = SAStorySceneSessionRepository(
+            db_session_factory,
+        )
+    else:
+        story_scene_session_repository = InMemoryStorySceneSessionRepository()
+    # SC1-C: the in-scene action chips. One writer instance serves both
+    # call sites — the opening (below) and every in-scene chat turn
+    # (``ChatService``) — so the two surfaces cannot drift on how a chip
+    # is written or which feature key routes it.
+    story_scene_chips_writer = LLMStorySceneChipsWriter(
+        provider=active_llm_provider,
+        feature_key=FEATURE_STORY_SCENE_CHIPS,
+    )
+    story_scene_service = StorySceneService(
+        sessions=story_scene_session_repository,
+        conversations=conversation_repository,
+        opener=LLMStorySceneOpener(
+            provider=active_llm_provider,
+            feature_key=FEATURE_STORY_SCENE_OPEN,
+            cloud_mode=app_settings.cloud.active,
+        ),
+        chips_writer=story_scene_chips_writer,
+        # §3.1 waterfall, in order: play the next beat of a running season,
+        # else force-open the next season and play its first beat, else an
+        # ad-hoc side story. Tuple order IS the waterfall order.
+        material_providers=(
+            PendingBeatSceneMaterialProvider(
+                story_arc_service=story_arc_service,
+            ),
+            ForcedSeasonSceneMaterialProvider(
+                story_arc_service=story_arc_service,
+            ),
+            SideStorySceneMaterialProvider(
+                memory_repository=memory_repository,
+                relationship_seed_repository=relationship_seed_repository,
+                conversation_repository=conversation_repository,
+                dialogue_summarizer=dialogue_summarizer,
+                # Dramatic-tier seeds are this layer's designated material
+                # source (STORY_SEED_ENRICHMENT_PLAN §1). An empty pool is
+                # the expected state until SE3 is imported, and degrades to
+                # relationship + memory rather than failing the scene.
+                gacha_service=story_gacha,
+                operator_profile_service=operator_profile_service,
+            ),
+        ),
+        story_arc_service=story_arc_service,
+        # Shares the chat turn's per-conversation mutex: an opening writes
+        # two messages into the same thread a chat turn writes into, and
+        # the two must not interleave.
+        turn_lease=ChatTurnLease.from_studio_lease(studio_execution_lease),
+        account_runtime_profile_resolver=account_runtime_profile_resolver,
+        operator_profile_service=operator_profile_service,
+        # SC3-B: per-tier daily ceiling on openings. The knob defaults to
+        # unlimited (None) so self-host never sees the guard fire.
+        quota_guard=StorySceneQuotaGuard(
+            sessions=story_scene_session_repository,
+            characters=character_repository,
+            profiles=account_runtime_profile_resolver,
+        ),
+        local_tz=local_tz,
+        # SC1-D: the shared wrap-up behind all three close routes (the
+        # in-turn verdict, 「結束場景」, and SC1-E's idle sweep). The canon
+        # collaborators are the *existing* ones — a realized beat has to
+        # land through the same chain a scheduled beat does, or a
+        # player-pulled scene would quietly write different history.
+        closer=LLMStorySceneCloser(
+            provider=active_llm_provider,
+            feature_key=FEATURE_STORY_SCENE_CLOSE,
+        ),
+        story_event_service=story_event_service,
+        memory_repository=memory_repository,
+        embedder=embedder,
+        # SC3-C: 起幕 is an action-priced entry point in cloud mode. Same
+        # null object as every other instrumented service, so self-host and
+        # token-billed tiers keep the exact path they had before.
+        action_billing=action_billing_service,
     )
 
     self_repetition_extractor = LLMSelfRepetitionExtractor(
@@ -3477,6 +3652,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # read the same published list the player is quoted from. ``None`` on
         # self-host, where the switches are not mounted at all.
         pricing=cloud_pricing_service,
+    )
+    # Read-only mirror of the same ceilings, for the "you have 2 of 3 slots
+    # left" hints. Built here because this is the first point at which both
+    # counters it needs exist (the usage ledger just above, the scene session
+    # repository further up); it writes nothing and gates nothing, so its
+    # position in the wiring order carries no other constraint.
+    player_runtime_limits_service = PlayerRuntimeLimitsService(
+        profiles=account_runtime_profile_resolver,
+        characters=character_repository,
+        usage_repository=account_runtime_usage_repository,
+        story_scene_sessions=story_scene_session_repository,
+        clock=clock,
     )
     turn_recorder: TurnRecorderPort = BackgroundTurnRecorder(turn_record_repository)
     usage_price_estimator = StaticPriceEstimator.from_json_file(
@@ -3911,6 +4098,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         tool_orchestrator=tool_orchestrator,
         story_event_service=story_event_service,
         story_arc_service=story_arc_service,
+        # 起幕 (SC1-C): a turn played inside a live scene gets the scene
+        # frame in its prompt, bumps the scene's idle clock, and comes
+        # back with action chips. Outside a scene neither is touched.
+        story_scene_sessions=story_scene_session_repository,
+        story_scene_chips_writer=story_scene_chips_writer,
+        # SC1-D: an in-scene turn also asks whether the scene just ended,
+        # and hands the wrap-up back on the same reply so the player does
+        # not have to reload to see the curtain come down.
+        story_scene_service=story_scene_service,
         proactive_attempt_repository=proactive_attempt_repository,
         feed_post_repository=feed_post_repository,
         journal_repository=turn_journal_repository,
@@ -4337,6 +4533,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ),
         subscription_access_guard=subscription_access_guard,
         visible_slot_port=visible_slot_port,
+        # SC1-E — a character inside a 起幕 scene does not also message the
+        # player from outside it (STORY_SCENE_PLAN §3.2). Pause only; the
+        # tick after the scene closes evaluates exactly as it did before.
+        story_scene_sessions=story_scene_session_repository,
     )
     # Phase 3 of SCENE_BEAT_PLAN — runs on every tick so an offline
     # user still sees beats land in memory by the time they come back.
@@ -4394,6 +4594,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ),
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
+        character_repository=character_repository,
         quota_overage=quota_overage_service,
     )
     feed_reaction_service = FeedReactionService(
@@ -4510,6 +4711,23 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             background_shadow_coordinator.owns_live_lease,
         )
 
+    # SC1-E — the idle 起幕 wrap-up. One instance serves both scheduling
+    # lines: the embedded tick executor calls it per character, and the
+    # distributed ``story_scene_timeout`` chain calls the same step. The
+    # window is the single configurable number in this feature
+    # (STORY_SCENE_PLAN §2 #5, 24h by default); everything downstream —
+    # the step, the chain's explicit due time, the unowned sweep — reads it
+    # from this one object rather than re-deriving it.
+    story_scene_timeout_closer = StorySceneTimeoutCloser(
+        sessions=story_scene_session_repository,
+        scenes=story_scene_service,
+        characters=character_repository,
+        idle_timeout_seconds=_env_int(
+            "YURALUME_STORY_SCENE_IDLE_TIMEOUT_SECONDS",
+            int(DEFAULT_STORY_SCENE_IDLE_TIMEOUT_SECONDS),
+        ),
+    )
+
     scheduler_metrics = SchedulerMetrics()
     proactive_scheduler = ProactiveScheduler(
         dispatcher=proactive_dispatcher,
@@ -4526,6 +4744,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         schedule_memorializer=schedule_memorializer,
         schedule_weather_drift=schedule_weather_drift_service,
         goal_review_service=daily_goal_review_service,
+        story_scene_timeout_closer=story_scene_timeout_closer,
         persona_dream_service=persona_dream_service,
         persona_dream_repository=persona_repository,
         account_runtime_profile_resolver=account_runtime_profile_resolver,
@@ -4694,6 +4913,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             operator_profile_repository=operator_profile_repository,
             deferral_check=_worker_deferral.check,
             beat_next_due_provider=beat_due_checker.next_due_at,
+            # An open scene's idle deadline is exact, so the chain jumps to
+            # it instead of rechecking hourly until the window has passed.
+            scene_timeout_due_provider=(
+                story_scene_timeout_closer.next_timeout_at
+            ),
             clock=clock,
         )
         # §13 social split handler: the pair lease (atomic two-character guard)
@@ -4964,6 +5188,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         world_event_repository=world_event_repository,
         operator_profile_service=operator_profile_service,
         subscription_access_guard=subscription_access_guard,
+        cloud_mode=app_settings.cloud.active,
     )
     if operator_persona_service is not None:
         operator_persona_projection_service = OperatorPersonaProjectionService(
@@ -5017,6 +5242,13 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             provider=active_llm_provider,
             feature_key=FEATURE_ARC_ADAPT,
         ),
+        # OP1-C — when the creator asks to be written into (or to watch)
+        # the story, the adaptation needs to know who they are to this
+        # cast: how each character addresses them, how close they stand.
+        # Never read under 「保持原樣」, where the player is not in the
+        # story at all. Fail-soft: no seed renders the mode block alone.
+        relationship_seed_repository=relationship_seed_repository,
+        operator_profile_service=operator_profile_service,
     )
     arc_series_continuation_draft_service = ArcSeriesContinuationDraftService(
         series_repository=arc_series_repository,
@@ -5027,6 +5259,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         adapter=LLMArcSeriesContinuationDraftAdapter(
             provider=active_llm_provider,
             feature_key=FEATURE_ARC_CONTINUATION_DRAFT,
+            # GF6 — hosted tone policy (domain/services/story_tone_policy).
+            cloud_mode=app_settings.cloud.active,
         ),
     )
 
@@ -5056,6 +5290,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             feature_key=FEATURE_CARD_TRANSLATE,
         ),
         arc_template_translator=arc_template_translator,
+        cloud_mode=app_settings.cloud.active,
     )
 
     # SillyTavern card front layer — converts a parsed ST V2/V3 card into
@@ -5070,12 +5305,26 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         ),
     )
 
-    # Character card marketplace (MVP) — indexes the bundled
-    # ``data/character_cards/*.lumecard`` packs and installs them through
-    # the same import path as a manual upload.
+    # Character card catalogue — the official cards from the Cloud catalog
+    # plus any local ``.lumecard`` packs, both installed through the same
+    # import path as a manual upload. Nothing here connects at boot: the
+    # catalog client is lazy, so a Cloud outage cannot delay startup, and an
+    # empty ``KOKORO_OFFICIAL_CARD_CATALOG_URL`` leaves the official source
+    # unwired entirely (self-host opt-out, plan §3.5).
+    official_card_source: OfficialCardPackSource | None = None
+    if app_settings.official_cards.enabled:
+        official_card_source = OfficialCardPackSource(
+            catalog=CachedOfficialCardCatalog(
+                client=OfficialCardCatalogClient(
+                    base_url=app_settings.official_cards.catalog_url,
+                ),
+            ),
+            import_service=character_card_import_service,
+        )
     character_card_pack_service = CharacterCardPackService(
         catalog=CharacterCardPackCatalog(),
         import_service=character_card_import_service,
+        official_cards=official_card_source,
     )
 
     scene_generator = _build_scene_generator(settings=app_settings)
@@ -5199,6 +5448,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         cloud_announcement_service=cloud_announcement_service,
         action_billing_service=action_billing_service,
         quota_overage_service=quota_overage_service,
+        player_runtime_limits_service=player_runtime_limits_service,
         player_locale_service=player_locale_service,
         geocoding_client=geocoding_client,
         external_chat_roster_service=external_chat_roster_service,
@@ -5212,6 +5462,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         story_beat_scene_service=story_beat_scene_service,
         story_arc_repository=story_arc_repository,
         story_arc_service=story_arc_service,
+        story_scene_service=story_scene_service,
+        story_scene_session_repository=story_scene_session_repository,
         arc_template_repository=arc_template_repository,
         arc_template_translator=arc_template_translator,
         arc_template_intake_service=arc_template_intake_service,

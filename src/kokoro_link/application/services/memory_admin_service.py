@@ -11,15 +11,24 @@ accidentally regress retrieval quality in the chat loop.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from kokoro_link.contracts.embedder import EmbedderPort
-from kokoro_link.contracts.memory import MemoryRepositoryPort, ScoredMemory
+from kokoro_link.contracts.memory import (
+    MemoryRepositoryPort,
+    MemorySummary,
+    ScoredMemory,
+)
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.infrastructure.memory.ranker import HybridWeights, rank_hybrid
 
 _LOGGER = logging.getLogger(__name__)
 _SEARCH_POOL_SIZE = 40
+
+DEFAULT_PAGE_LIMIT = 50
+"""Rows per browse page. Shared with the route so the HTTP default and
+the service default cannot drift apart."""
 
 
 class MemoryAdminService:
@@ -38,9 +47,31 @@ class MemoryAdminService:
         *,
         kind: str | None = None,
     ) -> list[MemoryItem]:
+        """Legacy unpaginated browse contract for pre-IV8 clients."""
         kinds = [MemoryKind.from_string(kind)] if kind else None
         return await self._memory_repository.list_all_for_character(
             character_id, kinds=kinds,
+        )
+
+    async def list_page_for_character(
+        self,
+        character_id: str,
+        *,
+        kind: str | None = None,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        before: datetime | None = None,
+    ) -> list[MemorySummary]:
+        """One keyset page of the browse projection.
+
+        Replaced an unbounded ``list_for_character``: the browser is the
+        only caller, and it never needed the whole table — on a
+        long-running character that was 1567 rows and ~2 s per open,
+        almost all of it spent moving vector columns the response does
+        not contain (plan §1.6).
+        """
+        kinds = [MemoryKind.from_string(kind)] if kind else None
+        return await self._memory_repository.list_page_for_character(
+            character_id, kinds=kinds, limit=limit, before=before,
         )
 
     async def get(self, item_id: str) -> MemoryItem | None:

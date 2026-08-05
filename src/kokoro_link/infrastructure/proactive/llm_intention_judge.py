@@ -39,6 +39,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.persona_curiosity import (
     render_persona_curiosity_plan_lines,
 )
+from kokoro_link.infrastructure.prompt.proactive_beat_invitation import (
+    render_awaiting_player_judge_lines,
+)
 from kokoro_link.infrastructure.prompt.proactive_streak import (
     render_unanswered_streak_lines,
 )
@@ -323,13 +326,29 @@ def _optional_story_events_block(context: ProactiveContext) -> str:
 
 
 def _optional_active_arc_block(context: ProactiveContext) -> str:
+    """Current arc, plus any scene of it that is waiting for the player.
+
+    OP3 rides the existing arc slot rather than adding a template slot:
+    the waiting beat *is* arc context, and reusing the slot keeps the
+    baseline prompt file — and therefore the prompt-pack hash — untouched.
+    When nothing is waiting (the ordinary case, and the only case for
+    every beat written before OP0) this renders exactly as before.
+    """
     arc = context.active_arc
-    if arc is None:
+    awaiting = context.beat_awaiting_player
+    if arc is None and awaiting is None:
         return ""
-    return _section(
-        "目前故事線：",
-        [f"- {arc.title}：{arc.premise[:260]}"],
-    )
+    body: list[str] = []
+    if arc is not None:
+        body.append(f"- {arc.title}：{arc.premise[:260]}")
+    if awaiting is not None:
+        body.extend(
+            render_awaiting_player_judge_lines(
+                awaiting,
+                today=to_timezone(context.now, context.local_tz).date(),
+            ),
+        )
+    return _section("目前故事線：", body)
 
 
 _PACE_PHRASES: dict[str, str] = {

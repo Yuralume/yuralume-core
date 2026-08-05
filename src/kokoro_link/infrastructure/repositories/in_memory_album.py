@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 
 from kokoro_link.contracts.album import AlbumRepositoryPort
 from kokoro_link.domain.entities.album_item import AlbumItem
@@ -28,10 +29,13 @@ class InMemoryAlbumRepository(AlbumRepositoryPort):
         *,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[AlbumItem]:
         items = list(self._by_character.get(character_id, []))
         # Newest first — caller expects this ordering for the grid UI
         items.sort(key=lambda i: i.created_at, reverse=True)
+        if before is not None:
+            items = [i for i in items if i.created_at < before]
         if offset:
             items = items[offset:]
         if limit is not None:

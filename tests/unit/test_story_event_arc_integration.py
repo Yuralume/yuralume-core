@@ -8,6 +8,15 @@ When the character has an active arc with a beat due today, the daily
 3. Keep gacha from hijacking the due arc beat's daily slot.
 
 When no arc beat is due, the gacha path runs as before.
+
+**Unattended callers** (proactive tick, character warm-up) pass
+``unattended=True``. Everything above still holds for them, with one
+exception: a beat whose ``operator_position`` is ``central`` is a scene
+about the player, so it is left waiting instead of being attempted and
+— past the recheck threshold — written into canon while the player is
+away (ARC_PLAYER_POSITION_PLAN §2 #5, red line 4). The attended chat
+path is unchanged for every position, which is what the paired
+characterization tests below pin.
 """
 
 from __future__ import annotations
@@ -31,7 +40,11 @@ from kokoro_link.contracts.story_arc import (
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import (
+    BEAT_PENDING,
     BEAT_REALIZED,
+    OPERATOR_POSITION_ABSENT,
+    OPERATOR_POSITION_CENTRAL,
+    OPERATOR_POSITION_PRESENT,
     StoryArc,
     StoryArcBeat,
     TENSION_CLIMAX,
@@ -69,9 +82,16 @@ class _RecordingExpander(StoryEventExpanderPort):
 class _FixedBeatPlanner(StoryArcPlannerPort):
     """Planner that always produces exactly one beat on today's date."""
 
-    def __init__(self, today: date, *, tension: str = TENSION_SETUP) -> None:
+    def __init__(
+        self,
+        today: date,
+        *,
+        tension: str = TENSION_SETUP,
+        operator_position: str | None = None,
+    ) -> None:
         self._today = today
         self._tension = tension
+        self._operator_position = operator_position
 
     async def plan_arc(
         self,
@@ -96,6 +116,7 @@ class _FixedBeatPlanner(StoryArcPlannerPort):
             scheduled_date=self._today,
             title="today beat", summary="今天要發生的事",
             tension=self._tension,
+            operator_position=self._operator_position,
         )
         return arc.with_beats([beat])
 
@@ -140,6 +161,7 @@ def _services(
     tension: str = TENSION_SETUP,
     rechecker: StoryBeatRecheckerPort | None = None,
     completion_writer: ArcCompletionMemoryWriterPort | None = None,
+    operator_position: str | None = None,
 ):
     seed_repo = InMemoryStorySeedRepository()
     event_repo = InMemoryStoryEventRepository()
@@ -147,7 +169,9 @@ def _services(
     arc_repo = InMemoryStoryArcRepository()
     arc_service = StoryArcService(
         repository=arc_repo,
-        planner=_FixedBeatPlanner(today, tension=tension),
+        planner=_FixedBeatPlanner(
+            today, tension=tension, operator_position=operator_position,
+        ),
         beat_rechecker=rechecker,
     )
     expander = _RecordingExpander()
@@ -375,3 +399,269 @@ async def test_no_due_beat_falls_back_to_gacha() -> None:
     event = report.events[0]
     assert event.seed_id == seed.id
     assert event.arc_beat_id is None
+
+
+# --- OP2-B follow-up: unattended callers must not play a central beat ---
+#
+# ``ensure_today`` has two kinds of caller. The chat turn is attended —
+# a player is in the room and the due beat is about to become today's
+# scene directive. The proactive tick and the character warm-up are not:
+# nothing they do here reaches a player. Before ``unattended``, both used
+# the same branch, so background ticks alone drove a ``central`` beat
+# past the recheck threshold and the rechecker performed it into canon
+# unseen. These tests pin both halves: central changes on the background
+# path only, and nothing changes on the attended path at all.
+
+
+def _realizing_rechecker() -> _FixedBeatRechecker:
+    return _FixedBeatRechecker(
+        StoryBeatRecheckDecision(
+            action="mark_realized",
+            reason="互動已完成 beat",
+            narrative="我終於把今天要說的話說出口了。",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unattended_ensure_today_leaves_central_beat_waiting() -> None:
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, arc_repo, expander, event_repo, seed_repo, _ = (
+        _services(today, operator_position=OPERATOR_POSITION_CENTRAL)
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+    # A stocked gacha pool: passing over the beat must not fall through
+    # to a diary entry either. The beat still owns the day — see
+    # ``test_player_arriving_after_unattended_ticks_still_gets_the_beat``
+    # for what a roll here would cost.
+    await seed_repo.add(StorySeed.create(seed_text="午後的慢跑"))
+
+    report = await event_service.ensure_today(
+        character, now=now, unattended=True,
+    )
+
+    assert report.newly_rolled == 0
+    assert report.events == ()
+    assert await event_repo.get_for_day(character.id, today.isoformat()) == []
+    assert expander.calls == []
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    waiting = updated.find_beat(beat.id)
+    assert waiting is not None
+    assert waiting.status == BEAT_PENDING
+    assert waiting.play_attempt_count == 0
+    assert waiting.last_play_attempt_source is None
+    assert waiting.realized_event_id is None
+
+
+@pytest.mark.asyncio
+async def test_unattended_ticks_never_realize_a_central_beat() -> None:
+    """Red line 4: repeat background ticks must not reach the rechecker.
+
+    The threshold is small, so before the fix a couple of ticks were
+    enough — this is the exact path that performed the player's own
+    scene while they were away.
+    """
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    rechecker = _realizing_rechecker()
+    event_service, arc_service, arc_repo, _, event_repo, _, memory_repo = (
+        _services(
+            today,
+            rechecker=rechecker,
+            operator_position=OPERATOR_POSITION_CENTRAL,
+        )
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    for _ in range(5):
+        report = await event_service.ensure_today(
+            character, now=now, unattended=True,
+        )
+        assert report.newly_rolled == 0
+
+    assert rechecker.contexts == []
+    assert await event_repo.get_for_day(character.id, today.isoformat()) == []
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    still_waiting = updated.find_beat(beat.id)
+    assert still_waiting is not None
+    assert still_waiting.status == BEAT_PENDING
+    assert still_waiting.play_attempt_count == 0
+    assert await memory_repo.query(character.id) == []
+
+
+@pytest.mark.asyncio
+async def test_player_arriving_after_unattended_ticks_still_gets_the_beat() -> None:
+    """Passing over is a pause, not a consumption.
+
+    Also pins *why* passing over holds the day's slot rather than
+    falling through to gacha: the pool below is stocked, so a fall-
+    through would roll a diary entry, and ``ensure_today`` returns at
+    the top once the day is full — the attended call would then never
+    reach the arc branch, never record its attempt, and the beat could
+    never reach the rechecker even with the player present. The
+    attempt count below is 1 exactly because the ticks left the day
+    open.
+    """
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, arc_repo, _, _, seed_repo, _ = _services(
+        today, operator_position=OPERATOR_POSITION_CENTRAL,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+    await seed_repo.add(StorySeed.create(seed_text="午後的慢跑"))
+
+    for _ in range(3):
+        await event_service.ensure_today(character, now=now, unattended=True)
+    await event_service.ensure_today(character, now=now)
+
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    staged = updated.find_beat(beat.id)
+    assert staged is not None
+    assert staged.play_attempt_count == 1
+    assert staged.last_play_attempt_source == "chat_scene_directive"
+
+
+@pytest.mark.asyncio
+async def test_attended_ensure_today_still_stages_a_central_beat() -> None:
+    """Characterization: the chat path is untouched by this fix.
+
+    Identical assertions to
+    ``test_arc_beat_is_staged_not_materialized_on_due_date``, with the
+    beat marked ``central`` — the player *is* in the room, so this is
+    exactly the surface the beat was waiting for.
+    """
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, arc_repo, expander, event_repo, *_ = _services(
+        today, operator_position=OPERATOR_POSITION_CENTRAL,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    report = await event_service.ensure_today(character, now=now)
+
+    assert report.newly_rolled == 0
+    assert report.events == ()
+    assert await event_repo.get_for_day(character.id, today.isoformat()) == []
+    assert expander.calls == []
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    staged = updated.find_beat(beat.id)
+    assert staged is not None
+    assert staged.status == BEAT_PENDING
+    assert staged.play_attempt_count == 1
+    assert staged.last_play_attempt_source == "chat_scene_directive"
+
+
+@pytest.mark.asyncio
+async def test_attended_recheck_can_still_realize_a_central_beat() -> None:
+    """The rechecker keeps its say on the attended path.
+
+    ``central`` restricts *who may play the beat*, not what the
+    rechecker may conclude once a player was actually given it and did
+    not take it.
+    """
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    rechecker = _realizing_rechecker()
+    event_service, arc_service, arc_repo, _, event_repo, _, _ = _services(
+        today,
+        rechecker=rechecker,
+        operator_position=OPERATOR_POSITION_CENTRAL,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    await event_service.ensure_today(character, now=now)
+    second = await event_service.ensure_today(character, now=now)
+
+    assert second.newly_rolled == 1
+    assert len(rechecker.contexts) == 1
+    events = await event_repo.get_for_day(character.id, today.isoformat())
+    assert [event.arc_beat_id for event in events] == [beat.id]
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    realized = updated.find_beat(beat.id)
+    assert realized is not None
+    assert realized.status == BEAT_REALIZED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "position",
+    [None, OPERATOR_POSITION_ABSENT, OPERATOR_POSITION_PRESENT],
+)
+async def test_unattended_ensure_today_still_stages_other_positions(
+    position: str | None,
+) -> None:
+    """Only ``central`` is passed over — the other three are unchanged.
+
+    ``None`` is in here on purpose: every beat written before OP0 reads
+    back as unjudged, and treating "nobody has said" as "the player is
+    essential" would freeze every existing arc's background progress.
+    """
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, arc_repo, _, _, _, _ = _services(
+        today, operator_position=position,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    report = await event_service.ensure_today(
+        character, now=now, unattended=True,
+    )
+
+    assert report.newly_rolled == 0
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    staged = updated.find_beat(beat.id)
+    assert staged is not None
+    assert staged.play_attempt_count == 1
+    assert staged.last_play_attempt_source == "chat_scene_directive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "position",
+    [None, OPERATOR_POSITION_ABSENT, OPERATOR_POSITION_PRESENT],
+)
+async def test_unattended_recheck_still_realizes_other_positions(
+    position: str | None,
+) -> None:
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    rechecker = _realizing_rechecker()
+    event_service, arc_service, arc_repo, _, event_repo, _, _ = _services(
+        today, rechecker=rechecker, operator_position=position,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    await event_service.ensure_today(character, now=now, unattended=True)
+    second = await event_service.ensure_today(
+        character, now=now, unattended=True,
+    )
+
+    assert second.newly_rolled == 1
+    events = await event_repo.get_for_day(character.id, today.isoformat())
+    assert [event.arc_beat_id for event in events] == [beat.id]
+    updated = await arc_repo.get(arc.id)
+    assert updated is not None
+    realized = updated.find_beat(beat.id)
+    assert realized is not None
+    assert realized.status == BEAT_REALIZED

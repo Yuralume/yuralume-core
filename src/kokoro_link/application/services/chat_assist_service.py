@@ -25,6 +25,7 @@ from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.entities.story_arc import StoryArc
 from kokoro_link.domain.entities.world_event import WorldEvent
+from kokoro_link.domain.services.story_tone_policy import resolve_prompt_tone
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_FRONTIER,
     sanitize_messages_for_tolerance,
@@ -76,6 +77,7 @@ class ChatAssistService:
         world_event_repository: WorldEventRepositoryPort | None = None,
         operator_profile_service: "OperatorProfileService | None" = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
+        cloud_mode: bool = False,
     ) -> None:
         self._character_service = character_service
         self._active_llm_provider = active_llm_provider
@@ -85,6 +87,10 @@ class ChatAssistService:
         self._world_event_repository = world_event_repository
         self._operator_profile_service = operator_profile_service
         self._subscription_access_guard = subscription_access_guard
+        # GF6 — the arc's tone label rides into this prompt too, so the
+        # hosted tone policy applies here as well. Default ``False``
+        # keeps self-host prompts byte-identical.
+        self._cloud_mode = cloud_mode
 
     async def suggest(
         self,
@@ -181,7 +187,7 @@ class ChatAssistService:
             *(recent_dialogue or ["- 尚無近期對話"]),
             "",
             "劇情上下文：",
-            *_story_lines(story_arc, today=today),
+            *_story_lines(story_arc, today=today, cloud_mode=self._cloud_mode),
             "",
             "RSS / 世界事件上下文：",
             *(_world_event_lines(world_events) or ["- 沒有可用的近期世界事件"]),
@@ -322,13 +328,18 @@ def _activity_line(activity: ScheduleActivity, *, local_tz: tzinfo) -> str:
     return f"{start}-{end} {activity.description}{location}{cue_text}"
 
 
-def _story_lines(arc: StoryArc | None, *, today) -> list[str]:
+def _story_lines(
+    arc: StoryArc | None, *, today, cloud_mode: bool = False,
+) -> list[str]:
     if arc is None:
         return ["- 尚無進行中的劇情弧"]
+    tone = resolve_prompt_tone(
+        arc.tone, cloud_mode=cloud_mode, context="chat assist story lines",
+    )
     lines = [
         f"- 進行中：{arc.title}",
         f"- 前提：{_trim(arc.premise, 260)}",
-        f"- 主題/調性：{arc.theme} / {arc.tone}",
+        f"- 主題/調性：{arc.theme} / {tone}",
     ]
     beats = arc.forward_beats(after=today, limit=3, include_today=True)
     if beats:

@@ -12,6 +12,18 @@ duration_days: 21
 binding:
   world_frames: [school, modern]
   required_traits: []
+
+# --- operator_position / operator_note labeling rule (OP0-B) ----------------
+# Same rule as `quiet_breakup.yaml`: a note describes **the character's**
+# motive or the line she has not said yet, never something the player has
+# already said, decided or done. The note goes verbatim into the scene
+# opener/closer prompt *before* the beat is played, so "你隨口問要不要一起去，
+# 她笑著點頭答應了" would hand the model a player line that never happened —
+# and the beat, once played, can be canonised as history.
+# `summary` obeys the same rule. This arc originally cast the player as an
+# NPC (`青梅竹馬`) and let that NPC talk; with the cast recast into
+# `operator_position`, every one of those lines had to move back to the
+# character's side of the table.
 beats:
   - sequence: 0
     day_offset: 0
@@ -25,19 +37,25 @@ beats:
     scene_characters: []
     dramatic_question: 今年的夏祭跟去年會不一樣嗎？
     required: true
+    operator_position: absent
 
   - sequence: 1
     day_offset: 2
     title: 傍晚的閒聊
     summary: |
-      回家路上跟朋友隨口提了一句「要不要一起去」。
-      朋友笑了一下說好，沒有特別認真，但答應就答應了。
+      回家路上，她試著把那句「要不要一起去」講得像隨口一問。
+      話說出口之後，她才發現自己其實在等一個答案。
     tension: setup
     scene_type: encounter
     location: 校門口
-    scene_characters: [青梅竹馬]
+    scene_characters: []
     dramatic_question: 這算是一個約定嗎？
     required: true
+    # "青梅竹馬" is the player, not an NPC — same OP0-B recast as
+    # quiet_breakup's "伴侶": this whole arc's central relationship is
+    # with the operator, so the cast label moves to the structured slot.
+    operator_position: central
+    operator_note: 她把邀約講得像隨口一問，正在等你的回答
 
   - sequence: 2
     day_offset: 4
@@ -51,6 +69,7 @@ beats:
     scene_characters: []
     dramatic_question: 自己也算被那股氣氛感染了嗎？
     required: false
+    operator_position: absent
 
   - sequence: 3
     day_offset: 6
@@ -64,33 +83,38 @@ beats:
     scene_characters: []
     dramatic_question: 一年的時間真的這麼短嗎？
     required: false
+    operator_position: absent
 
   - sequence: 4
     day_offset: 8
     title: 體育館後的長椅
     summary: |
-      午休時跟朋友坐在體育館後的長椅吃飯。
-      朋友突然問：「這是我們最後一次一起去吧？」
-      話講完後兩個人都安靜了一陣子。
+      午休時她抱著便當坐到體育館後的長椅上。
+      「這是我們最後一次一起去吧」——這句話在她心裡卡了一整個上午。
+      她想問出口，又怕問了就成真。
     tension: rising
     scene_type: revelation
     location: 體育館後
-    scene_characters: [青梅竹馬]
+    scene_characters: []
     dramatic_question: 「最後」這兩個字她準備好了嗎？
     required: true
+    operator_position: central
+    operator_note: 她想問你「這是不是我們最後一次一起去」，又怕先說出口的人是自己
 
   - sequence: 5
     day_offset: 11
     title: 攤位地圖
     summary: |
-      朋友傳了夏祭官方的攤位地圖過來。
-      兩個人開始用訊息劃路線：撈金魚、章魚燒、然後一定要去看煙火。
+      她把夏祭官方的攤位地圖找了出來，想跟你排一條路線。
+      撈金魚、章魚燒、然後一定要去看煙火——真正想說的那句話卻排不進去。
     tension: rising
     scene_type: encounter
     location: 自己的房間
-    scene_characters: [青梅竹馬]
+    scene_characters: []
     dramatic_question: 這份計畫之外還有什麼想說的話嗎？
     required: true
+    operator_position: central
+    operator_note: 她想把路線排給你看，計畫之外那句話還沒排進去
 
   - sequence: 6
     day_offset: 13
@@ -104,6 +128,7 @@ beats:
     scene_characters: []
     dramatic_question: 她在害怕什麼具體的東西嗎？
     required: false
+    operator_position: absent
 
   - sequence: 7
     day_offset: 15
@@ -117,45 +142,52 @@ beats:
     scene_characters: [母親]
     dramatic_question: 她想要怎樣被看見？
     required: false
+    operator_position: absent
 
   - sequence: 8
     day_offset: 17
     title: 前一天的訊息
     summary: |
-      晚上躺在床上看朋友傳來的最後一則訊息：「明天見」。
-      回了三個字花了五分鐘想。
+      晚上躺在床上，手機停在跟你的對話上。
+      她想傳的不只是「明天見」，三個字打了又刪，刪了又打。
     tension: rising
     scene_type: revelation
     location: 自己的房間
-    scene_characters: [青梅竹馬]
-    dramatic_question: 她想對朋友說什麼？
+    scene_characters: []
+    dramatic_question: 她想對你說什麼？
     required: true
+    operator_position: central
+    operator_note: 她想在睡前傳一句話給你，打了又刪，只差按下送出
 
   - sequence: 9
     day_offset: 18
     title: 入口的鳥居
     summary: |
       傍晚六點半，鳥居前人潮已經密密的。
-      朋友從遠遠的地方看見她，揮手的速度比平常快一點。
+      她踮著腳在人群裡找你，心跳比自己預期的快一點。
     tension: climax
     scene_type: encounter
     location: 神社入口的鳥居
-    scene_characters: [青梅竹馬]
+    scene_characters: []
     dramatic_question: 兩個人的眼神會說出什麼？
     required: true
+    operator_position: central
+    operator_note: 她在人群裡先找到了你，正想著要用什麼表情走過去
 
   - sequence: 10
     day_offset: 18
     title: 煙火開始的時候
     summary: |
-      第一發煙火炸開時，所有人都抬頭。
-      朋友的側臉在亮光裡比她想像中更陌生一點，又更熟悉一點。
+      第一發煙火炸開時，四周的人都抬起了頭。
+      她想看的其實不是煙火——是亮光裡那張比想像中更陌生、又更熟悉的側臉。
     tension: climax
     scene_type: revelation
     location: 神社後山的觀景台
-    scene_characters: [青梅竹馬]
+    scene_characters: []
     dramatic_question: 這個瞬間值得說出口嗎？
     required: true
+    operator_position: central
+    operator_note: 煙火炸開的瞬間，她偷偷看向你的側臉
 
   - sequence: 11
     day_offset: 21
@@ -169,3 +201,4 @@ beats:
     scene_characters: []
     dramatic_question: 這個夏天已經結束了嗎？
     required: true
+    operator_position: absent

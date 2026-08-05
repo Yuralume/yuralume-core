@@ -378,3 +378,41 @@ def test_dump_omits_nothing_and_default_language_round_trips_too() -> None:
     reloaded = load_arc_template_from_yaml(yaml_text, fallback_id=template.id)
 
     assert reloaded.language == "zh-TW"
+
+
+# ---------- OP0-B: player-position pair round-trips through .lumecard YAML
+
+
+def test_dump_and_load_arc_template_preserves_the_player_position_pair() -> None:
+    """``arc_template_to_mapping`` has to actually emit
+    ``operator_position`` / ``operator_note`` — the import side
+    (``build_arc_template_from_mapping``) has read both keys since
+    OP0-A landed them. Omitting them on the export side would silently
+    drop a character card author's player-position choice on every
+    export/import round trip without failing a single existing test."""
+    template = _sample_template()
+    beat0 = replace(
+        template.beats[0],
+        operator_position="central",
+        operator_note="她要向你坦白",
+    )
+    template = template.with_beats((beat0, template.beats[1]))
+
+    yaml_text = dump_arc_template_to_yaml(template)
+    reloaded = load_arc_template_from_yaml(yaml_text, fallback_id=template.id)
+
+    assert reloaded.beats[0].operator_position == "central"
+    assert reloaded.beats[0].operator_note == "她要向你坦白"
+    # The untouched second beat stays unjudged, not accidentally
+    # inherited from the first.
+    assert reloaded.beats[1].operator_position is None
+
+
+def test_dump_and_load_keeps_unjudged_beats_unjudged() -> None:
+    template = _sample_template()
+
+    yaml_text = dump_arc_template_to_yaml(template)
+    reloaded = load_arc_template_from_yaml(yaml_text, fallback_id=template.id)
+
+    assert all(b.operator_position is None for b in reloaded.beats)
+    assert all(b.operator_note is None for b in reloaded.beats)

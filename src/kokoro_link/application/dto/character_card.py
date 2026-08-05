@@ -354,6 +354,27 @@ class CharacterCardPreview(BaseModel):
     bundled_arc_series_member_count: int = 0
     stage_image_count: int = 0
     image_urls: list[str] = Field(default_factory=list)
+    source: str = "local"
+    """Where this card comes from: ``"local"`` for a bundled / uploaded
+    ``.lumecard`` this deployment holds, ``"cloud"`` for an official card
+    read from the Yuralume Cloud catalog.
+
+    The distinction is not cosmetic. A cloud entry is projected from the
+    catalog documents, which carry prose and images but **no structural
+    settings** — disposition bands, cadence numbers, world frame, bundled arc
+    counts stay at their defaults here because the catalog does not publish
+    them. A renderer must not present those defaults as facts about the card;
+    they belong to the ``.lumecard`` and only become real on install."""
+
+    localized: bool = False
+    """Whether this text is already in the viewer's own language.
+
+    Only the Cloud catalog can answer that (it resolved the locale chain and
+    said so). A local pack never claims it — which keeps the translate toggle
+    exactly where it has always been for local cards, and lets it disappear
+    for an official card that is already published in the player's
+    language."""
+
     source_format: str = "lumecard"
     """Which upload format this preview came from — ``"lumecard"`` for the
     native path (and bundled packs) or ``"sillytavern"`` when it was

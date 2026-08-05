@@ -55,6 +55,13 @@ class _RecordingArcTranslator:
                 tension=b.tension, scene_type=b.scene_type,
                 location=b.location, scene_characters=list(b.scene_characters),
                 dramatic_question=b.dramatic_question, required=b.required,
+                # Mirrors the real translator's contract (OP0-B):
+                # operator_position is structural and passes through
+                # untouched; operator_note is prose and gets "translated".
+                operator_position=b.operator_position,
+                operator_note=(
+                    f"EN::{b.operator_note}" if b.operator_note else None
+                ),
             )
             for b in template.beats
         ]
@@ -77,6 +84,8 @@ def _sample_template() -> ArcTemplate:
             ArcTemplateBeat.create(
                 sequence=0, day_offset=0, title="傳單",
                 summary="她撿到一張試鏡傳單。", tension="setup",
+                operator_position="central",
+                operator_note="她要向你坦白",
             ),
         ],
     )
@@ -145,6 +154,11 @@ async def test_translate_true_localizes_bundled_template() -> None:
     assert landed.title == "EN::咖啡廳偶像試鏡"
     assert landed.beats[0].title == "EN::傳單"
     assert landed.language == "en-US"
+    # OP0-B: the cross-language import path must carry the
+    # player-position pair through the translator hook — structural
+    # field untouched, prose field actually translated.
+    assert landed.beats[0].operator_position == "central"
+    assert landed.beats[0].operator_note == "EN::她要向你坦白"
 
 
 @pytest.mark.asyncio
@@ -161,6 +175,8 @@ async def test_translate_false_leaves_bundled_template() -> None:
     )
     assert landed is not None
     assert landed.title == "咖啡廳偶像試鏡"
+    assert landed.beats[0].operator_position == "central"
+    assert landed.beats[0].operator_note == "她要向你坦白"
 
 
 @pytest.mark.asyncio
@@ -179,3 +195,5 @@ async def test_translator_failure_is_per_template_failsoft() -> None:
     )
     assert landed is not None
     assert landed.title == "咖啡廳偶像試鏡"
+    assert landed.beats[0].operator_position == "central"
+    assert landed.beats[0].operator_note == "她要向你坦白"

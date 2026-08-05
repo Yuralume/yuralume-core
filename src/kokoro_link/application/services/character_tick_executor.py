@@ -42,6 +42,21 @@ def _slot_for(now: datetime) -> str:
     return str(int(now.timestamp()) // _SLOT_BUCKET_SECONDS)
 
 
+def _accepts_keyword(func: object, keyword: str) -> bool:
+    """Does ``func`` accept ``keyword`` or arbitrary keyword args?
+
+    Optional tick context is threaded only into collaborators that declare it,
+    preserving lean adapters and test doubles that predate that context.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if keyword in params:
+        return True
+    return any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+
 def _accepts_logical_slot(func: object) -> bool:
     """Does ``func`` take a ``logical_slot`` keyword?
 
@@ -50,13 +65,8 @@ def _accepts_logical_slot(func: object) -> bool:
     behaviour-preserving seam over collaborators — including lean test doubles
     — that predate the slot: they are called with the exact same signature as
     before, so no per-conversion parity is disturbed."""
-    try:
-        params = inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
-    if "logical_slot" in params:
-        return True
-    return any(p.kind == p.VAR_KEYWORD for p in params.values())
+    return _accepts_keyword(func, "logical_slot")
+
 
 #: A hook the caller supplies so per-step wall-clock time accumulates into the
 #: scheduler's :class:`SchedulerMetrics` under a fixed step name. It awaits the
@@ -113,7 +123,8 @@ class CharacterTickExecutor:
     """Runs steps (b)-(h) of the tick for one character.
 
     Steps (in order): rest recovery, beat-due scan, schedule ensure,
-    memorialize, feed compose (gated), feed comment reply, proactive dispatch.
+    memorialize, goal review, idle story-scene wrap-up, feed compose (gated),
+    feed comment reply, proactive dispatch.
     The subscription recheck (step a) stays with the caller's pre-loop filter;
     :meth:`subscription_allows` exposes the same guard for a single character so
     the distributed worker can reuse it without reimplementing the fail-soft.
@@ -129,6 +140,7 @@ class CharacterTickExecutor:
         schedule_memorializer=None,
         schedule_weather_drift=None,
         goal_review_service=None,
+        story_scene_timeout_closer=None,
         feed_composer=None,
         feed_comment_reply=None,
         dispatcher,
@@ -140,6 +152,7 @@ class CharacterTickExecutor:
         self._schedule_memorializer = schedule_memorializer
         self._schedule_weather_drift = schedule_weather_drift
         self._goal_review_service = goal_review_service
+        self._story_scene_timeout_closer = story_scene_timeout_closer
         self._feed_composer = feed_composer
         self._feed_comment_reply = feed_comment_reply
         self._dispatcher = dispatcher
@@ -151,6 +164,16 @@ class CharacterTickExecutor:
         self._feed_reply_accepts_slot = (
             feed_comment_reply is not None
             and _accepts_logical_slot(getattr(feed_comment_reply, "tick", None))
+        )
+        self._feed_compose_accepts_now = (
+            feed_composer is not None
+            and _accepts_keyword(getattr(feed_composer, "tick", None), "now")
+        )
+        self._feed_retry_accepts_now = (
+            feed_composer is not None
+            and _accepts_keyword(
+                getattr(feed_composer, "needs_daily_floor_retry", None), "now",
+            )
         )
 
     async def run(
@@ -229,11 +252,27 @@ class CharacterTickExecutor:
             return
         if self._goal_review_service is not None:
             await timer("goal_review", self._run_goal_review(character, now=now))
+        # (e3) Idle 起幕 scene wrap-up (SC1-E). The distributed topology runs
+        # this as its own ``story_scene_timeout`` chain; the embedded
+        # scheduler never reads that registry, so the step is ALSO hung here
+        # — otherwise a self-host player who walked away mid-scene would
+        # stay in it forever. Both lines call the same closer, and the close
+        # is a compare-and-set, so a deployment that somehow ran both would
+        # still produce exactly one wrap-up. Placed before the visible feed /
+        # proactive steps so a scene closed this tick immediately un-pauses
+        # the character's proactive delivery.
+        if self._story_scene_timeout_closer is not None:
+            await timer(
+                "story_scene_timeout",
+                self._run_scene_timeout(character, now=now),
+            )
         # (f) Feed compose — the ONLY per-character step gated by the tick gate.
         if _aborted():
             return
         if await gate.allows(character, BackgroundActivityClass.FEED_COMPOSE):
-            await timer("feed_compose", self._run_feed_compose(character))
+            await timer(
+                "feed_compose", self._run_feed_compose(character, now=now),
+            )
         # (g) Feed comment reply — NOT gated (LumeGram surface is not push-driven).
         if _aborted():
             return
@@ -381,18 +420,63 @@ class CharacterTickExecutor:
                 character.id,
             )
 
-    async def _run_feed_compose(self, character: Character) -> None:
-        """Best-effort feed-wall publish for one character. The composer's own
-        gates decide whether anything happens; failure degrades silently."""
-        if self._feed_composer is None:
+    async def _run_scene_timeout(
+        self, character: Character, *, now: datetime,
+    ) -> None:
+        """Best-effort idle wrap-up of this character's live 起幕 scene.
+
+        The closer already swallows its own failures (a scene left open is
+        retried next pass, which costs one cadence); this wrapper is the
+        same belt-and-braces every other step carries so a future change
+        inside the closer cannot take the rest of the tick down."""
+        if self._story_scene_timeout_closer is None:
             return
         try:
-            await self._feed_composer.tick(character)
+            await self._story_scene_timeout_closer.close_if_idle(
+                character, now=now,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: story scene timeout crashed character=%s",
+                character.id,
+            )
+
+    async def _run_feed_compose(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> bool:
+        """Best-effort feed-wall publish for one character.
+
+        Returns whether the character still needs its first post of the local
+        civil day so the distributed chain can retry at the unscaled base
+        cadence. Embedded callers ignore the result.
+        """
+        if self._feed_composer is None:
+            return False
+        try:
+            if self._feed_compose_accepts_now:
+                await self._feed_composer.tick(character, now=now)
+            else:
+                await self._feed_composer.tick(character)
         except Exception:
             _LOGGER.exception(
                 "proactive scheduler: feed_composer crashed character=%s",
                 character.id,
             )
+        retry_check = getattr(
+            self._feed_composer, "needs_daily_floor_retry", None,
+        )
+        if retry_check is None:
+            return False
+        try:
+            if self._feed_retry_accepts_now:
+                return bool(await retry_check(character, now=now))
+            return bool(await retry_check(character))
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: feed retry check crashed character=%s",
+                character.id,
+            )
+            return False
 
     async def _run_feed_comment_reply(
         self, character: Character, *, slot: str,
@@ -564,13 +648,28 @@ class CharacterTickExecutor:
         paid review per day."""
         await self._run_goal_review(character, now=now)
 
-    async def step_feed_compose(self, character: Character) -> None:
+    async def step_scene_timeout(
+        self, character: Character, *, now: datetime,
+    ) -> None:
+        """``story_scene_timeout`` kind: wrap up an idle 起幕 scene.
+
+        The distributed counterpart of the embedded tick's step (e3), and
+        deliberately the same private step: the red line that a wrap-up
+        never invents player actions lives inside the shared close, and the
+        timeout path is the one nobody is watching. A character with no
+        live scene — almost always — costs one indexed read."""
+        await self._run_scene_timeout(character, now=now)
+
+    async def step_feed_compose(
+        self, character: Character, *, now: datetime | None = None,
+    ) -> bool:
         """``feed_compose`` kind: best-effort feed-wall publish.
 
         The B1 multiplier already scaled this chain's cadence at due time (§4.3.1),
         so the handler does NOT re-apply the tick gate here; the composer's own
-        cooldown / daily-cap gates still decide whether anything is published."""
-        await self._run_feed_compose(character)
+        cooldown / daily-cap gates still decide whether anything is published.
+        Returns whether a base-cadence retry is needed for today's first post."""
+        return await self._run_feed_compose(character, now=now)
 
     async def step_feed_comment_reply(
         self, character: Character, *, logical_slot: str,

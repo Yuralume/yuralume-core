@@ -72,6 +72,9 @@ from kokoro_link.application.services.schedule_weather_drift_service import (
 from kokoro_link.application.services.social_tick_executor import (
     SocialTickExecutor,
 )
+from kokoro_link.application.services.story_scene_timeout import (
+    StorySceneTimeoutCloser,
+)
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
@@ -157,6 +160,7 @@ class ProactiveScheduler:
         schedule_memorializer: ScheduleMemorializer | None = None,
         schedule_weather_drift: ScheduleWeatherDriftService | None = None,
         goal_review_service: DailyGoalReviewService | None = None,
+        story_scene_timeout_closer: StorySceneTimeoutCloser | None = None,
         persona_dream_service: PersonaDreamService | None = None,
         persona_dream_repository: OperatorPersonaRepositoryPort | None = None,
         account_runtime_profile_resolver: (
@@ -249,6 +253,14 @@ class ProactiveScheduler:
         # review is actually paid for, so a proactive-heavy account whose
         # player rarely types still gets its goals reviewed daily.
         self._goal_review_service = goal_review_service
+        # Optional — idle 起幕 scene wrap-up (SC1-E). The per-character half
+        # runs inside the tick executor (both scheduling lines share that
+        # step); the scheduler itself only drives the once-per-tick sweep
+        # for sessions NO character chain covers — rows whose character was
+        # deleted. SQLite does not enforce the table's ON DELETE CASCADE,
+        # so on a self-host install those rows are real and stay ``open``
+        # forever unless something sweeps them by time alone.
+        self._story_scene_timeout_closer = story_scene_timeout_closer
         # Optional — operator-persona "dream" consolidation pass.
         # Runs per (character_id, operator_id) pair since each
         # character's persona is independent (no shared facts across
@@ -326,6 +338,7 @@ class ProactiveScheduler:
             schedule_memorializer=self._schedule_memorializer,
             schedule_weather_drift=self._schedule_weather_drift,
             goal_review_service=self._goal_review_service,
+            story_scene_timeout_closer=self._story_scene_timeout_closer,
             feed_composer=self._feed_composer,
             feed_comment_reply=self._feed_comment_reply,
             dispatcher=self._dispatcher,
@@ -688,6 +701,19 @@ class ProactiveScheduler:
                 "proactive_delivery_retry",
                 self._proactive_delivery_retry_worker.tick(now=now),
             )
+        # Retire idle scene rows nobody owns any more (SC1-E). Global, once
+        # per tick, and deliberately NOT the per-character wrap-up — that
+        # one runs inside the executor below, for both scheduling lines.
+        # This pass only touches sessions whose character is gone, which is
+        # exactly the set no chain can ever reach. The closer contains its
+        # own failures; the query is one indexed read and normally returns
+        # nothing.
+        if self._story_scene_timeout_closer is not None:
+            await self._timed(
+                steps,
+                "story_scene_unowned_sweep",
+                self._sweep_unowned_scenes(now),
+            )
         for character in characters:
             # Startup grace is a per-character caller input folded into a single
             # ``allow_dispatch`` flag — it suppresses BOTH the ARC_BEAT enqueue
@@ -730,6 +756,21 @@ class ProactiveScheduler:
         if outcome.peer_consolidated:
             self._last_peer_knowledge_at = now
         return active, frozen, total
+
+    async def _sweep_unowned_scenes(self, now: datetime) -> None:
+        """Retire idle scene rows whose character is gone. Never raises.
+
+        The closer already contains its own failures, but this step runs
+        *before* the per-character loop: an escape here would abort the
+        whole tick, so the housekeeping pass gets an explicit belt of its
+        own rather than inheriting one."""
+        assert self._story_scene_timeout_closer is not None
+        try:
+            await self._story_scene_timeout_closer.sweep_unowned(now=now)
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: unowned story scene sweep crashed",
+            )
 
     def _enqueue_arc_beat(
         self, character_id: str, beat_id: str | None,

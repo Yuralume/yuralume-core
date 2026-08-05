@@ -50,6 +50,8 @@ def _arc_with_today_beat(
     scene_type: str = SCENE_CONFLICT,
     required: bool = True,
     status: str = BEAT_PENDING,
+    operator_position: str | None = None,
+    operator_note: str | None = None,
 ) -> StoryArc:
     arc = StoryArc.create(
         character_id="c1",
@@ -68,6 +70,8 @@ def _arc_with_today_beat(
         scene_characters=npcs, location=location,
         dramatic_question=question, scene_type=scene_type,
         required=required,
+        operator_position=operator_position,
+        operator_note=operator_note,
     )
     return arc.with_beats([beat])
 
@@ -160,3 +164,65 @@ def test_directive_picks_revelation_label() -> None:
     assert "校園長椅" in prompt
     # Single-actor scene → no NPC line.
     assert "出場人物（除你之外）" not in prompt
+
+
+# --- OP2-A: player-position-derived framing (ARC_PLAYER_POSITION_PLAN) ---
+#
+# Characterization note: the retired instruction —
+#   "在合適時機讓這場戲自然發生 —— 場景的氣氛、出場人物的存在、戲劇問題的
+#   張力，至少要在本回合的回覆中**浮現一個**。如果使用者岔題，你可以自然
+#   地把話題引回來。"
+# — used to render unconditionally whenever the directive block rendered
+# at all, regardless of the beat's content. It gave the player exactly one
+# identity in this block: someone who might digress. The tests below pin
+# its removal and the position-derived replacement that took its place.
+
+
+def test_directive_retires_the_forced_single_element_instruction() -> None:
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(today=today)  # operator_position unjudged
+    prompt = _build(arc, today)
+    assert "至少要在本回合的回覆中" not in prompt
+    assert "浮現一個" not in prompt
+    assert "如果使用者岔題，你可以自然地把話題引回來" not in prompt
+
+
+def test_directive_none_position_uses_semantic_derivation_instruction() -> None:
+    # Default/unjudged (`operator_position=None`) must not invent a
+    # position — it hands the model a judgment instruction instead.
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(today=today, operator_position=None)
+    prompt = _build(arc, today)
+    assert "位置尚未判定" in prompt
+    assert "由你自行判斷是否即指玩家" in prompt
+
+
+def test_directive_central_position_frames_player_as_the_point_of_the_scene() -> None:
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(today=today, operator_position="central")
+    prompt = _build(arc, today)
+    assert "玩家是這場戲的核心" in prompt
+    assert "位置尚未判定" not in prompt
+
+
+def test_directive_present_position_frames_player_as_accompanying() -> None:
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(today=today, operator_position="present")
+    prompt = _build(arc, today)
+    assert "戲的重心不在玩家身上" in prompt
+
+
+def test_directive_absent_position_frames_scene_without_the_player() -> None:
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(today=today, operator_position="absent")
+    prompt = _build(arc, today)
+    assert "這場戲裡沒有玩家的位置" in prompt
+
+
+def test_directive_renders_operator_note_regardless_of_position() -> None:
+    today = date(2026, 5, 1)
+    arc = _arc_with_today_beat(
+        today=today, operator_position="present", operator_note="她要向你坦白",
+    )
+    prompt = _build(arc, today)
+    assert "- 玩家在這場戲的位置備註：她要向你坦白" in prompt

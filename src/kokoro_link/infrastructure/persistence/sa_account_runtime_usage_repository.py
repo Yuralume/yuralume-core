@@ -45,8 +45,10 @@ class SAAccountRuntimeUsageRepository:
         event_type: str,
         since: datetime,
         until: datetime | None = None,
+        resource_id: str | None = None,
     ) -> int:
         since_utc = ensure_utc(since)
+        resource = _normalise_resource_id(resource_id)
         stmt = select(func.count()).select_from(AccountRuntimeEventRow).where(
             AccountRuntimeEventRow.operator_id == operator_id,
             AccountRuntimeEventRow.event_type == event_type,
@@ -54,6 +56,8 @@ class SAAccountRuntimeUsageRepository:
         )
         if until is not None:
             stmt = stmt.where(AccountRuntimeEventRow.occurred_at <= ensure_utc(until))
+        if resource is not None:
+            stmt = stmt.where(AccountRuntimeEventRow.resource_id == resource)
         async with self._session_factory() as session:
             result = await session.execute(stmt)
             return int(result.scalar_one())
@@ -66,6 +70,8 @@ class SAAccountRuntimeUsageRepository:
         occurred_at: datetime,
         since: datetime,
         limit: int,
+        resource_id: str | None = None,
+        resource_limit: int | None = None,
     ) -> str | None:
         """Write the claim first, then check whether the window still fits.
 
@@ -83,6 +89,7 @@ class SAAccountRuntimeUsageRepository:
         event_id = str(uuid4())
         stamp = ensure_utc(occurred_at)
         since_utc = ensure_utc(since)
+        resource = _normalise_resource_id(resource_id)
         async with self._session_factory() as session:
             session.add(
                 AccountRuntimeEventRow(
@@ -90,6 +97,7 @@ class SAAccountRuntimeUsageRepository:
                     operator_id=operator_id,
                     event_type=event_type,
                     occurred_at=stamp,
+                    resource_id=resource,
                 ),
             )
             await session.commit()
@@ -110,6 +118,25 @@ class SAAccountRuntimeUsageRepository:
                 )
                 await session.commit()
                 return None
+            if resource is not None and resource_limit is not None:
+                resource_used = await session.execute(
+                    select(func.count())
+                    .select_from(AccountRuntimeEventRow)
+                    .where(
+                        AccountRuntimeEventRow.operator_id == operator_id,
+                        AccountRuntimeEventRow.event_type == event_type,
+                        AccountRuntimeEventRow.occurred_at >= since_utc,
+                        AccountRuntimeEventRow.resource_id == resource,
+                    ),
+                )
+                if int(resource_used.scalar_one()) > resource_limit:
+                    await session.execute(
+                        delete(AccountRuntimeEventRow).where(
+                            AccountRuntimeEventRow.id == event_id,
+                        ),
+                    )
+                    await session.commit()
+                    return None
         return event_id
 
     async def discard_event(self, *, event_id: str) -> None:

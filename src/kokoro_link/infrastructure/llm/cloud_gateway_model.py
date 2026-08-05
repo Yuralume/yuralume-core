@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections.abc import AsyncIterator, Sequence
@@ -81,6 +82,23 @@ class CloudGatewayChatModel(ChatModelPort):
         )
         self._max_request_bytes = max_request_bytes
         self.last_request_id = ""
+
+    def with_supports_vision(self, value: bool) -> "CloudGatewayChatModel":
+        """Return a copy whose vision capability the control plane pinned.
+
+        This one adapter fronts every hosted model, so the constructor's
+        ``supports_vision = True`` can only ever be a default — it says
+        nothing about the preset a feature actually routes to. When the
+        control-plane preset metadata carries an explicit ``supports_vision``,
+        ``CloudActiveLLMProvider`` binds it here onto a copy; a preset nobody
+        annotated keeps the constructor default and therefore the
+        pre-existing behaviour. ``copy.copy`` leaves the instance the factory
+        returned untouched, so binding can never mutate an adapter a caller
+        already holds a reference to.
+        """
+        clone = copy.copy(self)
+        clone.supports_vision = value
+        return clone
 
     async def generate(
         self,

@@ -29,6 +29,12 @@ class CloudRoutingProfile:
     # Optional until the User control-plane contract exposes embedding routes.
     # Missing field must remain a graceful env/default-preset fallback.
     embedding_feature_presets: dict[str, str] = field(default_factory=dict)
+    # ``preset_id -> supports_vision`` for the LLM presets whose control-plane
+    # metadata pins the capability. Only explicitly annotated presets appear
+    # here: hosted presets are concrete upstream models, and a text-only one
+    # must be visible to Core so the chat image-recognition preflight fires
+    # instead of shipping images to a model that cannot read them.
+    llm_preset_vision: dict[str, bool] = field(default_factory=dict)
 
     def preset_for(self, capability: str, feature_key: str) -> str | None:
         mapping = {
@@ -39,6 +45,17 @@ class CloudRoutingProfile:
             "tts": self.tts_voice_defaults,
         }.get(capability, {})
         return mapping.get(feature_key)
+
+    def supports_vision_for(self, preset_id: str) -> bool | None:
+        """Return the pinned vision capability of an LLM preset.
+
+        ``None`` means "not pinned" — the control plane never annotated this
+        preset — and callers must keep the adapter's own default rather than
+        assume either answer. That three-state contract is what makes the
+        rollout free of behaviour change: an unannotated catalog pins
+        nothing, so every hosted call behaves exactly as before.
+        """
+        return self.llm_preset_vision.get(preset_id)
 
     def is_disabled(self, capability: str, feature_key: str) -> bool:
         return (
@@ -65,6 +82,7 @@ class CloudRoutingProfile:
             image_feature_presets=_string_map(payload.get("image_feature_presets")),
             video_feature_presets=_string_map(payload.get("video_feature_presets")),
             embedding_feature_presets=_string_map(payload.get("embedding_feature_presets")),
+            llm_preset_vision=_bool_map(payload.get("llm_preset_vision")),
             tts_voice_defaults=_string_map(payload.get("tts_voice_defaults")),
             strict_no_fallback=bool(payload.get("strict_no_fallback", False)),
             disabled_features=frozenset(_string_list(payload.get("disabled_features"))),
@@ -95,6 +113,25 @@ def _string_map(value: Any) -> dict[str, str]:
         if text:
             result[str(key)] = text
     return result
+
+
+def _bool_map(value: Any) -> dict[str, bool]:
+    """Keep only entries the control plane stated as real JSON booleans.
+
+    ``isinstance(item, bool)`` is checked with no coercion at all: a
+    ``"false"`` string or a ``0`` is an unexpected shape, and reading intent
+    into it would silently flip a model's declared capability. Dropping such
+    an entry lands on "not pinned", which is the safe default. Same rule as
+    ``routing_vision.parse_vision_override`` — note ``isinstance(1, bool)``
+    is False, so a bare number never masquerades as a pin.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, bool)
+    }
 
 
 def _string_list(value: Any) -> list[str]:

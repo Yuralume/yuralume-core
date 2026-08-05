@@ -7,6 +7,7 @@ and Object Storage. Tool-side integration (``ComfyImageTool`` calling
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from kokoro_link.application.services.album_service import (
     StageFullError,
     StageImageNotFoundError,
 )
-from kokoro_link.domain.entities.album_item import SOURCE_STAGE, SOURCE_TOOL
+from kokoro_link.domain.entities.album_item import SOURCE_STAGE, SOURCE_TOOL, AlbumItem
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.repositories.in_memory_album import (
@@ -310,6 +311,79 @@ async def test_list_is_newest_first(
     ]
 
 
+# ---------- pagination (IV9) ----------
+
+
+@pytest.mark.asyncio
+async def test_list_for_character_paginates_with_before_cursor(
+    service: AlbumService,
+    album_repo: InMemoryAlbumRepository,
+    character_repo: InMemoryCharacterRepository,
+) -> None:
+    """Keyset paging (feed's shape) must walk the whole set exactly
+    once, newest-first, regardless of page size."""
+    character = await _seed_character(character_repo)
+    base = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+    for idx in range(5):
+        await album_repo.add(AlbumItem.create(
+            character_id=character.id,
+            url=f"/uploads/characters/{character.id}/tools/{idx}.png",
+            source=SOURCE_TOOL,
+            created_at=base + timedelta(minutes=idx),
+        ))
+    # Newest-first order is 4, 3, 2, 1, 0.
+
+    first_page = await service.list_for_character(character.id, limit=2)
+    assert [i.url.rsplit("/", 1)[-1] for i in first_page] == ["4.png", "3.png"]
+
+    second_page = await service.list_for_character(
+        character.id, limit=2, before=first_page[-1].created_at,
+    )
+    assert [i.url.rsplit("/", 1)[-1] for i in second_page] == ["2.png", "1.png"]
+
+    third_page = await service.list_for_character(
+        character.id, limit=2, before=second_page[-1].created_at,
+    )
+    assert [i.url.rsplit("/", 1)[-1] for i in third_page] == ["0.png"]
+
+    fourth_page = await service.list_for_character(
+        character.id, limit=2, before=third_page[-1].created_at,
+    )
+    assert fourth_page == []
+
+
+@pytest.mark.asyncio
+async def test_list_for_character_without_limit_still_returns_everything(
+    service: AlbumService,
+    character_repo: InMemoryCharacterRepository,
+) -> None:
+    """Callers that predate pagination (``_gc_to_fit``, existing tests)
+    must keep getting the full list when they omit ``limit``."""
+    character = await _seed_character(character_repo)
+    for idx in range(4):
+        await service.add_auto(
+            character_id=character.id,
+            url=f"/uploads/characters/{character.id}/tools/{idx}.png",
+        )
+    items = await service.list_for_character(character.id)
+    assert len(items) == 4
+
+
+@pytest.mark.asyncio
+async def test_count_for_character(
+    service: AlbumService,
+    character_repo: InMemoryCharacterRepository,
+) -> None:
+    character = await _seed_character(character_repo)
+    assert await service.count_for_character(character.id) == 0
+    for idx in range(3):
+        await service.add_auto(
+            character_id=character.id,
+            url=f"/uploads/characters/{character.id}/tools/{idx}.png",
+        )
+    assert await service.count_for_character(character.id) == 3
+
+
 # ---------- storage safety ----------
 
 
@@ -333,7 +407,6 @@ async def test_delete_refuses_path_traversal(
 
     # Sneak a malicious URL into the repo directly (bypasses service.add_auto
     # so we can test the defensive resolver in isolation)
-    from kokoro_link.domain.entities.album_item import AlbumItem
     bad = AlbumItem.create(
         character_id=character.id,
         url=f"/uploads/characters/{character.id}/../other-char-secret.png",

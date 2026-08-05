@@ -10,9 +10,12 @@ Mirrors ``CharacterCardTranslatorPort`` — same fail-soft contract, same
 "structural fields are immutable" red line. Only prose fields are ever
 translated; structural fields (``theme`` / ``tone`` / ``tension`` /
 ``scene_type`` / ``day_offset`` / ``sequence`` / ``required`` /
-``duration_days`` / ``world_frames`` / applicability / target ids)
-must remain byte-for-byte unchanged so the model can never reinterpret
-an enum or reshape the arc.
+``duration_days`` / ``world_frames`` / ``operator_position`` /
+applicability / target ids) must remain byte-for-byte unchanged so the
+model can never reinterpret an enum or reshape the arc.
+``operator_position`` (OP0) is structural despite living next to a
+prose field — it is a closed-vocabulary flag consumers branch on, not
+language-bearing text.
 """
 
 from __future__ import annotations
@@ -34,9 +37,12 @@ class ArcTemplateTranslatorPort(ABC):
 
         Prose fields: ``title``, ``premise``, and each beat's ``title`` /
         ``summary`` / ``location`` / ``scene_characters`` /
-        ``dramatic_question``. Everything else is structural and must be
-        preserved unchanged. Returning ``template`` means translation was
-        skipped or failed (fail-soft). The returned template's
-        ``language`` should reflect ``target_language`` when a real
-        translation happened so the picker badge is honest.
+        ``dramatic_question`` / ``operator_note``. Everything else is
+        structural and must be preserved unchanged — including
+        ``operator_position``, which sits right next to ``operator_note``
+        on the same beat but is never translated (see module docstring).
+        Returning ``template`` means translation was skipped or failed
+        (fail-soft). The returned template's ``language`` should reflect
+        ``target_language`` when a real translation happened so the
+        picker badge is honest.
         """

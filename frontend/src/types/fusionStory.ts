@@ -105,6 +105,26 @@ export interface IterateBeatPayload extends QuotedActionPrice {
 
 export type PolishFusionStoryPayload = QuotedActionPrice
 
+/**
+ * How the creator enters the story they just wrote (OP1-C / plan 拍板 #2).
+ *
+ * - `write_in`  — rewrite the beats so the player has a real place in them
+ * - `observer`  — story untouched, the player is there watching it happen
+ * - `unchanged` — a pure character story; the player is in none of it
+ *
+ * Omitting the field is the same as `unchanged` server-side: a caller who
+ * never saw the choice must not have their prose rewritten. The UI always
+ * sends an explicit value.
+ */
+export type FusionToArcOperatorMode = 'write_in' | 'observer' | 'unchanged'
+
+export const FUSION_TO_ARC_OPERATOR_MODES: FusionToArcOperatorMode[] = [
+  'write_in',
+  'observer',
+  'unchanged',
+]
+
 export interface FusionToArcDraftPayload {
   instruction?: string | null
+  operator_mode?: FusionToArcOperatorMode
 }

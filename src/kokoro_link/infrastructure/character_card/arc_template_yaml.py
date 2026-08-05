@@ -66,6 +66,13 @@ def arc_template_to_mapping(
                 "scene_characters": list(beat.scene_characters),
                 "dramatic_question": beat.dramatic_question,
                 "required": beat.required,
+                # OP0-B: the import side (``build_arc_template_from_
+                # mapping``) has read these two keys since OP0-A landed
+                # them — omitting them here would silently drop a
+                # character card author's player-position choice on
+                # every export/import round trip.
+                "operator_position": beat.operator_position,
+                "operator_note": beat.operator_note,
             }
             for beat in template.beats
         ],

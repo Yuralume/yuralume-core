@@ -24,9 +24,26 @@
 | `UiInput` | 文字輸入（含 number / date / password 等 type） | `modelValue`, `label`, `hint`, `type`, `placeholder`, `disabled`, `readonly`, `required` |
 | `UiTextarea` | 多行文字 | `modelValue`, `label`, `hint`, `rows`, `maxlength` |
 | `UiSelect` | 下拉選單（深色 option 已處理） | `modelValue`, `options[]`, `placeholder`；也可用 default slot 自行寫 `<option>` |
+| `UiCombobox` | 可輸入的下拉（自由文字 + 建議清單） | `modelValue`, `options[]`, `allowCustom`, `clearable`, `loading`, `maxVisible`, `inputId`, `ariaLabel` |
 | `UiCard` | 卡片容器 | `size`, `hoverable`, `title`；slots: `header` / `actions` / `default` / `footer` |
 | `UiSection` | 表單分組 | `title`, `description`, `bordered`；slots: `header` / `default` |
 | `UiBadge` | 狀態徽章 | `variant: default \| primary \| success \| warning \| danger` |
+| `UiImage` | 物件儲存圖片（自動選尺寸變體） | `src`, `variant: avatar \| thumb \| content \| full`, `alt`, `sizes`, `width`/`height`, `aspectRatio`, `loading` |
+
+### `UiImage` 的用途導向 API
+
+呼叫端**只說用途**，不指定尺寸；元件負責產出 `srcset` / `sizes` / `loading` / `decoding="async"` 與佔位尺寸。
+
+| variant | 交付 | 佔位 | 典型呼叫端 |
+|---|---|---|---|
+| `avatar` | 單一 `?v=w320` | 40×40（可覆寫） | 側欄頭像 |
+| `thumb` | `?v=w320 320w, ?v=w768 768w` | `2 / 3` | 角色圖 grid、相簿格 |
+| `content` | 同上 | `2 / 3` | 聊天氣泡圖 |
+| `full` | 單一 `?v=full`、eager | `2 / 3` | 舞台、燈箱 |
+
+`srcset` 只放兩個變體，是因為 `w` descriptor 需要真實像素寬，而前端不知道原圖尺寸；`full` 因此走單一 `src`。**佔位尺寸一律輸出**——它是離屏釋放的前置條件，少了它卸載瞬間高度會塌陷、捲動位置亂跳。
+
+根節點就是 `<img>` 本身（無 wrapper），所以 `.image-tile img` 這種既有後代選擇器仍然有效，`class` / `style` / `draggable` / `title` / 事件監聽全部 fallthrough。詳見 `docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md` D1/D2/D5。
 
 ## 使用範例
 

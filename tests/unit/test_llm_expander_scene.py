@@ -111,6 +111,28 @@ async def test_meaningful_scene_switches_to_scene_prompt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_blanket_exclusion_of_the_user_is_retired() -> None:
+    """OP2-C. Characterized before flipping: the scene constraints used
+    to contain the flat 「不要把使用者寫進這場戲；這是角色自己正在經歷的
+    瞬間。」 — a blanket exclusion that a beat marked ``central`` or
+    ``present`` would directly contradict. Retired in favour of the
+    shared position block, which still forbids inventing player lines.
+    """
+    model = _CapturingModel()
+    await LLMStoryEventExpander(model=model).expand(
+        seed=_DuckSeed("她踏進教室時，老師已經在等。"),
+        character_name="Aki",
+        character_summary="插畫家",
+        speaking_style="溫柔",
+        world_frame="modern",
+        scene=SceneContext(scene_type="conflict", location="音樂教室"),
+    )
+    assert model.last_prompt is not None
+    assert "不要把使用者寫進這場戲" not in model.last_prompt
+    assert "玩家在這場戲的位置：" in model.last_prompt
+
+
+@pytest.mark.asyncio
 async def test_empty_scene_falls_back_to_journal() -> None:
     # All structured fields empty — `is_meaningful()` returns False so
     # the expander stays on the journal prompt instead of producing

@@ -1,6 +1,77 @@
+<script lang="ts">
+/**
+ * The stage is the one surface that legitimately wants the original pixels —
+ * it is full-screen and the 1024x1536 source is already being *scaled up*, so
+ * a thumbnail here would show as blur. What it does not want is the original
+ * *file*: `variant="full"` is the same pixels re-encoded as WebP, 2313 KB down
+ * to 218 KB (IMAGE_DELIVERY_AND_PAGINATION_PLAN §1.5 / D1).
+ *
+ * The second half of ticket IV5-B is what is mounted. This component used to
+ * put **every** URL in `image_urls` into an `<img>` and hide all but one with
+ * `opacity: 0` — an invisible image is still a decoded bitmap, and at
+ * 1024x1536x4 bytes that is 6.0 MB of resident memory per hidden image, for as
+ * long as the character stays selected. Six images meant 36 MB to show one.
+ *
+ * Now only a window is mounted. The window is not "the active one": a
+ * cross-fade is a transition *between two co-existing elements*, so both ends
+ * of every move this component can make have to already be in the DOM.
+ * See `stageMountedIndices`.
+ */
+
+/**
+ * How many neighbours on each side of the active image stay mounted.
+ *
+ * One, because every automatic move is +/-1: the 8 s rotation, both arrows and
+ * the pointer swipe. Keeping both neighbours means those moves find their
+ * target already mounted *and* decoded, and the 1.2 s fade starts on the same
+ * frame as the click — exactly as it did when all N were mounted.
+ */
+const NEIGHBOUR_RADIUS = 1
+
+/** Modulo that also wraps negatives, so `prev` from index 0 lands on the last. */
+function wrapIndex(index: number, total: number): number {
+  return ((index % total) + total) % total
+}
+
+/**
+ * The indices that need a live `<img>`, in ascending order.
+ *
+ * Ascending matters: the elements are absolutely stacked and paint in document
+ * order, so a cross-fade's over/under relationship is decided by index. Keeping
+ * the old order keeps the old look.
+ *
+ * `retained` carries the two indices that are outside the window but still have
+ * to be on screen for one move: the image currently *fading out* (after a dot
+ * jump the outgoing index is nowhere near the new window) and a jump target
+ * that was mounted a frame early so that its fade-*in* has a `0` to transition
+ * from. Both are single slots, so the mounted count is four in the steady state
+ * — five for the two frames a second consecutive dot jump straddles — and never
+ * a function of how many images the character has.
+ */
+export function stageMountedIndices(
+  total: number,
+  active: number,
+  retained: readonly (number | null)[] = [],
+): number[] {
+  if (total <= 0) return []
+  const live = new Set<number>()
+  const centre = wrapIndex(active, total)
+  for (let offset = -NEIGHBOUR_RADIUS; offset <= NEIGHBOUR_RADIUS; offset += 1) {
+    live.add(wrapIndex(centre + offset, total))
+  }
+  for (const index of retained) {
+    if (index === null) continue
+    if (!Number.isInteger(index) || index < 0 || index >= total) continue
+    live.add(index)
+  }
+  return [...live].sort((a, b) => a - b)
+}
+</script>
+
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { UiImage } from '@/components/ui'
 import type { Character } from '@/types/character'
 
 const { t } = useI18n()
@@ -11,10 +82,23 @@ const props = defineProps<{
 
 const ROTATE_INTERVAL_MS = 8000
 
+/** The selected image. Drives the dots, the arrows and the `.active` opacity. */
 const activeIndex = ref(0)
+/** The image that is fading out — held mounted so the cross-fade has two ends. */
+const previousIndex = ref<number | null>(null)
+/** A jump target, mounted before it is activated so its fade-in can run. */
+const pendingIndex = ref<number | null>(null)
 let rotateTimer: ReturnType<typeof setInterval> | null = null
+let pendingFrame: number | null = null
 
 const images = computed<string[]>(() => props.character?.image_urls ?? [])
+
+const mountedIndices = computed(() =>
+  stageMountedIndices(images.value.length, activeIndex.value, [
+    previousIndex.value,
+    pendingIndex.value,
+  ]),
+)
 
 function clearTimer() {
   if (rotateTimer !== null) {
@@ -23,34 +107,93 @@ function clearTimer() {
   }
 }
 
+function cancelPendingFrame() {
+  if (pendingFrame !== null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(pendingFrame)
+  }
+  pendingFrame = null
+}
+
+/**
+ * Two frames, not one. A freshly inserted element's `opacity: 0` has to be
+ * *observed* by the browser before `opacity: 1` can transition away from it;
+ * a single `requestAnimationFrame` still lands inside the frame that did the
+ * insertion, and the browser would collapse both styles into one recalc and
+ * skip the transition entirely. Same reasoning Vue's own `<Transition>` uses.
+ *
+ * Outside a browser (SSR) there is nothing to animate, so it runs inline.
+ */
+function nextFrame(run: () => void) {
+  if (typeof requestAnimationFrame !== 'function') {
+    run()
+    return
+  }
+  pendingFrame = requestAnimationFrame(() => {
+    pendingFrame = requestAnimationFrame(() => {
+      pendingFrame = null
+      run()
+    })
+  })
+}
+
+function commitIndex(index: number) {
+  previousIndex.value = activeIndex.value
+  activeIndex.value = index
+  pendingIndex.value = null
+}
+
+/**
+ * The single entry point for changing image. Adjacent targets (rotation,
+ * arrows, swipe) are already mounted and switch on the spot; only a dot jump
+ * can land outside the window, and that one waits a frame so the arriving
+ * element fades in instead of appearing at full opacity.
+ */
+function selectIndex(index: number) {
+  cancelPendingFrame()
+  pendingIndex.value = null
+  if (index === activeIndex.value) return
+  if (mountedIndices.value.includes(index)) {
+    commitIndex(index)
+    return
+  }
+  pendingIndex.value = index
+  nextFrame(() => commitIndex(index))
+}
+
 function restartRotation() {
   clearTimer()
   if (images.value.length <= 1) return
   rotateTimer = setInterval(() => {
-    activeIndex.value = (activeIndex.value + 1) % images.value.length
+    selectIndex(wrapIndex(activeIndex.value + 1, images.value.length))
   }, ROTATE_INTERVAL_MS)
 }
 
 watch(
   () => [props.character?.id, images.value.length] as const,
   () => {
+    cancelPendingFrame()
     activeIndex.value = 0
+    previousIndex.value = null
+    pendingIndex.value = null
     restartRotation()
   },
   { immediate: true },
 )
 
-onBeforeUnmount(clearTimer)
+onBeforeUnmount(() => {
+  clearTimer()
+  cancelPendingFrame()
+})
 
 function handleDotClick(index: number) {
-  activeIndex.value = index
+  selectIndex(index)
   restartRotation()
 }
 
 function step(delta: -1 | 1) {
   const total = images.value.length
   if (total <= 1) return
-  activeIndex.value = (activeIndex.value + delta + total) % total
+  selectIndex(wrapIndex(activeIndex.value + delta, total))
   restartRotation()
 }
 
@@ -113,13 +256,14 @@ function handlePointerCancel() {
       </div>
 
       <template v-else>
-        <img
-          v-for="(url, index) in images"
-          :key="url"
-          :src="url"
+        <UiImage
+          v-for="index in mountedIndices"
+          :key="`${index}:${images[index]}`"
+          :src="images[index]"
+          variant="full"
           :alt="character.name"
           :class="['stage-image', { active: index === activeIndex }]"
-          draggable="false"
+          :draggable="false"
         />
       </template>
 
@@ -183,7 +327,15 @@ function handlePointerCancel() {
      side into transparent so the portrait blends into the stage
      gradient instead of showing a hard rectangular cut-off. The
      horizontal + vertical masks are composited (intersect) so corners
-     feather on both axes. ``-webkit-mask-*`` for Safari / iOS. */
+     feather on both axes. ``-webkit-mask-*`` for Safari / iOS.
+
+     The two layers are not a duplicate of each other — one feathers the
+     left/right edges, the other the top/bottom — so neither can be
+     dropped without losing feathering on that axis. What made them
+     expensive was the count: a masked element gets its own composited
+     layer, and this rule used to apply to every URL the character had.
+     Since IV5-B at most four elements carry it (see stageMountedIndices),
+     which is where that cost went. Visuals deliberately unchanged. */
   -webkit-mask-image:
     linear-gradient(
       to right,

@@ -6,6 +6,10 @@ import { CloseOutlined, LeftOutlined, RightOutlined } from '@ant-design/icons-vu
 import CharacterCardFace from '@/components/CharacterCardFace.vue'
 import CharacterCardThumb from '@/components/CharacterCardThumb.vue'
 import { UiButton } from '@/components/ui'
+import {
+  shouldHideTranslateToggle,
+  shouldShowOfficialCardsUnavailableNotice,
+} from '@/utils/characterCardSource'
 import type { CharacterCardPreview } from '@/utils/api/characters'
 
 const props = withDefaults(
@@ -20,6 +24,8 @@ const props = withDefaults(
     translateEnabled?: boolean
     translateLoading?: boolean
     translateError?: string | null
+    /** Cloud 官方卡暫時讀不到（browse 模式才有意義；本地卡不受影響）。 */
+    officialCardsUnavailable?: boolean
   }>(),
   {
     activeIndex: 0,
@@ -29,6 +35,7 @@ const props = withDefaults(
     translateEnabled: false,
     translateLoading: false,
     translateError: null,
+    officialCardsUnavailable: false,
   },
 )
 
@@ -74,6 +81,14 @@ const actionLabel = computed(() => (
 ))
 const canShowTranslate = computed(() => (
   !props.loading && !props.error && props.cards.length > 0
+  && !shouldHideTranslateToggle(activeCard.value)
+))
+const showOfficialCardsUnavailable = computed(() => (
+  shouldShowOfficialCardsUnavailableNotice({
+    officialCardsUnavailable: props.officialCardsUnavailable,
+    loading: props.loading,
+    error: props.error,
+  })
 ))
 
 watch(() => props.visible, (visible) => {
@@ -192,6 +207,10 @@ function handleWindowKeydown(event: KeyboardEvent) {
           </span>
         </div>
         </header>
+
+        <p v-if="showOfficialCardsUnavailable" class="character-card-gallery__notice" role="status">
+          {{ t('playerSidebar.characterCards.officialUnavailable') }}
+        </p>
 
         <p v-if="loading" class="character-card-gallery__state">
           {{ t('common.state.loading') }}
@@ -396,6 +415,19 @@ function handleWindowKeydown(event: KeyboardEvent) {
 
 .character-card-gallery__error {
   color: #f4a3a3;
+}
+
+/* 官方卡目錄暫時讀不到：非致命提示，本地卡與已裝角色不受影響，所以走警示色而非錯誤色。 */
+.character-card-gallery__notice {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgba(255, 209, 128, 0.32);
+  border-radius: 6px;
+  background: rgba(255, 209, 128, 0.08);
+  color: #ffd180;
+  font-size: var(--font-xs);
+  line-height: 1.6;
+  text-align: center;
 }
 
 .character-card-gallery__translate {

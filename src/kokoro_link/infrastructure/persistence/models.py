@@ -785,6 +785,17 @@ class MemoryItemRow(Base):
     """
 
     __tablename__ = "memory_items"
+    __table_args__ = (
+        Index(
+            "ix_memory_items_character_created",
+            "character_id",
+            text("created_at DESC"),
+        ),
+    )
+    """Keyset pagination support for the memory browser: the standalone
+    ``character_id`` index still had to sort every one of a character's
+    rows to answer ``ORDER BY created_at DESC LIMIT n``. Matching the
+    ordering direction lets the page come straight off the index."""
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     character_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
@@ -1259,6 +1270,16 @@ class StoryArcBeatRow(Base):
     last_play_push_intensity: Mapped[str | None] = mapped_column(
         String(32), nullable=True,
     )
+    # --- Retry budget (SC0) -----------------------------------------
+    # Split out from ``play_attempt_count`` because that column counts
+    # every time the beat was surfaced — including a player's chat turns
+    # — while the autonomous retry budget may only spend real failures.
+    play_failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    last_play_failure_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     # --- Scene structure (Phase 1 of SCENE_BEAT_PLAN) ---------------
     # JSON-encoded list of scene-character labels — keeps the "small
     # list as Text" convention (see ``allowed_tools``) so SQLite-backed
@@ -1274,6 +1295,15 @@ class StoryArcBeatRow(Base):
     required: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True,
     )
+    # --- Player's place in this scene (OP0) --------------------------
+    # Both nullable with no server default: NULL is the domain's fourth
+    # state ("unjudged"), not a missing value to be filled in, so every
+    # pre-existing beat legitimately reads back as NULL and the
+    # migration backfills nothing.
+    operator_position: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+    )
+    operator_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AppPreferenceRow(Base):
@@ -3065,3 +3095,86 @@ class ExternalProactiveEventRow(Base):
     )
 
 
+
+class StorySceneSessionRow(Base):
+    """One player-pulled story scene («起幕») and its live state.
+
+    The scene's messages live in the ordinary conversation; this row is
+    the *frame* around them plus everything a later request needs to keep
+    playing it — which waterfall layer supplied the material, which beat
+    is being played, the visible title/location/mood, the dramatic
+    question, and the idle clock. It has to be a row rather than a
+    process attribute because the replica that opens a scene is routinely
+    not the one that serves its next turn or closes it on timeout.
+
+    ``uq_story_scene_sessions_open_character`` — a partial unique index
+    over ``character_id`` restricted to ``status = 'open'`` — makes "one
+    live scene per character" a schema invariant, the same portable shape
+    ``story_arcs`` uses for its single-active-arc rule. Closed rows are
+    unconstrained so the played-scene history accumulates.
+
+    ``arc_id`` / ``beat_id`` carry no FK on purpose: the arc repository
+    replaces a whole arc's beat rows on every save, so ``ON DELETE SET
+    NULL`` would unlink a live scene from its beat during an unrelated
+    arc edit (same reasoning as ``realized_event_id``).
+    """
+
+    __tablename__ = "story_scene_sessions"
+    __table_args__ = (
+        Index(
+            "uq_story_scene_sessions_open_character",
+            "character_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
+        Index(
+            "ix_story_scene_sessions_status_activity",
+            "status",
+            "last_activity_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_layer: Mapped[str] = mapped_column(String(24), nullable=False)
+    arc_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    beat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    title: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    location: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mood: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scene_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dramatic_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    closed_reason: Mapped[str | None] = mapped_column(
+        String(24), nullable=True,
+    )
+    # --- Player's place in this scene (OP2-D) -------------------------
+    # Copied from the opening StorySceneMaterial, same reasoning as
+    # scene_type / dramatic_question above: the closer reads only this
+    # row, never the beat.
+    operator_position: Mapped[str | None] = mapped_column(
+        String(length=16), nullable=True,
+    )
+    operator_note: Mapped[str | None] = mapped_column(Text, nullable=True)

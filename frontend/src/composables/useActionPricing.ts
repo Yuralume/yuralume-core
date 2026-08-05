@@ -44,6 +44,14 @@ export const ACTION_FEED_POST_OVERAGE = 'feed_post_overage'
 export const ACTION_FUSION_STORY = 'fusion_story'
 export const ACTION_FUSION_STORY_ITERATE = 'fusion_story_iterate'
 
+/**
+ * 起幕 (plan SC). One price for raising the curtain — the narration, the
+ * character's first line, the scene frame. The turns played inside the scene
+ * are ordinary chat and are charged as `chat`, which is why the composer
+ * shows this number next to the button and not on the scene itself.
+ */
+export const ACTION_STORY_SCENE_OPEN = 'story_scene_open'
+
 const BILLING_SHAPE_ACTION_FIXED = 'action_fixed'
 
 /** What the caller knows about the wallet when pre-checking an action. */

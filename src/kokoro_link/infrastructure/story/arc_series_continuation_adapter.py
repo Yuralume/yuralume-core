@@ -23,6 +23,7 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_arc import StoryArc, StoryArcBeat
 from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.services.story_tone_policy import resolve_prompt_tone
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
@@ -41,19 +42,27 @@ class LLMArcSeriesContinuationDraftAdapter:
         provider: ActiveLLMProviderPort | None = None,
         model: ChatModelPort | None = None,
         feature_key: str = FEATURE_ARC_CONTINUATION_DRAFT,
+        cloud_mode: bool = False,
     ) -> None:
         self._resolver = ModelResolver(
             provider=provider,
             model=model,
             feature_key=feature_key,
         )
+        # GF6 — this prompt is a render boundary: the series' and every
+        # completed arc's ``tone`` is interpolated verbatim into the JSON
+        # the model reads, so a stored ``mature`` (or an off-catalogue
+        # free-form string) would instruct the continuation author.
+        # Default ``False`` keeps self-host prompts byte-identical (see
+        # ``domain.services.story_tone_policy``).
+        self._cloud_mode = cloud_mode
 
     async def draft(
         self, context: ArcSeriesContinuationContext,
     ) -> TemplateDraft | None:
         if await self._resolver.is_fake():
             return None
-        prompt = _build_prompt(context)
+        prompt = _build_prompt(context, cloud_mode=self._cloud_mode)
         try:
             raw = await self._resolver.generate(prompt)
         except Exception:
@@ -65,7 +74,9 @@ class LLMArcSeriesContinuationDraftAdapter:
         return template_draft_from_llm_json(data)
 
 
-def _build_prompt(context: ArcSeriesContinuationContext) -> str:
+def _build_prompt(
+    context: ArcSeriesContinuationContext, *, cloud_mode: bool = False,
+) -> str:
     body = get_default_loader().render(
         "story/arc_series_continuation_draft",
         character_json=json.dumps(
@@ -74,12 +85,15 @@ def _build_prompt(context: ArcSeriesContinuationContext) -> str:
             indent=2,
         ),
         series_json=json.dumps(
-            _series_payload(context),
+            _series_payload(context, cloud_mode=cloud_mode),
             ensure_ascii=False,
             indent=2,
         ),
         completed_arcs_json=json.dumps(
-            [_arc_payload(arc) for arc in context.completed_arcs],
+            [
+                _arc_payload(arc, cloud_mode=cloud_mode)
+                for arc in context.completed_arcs
+            ],
             ensure_ascii=False,
             indent=2,
         ),
@@ -114,14 +128,20 @@ def _character_payload(character: Character) -> dict:
     }
 
 
-def _series_payload(context: ArcSeriesContinuationContext) -> dict:
+def _series_payload(
+    context: ArcSeriesContinuationContext, *, cloud_mode: bool = False,
+) -> dict:
     series = context.series
     return {
         "id": series.id,
         "title": series.title,
         "premise": series.premise,
         "theme": series.theme,
-        "tone": series.tone,
+        "tone": resolve_prompt_tone(
+            series.tone,
+            cloud_mode=cloud_mode,
+            context="arc series continuation draft (series)",
+        ),
         "member_template_ids": list(series.member_template_ids),
         "progress": {
             "status": context.progress.status,
@@ -131,13 +151,17 @@ def _series_payload(context: ArcSeriesContinuationContext) -> dict:
     }
 
 
-def _arc_payload(arc: StoryArc) -> dict:
+def _arc_payload(arc: StoryArc, *, cloud_mode: bool = False) -> dict:
     return {
         "id": arc.id,
         "title": arc.title,
         "premise": arc.premise,
         "theme": arc.theme,
-        "tone": arc.tone,
+        "tone": resolve_prompt_tone(
+            arc.tone,
+            cloud_mode=cloud_mode,
+            context="arc series continuation draft (completed arc)",
+        ),
         "source_template_id": arc.source_template_id,
         "beats": [_beat_payload(beat) for beat in arc.beats],
     }

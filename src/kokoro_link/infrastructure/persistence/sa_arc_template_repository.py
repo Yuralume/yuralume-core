@@ -11,6 +11,7 @@ to ``None`` and ``save_for_user`` refuses to write over a pack slug.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, or_, select
@@ -23,7 +24,10 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplateBeat,
     ArcTemplateBinding,
 )
+from kokoro_link.domain.entities.story_arc import normalise_operator_position
 from kokoro_link.infrastructure.persistence.models import ArcTemplateRow
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _now_utc() -> datetime:
@@ -44,11 +48,31 @@ def _dump_beats(beats: tuple[ArcTemplateBeat, ...]) -> str:
                 "scene_characters": list(b.scene_characters),
                 "dramatic_question": b.dramatic_question,
                 "required": b.required,
+                "operator_position": b.operator_position,
+                "operator_note": b.operator_note,
             }
             for b in beats
         ],
         ensure_ascii=False,
     )
+
+
+def _decode_operator_position(raw: object) -> str | None:
+    """Read a stored position leniently — see the SA arc repo twin.
+
+    ``_load_beats`` drops a whole beat when ``create`` raises, so a value
+    the domain would reject has to be neutralised here: an unreadable
+    *framing hint* must not cost the scene it belongs to.
+    """
+    try:
+        return normalise_operator_position(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "arc_templates beat operator_position %r is not a known "
+            "position — treating as unjudged",
+            raw,
+        )
+        return None
 
 
 def _load_beats(raw: str | None) -> list[ArcTemplateBeat]:
@@ -80,6 +104,10 @@ def _load_beats(raw: str | None) -> list[ArcTemplateBeat]:
                     ),
                     dramatic_question=entry.get("dramatic_question"),
                     required=bool(entry.get("required", True)),
+                    operator_position=_decode_operator_position(
+                        entry.get("operator_position"),
+                    ),
+                    operator_note=entry.get("operator_note"),
                 )
             )
         except (TypeError, ValueError):

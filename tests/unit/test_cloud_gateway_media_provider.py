@@ -364,13 +364,18 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
     assert headers["x-yuralume-audience"] == "yuralume-gateway"
     assert headers["x-yuralume-account"] == "acct_1"
     assert headers["x-yuralume-tenant"] == "tenant_1"
-    assert headers["x-yuralume-feature"] == "tts"
+    # Gateway billing classifies the player-visible synthesis action by this
+    # trigger key.  The request body keeps the TTS service's capability key
+    # (``tts``), but the trusted attribution header must name the foreground
+    # feature or Gateway deliberately treats it as unknown/no-charge.
+    assert headers["x-yuralume-feature"] == "tts_synthesis"
     assert headers["x-yuralume-character"] == "chr_abc"
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("tts-")
     assert adapter.last_request_id == headers["x-request-id"]
     payload = seen["payload"]
     assert payload["text"] == "hello"
+    assert payload["feature_key"] == "tts"
     assert payload["voice_id"] == "voice_default"
     assert payload["options"]["text_lang"] == "en"
 

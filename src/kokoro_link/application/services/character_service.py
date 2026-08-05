@@ -81,6 +81,15 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+CHARACTER_CREATE_LIMIT_WINDOW = timedelta(hours=24)
+"""Rolling window for ``daily_character_create_limit``.
+
+One constant, two readers: the wall in
+``_validate_runtime_profile_allows_character_create`` below and the
+display-only mirror in
+:mod:`~kokoro_link.application.services.player_runtime_limits`. They must
+agree, or the hint quotes a different day than the one the wall enforces."""
+
 
 class CharacterValidationError(ValueError):
     """Character mutation payload is invalid for the current user."""
@@ -480,7 +489,7 @@ class CharacterService:
             used = await self._account_runtime_usage_repository.count_events(
                 operator_id=user_id,
                 event_type=ACCOUNT_RUNTIME_EVENT_CHARACTER_CREATE,
-                since=now - timedelta(hours=24),
+                since=now - CHARACTER_CREATE_LIMIT_WINDOW,
                 until=now,
             )
             if used >= profile.daily_character_create_limit:

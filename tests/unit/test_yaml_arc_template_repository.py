@@ -196,6 +196,62 @@ def test_scene_characters_accepts_comma_string(tmp_path: Path) -> None:
     assert entry.template.beats[1].scene_characters == ("指導老師", "同學A")
 
 
+def test_beats_without_the_operator_keys_load_as_unjudged(
+    tmp_path: Path,
+) -> None:
+    """OP0-A — every YAML written before the slot existed (including the
+    three bundled packs) must still load; absence means *unjudged*."""
+    _write(tmp_path / "cafe_idol_audition.yaml", _VALID_TEMPLATE_YAML)
+    loader = YAMLArcTemplatePackLoader(directories=[tmp_path])
+
+    entry = _by_id(loader.load_all(), "cafe_idol_audition")
+    assert entry is not None
+    assert all(b.operator_position is None for b in entry.template.beats)
+    assert all(b.operator_note is None for b in entry.template.beats)
+
+
+def test_operator_position_and_note_are_read_from_yaml(
+    tmp_path: Path,
+) -> None:
+    yaml_with_position = _VALID_TEMPLATE_YAML.replace(
+        "    dramatic_question: 她要承認嗎？",
+        "    dramatic_question: 她要承認嗎？\n"
+        "    operator_position: central\n"
+        "    operator_note: 她要向你坦白",
+    )
+    _write(tmp_path / "x.yaml", yaml_with_position)
+    loader = YAMLArcTemplatePackLoader(directories=[tmp_path])
+
+    entry = _by_id(loader.load_all(), "cafe_idol_audition")
+    assert entry is not None
+    assert entry.template.beats[1].operator_position == "central"
+    assert entry.template.beats[1].operator_note == "她要向你坦白"
+    # The untouched first beat stays unjudged.
+    assert entry.template.beats[0].operator_position is None
+
+
+def test_off_vocabulary_position_rejects_the_template(tmp_path: Path) -> None:
+    """An authoring-time typo is loud, not silently downgraded.
+
+    The loader's contract is "loose typing, strict entity": a position
+    nobody defined would ship a template whose player framing nobody
+    chose, so the file is skipped (logged) exactly like any other schema
+    violation, and the neighbouring pack still loads."""
+    _write(tmp_path / "bad.yaml", _VALID_TEMPLATE_YAML.replace(
+        "id: cafe_idol_audition", "id: bad",
+    ).replace(
+        "    dramatic_question: 她要承認嗎？",
+        "    dramatic_question: 她要承認嗎？\n"
+        "    operator_position: protagonist",
+    ))
+    _write(tmp_path / "ok.yaml", _VALID_TEMPLATE_YAML.replace(
+        "id: cafe_idol_audition", "id: ok",
+    ))
+    loader = YAMLArcTemplatePackLoader(directories=[tmp_path])
+
+    assert [e.template.id for e in loader.load_all()] == ["ok"]
+
+
 def test_cache_is_lazy_and_reloadable(tmp_path: Path) -> None:
     loader = YAMLArcTemplatePackLoader(directories=[tmp_path])
     # Empty directory → empty cache, no error.

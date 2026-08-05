@@ -34,6 +34,8 @@ from kokoro_link.domain.entities.story_arc import (
     StoryArc,
     StoryArcBeat,
     TENSION_SETUP,
+    normalise_operator_note,
+    normalise_operator_position,
     _VALID_SCENE_TYPES,  # noqa: F401 — kept for clarity; we don't enforce here
 )
 
@@ -55,7 +57,14 @@ depending on the template's intent. Known values:
 - ``lighthearted`` — comic relief, banter, low-stakes mishaps
 
 Unknown values fall through to ``daily`` framing in the expander —
-authors can introduce shades without a code change."""
+authors can introduce shades without a code change.
+
+**Hosted caveat (GF6)**: ``mature`` is self-host only, and cloud mode
+narrows the free-string freedom above to the known catalogue at the
+prompt boundary. The policy — which surfaces fold, which reject, and
+why the write and render boundaries have different strictness — lives
+in :mod:`kokoro_link.domain.services.story_tone_policy`; do not
+re-derive it at a new call site."""
 
 ARC_TEMPLATE_SCOPE_GENERIC = "generic"
 ARC_TEMPLATE_SCOPE_CHARACTER_BOUND = "character_bound"
@@ -130,6 +139,14 @@ class ArcTemplateBeat:
     scene_characters: tuple[str, ...] = ()
     dramatic_question: str | None = None
     required: bool = True
+    # --- Player's place in this scene (OP0) --------------------------
+    # Mirror of ``StoryArcBeat``'s pair, sharing the same normalisers so
+    # a template author and a planner author never face two different
+    # conventions. Last fields so no positional construction shifts.
+    operator_position: str | None = None
+    """One of ``VALID_OPERATOR_POSITIONS``, or ``None`` = unjudged."""
+    operator_note: str | None = None
+    """Optional prose about how the player figures in this scene."""
 
     def __post_init__(self) -> None:
         if self.sequence < 0:
@@ -148,6 +165,18 @@ class ArcTemplateBeat:
                     "ArcTemplateBeat.scene_characters entries must be "
                     "non-empty strings",
                 )
+        # Same rule, same error, same place as ``StoryArcBeat`` — an
+        # off-vocabulary position is rejected on both sides.
+        object.__setattr__(
+            self,
+            "operator_position",
+            normalise_operator_position(self.operator_position),
+        )
+        object.__setattr__(
+            self,
+            "operator_note",
+            normalise_operator_note(self.operator_note),
+        )
 
     @classmethod
     def create(
@@ -163,6 +192,8 @@ class ArcTemplateBeat:
         scene_characters: Iterable[str] = (),
         dramatic_question: str | None = None,
         required: bool = True,
+        operator_position: str | None = None,
+        operator_note: str | None = None,
     ) -> "ArcTemplateBeat":
         # Same normalisation rules as StoryArcBeat — keep both sides
         # symmetric so a template author and a planner author don't
@@ -186,6 +217,8 @@ class ArcTemplateBeat:
             scene_characters=tuple(deduped),
             dramatic_question=(dramatic_question or "").strip() or None,
             required=bool(required),
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
 
 
@@ -358,6 +391,11 @@ class ArcTemplate:
                     scene_characters=tpl_beat.scene_characters,
                     dramatic_question=tpl_beat.dramatic_question,
                     required=tpl_beat.required,
+                    # An authored player position is the whole point of
+                    # the slot — dropping it here would mean the runtime
+                    # arc silently reverts every beat to "unjudged".
+                    operator_position=tpl_beat.operator_position,
+                    operator_note=tpl_beat.operator_note,
                 )
             )
         return arc.with_beats(beats)

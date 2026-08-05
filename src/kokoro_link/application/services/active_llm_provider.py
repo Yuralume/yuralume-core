@@ -359,9 +359,11 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
         pick must be able to correct it too. NSFW reroutes skip the
         override — the entry describes the normal route's model, not the
         hijacked NSFW target. Adapters without ``with_supports_vision``
-        (fake, cloud gateway) pass through unchanged, as does everything
+        (e.g. the fake model) pass through unchanged, as does everything
         when no override is pinned: the (already reasoning-bound or
-        registry) instance is returned as-is.
+        registry) instance is returned as-is. (Cloud-mode resolution never
+        reaches this resolver; its gateway adapter gets vision pins bound
+        by ``CloudActiveLLMProvider`` from control-plane preset metadata.)
         """
         binder = getattr(model, "with_supports_vision", None)
         if binder is None:

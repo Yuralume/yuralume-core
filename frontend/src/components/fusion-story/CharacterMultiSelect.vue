@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { UiBadge } from '@/components/ui'
+import { UiBadge, UiImage } from '@/components/ui'
 import type { Character } from '@/types/character'
 
 type MaterialTier = 'rich' | 'ok' | 'sparse'
@@ -97,7 +97,18 @@ const helperText = computed(() => {
           @change="toggle(char.id)"
         />
         <div class="multi-select__avatar">
-          <img v-if="char.image_urls?.[0]" :src="char.image_urls[0]" :alt="char.name" />
+          <!-- 36px circle (32px under 768px). This one had no `loading`
+               at all, so a fusion roster of twenty characters fetched
+               twenty 1024x1536 originals on mount; `avatar` makes each a
+               single lazy `?v=w320`. -->
+          <UiImage
+            v-if="char.image_urls?.[0]"
+            variant="avatar"
+            :src="char.image_urls[0]"
+            :alt="char.name"
+            :width="36"
+            :height="36"
+          />
           <span v-else>{{ char.name?.[0] ?? '?' }}</span>
         </div>
         <div class="multi-select__meta">

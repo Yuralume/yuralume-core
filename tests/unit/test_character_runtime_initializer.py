@@ -49,10 +49,12 @@ class _RecordingStoryArcService:
 class _RecordingStoryEventService:
     def __init__(self, *, crash: bool = False) -> None:
         self.calls: list[str] = []
+        self.unattended_flags: list[bool] = []
         self._crash = crash
 
-    async def ensure_today(self, character):
+    async def ensure_today(self, character, *, unattended=False):
         self.calls.append(character.id)
+        self.unattended_flags.append(unattended)
         if self._crash:
             raise RuntimeError("story expander unavailable")
         return type("Report", (), {"newly_rolled": 1})()
@@ -90,6 +92,13 @@ async def test_prepare_after_create_pre_generates_runtime_context() -> None:
         }
     ]
     assert story_event_service.calls == [created.id]
+    # Warm-up, not a performance: nothing here is shown to anyone, so a
+    # due beat that is *about the player* must be left waiting rather
+    # than recorded as surfaced to them (ARC_PLAYER_POSITION_PLAN §2 #5).
+    # Even one phantom attempt matters — the recheck threshold is small
+    # enough that it buys the rechecker the right to declare the scene
+    # performed on the player's first turn instead of letting them play it.
+    assert story_event_service.unattended_flags == [True]
 
 
 @pytest.mark.asyncio

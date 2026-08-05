@@ -59,6 +59,44 @@ _VALID_BEAT_STATUSES = frozenset(
     {BEAT_PENDING, BEAT_ACTIVE, BEAT_REALIZED, BEAT_SKIPPED},
 )
 
+# --- Play attempt results ---------------------------------------------
+# Closed vocabulary written by our own staging paths (never by a model or
+# a user), so membership is a legitimate domain check rather than the
+# keyword special-casing the LLM-first rule forbids.
+#
+# Two meanings live in ``last_play_attempt_result``: *what happened* to a
+# staging attempt, and — since ``with_status`` also writes the field — how
+# a beat reached a terminal status. Only the failure trio charges the
+# autonomous retry budget (BACKGROUND_COST_CONTROL_PLAN §10 #3); anything
+# else ("prompted", "notification_candidate", "scene_written:<strategy>",
+# "realized", "skipped") is bookkeeping the LLM reads.
+PLAY_RESULT_FAILED = "failed"
+"""Autonomous scene run produced nothing and no finer cause was known."""
+PLAY_RESULT_WRITER_CRASHED = "writer_crashed"
+"""The scene writer raised."""
+PLAY_RESULT_EMPTY_SCENE = "empty_scene"
+"""The scene writer returned an empty narrative."""
+PLAY_RESULT_RETRY_EXHAUSTED = "retry_exhausted"
+"""Terminal marker written by the retirement path when the failure budget
+runs out. Not an attempt result — it rides along a ``skipped`` status
+flip, so it never charges the budget it is the consequence of."""
+
+FAILED_PLAY_RESULTS = frozenset(
+    {PLAY_RESULT_FAILED, PLAY_RESULT_WRITER_CRASHED, PLAY_RESULT_EMPTY_SCENE},
+)
+
+
+def is_failed_play_result(result: object) -> bool:
+    """Did this staging attempt fail (and therefore cost a retry)?
+
+    Unknown values are *not* failures: over-suppression is the failure
+    mode this classification exists to remove, and the retirement path
+    below is the backstop for a genuinely dead beat. Callers must use the
+    ``PLAY_RESULT_*`` constants so a new failure kind is a one-line
+    addition to ``FAILED_PLAY_RESULTS`` rather than a silent free retry.
+    """
+    return _normalise_optional_label(result) in FAILED_PLAY_RESULTS
+
 # --- Scene types ------------------------------------------------------
 # Categorical hint for the expander prompt — drives tone & pacing of the
 # realized narrative. Free string with a recognised set; unknown values
@@ -75,6 +113,39 @@ _VALID_SCENE_TYPES = frozenset(
     {SCENE_ENCOUNTER, SCENE_REVELATION, SCENE_CONFLICT, SCENE_RESOLUTION, SCENE_INTERLUDE},
 )
 
+# --- Operator position (OP0 of ARC_PLAYER_POSITION_PLAN) --------------
+# Where the *player* stands in this scene. Until this slot existed a
+# beat could only name third-party NPC labels in ``scene_characters``,
+# so every consumer had to re-invent the player's place in the story
+# from prose — which is exactly the "湊/卡" the plan diagnoses.
+#
+# Deliberately a **closed** vocabulary, unlike ``scene_type`` (which
+# stays permissive so a planner can invent shades): consumers branch on
+# this value — the autonomous beat scan skips ``central`` outright — so
+# an off-vocabulary string would silently take a branch nobody chose.
+OPERATOR_POSITION_ABSENT = "absent"
+"""The player is not in this scene. A pure character-side beat that can
+be played to completion without them."""
+OPERATOR_POSITION_PRESENT = "present"
+"""The player is in the scene but the scene is not *about* them — they
+are there, accompanying, watching, reacting."""
+OPERATOR_POSITION_CENTRAL = "central"
+"""The scene is about the player and cannot be played without them.
+Autonomous paths leave it alone; the player-facing exits play it."""
+
+VALID_OPERATOR_POSITIONS = frozenset(
+    {
+        OPERATOR_POSITION_ABSENT,
+        OPERATOR_POSITION_PRESENT,
+        OPERATOR_POSITION_CENTRAL,
+    },
+)
+"""The three legal values. ``None`` is **not** a member and is the
+fourth, default state: *unjudged*. Every beat that existed before this
+slot reads back as ``None`` (the migration deliberately backfills
+nothing), and consumers answer ``None`` by deriving a framing
+semantically rather than by assuming one."""
+
 # --- Arc status -------------------------------------------------------
 # - active: the current running arc (at most one per character, enforced
 #   at service layer, not schema)
@@ -85,6 +156,50 @@ ARC_COMPLETED = "completed"
 ARC_ABANDONED = "abandoned"
 
 _VALID_ARC_STATUSES = frozenset({ARC_ACTIVE, ARC_COMPLETED, ARC_ABANDONED})
+
+
+def normalise_operator_position(value: object) -> str | None:
+    """Canonical form of an operator-position value, or raise.
+
+    ``None`` / blank → ``None`` (*unjudged*); a known label in any
+    casing → the canonical lowercase constant; anything else raises
+    ``ValueError``. Shared by ``StoryArcBeat`` and ``ArcTemplateBeat``
+    so the runtime beat and the blueprint beat cannot drift apart —
+    the same "Same normalisation rules — keep both sides symmetric"
+    contract ``scene_characters`` already carries.
+
+    Strict on purpose at the domain boundary. Ingest paths that must
+    survive garbage (an LLM planner's response, a row written by an
+    older schema) catch this and degrade to ``None``; they do not get
+    to invent a fourth position.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            "operator_position must be a string or None, got "
+            f"{type(value).__name__}",
+        )
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned not in VALID_OPERATOR_POSITIONS:
+        raise ValueError(
+            f"operator_position {value!r} must be one of "
+            f"{sorted(VALID_OPERATOR_POSITIONS)} or None (unjudged)",
+        )
+    return cleaned
+
+
+def normalise_operator_note(value: object) -> str | None:
+    """Free-text note about the player's dramatic place in this scene.
+
+    Coerce-don't-reject (mirrors ``_normalise_optional_label``): blank
+    and non-string collapse to ``None``. Prose, not vocabulary — it is
+    what a writer prompt reads ("她要向你坦白"), so it is never
+    validated against a list and never branched on.
+    """
+    return _normalise_optional_label(value)
 
 
 def _utcnow() -> datetime:
@@ -150,6 +265,27 @@ class StoryArcBeat:
     last_play_push_intensity: str | None = None
     """Factual label for how strongly the last attempt tried to surface
     the beat. The LLM decides whether to escalate from this fact."""
+    play_failure_count: int = 0
+    """How many staging attempts actually *failed* (see
+    ``FAILED_PLAY_RESULTS``). Separate from ``play_attempt_count``
+    because that one answers "how often was this surfaced" — a question
+    a chatty player inflates — while the autonomous retry budget must
+    answer "how often did we try and fail"."""
+    last_play_failure_at: datetime | None = None
+    """When the last *failed* attempt happened. The retry backoff anchors
+    here so a later non-failing attempt cannot push the retry window
+    out."""
+    # --- Player's place in this scene (OP0) --------------------------
+    # ``scene_characters`` is the NPC cast and says nothing about the
+    # player; these two say where the player stands. Kept as the last
+    # fields so no positional construction anywhere shifts.
+    operator_position: str | None = None
+    """One of ``VALID_OPERATOR_POSITIONS``, or ``None`` = unjudged.
+    Structural — consumers branch on it, and it is never translated."""
+    operator_note: str | None = None
+    """Optional one-line prose about *how* the player figures in this
+    scene ("她要向你坦白"). Player-visible natural language: material for
+    writer prompts, and a translation candidate."""
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -183,6 +319,8 @@ class StoryArcBeat:
                 )
         if self.play_attempt_count < 0:
             raise ValueError("StoryArcBeat.play_attempt_count must be >= 0")
+        if self.play_failure_count < 0:
+            raise ValueError("StoryArcBeat.play_failure_count must be >= 0")
         object.__setattr__(
             self,
             "last_play_attempt_source",
@@ -197,6 +335,19 @@ class StoryArcBeat:
             self,
             "last_play_push_intensity",
             _normalise_optional_label(self.last_play_push_intensity),
+        )
+        # Raises on an off-vocabulary position — see
+        # ``normalise_operator_position``. ``dataclasses.replace`` runs
+        # __post_init__ too, so every ``with_*`` helper is covered.
+        object.__setattr__(
+            self,
+            "operator_position",
+            normalise_operator_position(self.operator_position),
+        )
+        object.__setattr__(
+            self,
+            "operator_note",
+            normalise_operator_note(self.operator_note),
         )
 
     @classmethod
@@ -221,6 +372,10 @@ class StoryArcBeat:
         last_play_attempt_source: str | None = None,
         last_play_attempt_result: str | None = None,
         last_play_push_intensity: str | None = None,
+        play_failure_count: int = 0,
+        last_play_failure_at: datetime | None = None,
+        operator_position: str | None = None,
+        operator_note: str | None = None,
         id: str | None = None,
     ) -> StoryArcBeat:
         resolved_tension = tension.strip() or TENSION_SETUP
@@ -263,6 +418,13 @@ class StoryArcBeat:
             last_play_push_intensity=_normalise_optional_label(
                 last_play_push_intensity,
             ),
+            play_failure_count=max(0, int(play_failure_count)),
+            last_play_failure_at=last_play_failure_at,
+            # Normalised (and validated) in __post_init__ — same as the
+            # attempt labels above, so create() and a bare constructor
+            # cannot disagree about what a legal position is.
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
 
     def with_status(
@@ -296,6 +458,15 @@ class StoryArcBeat:
         result: str,
         push_intensity: str,
     ) -> StoryArcBeat:
+        """Record a staging attempt.
+
+        ``play_attempt_count`` / ``last_play_attempt_*`` keep their
+        original "this beat was surfaced" meaning — the prompt layer
+        renders them and every source bumps them. The failure counters
+        move only when ``result`` is a real failure, which is what the
+        retry budget spends.
+        """
+        failed = is_failed_play_result(result)
         return replace(
             self,
             play_attempt_count=self.play_attempt_count + 1,
@@ -303,6 +474,10 @@ class StoryArcBeat:
             last_play_attempt_source=_normalise_optional_label(source),
             last_play_attempt_result=_normalise_optional_label(result),
             last_play_push_intensity=_normalise_optional_label(push_intensity),
+            play_failure_count=self.play_failure_count + (1 if failed else 0),
+            last_play_failure_at=(
+                attempted_at if failed else self.last_play_failure_at
+            ),
         )
 
     def with_fields(
@@ -317,7 +492,17 @@ class StoryArcBeat:
         dramatic_question: str | None = None,
         scene_type: str | None = None,
         required: bool | None = None,
+        operator_position: str | None = None,
+        operator_note: str | None = None,
     ) -> StoryArcBeat:
+        """Patch scene fields. ``None`` means *leave unchanged*.
+
+        That sentinel collides with ``operator_position``'s legitimate
+        ``None`` (*unjudged*), so clearing the slot uses the same escape
+        hatch ``location`` / ``dramatic_question`` already use: pass
+        ``""``. An editor that wants "back to unjudged" sends a blank
+        string, not a missing key.
+        """
         if scene_characters is not None:
             seen: set[str] = set()
             deduped: list[str] = []
@@ -342,6 +527,17 @@ class StoryArcBeat:
             cleaned_scene_type = scene_type.strip() or self.scene_type
         else:
             cleaned_scene_type = self.scene_type
+        if operator_position is not None:
+            # Validation stays in __post_init__ (via replace) so an
+            # illegal patch is rejected the same way an illegal
+            # construction is.
+            next_position = operator_position
+        else:
+            next_position = self.operator_position
+        if operator_note is not None:
+            next_note = normalise_operator_note(operator_note)
+        else:
+            next_note = self.operator_note
         return replace(
             self,
             scheduled_date=scheduled_date if scheduled_date is not None else self.scheduled_date,
@@ -353,6 +549,8 @@ class StoryArcBeat:
             dramatic_question=cleaned_question,
             scene_type=cleaned_scene_type,
             required=self.required if required is None else bool(required),
+            operator_position=next_position,
+            operator_note=next_note,
         )
 
 

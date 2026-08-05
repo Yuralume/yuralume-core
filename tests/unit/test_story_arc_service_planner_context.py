@@ -1,6 +1,6 @@
-"""AE0 — what ``StoryArcService`` feeds the arc planner.
+"""AE0 / OP1-A — what ``StoryArcService`` feeds the arc planner.
 
-Two new inputs reach the LLM planning path:
+Three inputs reach the LLM planning path:
 
 - ``seed_candidates`` — ``dramatic``-tier story seeds rolled as
   subject-matter candidates, minus whatever the last few arcs already
@@ -8,11 +8,15 @@ Two new inputs reach the LLM planning path:
   few chat turns.
 - ``arc_history`` — one-line digests of earlier arcs, oldest first, as
   the semantic anti-repetition input.
+- ``operator_relationship_lines`` (OP1-A) — who the *player* is to this
+  character: how they are addressed, the relationship, the distance.
+  Without it the planner could not name the player, and so had no basis
+  on which to decide whether a beat is about them.
 
 The invariants under test are mostly about what happens when those
 inputs are *not* available: no gacha wired, an empty pool, a raising
-repository, or a planner still pinned to the pre-AE0 signature must all
-produce an arc exactly as before.
+repository, no confirmed relationship seed, or a planner still pinned to
+the pre-AE0 signature must all produce an arc exactly as before.
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ from kokoro_link.contracts.story_arc import (
     StoryArcSeasonDeciderPort,
 )
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.character_operator_relationship_seed import (
+    CharacterOperatorRelationshipSeed,
+)
 from kokoro_link.domain.entities.story_arc import (
     ARC_ABANDONED,
     ARC_COMPLETED,
@@ -45,6 +52,9 @@ from kokoro_link.domain.entities.story_seed import (
     StorySeed,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
+from kokoro_link.infrastructure.repositories.in_memory_initial_relationship import (
+    InMemoryCharacterOperatorRelationshipSeedRepository,
+)
 from kokoro_link.infrastructure.repositories.in_memory_stories import (
     InMemoryStorySeedRepository,
     InMemoryStoryEventRepository,
@@ -83,11 +93,12 @@ def _plan_stub_arc(
 
 
 class _RecordingPlanner(StoryArcPlannerPort):
-    """Declares the AE0 kwargs and records every call's context."""
+    """Declares the AE0 / OP1-A kwargs and records every call's context."""
 
     def __init__(self) -> None:
         self.seed_candidates: list[tuple[StorySeed, ...]] = []
         self.arc_histories: list[tuple[str, ...]] = []
+        self.relationship_lines: list[tuple[str, ...]] = []
 
     async def plan_arc(
         self,
@@ -102,9 +113,11 @@ class _RecordingPlanner(StoryArcPlannerPort):
         today: date | None = None,
         seed_candidates: tuple[StorySeed, ...] = (),
         arc_history: tuple[str, ...] = (),
+        operator_relationship_lines: tuple[str, ...] = (),
     ) -> StoryArc:
         self.seed_candidates.append(seed_candidates)
         self.arc_histories.append(arc_history)
+        self.relationship_lines.append(operator_relationship_lines)
         return _plan_stub_arc(
             character_id=character.id,
             start_date=start_date,
@@ -434,6 +447,247 @@ async def test_legacy_planner_signature_still_plans_an_arc() -> None:
 
     assert planner.calls == 1
     assert arc.beats
+
+
+# ---- OP1-A: the player facts the planner never had --------------------
+#
+# ARC_PLAYER_POSITION_PLAN §1: the arc planner's only input about the
+# player was a language tag. It could not name them, did not know how
+# close they stand, and therefore had no basis on which to decide whether
+# a beat is *about* them. The seed the user confirmed at creation time is
+# the material that already exists for exactly this question, so the
+# service now renders it into the planner call — on every LLM planning
+# path, not just the first arc.
+
+
+class _Operator:
+    def __init__(self, operator_id: str, language: str = "zh-TW") -> None:
+        self.id = operator_id
+        self.primary_language = language
+
+
+class _OperatorProfiles:
+    def __init__(self, operator: _Operator | None) -> None:
+        self._operator = operator
+
+    async def get_for_user(self, user_id: str) -> _Operator | None:  # noqa: ARG002
+        return self._operator
+
+
+class _ExplodingSeedRepository:
+    async def get(self, character_id: str, operator_id: str) -> object:  # noqa: ARG002
+        raise RuntimeError("relationship seed table unreachable")
+
+
+async def _seed_repository(
+    *, character_id: str, operator_id: str, **fields: object,
+) -> InMemoryCharacterOperatorRelationshipSeedRepository:
+    repository = InMemoryCharacterOperatorRelationshipSeedRepository()
+    await repository.save(
+        CharacterOperatorRelationshipSeed(
+            character_id=character_id, operator_id=operator_id, **fields,
+        ),
+    )
+    return repository
+
+
+def _service_with_relationship(
+    *,
+    character: Character,
+    planner: _RecordingPlanner,
+    repository: InMemoryStoryArcRepository | None = None,
+    seed_repository: object | None = None,
+    operator: _Operator | None = None,
+    season_decider: StoryArcSeasonDeciderPort | None = None,
+) -> StoryArcService:
+    return StoryArcService(
+        repository=repository or InMemoryStoryArcRepository(),
+        planner=planner,
+        operator_profile_service=_OperatorProfiles(operator),
+        relationship_seed_repository=seed_repository,
+        season_decider=season_decider,
+    )
+
+
+@pytest.mark.asyncio
+async def test_planner_learns_how_the_player_is_addressed() -> None:
+    character = _character()
+    planner = _RecordingPlanner()
+    operator = _Operator("op-1")
+    service = _service_with_relationship(
+        character=character,
+        planner=planner,
+        operator=operator,
+        seed_repository=await _seed_repository(
+            character_id=character.id,
+            operator_id=operator.id,
+            user_address_name="小北",
+            character_address_name="唯醬",
+            relationship_label="住在一起兩年的戀人",
+            tone_distance="親暱但不黏",
+        ),
+    )
+
+    await service.start_new_arc(character, today=date(2026, 5, 1))
+
+    lines = planner.relationship_lines[0]
+    assert "- 角色怎麼稱呼玩家：小北" in lines
+    assert "- 玩家怎麼稱呼角色：唯醬" in lines
+    assert "- 關係：住在一起兩年的戀人" in lines
+    assert "- 語氣距離：親暱但不黏" in lines
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    ["no-repository", "no-operator", "no-profile-service", "empty-seed"],
+)
+async def test_absent_relationship_material_plans_exactly_as_before(
+    kind: str,
+) -> None:
+    # Four ways to have nothing to say about the player. All of them must
+    # hand the planner an empty tuple — which renders the pre-OP1-A
+    # prompt — rather than a half-filled block the model feels obliged
+    # to complete.
+    character = _character()
+    planner = _RecordingPlanner()
+    operator = _Operator("op-1")
+    if kind == "no-repository":
+        service = _service_with_relationship(
+            character=character, planner=planner, operator=operator,
+        )
+    elif kind == "no-operator":
+        service = _service_with_relationship(
+            character=character,
+            planner=planner,
+            operator=None,
+            seed_repository=await _seed_repository(
+                character_id=character.id,
+                operator_id="op-1",
+                relationship_label="戀人",
+            ),
+        )
+    elif kind == "no-profile-service":
+        service = StoryArcService(
+            repository=InMemoryStoryArcRepository(),
+            planner=planner,
+            relationship_seed_repository=await _seed_repository(
+                character_id=character.id,
+                operator_id="op-1",
+                relationship_label="戀人",
+            ),
+        )
+    else:
+        service = _service_with_relationship(
+            character=character,
+            planner=planner,
+            operator=operator,
+            # Confirmed, but the user filled nothing in.
+            seed_repository=await _seed_repository(
+                character_id=character.id, operator_id=operator.id,
+            ),
+        )
+
+    arc = await service.start_new_arc(character, today=date(2026, 5, 1))
+
+    assert arc.beats
+    assert planner.relationship_lines == [()]
+
+
+@pytest.mark.asyncio
+async def test_relationship_lookup_failure_never_blocks_arc_creation() -> None:
+    character = _character()
+    planner = _RecordingPlanner()
+    service = _service_with_relationship(
+        character=character,
+        planner=planner,
+        operator=_Operator("op-1"),
+        seed_repository=_ExplodingSeedRepository(),
+    )
+
+    arc = await service.start_new_arc(character, today=date(2026, 5, 1))
+
+    # A missing relationship costs a nuance in one arc, never the arc.
+    assert arc.beats
+    assert planner.relationship_lines == [()]
+
+
+@pytest.mark.asyncio
+async def test_next_season_inherits_the_player_facts() -> None:
+    # Season continuation is the same planner chain, so it must pick the
+    # material up without its own plumbing — pinned here because "it
+    # inherits naturally" is exactly the kind of claim that quietly stops
+    # being true.
+    repository = InMemoryStoryArcRepository()
+    character = _character()
+    planner = _RecordingPlanner()
+    operator = _Operator("op-1")
+    await _store_past_arc(
+        repository,
+        character_id=character.id,
+        title="第一季",
+        premise="第一段題材",
+        updated_at=_at(1),
+    )
+
+    class _AlwaysOpen(StoryArcSeasonDeciderPort):
+        async def decide(
+            self, context: StoryArcSeasonContext,  # noqa: ARG002
+        ) -> StoryArcSeasonDecision:
+            return StoryArcSeasonDecision(should_start=True, reason="test")
+
+    service = _service_with_relationship(
+        character=character,
+        planner=planner,
+        repository=repository,
+        operator=operator,
+        season_decider=_AlwaysOpen(),
+        seed_repository=await _seed_repository(
+            character_id=character.id,
+            operator_id=operator.id,
+            relationship_label="還在試探彼此的同事",
+        ),
+    )
+
+    arc = await service.ensure_active_arc(character, today=date(2026, 5, 1))
+
+    assert arc is not None
+    assert planner.relationship_lines[0] == ("- 關係：還在試探彼此的同事",)
+
+
+@pytest.mark.asyncio
+async def test_force_open_season_inherits_the_player_facts() -> None:
+    # 起幕's forced open skips the season decider, not the planner
+    # context: the player pulled this season into existence, so the
+    # planner had better know who they are.
+    repository = InMemoryStoryArcRepository()
+    character = _character()
+    planner = _RecordingPlanner()
+    operator = _Operator("op-1")
+    await _store_past_arc(
+        repository,
+        character_id=character.id,
+        title="第一季",
+        premise="第一段題材",
+        updated_at=_at(1),
+    )
+    service = _service_with_relationship(
+        character=character,
+        planner=planner,
+        repository=repository,
+        operator=operator,
+        # No decider wired at all — force_open_season must not need one.
+        seed_repository=await _seed_repository(
+            character_id=character.id,
+            operator_id=operator.id,
+            relationship_label="還在試探彼此的同事",
+        ),
+    )
+
+    arc = await service.force_open_season(character, today=date(2026, 5, 1))
+
+    assert arc is not None
+    assert planner.relationship_lines[0] == ("- 關係：還在試探彼此的同事",)
 
 
 @pytest.mark.asyncio

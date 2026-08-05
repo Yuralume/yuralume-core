@@ -22,10 +22,24 @@ class MessageKind(str, Enum):
       artifact (e.g. a ``/pic`` image) and whose text content is empty.
       Filtered out of schedule / arc / proactive context because a bare
       image URL isn't useful dialogue.
+    - ``SCENE_NARRATION`` — third-person narration that opens or closes a
+      story scene (「起幕」, SC1). Not the character speaking, so the
+      anti-repetition sampler (which reads back the character's own
+      lines) skips it, and the frontend frames it as a scene card rather
+      than a chat bubble. It is otherwise **ordinary history**: the
+      narration states facts the scene established, and a later turn that
+      could not see them would contradict the story it is inside.
+
+    Values are persisted verbatim in a ``String(16)`` column; a new
+    member must stay within that budget. Unknown values read back from
+    the database degrade to ``CHAT`` (see the repositories' ``_coerce_
+    kind``), which is the safe direction — a message of an unrecognised
+    kind is still dialogue the model should see.
     """
 
     CHAT = "chat"
     TOOL_ONLY = "tool_only"
+    SCENE_NARRATION = "scene_narration"
 
 
 class MessageContentMode(str, Enum):

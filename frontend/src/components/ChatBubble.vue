@@ -16,6 +16,14 @@ import { revealDelaysFor, splitAssistantBubbles } from '@/utils/chatSegments'
 import { clampSeedPrompt, composeMomentSeed } from '@/utils/fusionSeed'
 import { stashStudioSeed } from '@/utils/studioSeedTransfer'
 import { isTTSPlaybackEligible } from '@/utils/ttsAvailability'
+import { UiImage } from '@/components/ui'
+import { observeOffscreenRelease } from '@/utils/offscreenImageObserver'
+import {
+  type ImageBox,
+  OFFSCREEN_IMAGE_RELEASE_MARGIN_PX,
+  releasedImageSrc,
+  usableImageBox,
+} from '@/utils/offscreenImageRelease'
 
 const { t } = useI18n()
 const { isAdmin } = useAuth()
@@ -50,6 +58,65 @@ const imageAttachments = computed<MessageAttachment[]>(() =>
 const otherAttachments = computed<MessageAttachment[]>(() =>
   (props.message.attachments ?? []).filter(a => a.kind !== 'image'),
 )
+
+// --- Chat pictures: right size, and only while they are worth holding (IV5-C)
+/**
+ * How wide a chat picture ever actually paints, so the browser can pick the
+ * cheap candidate instead of assuming `100vw`.
+ *
+ * From the layout, not from a guess: the desktop chat column is 420 px
+ * (`StagePage`), less the container's 32 px of padding, and `.bubble` caps at
+ * 80% of that — 310 px, rounded to the 320 px the small variant already is.
+ * Below that breakpoint the thread is viewport-wide, so the same 80% of
+ * `100vw - 32px` is ~72vw. `.bubble-image { max-height: 360px }` usually binds
+ * first (a 2:3 portrait paints 240 px wide), so this is the ceiling, not the
+ * common case.
+ */
+const BUBBLE_IMAGE_SIZES = '(max-width: 960px) 72vw, 320px'
+
+/** The whole picture strip is observed as one unit; a bubble rarely has two. */
+const bubbleImagesEl = ref<HTMLElement | null>(null)
+const imagesReleased = ref(false)
+let stopObservingImages: (() => void) | null = null
+
+/**
+ * The box each picture occupied while it was loaded, keyed by URL.
+ *
+ * Fed straight back as the element's `width`/`height`, which is what makes
+ * releasing free of layout consequences: the placeholder is the same box the
+ * picture was. Recorded on load rather than assumed, because chat attachments
+ * are not all the 1024x1536 this product generates — players upload their own,
+ * and `MessageAttachment` carries no dimensions for us to read.
+ */
+const imageBoxes = ref<Record<string, ImageBox>>({})
+
+function imageSrcFor(url: string): string {
+  return releasedImageSrc(url, imagesReleased.value)
+}
+
+function rememberImageBox(url: string, event: Event) {
+  const el = event.target as HTMLImageElement | null
+  // `complete` + a real natural width means the bytes are in and layout has
+  // settled around them; measuring earlier records the placeholder as if it
+  // were the picture.
+  if (!el || !el.complete || el.naturalWidth <= 0) return
+  const box = usableImageBox(el.offsetWidth, el.offsetHeight)
+  if (box) imageBoxes.value = { ...imageBoxes.value, [url]: box }
+}
+
+// The strip is behind `v-if` (it only renders once the text has finished
+// revealing), so the element arrives after mount and can go away again —
+// hence a watch rather than a one-shot `onMounted`.
+watch(bubbleImagesEl, (el) => {
+  stopObservingImages?.()
+  stopObservingImages = null
+  if (!el) return
+  stopObservingImages = observeOffscreenRelease(
+    el,
+    OFFSCREEN_IMAGE_RELEASE_MARGIN_PX,
+    (released) => { imagesReleased.value = released },
+  )
+})
 
 // Split `*action*` runs out of the content so they can render with a
 // distinct muted / italic style. Matches single-line runs only — if the
@@ -243,6 +310,10 @@ onBeforeUnmount(() => {
   revealRunId += 1
   clearRevealTimer()
   teardownAudio()
+  // The shared observer holds this element strongly; leaving it observed would
+  // keep the whole unmounted bubble alive.
+  stopObservingImages?.()
+  stopObservingImages = null
 })
 
 const ttsButtonLabel = computed(() => {
@@ -418,7 +489,13 @@ watch(
       <span class="bubble-dot" /><span class="bubble-dot" /><span class="bubble-dot" />
     </div>
 
-    <div v-if="imageAttachments.length && allBubblesVisible" class="bubble-images">
+    <div
+      v-if="imageAttachments.length && allBubblesVisible"
+      ref="bubbleImagesEl"
+      class="bubble-images"
+    >
+      <!-- The href stays the original: "open in a new tab" means the full
+           picture, not the size the thread happened to display. -->
       <a
         v-for="att in imageAttachments"
         :key="att.url"
@@ -427,11 +504,15 @@ watch(
         rel="noopener"
         class="bubble-image-link"
       >
-        <img
-          :src="att.url"
+        <UiImage
+          :src="imageSrcFor(att.url)"
           :alt="att.caption ?? t('chat.bubble.imageAlt')"
+          variant="content"
+          :sizes="BUBBLE_IMAGE_SIZES"
+          :width="imageBoxes[att.url]?.width"
+          :height="imageBoxes[att.url]?.height"
           class="bubble-image"
-          loading="lazy"
+          @load="rememberImageBox(att.url, $event)"
         />
         <span v-if="att.caption" class="bubble-image-caption">{{ att.caption }}</span>
       </a>
@@ -682,6 +763,13 @@ watch(
 .bubble-image {
   max-width: 100%;
   max-height: 360px;
+  /* Not decoration — the counterpart to the measured `width`/`height` the
+     released placeholder carries (IV5-C). A replaced element with *both*
+     dimensions pinned ignores its ratio when `max-width` shrinks it, so a
+     narrowed window would squash the picture. With the height auto, the width
+     attribute (and the ratio it implies) drives both states to the same box,
+     released or not. */
+  height: auto;
   border-radius: 10px;
   border: 1px solid var(--color-border);
   background: rgba(0, 0, 0, 0.15);
