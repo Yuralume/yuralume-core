@@ -24,7 +24,9 @@ from kokoro_link.infrastructure.repositories.in_memory_cloud_subscription import
 )
 
 
-def _character(*, user_id: str = "cloud:acct_1") -> Character:
+def _character(
+    *, user_id: str = "cloud:acct_1", origin_official_card_id: str | None = None,
+) -> Character:
     return Character.create(
         name="Kokoro",
         summary="A helpful companion",
@@ -40,6 +42,7 @@ def _character(*, user_id: str = "cloud:acct_1") -> Character:
             trust=50,
             energy=80,
         ),
+        origin_official_card_id=origin_official_card_id,
     )
 
 
@@ -74,6 +77,7 @@ async def test_cloud_identity_resolver_maps_character_owner_projection() -> None
     assert identity.operator_id == "cloud:acct_1"
     assert identity.character_ref.startswith("chr_")
     assert identity.character_ref != _character().id
+    assert identity.character_origin is None
 
 
 @pytest.mark.asyncio
@@ -90,6 +94,25 @@ async def test_cloud_identity_resolver_maps_operator_projection_without_characte
     assert identity.tenant_id == "tenant_1"
     assert identity.operator_id == "cloud:acct_1"
     assert identity.character_ref == ""
+    assert identity.character_origin is None
+
+
+@pytest.mark.asyncio
+async def test_cloud_identity_resolver_carries_origin_for_managed_character() -> None:
+    # EC7: a managed character's plaintext origin card slug rides on the
+    # identity so the five Gateway adapters can send it; an ordinary
+    # character (above) leaves it None.
+    repo = InMemoryOperatorProfileRepository()
+    await repo.save(_operator())
+    resolver = CloudOperatorIdentityResolver(repository=repo)
+
+    identity = await resolver.resolve_context(
+        CloudResourceContext.for_character(
+            _character(origin_official_card_id="official-yumi"),
+        ),
+    )
+
+    assert identity.character_origin == "official-yumi"
 
 
 @pytest.mark.asyncio

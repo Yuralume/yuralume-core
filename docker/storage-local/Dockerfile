@@ -5,7 +5,16 @@ WORKDIR /app
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock README.md ./
-COPY src ./src
+# Deliberately copy only the storage runtime closure. Hosted release tooling
+# hashes the same paths and can therefore reuse this image for app-only Core
+# releases without smuggling unrelated application code into the artifact.
+COPY src/kokoro_link/__init__.py ./src/kokoro_link/__init__.py
+COPY src/kokoro_link/contracts/__init__.py ./src/kokoro_link/contracts/__init__.py
+COPY src/kokoro_link/contracts/object_storage.py ./src/kokoro_link/contracts/object_storage.py
+COPY src/kokoro_link/infrastructure/__init__.py ./src/kokoro_link/infrastructure/__init__.py
+COPY src/kokoro_link/infrastructure/storage/__init__.py ./src/kokoro_link/infrastructure/storage/__init__.py
+COPY src/kokoro_link/infrastructure/storage/keys.py ./src/kokoro_link/infrastructure/storage/keys.py
+COPY src/kokoro_link/storage_service ./src/kokoro_link/storage_service
 
 RUN uv sync --frozen --no-dev && uv cache clean
 

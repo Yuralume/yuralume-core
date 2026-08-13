@@ -153,6 +153,7 @@ class ProactiveScheduler:
         proactive_delivery_retry_worker: (
             ProactiveDeliveryRetryWorker | None
         ) = None,
+        feed_video_job_service=None,  # noqa: ANN001 - FeedVideoJobService
         character_encounter_service: CharacterEncounterService | None = None,
         encounter_plan_interval_seconds: float = _DEFAULT_ENCOUNTER_PLAN_INTERVAL_SECONDS,
         character_social_knowledge_service: CharacterSocialKnowledgeService | None = None,
@@ -223,6 +224,12 @@ class ProactiveScheduler:
         # the same event_id/envelope (never re-runs judge/decider). ``None`` on the
         # self-host default (no ledger) → the tick is byte-identical.
         self._proactive_delivery_retry_worker = proactive_delivery_retry_worker
+        # CV4 embedded carrier for the deferred video pipeline. Wired ONLY on a
+        # deployment whose video provider takes jobs (the hosted cloud
+        # adapter); a self-host scheduler gets ``None`` and therefore does not
+        # gain a single query per tick — the pipeline that would write the rows
+        # this sweeps cannot run there in the first place.
+        self._feed_video_job_service = feed_video_job_service
         # Optional — Route B character encounters advance the world
         # without a user opening either character's chat. Running a due
         # encounter is the expensive multi-turn LLM path; both run and plan
@@ -701,6 +708,17 @@ class ProactiveScheduler:
                 "proactive_delivery_retry",
                 self._proactive_delivery_retry_worker.tick(now=now),
             )
+        # Land (or time out) any LumeGram clip submitted by an earlier tick.
+        # Global, once per tick, and unwired on self-host — see the field's
+        # note. The service contains its own failures, so a broker outage
+        # leaves the rows pending for the next sweep instead of breaking the
+        # tick; a row past its deadline degrades to its first frame here.
+        if self._feed_video_job_service is not None:
+            await self._timed(
+                steps,
+                "feed_video_poll",
+                self._sweep_pending_feed_videos(now),
+            )
         # Retire idle scene rows nobody owns any more (SC1-E). Global, once
         # per tick, and deliberately NOT the per-character wrap-up — that
         # one runs inside the executor below, for both scheduling lines.
@@ -756,6 +774,21 @@ class ProactiveScheduler:
         if outcome.peer_consolidated:
             self._last_peer_knowledge_at = now
         return active, frozen, total
+
+    async def _sweep_pending_feed_videos(self, now: datetime) -> None:
+        """Observe every due in-flight video job. Never raises.
+
+        The service already contains per-row failures; this belt exists for
+        the same reason the unowned-scene sweep has one — the step runs
+        before the per-character loop, so an escape here would abort the
+        whole tick."""
+        assert self._feed_video_job_service is not None
+        try:
+            await self._feed_video_job_service.tick(now=now)
+        except Exception:
+            _LOGGER.exception(
+                "proactive scheduler: pending feed video sweep crashed",
+            )
 
     async def _sweep_unowned_scenes(self, now: datetime) -> None:
         """Retire idle scene rows whose character is gone. Never raises.

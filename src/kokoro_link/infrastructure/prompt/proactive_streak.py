@@ -14,7 +14,7 @@ licence to let that land emotionally — the character re-derived a
 near-identical opener every day instead of evolving (mild interest →
 worry → sulking → giving space), which reads as a broken record.
 
-LLM-first stance (CLAUDE.md): this is a **fact layer**. It states the
+LLM-first stance: this is a **fact layer**. It states the
 count and opens the door to a persona-driven reaction. It must never
 encode "N >= 3 → get angry"; direction and intensity are always the
 model's call from persona + disposition + current state.

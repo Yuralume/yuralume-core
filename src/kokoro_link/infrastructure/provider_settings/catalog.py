@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from kokoro_link.infrastructure.provider_settings.runtime_ids import (
+    CONNECTION_SLUG_FIELD_KEY,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderFieldSpec:
@@ -309,6 +313,26 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
         placeholder="/comfyui/models/loras",
         advanced=True,
     )
+    # Offered on every preset with an llm / image / video capability —
+    # those mount into registries keyed by id, so a second row of the same
+    # preset needs its own slug to coexist instead of replacing the first
+    # one at sync time (see runtime_ids). tts / embedding / search presets
+    # do NOT get it: they mount exactly one backend by design, where extra
+    # rows are standby, not parallel.
+    connection_slug = ProviderFieldSpec(
+        key=CONNECTION_SLUG_FIELD_KEY,
+        label="Connection slug (blank for your first connection of this provider)",
+        placeholder="e.g. relay-b",
+        advanced=True,
+        hint=(
+            "Only needed when you keep several connections of this same "
+            "provider — e.g. a relay vendor whose API keys each serve a "
+            "different model line-up. The slug becomes part of the id you "
+            "pick in the model selector (custom_openai_compatible__relay-b), "
+            "so keep it short, ASCII, and do not rename it afterwards: "
+            "settings that point at the old id fall back to the default."
+        ),
+    )
     return (
         ProviderCatalogEntry(
             id="openai",
@@ -331,6 +355,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="remote",
             default_models=(
@@ -351,6 +376,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 supports_vision,
                 max_tokens,
                 thinking_budget_tokens,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             default_models=("claude-sonnet-4-5",),
@@ -368,6 +394,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 timeout_seconds,
                 supports_vision,
                 max_tokens,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             # gemini-2.0-flash was hard shut down 2026-06-01 (404 on every
@@ -385,7 +412,12 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
             display_name="xAI",
             capabilities=("image",),
             auth_fields=(api_key,),
-            config_fields=(base_url, default_model, timeout_seconds),
+            config_fields=(
+                base_url,
+                default_model,
+                timeout_seconds,
+                connection_slug,
+            ),
             model_catalog_mode="manual",
             # grok-2-image-1212 is legacy (dropped from docs.x.ai models
             # page) and rejects aspect_ratio; grok-imagine is current.
@@ -409,6 +441,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 comfyui_workflow_file,
                 comfyui_lora_dir,
                 timeout_seconds,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             adapter_kind="comfyui",
@@ -419,7 +452,12 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
             display_name="Google Veo",
             capabilities=("video",),
             auth_fields=(api_key,),
-            config_fields=(base_url, default_model, timeout_seconds),
+            config_fields=(
+                base_url,
+                default_model,
+                timeout_seconds,
+                connection_slug,
+            ),
             model_catalog_mode="manual",
             default_models=("veo-3.1-generate-preview",),
             adapter_kind="google_veo",
@@ -455,6 +493,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="remote",
             default_models=("openai/gpt-4o-mini",),
@@ -482,6 +521,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="remote",
             # NanoGPT's authoritative /api/v1/models list dropped the bare
@@ -505,6 +545,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             # 'deepseek-chat' fully retires 2026-07-24 (404 model-not-found
@@ -528,6 +569,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             default_models=("mistral-small-latest",),
@@ -551,6 +593,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             adapter_kind="openai_compatible",
@@ -572,6 +615,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 reasoning_effort,
                 extra_request_params,
                 strip_think_tags,
+                connection_slug,
             ),
             model_catalog_mode="manual",
             default_models=("local-model", "text-embedding-bge-m3"),
@@ -582,7 +626,12 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
             display_name="Custom Media Gateway",
             capabilities=("image", "video"),
             auth_fields=(api_key,),
-            config_fields=(required_base_url, required_default_model, timeout_seconds),
+            config_fields=(
+                required_base_url,
+                required_default_model,
+                timeout_seconds,
+                connection_slug,
+            ),
             model_catalog_mode="manual",
             adapter_kind="custom_media_gateway",
         ),

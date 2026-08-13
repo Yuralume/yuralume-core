@@ -89,6 +89,7 @@ class PromptContextBuilderPort(Protocol):
         calendar_context: str = "",
         weather_context: str = "",
         world_event_context: tuple[str, ...] | None = None,
+        world_event_recall: tuple[str, ...] | None = None,
         upcoming_day_schedules: list[DailySchedule] | None = None,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         include_operator_status: bool = True,
@@ -126,6 +127,19 @@ class PromptContextBuilderPort(Protocol):
         ``world_event_context`` is an optional read-only RSS fact block
         for chat. It may include source locale and operator location;
         the builder renders it as facts and the LLM decides relevance.
+        Each event line carries the original link so the character can
+        ``web_fetch`` it when the player asks for detail the clipped
+        summary does not hold.
+
+        ``world_event_recall`` is the same fact shape for events this
+        character **already raised** with the player on another surface
+        (a proactive DM today, other surfaces as they start recording
+        mentions). It is a distinct block because the instruction is the
+        opposite of the candidate one: candidates may be dropped,
+        recalled events the character is expected to still know. A
+        consumed event never appears in ``world_event_context`` again —
+        its inbox row is claimed — so without this the character forgets
+        material it brought up itself.
 
         ``image_recognition_context`` is the multimodal recognition
         summary for a text-only main model (empty when the model sees

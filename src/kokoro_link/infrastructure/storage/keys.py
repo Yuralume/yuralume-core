@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 from urllib.parse import unquote
 
 from kokoro_link.contracts.object_storage import ObjectStorageError
+
+#: Any segment made up of nothing but dots -- ``"."``, ``".."``, ``"..."``,
+#: ``"...."``... -- not just the two POSIX-special cases. Win32 path
+#: normalisation silently *strips* a trailing-dot path component entirely
+#: (``"tts\\...\\"`` resolves to ``"tts\\"``), so on Windows a segment this
+#: pattern doesn't catch can make a purge prefix that looks two-segments-deep
+#: (``"tts/.../"``, passes the length-2 check below) collapse, once resolved
+#: on disk, to its one-segment parent -- turning a scoped purge into one that
+#: empties the whole parent directory. POSIX doesn't strip these, but the
+#: validator is shared code and must be safe regardless of the OS it runs on.
+_ALL_DOTS_SEGMENT_RE = re.compile(r"^\.+$")
 
 _ALLOWED_CHARS = set(
     "abcdefghijklmnopqrstuvwxyz"
@@ -61,4 +73,54 @@ def validate_object_key(raw: str) -> str:
         if any(ch not in _ALLOWED_CHARS for ch in part):
             raise ObjectStorageError(f"unsafe object_key segment: {part!r}")
     return "/".join(parts)
+
+
+def validate_purge_prefix(raw: str) -> str:
+    """Validate a prefix for :meth:`SupportsPrefixPurge.purge_prefix`.
+
+    A prefix purge is bulk, irreversible deletion driven by a caller-built
+    string — CD1's threat model (contracts/object_storage.py) is that
+    string being wrong, not malicious, but "wrong" is exactly as
+    destructive as "malicious" when the operation is delete-everything-
+    under. The shape checks below exist to make a purge call structurally
+    incapable of reaching past the one character's subtree it is meant
+    for:
+
+    * must end with ``/`` — a purge always targets a directory-shaped
+      subtree, never a single object key or a bare stem that a later typo
+      could turn into a much wider match (``"characters/1"`` would also
+      match ``"characters/10/..."``; ``"characters/1/"`` cannot);
+    * at least two non-empty segments — ``characters/{id}/`` is the
+      shallowest legitimate target. A single segment such as
+      ``"characters/"`` would purge *every* character's objects in one
+      call, which is never what a per-character delete wants;
+    * every segment passes the same character allow-list
+      :func:`validate_object_key` enforces, and any all-dots segment
+      (``.``, ``..``, ``...``, ...) is rejected the same way — a prefix
+      this function returns is a prefix ``validate_object_key`` would
+      also accept as key parts. All-dots segments beyond ``.``/``..`` are
+      rejected here specifically (not just those two): see
+      :data:`_ALL_DOTS_SEGMENT_RE`.
+
+    Raises :class:`ObjectStorageError` on any violation. Returns the
+    normalised prefix (always ``/``-joined, always trailing-slashed) on
+    success.
+    """
+    text = unquote((raw or "").strip())
+    if not text.endswith("/"):
+        raise ObjectStorageError(f"purge prefix must end with '/': {raw!r}")
+    if text.startswith("/") or "\\" in text:
+        raise ObjectStorageError(f"unsafe purge prefix: {raw!r}")
+    segments = text[:-1].split("/")
+    if len(segments) < 2 or any(
+        seg == "" or _ALL_DOTS_SEGMENT_RE.match(seg) for seg in segments
+    ):
+        raise ObjectStorageError(
+            f"purge prefix needs at least two non-empty, non-dots-only "
+            f"segments: {raw!r}",
+        )
+    for segment in segments:
+        if any(ch not in _ALLOWED_CHARS for ch in segment):
+            raise ObjectStorageError(f"unsafe purge prefix segment: {segment!r}")
+    return "/".join(segments) + "/"
 

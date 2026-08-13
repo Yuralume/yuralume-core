@@ -14,6 +14,7 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentityResolverPort,
     CloudIdentityUnavailable,
     CloudResourceContext,
+    character_origin_headers,
 )
 from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfilePort
 from kokoro_link.contracts.embedder import EmbedderError, EmbedderPort
@@ -227,5 +228,7 @@ class CloudGatewayEmbedder(EmbedderPort):
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
+            # EC7: origin attribution, present only for a managed character.
+            **character_origin_headers(identity),
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         }

@@ -23,6 +23,38 @@ class DeferredIntentRepositoryPort(Protocol):
         """Return ``status=active`` motives for the pair whose ``expires_at``
         is still after ``now``. Newest first."""
 
+    async def list_due_for(
+        self,
+        character_id: str,
+        operator_id: str,
+        *,
+        now: datetime,
+        limit: int = 5,
+    ) -> list[DeferredIntent]:
+        """Return still-live motives whose ``revisit_at`` alarm has rung
+        (``revisit_at <= now``). Newest first.
+
+        Deliberately narrower than ``list_active_for``: the dispatcher
+        runs this on the cheap side of the gate, so implementations must
+        push the ``revisit_at IS NOT NULL`` filter down to the store
+        rather than fetching everything and filtering in Python."""
+
+    async def clear_revisit(self, intent_id: str) -> bool:
+        """Drop the ``revisit_at`` alarm on one row, keeping the motive.
+
+        Returns ``True`` when a row was updated. Called the moment an
+        alarm is spent so it cannot exempt a second tick."""
+
+    async def restore_revisit(
+        self, intent_id: str, *, revisit_at: datetime,
+    ) -> bool:
+        """Undo a spend on a row whose tick never produced a judgement.
+
+        Only applies to a row that is still ``status=active`` **and**
+        currently alarm-less, so a concurrent consume — or a fresher
+        appointment written by another instance — always wins over a
+        late restore. Returns ``True`` when a row was updated."""
+
     async def mark_consumed(
         self, intent_id: str, *, now: datetime,
     ) -> bool:

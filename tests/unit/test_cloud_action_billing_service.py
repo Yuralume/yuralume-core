@@ -142,6 +142,30 @@ class _StubQuotes:
             self._prices = dict(self._warm_prices)
 
 
+class _StubTierQuotes:
+    """The authoritative private quote for the operator's exact tier."""
+
+    def __init__(
+        self, prices: dict[tuple[str, str], float] | None = None,
+    ) -> None:
+        self._prices = prices or {}
+        self.calls: list[tuple[str, str]] = []
+        self.invalidated: list[str] = []
+
+    async def quote_price_cr(
+        self, *, tier_name: str, action_key: str,
+    ) -> float | None:
+        self.calls.append((tier_name, action_key))
+        return self._prices.get((tier_name, action_key))
+
+    def invalidate(self, tier_name: str) -> None:
+        self.invalidated.append(tier_name)
+        self._prices = {
+            key: value for key, value in self._prices.items()
+            if key[0] != tier_name
+        }
+
+
 async def _no_sleep(_delay: float) -> None:
     """Retries are about ordering, not wall-clock time."""
     return None
@@ -153,6 +177,7 @@ def _service(
     profile: AccountRuntimeProfile = _ACTION_TIER,
     tenant_id: str | None = "tenant-1",
     pricing: _StubQuotes | None = None,
+    tier_pricing: _StubTierQuotes | None = None,
     close_retry_delays: tuple[float, ...] = (0.0, 0.0, 0.0),
 ) -> CloudActionBillingService:
     return CloudActionBillingService(
@@ -160,6 +185,7 @@ def _service(
         profile_resolver=_StubProfiles(profile),
         operator_profiles=_StubOperatorRepository(tenant_id),
         pricing=pricing,
+        tier_pricing=tier_pricing,
         close_retry_delays=close_retry_delays,
         sleep=_no_sleep,
     )
@@ -207,6 +233,32 @@ async def test_action_charges_scopes_and_settles() -> None:
     assert client.released == []
     assert current_interaction() is None
     assert service.counters.charged == 1
+
+
+@pytest.mark.asyncio
+async def test_begin_forwards_character_origin_for_a_managed_character() -> None:
+    """EC7: the origin card slug rides the charge, snake_case as agreed with
+    the Cloud-side ledger contract (EC7-B)."""
+    client = _RecordingClient()
+    service = _service(client)
+
+    handle = await service.begin(
+        ACTION_CHAT, operator_id="op-1", character_origin="official-yumi",
+    )
+
+    assert client.charges[0]["character_origin"] == "official-yumi"
+    await service.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_begin_omits_character_origin_for_an_ordinary_character() -> None:
+    client = _RecordingClient()
+    service = _service(client)
+
+    handle = await service.begin(ACTION_CHAT, operator_id="op-1")
+
+    assert client.charges[0]["character_origin"] is None
+    await service.release(handle)
 
 
 @pytest.mark.asyncio
@@ -680,6 +732,42 @@ async def test_the_charge_carries_the_price_core_quoted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unquoted_external_turn_uses_the_private_tier_price() -> None:
+    """LINE has no browser quote, so its server-side quote must be exact-tier.
+
+    An unlisted tier may legitimately cost 4 while the public tier costs 6;
+    substituting the public cache creates a permanent 409 retry loop.
+    """
+    client = _RecordingClient()
+    public_quotes = _StubQuotes({("standard", ACTION_CHAT): 6.0})
+    tier_quotes = _StubTierQuotes({("standard", ACTION_CHAT): 4.0})
+    service = _service(
+        client, pricing=public_quotes, tier_pricing=tier_quotes,
+    )
+
+    await service.begin(ACTION_CHAT, operator_id="op-1")
+
+    assert client.charges[0]["expected_price_cr"] == 4.0
+    assert tier_quotes.calls == [("standard", ACTION_CHAT)]
+    assert public_quotes.warmed == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_private_tier_quote_never_substitutes_public_price() -> None:
+    client = _RecordingClient()
+    public_quotes = _StubQuotes({("standard", ACTION_CHAT): 6.0})
+    tier_quotes = _StubTierQuotes()
+    service = _service(
+        client, pricing=public_quotes, tier_pricing=tier_quotes,
+    )
+
+    await service.begin(ACTION_CHAT, operator_id="op-1")
+
+    assert client.charges[0]["expected_price_cr"] is None
+    assert public_quotes.warmed == 0
+
+
+@pytest.mark.asyncio
 async def test_a_cold_cache_warms_once_and_binds_the_fetched_price() -> None:
     """A fresh process must not demote priced actions to unbound charges.
 
@@ -726,12 +814,13 @@ async def test_an_unquoted_action_charges_unbound_rather_than_blocking() -> None
 async def test_a_price_change_refuses_the_action_and_drops_the_stale_quote() -> None:
     """C1: nothing is reserved, and nothing may re-quote the old number."""
     quotes = _StubQuotes({("standard", ACTION_CHAT): 3.0})
+    tier_quotes = _StubTierQuotes({("standard", ACTION_CHAT): 3.0})
     client = _RecordingClient(
         error=ActionPriceChanged(
             action_key=ACTION_CHAT, expected_price_cr=3.0, current_price_cr=4.0,
         ),
     )
-    service = _service(client, pricing=quotes)
+    service = _service(client, pricing=quotes, tier_pricing=tier_quotes)
 
     ran = False
     with pytest.raises(ActionPriceChanged) as excinfo:
@@ -741,6 +830,7 @@ async def test_a_price_change_refuses_the_action_and_drops_the_stale_quote() -> 
     assert ran is False
     assert excinfo.value.current_price_cr == 4.0
     assert quotes.invalidated == 1
+    assert tier_quotes.invalidated == ["standard"]
     assert service.counters.price_changed == 1
     assert client.settled == []
     assert client.released == []
@@ -815,6 +905,20 @@ async def test_the_client_quote_wins_over_this_replica_s_cache() -> None:
     )
 
     assert client.charges[0]["expected_price_cr"] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_client_quote_wins_without_reading_the_private_tier() -> None:
+    client = _RecordingClient()
+    tier_quotes = _StubTierQuotes({("standard", ACTION_CHAT): 4.0})
+    service = _service(client, tier_pricing=tier_quotes)
+
+    await service.begin(
+        ACTION_CHAT, operator_id="op-1", quoted_price_cr=2.5,
+    )
+
+    assert client.charges[0]["expected_price_cr"] == 2.5
+    assert tier_quotes.calls == []
 
 
 @pytest.mark.asyncio

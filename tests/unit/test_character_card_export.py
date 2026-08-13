@@ -24,6 +24,7 @@ from kokoro_link.application.dto.character_card import (
 )
 from kokoro_link.application.services.character_card_export_service import (
     CharacterCardExportService,
+    CharacterCardManagedError,
     CharacterCardNotFoundError,
 )
 from kokoro_link.application.services.character_service import CharacterService
@@ -33,6 +34,8 @@ from kokoro_link.domain.entities.arc_template import (
     ArcTemplate,
     ArcTemplateBeat,
 )
+from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.infrastructure.character_card.arc_template_yaml import (
     dump_arc_template_to_yaml,
@@ -348,6 +351,51 @@ async def test_export_cross_user_is_not_found() -> None:
     )
     with pytest.raises(CharacterCardNotFoundError):
         await service.export(character_id, user_id="someone-else")
+
+
+@pytest.mark.asyncio
+async def test_export_refuses_managed_character() -> None:
+    """EC3: a managed (IP-partner) character's persona lives only on the
+    server — exporting it as a portable ``.lumecard`` is refused, distinct
+    from the not-found/cross-user 404s above (the character *is* the
+    caller's own, so a 404 here would misrepresent the refusal)."""
+    char_repo = InMemoryCharacterRepository()
+    character_service = CharacterService(char_repo)
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    service = CharacterCardExportService(
+        character_service=character_service,
+        object_storage=storage,
+        app_version="test",
+    )
+    managed = Character.create(
+        name="Mio",
+        summary="IP 合作角色",
+        personality=["溫柔"],
+        interests=["咖啡"],
+        speaking_style="輕快",
+        boundaries=[],
+        state=CharacterState(
+            emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
+        ),
+        origin_official_card_id="cloud-card-mio",
+    )
+    await char_repo.save(managed)
+
+    with pytest.raises(CharacterCardManagedError):
+        await service.export(managed.id, user_id=DEFAULT_OPERATOR_ID)
+
+
+@pytest.mark.asyncio
+async def test_export_ordinary_character_unaffected_by_managed_gate() -> None:
+    """The managed gate must not regress the ordinary path: an
+    unmanaged character (``origin_official_card_id`` unset — the only
+    kind a self-host install ever has) exports exactly as before."""
+    service, character_service, storage, arc_repo = await _build()
+    character_id = await _seed_full_character(
+        character_service, storage, arc_repo,
+    )
+    exported = await service.export(character_id, user_id=DEFAULT_OPERATOR_ID)
+    assert exported.filename.endswith(".lumecard")
 
 
 # ---------- Phase A0: language round-trips through .lumecard YAML -------

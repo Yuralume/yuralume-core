@@ -15,8 +15,8 @@ from kokoro_link.domain.entities.fusion_story import FusionStory
 #
 # A fusion story is prose the creator wrote *about characters*; an arc is
 # something the creator will then live through *with* a character. That
-# gap is a question only the creator can answer, so ARC_PLAYER_POSITION_PLAN
-# 拍板 #2 makes it an explicit three-way choice at conversion time rather
+# gap is a question only the creator can answer, so 拍板 #2 makes it
+# an explicit three-way choice at conversion time rather
 # than something the system infers ("創作意圖不該系統猜").
 #
 # Deliberately its own closed vocabulary and **not** reused from
@@ -46,7 +46,7 @@ VALID_FUSION_OPERATOR_MODES = frozenset(
 )
 
 DEFAULT_FUSION_OPERATOR_MODE = FUSION_OPERATOR_MODE_UNCHANGED
-"""What an unstated mode means (ARC_PLAYER_POSITION_PLAN §3.2).
+"""What an unstated mode means.
 
 A caller that says nothing has not chosen — and of the three, exactly one
 does not touch the creator's story: ``unchanged``. Defaulting to a rewrite

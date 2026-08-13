@@ -56,6 +56,14 @@ export interface ProbeReport {
 export interface ProviderConnection {
   id: string
   provider: string
+  /**
+   * Registry id this row serves under — the preset id, or
+   * `provider__slug` when a `connection_slug` distinguishes it from a
+   * sibling row of the same preset. Server-derived (never sent on write);
+   * shown on the card so the operator knows which entry of the model
+   * selector belongs to this connection.
+   */
+  runtime_provider_id: string
   label: string
   enabled: boolean
   capabilities: string[]

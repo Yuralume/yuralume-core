@@ -59,6 +59,7 @@ class VideoProviderPort(Protocol):
         length_frames: int = 81,
         recent_dialogue: str = "",
         use_runtime_state: bool = True,
+        first_frame_url: str | None = None,
     ) -> bytes:
         """Render a single short clip and return its raw bytes (mp4).
 
@@ -70,5 +71,19 @@ class VideoProviderPort(Protocol):
         the character's appearance / visual gender presentation.
         ``recent_dialogue`` and ``use_runtime_state`` are hints
         adapters may ignore.
+
+        ``first_frame_url`` is an image-to-video reference: a fetchable
+        URL (``data:`` or absolute ``http(s)://``) for the frame the clip
+        should start from, following the "pass a URL, not bytes" shape
+        :attr:`ImageProviderPort.generate.user_attachment_urls` already
+        established. Backends without an i2v path **ignore it** — none of
+        the four adapters shipped today consume it, and adding it must
+        not change a single byte of their behaviour.
+
+        Note that the *hosted asynchronous* path does not travel through
+        this parameter: it needs the frame as bytes so the broker can
+        stage it for a worker that cannot reach Core's object store at
+        all. See :mod:`kokoro_link.contracts.async_video_job` and
+        the Media Jobs Service spec §2 for that decision.
         """
         ...

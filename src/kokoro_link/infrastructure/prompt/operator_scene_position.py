@@ -17,7 +17,7 @@ a guess baked into code. So the ``None`` branch here hands the judgment
 back to the model from the rest of the material (cast list, dramatic
 question, summary) rather than special-casing any keyword in it — writing
 a keyword table for "does '伴侶' mean the player" is exactly what the
-LLM-first rule in AGENTS.md forbids.
+LLM-first rule forbids.
 """
 
 from __future__ import annotations

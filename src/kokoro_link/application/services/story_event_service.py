@@ -194,7 +194,7 @@ class StoryEventService:
         dispatcher, character warm-up) is *unattended*: nothing it does
         here reaches a player, so a beat whose ``operator_position`` is
         ``central`` is passed over — no play attempt, no recheck, and
-        therefore no ``mark_realized`` (ARC_PLAYER_POSITION_PLAN §2 #5,
+        therefore no ``mark_realized`` (
         red line 4). Without the flag, background ticks alone push such a
         beat past the recheck threshold and the rechecker quietly writes
         the scene into canon — a scene that only exists *because* the

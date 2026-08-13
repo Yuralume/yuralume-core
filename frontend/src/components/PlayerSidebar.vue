@@ -16,7 +16,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useRuntimeLimits } from '@/composables/useRuntimeLimits'
 import type { MessagingPlatform } from '@/types/messaging'
 import { resolveWebPushNudge } from '@/utils/webPushNudge'
-import { UiImage } from '@/components/ui'
+import { UiBadge, UiImage } from '@/components/ui'
 import SidebarBrand from './SidebarBrand.vue'
 import CharacterLimitAdvisory from './CharacterLimitAdvisory.vue'
 import CloudCreditsBadge from './CloudCreditsBadge.vue'
@@ -467,6 +467,7 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
             :character-id="selectedCharacter.id"
             :world-frame="worldFrame"
             :arc-template-id="selectedCharacter.arc_template_id ?? null"
+            :managed="selectedCharacter.managed === true"
             @update:world-frame="onWorldFrameChange"
             @update:arc-template="handleArcTemplateChange"
             @active-arc-change="handleLifeStoryActiveArcChange"
@@ -528,7 +529,15 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
           </button>
         </div>
 
+        <!-- EC2-B：託管角色的立繪由授權方提供並鎖定，前端整段隱藏
+             上傳／刪除／重新生成，不是灰掉——避免玩家對著空清單以為
+             「還沒設定」而動手上傳。 -->
+        <div v-if="selectedCharacter.managed" class="managed-images-notice">
+          <UiBadge variant="primary">{{ t('characterEdit.managed.imagesBadge') }}</UiBadge>
+          <p class="managed-images-notice__text">{{ t('characterEdit.managed.imagesNotice') }}</p>
+        </div>
         <CharacterImagesPanel
+          v-else
           :character="selectedCharacter"
           :show-technical-hints="!cloudMode"
           @updated="emit('characterUpdated', $event)"
@@ -539,6 +548,7 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
         <CollapsibleSection :title="t('playerSidebar.album.sectionTitle')" :default-open="true">
           <AlbumPanel
             :character-id="selectedCharacter.id"
+            :managed="selectedCharacter.managed === true"
             @character-updated="handleAlbumCharacterUpdated"
           />
         </CollapsibleSection>
@@ -897,6 +907,24 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
 .admin-link-hint__link {
   color: var(--color-primary);
   text-decoration: none;
+}
+
+.managed-images-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.managed-images-notice__text {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 .admin-link-hint__link:hover {

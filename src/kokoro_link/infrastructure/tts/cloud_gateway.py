@@ -10,6 +10,8 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudGatewayIdentityResolverPort,
     CloudResourceContext,
+    character_origin_header,
+    character_origin_headers,
 )
 from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfilePort
 from kokoro_link.contracts.generation_trigger import (
@@ -71,12 +73,40 @@ class CloudGatewayTTSAdapter:
         self._timeout = timeout_seconds
         self.last_request_id = ""
 
-    async def list_voices(self) -> list[TTSVoice]:
+    async def list_voices(
+        self,
+        *,
+        character_id: str | None = None,
+        character_origin: str = "",
+    ) -> list[TTSVoice]:
+        """The menu for the calling context.
+
+        Declaring nothing sends no origin header, so the TTS service answers
+        with the ordinary catalog only (EC5-A default) — that is also what an
+        unresolvable ``character_id`` degrades to, since scoping the id
+        against the caller is the route's job, not this adapter's (see
+        :func:`list_tts_assets`). Declaring a card adds
+        ``X-Yuralume-Character-Origin`` (EC7), which lets the TTS service also
+        surface the voice bound to that card. The enforcement that matters
+        still lives at synthesis time; this is convenience for the picker —
+        and, for the install, the only way to see the voice it must bind.
+
+        ``character_origin`` is the same declaration made directly rather
+        than looked up, for the caller holding a card and no character
+        (EC5-D). It wins over ``character_id`` because it is the more
+        specific statement of the same thing.
+        """
+        headers = self._base_headers(request_prefix="tts")
+        headers.update(
+            await self._origin_headers(
+                character_id=character_id, character_origin=character_origin,
+            ),
+        )
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(
                     f"{self._base_url}/v1/voices",
-                    headers=self._base_headers(request_prefix="tts"),
+                    headers=headers,
                 )
             if response.status_code >= 400:
                 raise TTSUnavailable(
@@ -101,9 +131,31 @@ class CloudGatewayTTSAdapter:
                     label=str(item.get("label") or voice_id),
                     prompt_lang=str(item.get("prompt_lang") or ""),
                     is_complete=bool(item.get("is_complete", True)),
+                    # EC5-A: present only on a voice cast for one official
+                    # card. Absent on every ordinary voice, and on any
+                    # catalog that predates the field.
+                    exclusive_card_id=str(
+                        item.get("exclusive_card_id") or "",
+                    ).strip(),
                 ),
             )
         return out
+
+    async def _origin_headers(
+        self, *, character_id: str | None, character_origin: str,
+    ) -> dict[str, str]:
+        """The origin declaration for a listing, from whichever half the
+        caller holds — see :meth:`list_voices`."""
+        explicit = character_origin_header(character_origin)
+        if explicit or not character_id:
+            return explicit
+        character = await self._characters.get(character_id)
+        if character is None:
+            return {}
+        identity = await self._identity_resolver.resolve_context(
+            CloudResourceContext.for_character(character),
+        )
+        return character_origin_headers(identity)
 
     async def synthesize(self, request: TTSRequest) -> TTSResult:
         character_id = request.character_id.strip()
@@ -194,6 +246,8 @@ class CloudGatewayTTSAdapter:
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": _TTS_SYNTHESIS_FEATURE_KEY,
             "X-Yuralume-Character": identity.character_ref,
+            # EC7: origin attribution, present only for a managed character.
+            **character_origin_headers(identity),
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
         })
         return headers

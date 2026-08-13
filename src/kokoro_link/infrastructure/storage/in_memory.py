@@ -11,7 +11,10 @@ from kokoro_link.contracts.object_storage import (
     ObjectNotFoundError,
     StoredObject,
 )
-from kokoro_link.infrastructure.storage.keys import validate_object_key
+from kokoro_link.infrastructure.storage.keys import (
+    validate_object_key,
+    validate_purge_prefix,
+)
 
 
 class InMemoryObjectStorage:
@@ -95,6 +98,20 @@ class InMemoryObjectStorage:
             content_type=source_meta.content_type,
             metadata=metadata if metadata is not None else source_meta.metadata,
         )
+
+    async def purge_prefix(self, *, prefix: str) -> int:
+        """CD1 ``SupportsPrefixPurge``: dict-scan delete, same prefix
+        shape rules as the HTTP-backed adapter enforce server-side."""
+        safe_prefix = validate_purge_prefix(prefix)
+        matching = {
+            key
+            for key in (*self._objects, *self._metadata)
+            if key.startswith(safe_prefix)
+        }
+        for key in matching:
+            self._objects.pop(key, None)
+            self._metadata.pop(key, None)
+        return len(matching)
 
     async def public_url(self, *, object_key: str) -> str:
         key = validate_object_key(object_key)

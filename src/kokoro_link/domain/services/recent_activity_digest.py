@@ -41,7 +41,7 @@ CF5 shipped with 3 (one rolling window); SE1 widened it to 7 because the
 observed motif cycle is weekly, not per-window — a one-off that came back
 every four to five days sat just outside a 3-day digest and read as fresh.
 Seven civil days is the span the planner is asked to diversify against
-(STORY_SEED_ENRICHMENT_PLAN §3 SE1); the per-day description cap keeps the
+the per-day description cap keeps the
 wider window's prompt weight bounded.
 """
 

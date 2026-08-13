@@ -1,6 +1,6 @@
 """Per-target execution lease for Creator Studio pipelines.
 
-HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §13 Phase 4 前置 1.
+Phase 4 前置 1.
 
 Fusion / branching generation runs as ``asyncio`` tasks *inside the API
 process*, serialized per target by a process-local ``asyncio.Lock``. That lock

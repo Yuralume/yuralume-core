@@ -34,16 +34,41 @@ from kokoro_link.domain.value_objects.voice_profile import VoiceProfile
 #   - ``manual``            → admin console; sticky (chat does not undo it).
 #   - ``subscription_lapse``→ legacy pre-migration Cloud billing provenance;
 #                             new billing locks use the orthogonal tenant state.
+#   - ``exclusive_contract_end`` → Cloud per-card IP-partner contract ended
+#                             (D7 / EC10); sticky like ``manual``, but cleared
+#                             only by the matching per-card ``unfreeze``
+#                             message, never by an admin or a player.
 # ``None`` (legacy freezes with no recorded provenance) is treated as a soft
 # freeze equivalent to ``idle`` for thaw purposes.
 FREEZE_REASON_IDLE = "idle"
 FREEZE_REASON_MANUAL = "manual"
 FREEZE_REASON_SUBSCRIPTION_LAPSE = "subscription_lapse"
 
+# A Cloud official card's IP-partner contract has ended, silencing every
+# character installed from it (``origin_official_card_id``), across every
+# tenant, until the partner relationship resumes (D7 / EC10-A is the Cloud
+# side that owns the switch; EC10-B below is the Core-side consumer).
+# Excluded from ``CHAT_THAWABLE_FREEZE_REASONS`` below — see that set's
+# docstring — so a user's foreground chat turn can never silently undo it;
+# only a matching per-card ``unfreeze`` message clears it.
+FREEZE_REASON_EXCLUSIVE_CONTRACT_END = "exclusive_contract_end"
+
+# A ``.lumebackup`` restore lands the character row in its very first row
+# batch, minutes before memories / media / schedules follow (CB A3). The row
+# lands frozen under this provenance so the half-landed character can neither
+# chat (``chat_service`` refuses with a typed error — unlike ``manual``,
+# which only stops background work) nor tick in the background; the restore
+# job restores the exported freeze state on success and its failure cleanup
+# deletes the row outright. Never player- or admin-thawable.
+FREEZE_REASON_RESTORE = "restore"
+
 # Freeze reasons that a user's foreground chat is allowed to auto-thaw.
 # ``subscription_lapse`` remains excluded for migrated/legacy rows; ``manual``
-# is excluded so chat never silently undoes an admin action. Current billing
-# authorization is enforced by ``SubscriptionAccessGuard``.
+# is excluded so chat never silently undoes an admin action; ``restore`` is
+# excluded because the character simply isn't fully there yet;
+# ``exclusive_contract_end`` is excluded for the same reason as ``manual`` —
+# a Cloud-authoritative per-card freeze, not a player- or chat-clearable one.
+# Current billing authorization is enforced by ``SubscriptionAccessGuard``.
 CHAT_THAWABLE_FREEZE_REASONS: frozenset[str | None] = frozenset(
     {FREEZE_REASON_IDLE, None},
 )
@@ -90,7 +115,7 @@ class CharacterLora:
 
     ``name`` is a filename under the ComfyUI ``models/loras/``
     directory (no path, no extension stripping — e.g.
-    ``"PrincessConnect_Kokkoro_IlluXL.safetensors"``). Multiple LoRAs
+    ``"my_character_style_v1.safetensors"``). Multiple LoRAs
     are chained model-then-clip in order, with per-LoRA strength.
 
     ``strength`` applies to both the model and CLIP paths (we expose
@@ -310,6 +335,17 @@ class Character:
     behaviour. A string id points to an ``ArcSeries`` whose member
     templates are materialised one at a time by ``StoryArcService``.
     """
+    origin_official_card_id: str | None = None
+    """Cloud-exclusive official card this character was installed from.
+
+    ``None`` (the only value a self-host install ever holds, and the
+    default for every player-authored character) means the player owns
+    the persona outright. A non-``None`` card id makes this a *managed*
+    character — see :attr:`is_managed`.
+
+    Provenance, not configuration: it is set once when the card is
+    installed and is never mutated afterwards, so nothing in the update
+    path takes it as an argument."""
     feed_daily_limit: int = _DEFAULT_FEED_DAILY_LIMIT
     """Cap on autonomous feed-wall posts per civil day. Independent
     from ``proactive_daily_limit`` because feed posts and IM-style
@@ -450,6 +486,17 @@ class Character:
     never chatted with (``state.last_active_at is None``). ``None`` on a
     freshly-constructed entity before it round-trips through the DB."""
 
+    @property
+    def is_managed(self) -> bool:
+        """Whether the persona belongs to an IP partner, not the player.
+
+        The single derivation of "managed" in the system: every surface
+        that has to treat these characters differently (the player-facing
+        projection, the update guard, later the export gates) asks this
+        instead of re-testing the column, so there is one place to change
+        if provenance ever grows a second source."""
+        return bool(self.origin_official_card_id)
+
     def feature_video_profile_for(
         self, feature_key: str,
     ) -> FeatureVideoProfileOverride | None:
@@ -558,6 +605,7 @@ class Character:
         body_state: BodyState | None = None,
         operator_pace_preference: str = "",
         personality_type: CharacterPersonalityType | None = None,
+        origin_official_card_id: str | None = None,
     ) -> "Character":
         return cls(
             id=str(uuid4()),
@@ -606,6 +654,9 @@ class Character:
             ),
             feature_video_profiles=_normalise_feature_video_profiles(
                 feature_video_profiles,
+            ),
+            origin_official_card_id=_normalise_template_id(
+                origin_official_card_id,
             ),
             feed_daily_limit=_clamp_feed_daily_limit(feed_daily_limit),
             companions=_normalise_companions(companions),
@@ -850,6 +901,14 @@ def _clamp_feed_daily_limit(value: int) -> int:
     if value > 50:
         return 50
     return value
+
+
+#: Public aliases: the ``.lumebackup`` restore pipeline lands character rows
+#: straight through the Core insert, bypassing ``Character.create``. It reuses
+#: these exact clamps so an imported daily limit can never exceed the ceiling
+#: the domain enforces here — one source of truth, no drift.
+clamp_daily_limit = _clamp_daily_limit
+clamp_feed_daily_limit = _clamp_feed_daily_limit
 
 
 _PACE_PREFERENCES: frozenset[str] = frozenset({

@@ -13,6 +13,14 @@ don't have to coordinate DB + filesystem + character entity themselves:
 - ``promote_to_stage`` — reverse: move an album entry into the stage
   carousel, honouring its 12-slot cap.
 
+``transfer_from_stage`` and ``promote_to_stage`` both write
+``Character.image_urls`` directly, bypassing the ``update_character``
+PATCH allowlist entirely — so both refuse outright (``AlbumManagedError``)
+when the character is managed (EC2-C), rather than relying on that
+allowlist to catch what is really a second write path onto the same
+field. ``add_auto`` / ``delete`` don't touch ``image_urls`` and are
+unaffected.
+
 Object deletion is best-effort; losing the bytes but keeping the DB
 consistent is strictly better than the reverse (album row points at
 nothing vs orphan file wastes disk).
@@ -68,6 +76,19 @@ class StageImageNotFoundError(AlbumServiceError):
 
 class StageFullError(AlbumServiceError):
     """Raised when ``promote_to_stage`` would overflow the 12-slot cap."""
+
+
+class AlbumManagedError(AlbumServiceError):
+    """The character is a *managed* (IP-partner) character (EC3) whose
+    ``image_urls`` are licensor-owned assets — official art can't be
+    deleted and players can't upload their own. ``CharacterService.
+    update_character`` already refuses non-blank writes to
+    ``image_urls`` (``managed_character_update_policy``), but the album's
+    own endpoints write ``image_urls`` directly and never go through that
+    allowlist, so they need the same refusal here. Mirrors
+    :class:`CharacterCardManagedError`: the character is visible to the
+    caller (it's in their own roster), so a 404 would be a lie — this is
+    a 403, "exists, wrong kind, refuse"."""
 
 
 class AlbumService:
@@ -180,6 +201,12 @@ class AlbumService:
         Returns ``(updated_character, new_album_item)``.
         """
         character = await self._load_character(character_id)
+        if character.is_managed:
+            raise AlbumManagedError(
+                f"Character {character_id!r} is a managed character; "
+                "its stage art is licensor-owned and cannot be moved "
+                "off the carousel",
+            )
         if url not in character.image_urls:
             raise StageImageNotFoundError(
                 "Image URL not on this character's stage",
@@ -210,6 +237,11 @@ class AlbumService:
                 f"Album item {item_id!r} not found",
             )
         character = await self._load_character(item.character_id)
+        if character.is_managed:
+            raise AlbumManagedError(
+                f"Character {item.character_id!r} is a managed character; "
+                "players may not add images to its stage carousel",
+            )
         if len(character.image_urls) >= MAX_IMAGES_PER_CHARACTER:
             raise StageFullError(
                 f"Stage already has {MAX_IMAGES_PER_CHARACTER} images — "

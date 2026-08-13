@@ -3,7 +3,7 @@
 These tests model two deployments: a card is exported from one set of
 repos and imported into a *fresh* set, proving the A-layer settings are
 portable while B/C layers reset and bundled arc templates land (with id
-collisions remapped). See ``docs/CHARACTER_CARD_PLAN.md`` §4 / §6.
+collisions remapped).
 """
 
 from __future__ import annotations

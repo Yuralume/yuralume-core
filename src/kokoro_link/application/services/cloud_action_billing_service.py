@@ -47,6 +47,7 @@ from kokoro_link.contracts.cloud_action_billing import (
     ActionPriceChanged,
     QuotedPricePort,
 )
+from kokoro_link.contracts.cloud_action_pricing import TierQuotedPricePort
 from kokoro_link.contracts.generation_trigger import (
     GenerationTrigger,
     current_generation_trigger,
@@ -173,6 +174,7 @@ class CloudActionBillingService:
         profile_resolver: AccountRuntimeProfileResolverPort,
         operator_profiles: OperatorProfileRepositoryPort,
         pricing: QuotedPricePort | None = None,
+        tier_pricing: TierQuotedPricePort | None = None,
         close_retry_delays: Sequence[float] = _CLOSE_RETRY_DELAYS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -182,6 +184,7 @@ class CloudActionBillingService:
         # Optional so self-host and every test that does not care about quote
         # binding keeps constructing the service with three arguments.
         self._pricing = pricing
+        self._tier_pricing = tier_pricing
         self._close_retry_delays = tuple(close_retry_delays)
         self._sleep = sleep
         self._pending_closes: set[asyncio.Task] = set()
@@ -195,6 +198,7 @@ class CloudActionBillingService:
         action_kind: str = ACTION_KIND_USER_ACTION,
         quoted_price_cr: float | None = None,
         interaction_id: str | None = None,
+        character_origin: str | None = None,
     ) -> ActionChargeHandle | None:
         """Charge for one action, or ``None`` when this action is not billed.
 
@@ -207,8 +211,13 @@ class CloudActionBillingService:
         screen. It wins over Core's process-local cache, which is only a proxy
         for what was displayed and can be a price this player never saw (a
         second replica, a cache refreshed between the quote and the send).
-        Omitted — an older client, or one with nothing quotable — falls back to
-        the cache, which is the pre-R9 behaviour.
+        Omitted — an older client or a server channel — resolves the tenant's
+        exact private tier. Hosted never substitutes another public tier.
+
+        ``character_origin`` (EC7) is the official card slug of the action's
+        character, forwarded to the User ledger for cloud-exclusive-character
+        attribution. ``None`` for every ordinary character and every action
+        with no single character in scope.
 
         Raises :class:`ActionPriceChanged` when the User service refuses the
         quote Core displayed. Foreground routes render it; background callers
@@ -224,16 +233,7 @@ class CloudActionBillingService:
             interaction_id = new_interaction_id()
         quoted = _finite_price(quoted_price_cr)
         if quoted is None:
-            quoted = self._quoted_price(
-                tier_name=target.tier_name, action_key=action_key,
-            )
-        if quoted is None:
-            # A cold cache has no number to bind, and the User service refuses
-            # an unquoted charge for a priced action — which would demote this
-            # whole action to a free run. Warm once and re-read; the steady
-            # state never takes this branch.
-            await self._warm_quotes()
-            quoted = self._quoted_price(
+            quoted = await self._server_quote(
                 tier_name=target.tier_name, action_key=action_key,
             )
         try:
@@ -243,6 +243,7 @@ class CloudActionBillingService:
                 interaction_id=interaction_id,
                 action_kind=action_kind,
                 expected_price_cr=quoted,
+                character_origin=character_origin,
             )
         except ActionChargeUnavailable:
             self.counters.charge_failed += 1
@@ -256,7 +257,7 @@ class CloudActionBillingService:
             # The quote Core showed is stale by definition now, so drop it
             # before anything else can quote the same wrong number.
             self.counters.price_changed += 1
-            self._invalidate_quotes()
+            self._invalidate_quotes(target.tier_name)
             _LOGGER.info(
                 "action price changed under a live session (action=%s "
                 "quoted=%s current=%s) — nothing was reserved",
@@ -507,6 +508,7 @@ class CloudActionBillingService:
         action_kind: str = ACTION_KIND_USER_ACTION,
         quoted_price_cr: float | None = None,
         interaction_id: str | None = None,
+        character_origin: str | None = None,
     ) -> AsyncIterator[ActionChargeHandle | None]:
         """Charge, scope, and close one action around the ``async with`` body.
 
@@ -520,6 +522,7 @@ class CloudActionBillingService:
             action_kind=action_kind,
             quoted_price_cr=quoted_price_cr,
             interaction_id=interaction_id,
+            character_origin=character_origin,
         )
         with interaction_scope(handle.context if handle else None):
             try:
@@ -530,6 +533,35 @@ class CloudActionBillingService:
         await self.settle(handle)
 
     # -- who is billed, and at what quoted price -----------------------
+
+    async def _server_quote(
+        self, *, tier_name: str, action_key: str,
+    ) -> float | None:
+        """Resolve a quote-less server action against its exact private tier."""
+        if self._tier_pricing is not None:
+            try:
+                return await self._tier_pricing.quote_price_cr(
+                    tier_name=tier_name, action_key=action_key,
+                )
+            except Exception:  # noqa: BLE001 — pricing outages fail soft
+                _LOGGER.warning(
+                    "could not resolve the private tier quote for %s/%s — "
+                    "charging unbound",
+                    tier_name, action_key, exc_info=True,
+                )
+                return None
+
+        # Compatibility for self-host and callers that do not configure the
+        # private-tier resolver. Hosted production always wires it below.
+        quoted = self._quoted_price(
+            tier_name=tier_name, action_key=action_key,
+        )
+        if quoted is None:
+            await self._warm_quotes()
+            quoted = self._quoted_price(
+                tier_name=tier_name, action_key=action_key,
+            )
+        return quoted
 
     def _quoted_price(
         self, *, tier_name: str, action_key: str,
@@ -554,13 +586,19 @@ class CloudActionBillingService:
             )
             return None
 
-    def _invalidate_quotes(self) -> None:
-        if self._pricing is None:
-            return
-        try:
-            self._pricing.invalidate()
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning("could not invalidate the price cache", exc_info=True)
+    def _invalidate_quotes(self, tier_name: str) -> None:
+        if self._tier_pricing is not None:
+            try:
+                self._tier_pricing.invalidate(tier_name)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "could not invalidate the private tier price cache", exc_info=True,
+                )
+        if self._pricing is not None:
+            try:
+                self._pricing.invalidate()
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("could not invalidate the price cache", exc_info=True)
 
     async def _warm_quotes(self) -> None:
         if self._pricing is None:
@@ -655,6 +693,7 @@ class NullActionBillingService:
         action_kind: str = ACTION_KIND_USER_ACTION,
         quoted_price_cr: float | None = None,
         interaction_id: str | None = None,
+        character_origin: str | None = None,
     ) -> ActionChargeHandle | None:
         return None
 
@@ -686,5 +725,6 @@ class NullActionBillingService:
         action_kind: str = ACTION_KIND_USER_ACTION,
         quoted_price_cr: float | None = None,
         interaction_id: str | None = None,
+        character_origin: str | None = None,
     ) -> AsyncIterator[ActionChargeHandle | None]:
         yield None

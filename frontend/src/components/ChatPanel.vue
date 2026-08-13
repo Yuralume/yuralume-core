@@ -162,6 +162,9 @@ const emit = defineEmits<{
 const inputText = ref('')
 const sending = ref(false)
 const messagesContainer = ref<HTMLElement>()
+// 浮動「回到最新」箭頭：捲離底部超過這個距離才顯示，見 handleMessagesScroll。
+const SCROLL_TO_LATEST_THRESHOLD_PX = 160
+const showScrollToLatest = ref(false)
 const textareaRef = ref<HTMLTextAreaElement>()
 const fileInputRef = ref<HTMLInputElement>()
 const localMessages = ref<ChatMessage[]>([])
@@ -1101,6 +1104,18 @@ function chatErrorContent(err: unknown): string {
     && err.code === 'subscription_frozen') {
     return t('chat.errors.subscriptionFrozen')
   }
+  if (err instanceof ChatRuntimeLimitError
+    && err.code === 'character_contract_ended') {
+    return t('chat.errors.characterContractEnded')
+  }
+  if (err instanceof ChatRuntimeLimitError
+    && err.code === 'cost_cap_exceeded') {
+    return t('chat.errors.costCapExceeded')
+  }
+  if (err instanceof ChatRuntimeLimitError
+    && err.code === 'quota_exceeded') {
+    return t('chat.errors.quotaExceeded')
+  }
   if (err instanceof ChatStreamProtocolError
     && err.code === 'stream_ended_without_final_response') {
     return t('chat.errors.streamError', {
@@ -1128,9 +1143,25 @@ function handleCompositionEnd() {
 
 async function scrollToBottom() {
   await nextTick()
-  if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-  }
+  const el = messagesContainer.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  updateScrollToLatestVisibility()
+  // A page of history that has never rendered before (fresh load, character
+  // switch) lands here with most bubbles still on their content-visibility
+  // placeholder height, so `scrollHeight` above is an underestimate and this
+  // jump can fall short of the real bottom. Measured: the browser settles
+  // real sizes two rAFs after the DOM patch, not one — a single rAF still
+  // reads the placeholder height. Two nested frames is what actually lands
+  // on the last message.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const settled = messagesContainer.value
+      if (!settled) return
+      settled.scrollTop = settled.scrollHeight
+      updateScrollToLatestVisibility()
+    })
+  })
 }
 
 // --- Older history (IV10) --------------------------------------------
@@ -1155,9 +1186,30 @@ const canLoadOlder = computed(
   () => olderHasMore.value && olderCursor.value !== null,
 )
 
+/** Re-measures the live DOM position — never trust a stale snapshot. */
+function updateScrollToLatestVisibility() {
+  const el = messagesContainer.value
+  if (!el) return
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+  showScrollToLatest.value = distanceFromBottom > SCROLL_TO_LATEST_THRESHOLD_PX
+}
+
+// `scrollToBottom()` fires from a `watch(() => props.messages, ...)` whose
+// timing can race the `v-else` branch that first mounts `messagesContainer`
+// (fresh page load, character switch): the container may not exist yet the
+// moment that particular call's `nextTick()` resolves, so it silently
+// no-ops and the arrow's visibility never gets a first real reading. A
+// `flush: 'post'` watch on the rendered array itself re-checks after every
+// render the array causes — cheap, and it self-heals regardless of why an
+// earlier check landed before the DOM did.
+watch(localMessages, () => {
+  nextTick(updateScrollToLatestVisibility)
+}, { flush: 'post' })
+
 function handleMessagesScroll() {
   const el = messagesContainer.value
   if (!el) return
+  updateScrollToLatestVisibility()
   if (!shouldLoadOlder({
     scrollTop: el.scrollTop,
     hasMore: canLoadOlder.value,
@@ -1392,11 +1444,12 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <div
-        ref="messagesContainer"
-        class="messages-container"
-        @scroll.passive="handleMessagesScroll"
-      >
+      <div class="messages-wrap">
+        <div
+          ref="messagesContainer"
+          class="messages-container"
+          @scroll.passive="handleMessagesScroll"
+        >
         <!-- 更早的訊息（IV10）。捲到頂端附近會自動載入；這顆按鈕是給
              「內容比容器短所以捲不動」與鍵盤操作的人用的。 -->
         <div v-if="canLoadOlder" class="messages-older">
@@ -1476,6 +1529,20 @@ onUnmounted(() => {
             :href="portalUrl"
           >{{ t('chat.errors.demoMaxMessagesCta') }}</a>
         </div>
+      </div>
+
+        <!-- 浮動「回到最新」箭頭：捲離底部一段距離才出現，避免一直待在
+             畫面上遮住最後幾則訊息。 -->
+        <button
+          v-if="showScrollToLatest"
+          type="button"
+          class="scroll-to-latest-btn"
+          :aria-label="t('chat.history.scrollToLatest')"
+          :title="t('chat.history.scrollToLatest')"
+          @click="scrollToBottom"
+        >
+          <span aria-hidden="true">↓</span>
+        </button>
       </div>
 
       <div class="chat-input-area">
@@ -1821,7 +1888,7 @@ onUnmounted(() => {
   background: linear-gradient(180deg, rgba(9, 14, 26, 0.35), rgba(16, 10, 38, 0.65));
 }
 
-.chat-panel--dm .messages-container,
+.chat-panel--dm .messages-wrap,
 .chat-panel--dm .chat-input-area {
   width: min(100%, 460px);
   align-self: center;
@@ -1990,6 +2057,18 @@ onUnmounted(() => {
   color: var(--color-text-secondary);
 }
 
+/* 捲動區的非捲動外殼：讓浮動箭頭以此為定位基準而不隨內容捲走。
+   箭頭若直接當 .messages-container 的子元素、position: absolute，
+   containing block 仍是會捲動的那個元素本身，畫面上還是會被捲走——
+   一定要是捲動元素的「外面」一層才行。 */
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .messages-container {
   flex: 1;
   overflow-y: auto;
@@ -2002,6 +2081,35 @@ onUnmounted(() => {
      which on iOS can otherwise lift the input area above the keyboard
      unexpectedly mid-scroll. */
   overscroll-behavior: contain;
+}
+
+.scroll-to-latest-btn {
+  position: absolute;
+  right: 20px;
+  bottom: 16px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(30, 32, 38, 0.85);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-primary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(4px);
+  transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  z-index: 5;
+}
+
+.scroll-to-latest-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  transform: translateY(-2px);
 }
 
 /* 離屏訊息不進 layout / paint（IV5-C, 計畫 D6-3）。

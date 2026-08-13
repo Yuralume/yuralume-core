@@ -240,6 +240,22 @@ class CharacterRow(Base):
     stale bindings can fail-soft in application services instead of
     deleting character rows.
     """
+    origin_official_card_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+    )
+    """Provenance of an IP-partner *managed* character (EC series).
+
+    NULL = an ordinary player-authored character; the player owns the
+    persona and every API surface behaves as it always has (this is the
+    only value a self-host install ever holds). Non-NULL = the row was
+    installed from a cloud-exclusive official card whose id this is: the
+    persona lives on the server, the player-facing projection masks it
+    and the update path rejects writes to it.
+
+    Not a foreign key — the card is a Cloud-side record, there is no
+    local table to reference. Written once at install time and never by
+    the aggregate ``save()`` (see ``_domain_to_row``), so no later write
+    can invent or erase a character's provenance."""
     feature_models_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default="[]",
     )
@@ -2061,6 +2077,12 @@ class DeferredIntentRow(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    revisit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    """When the judge named a concrete future moment for this motive
+    ("we agreed on 19:30"). NULL for every motive without a clock —
+    which is every row written before this column existed."""
 
 
 class ExperimentRow(Base):
@@ -2339,6 +2361,86 @@ class StudioGenerationJobRow(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True,
+    )
+
+
+class PendingFeedVideoRow(Base):
+    """A composed feed post waiting on an asynchronous video job (CV4).
+
+    The row *is* the restart story for the deferred pipeline: the tick
+    that submitted the job publishes nothing, so everything the landing
+    half needs — the draft, the already-rendered first frame, the job
+    ticket and its deadline — lives here until one of the two exits fires.
+
+    ``character_id`` cascades: a deleted character can have no post to
+    land, and leaving the row would strand a poll chain on a ghost. The
+    ``(status, next_poll_at)`` index is the sweep's only query.
+    """
+
+    __tablename__ = "pending_feed_videos"
+    __table_args__ = (
+        Index(
+            "ix_pending_feed_videos_status_next_poll",
+            "status",
+            "next_poll_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    operator_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="",
+    )
+    job_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, index=True,
+    )
+    content_text: Mapped[str] = mapped_column(Text, nullable=False)
+    post_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="daily",
+    )
+    source_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="manual",
+    )
+    source_ref_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    first_frame_url: Mapped[str] = mapped_column(Text, nullable=False)
+    first_frame_key: Mapped[str] = mapped_column(
+        Text, nullable=False, default="",
+    )
+    image_prompt: Mapped[str] = mapped_column(
+        Text, nullable=False, default="",
+    )
+    video_prompt: Mapped[str] = mapped_column(
+        Text, nullable=False, default="",
+    )
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=900,
+    )
+    next_poll_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+    )
+    post_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    note: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
     )
 
 

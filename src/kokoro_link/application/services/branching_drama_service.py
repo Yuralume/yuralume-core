@@ -19,7 +19,7 @@ advances, prefetching 2 layers ahead in the background.
 pipeline a fixed per-action price (``fusion_story`` /
 ``fusion_story_iterate``); the branching-drama family stays
 ``charging_mode=legacy`` in ``contracts/action-catalog.json`` and keeps
-billing per Gateway call, per the CREATOR_STUDIO_VALUE_LINE_PLAN §2.6 ruling.
+billing per Gateway call, per the Creator Studio value-line ruling.
 The reason is structural, not scheduling: a drama's cost is driven by how deep
 the *player* walks the tree and how many images the lazy prefetch decides to
 draw, so there is no bounded unit of work a single up-front price could honour.

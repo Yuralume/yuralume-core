@@ -1,12 +1,12 @@
-"""Core-side view of the public hosted price list (AP3).
+"""Core-side views of hosted action pricing (AP3).
 
-The price list is owned by the Cloud control plane and published un-authenticated
-at ``GET /v1/public/pricing``. Core proxies it for one reason: the in-game SPA
-cannot read the User service directly (no CORS there, and the Portal CSP pins
-``connect-src 'self'``), and a player must be able to see what an action costs
-*before* pressing the button.
+The Cloud control plane owns both the public storefront list and the private
+single-tier list Core serves to an authenticated player. The private view is
+required because an active unlisted tier can legitimately charge a different
+amount from the storefront tier; substituting the public number creates an
+unrecoverable ``409 price_changed`` loop.
 
-Core stores no prices and hardcodes none — it caches a snapshot and forgets it.
+Core stores no prices and hardcodes none — it only caches snapshots.
 Whatever the back office says today is what the player is quoted today.
 """
 
@@ -48,3 +48,27 @@ class ActionPricingPort(Protocol):
         Raises :class:`ActionPricingUnavailable` on any failure; the caching
         service decides whether to serve last-known-good.
         """
+
+
+class TierActionPricingPort(Protocol):
+    async def fetch(self, tier_name: str) -> PublicPricing:
+        """Read one active tier's prices from the private control plane.
+
+        Raises :class:`ActionPricingUnavailable` on any failure. The caller
+        must never substitute another tier's public price.
+        """
+
+
+class TierQuotedPricePort(Protocol):
+    """Authoritative server-side quote for one exact hosted tier."""
+
+    async def quote_price_cr(
+        self, *, tier_name: str, action_key: str,
+    ) -> float | None:
+        """Return one action's current price, or `None` when unknown.
+
+        Implementations must never substitute another tier's public price.
+        """
+
+    def invalidate(self, tier_name: str) -> None:
+        """Drop only this tier's cached private quote."""

@@ -4,7 +4,7 @@
  * it is full-screen and the 1024x1536 source is already being *scaled up*, so
  * a thumbnail here would show as blur. What it does not want is the original
  * *file*: `variant="full"` is the same pixels re-encoded as WebP, 2313 KB down
- * to 218 KB (IMAGE_DELIVERY_AND_PAGINATION_PLAN §1.5 / D1).
+ * to 218 KB.
  *
  * The second half of ticket IV5-B is what is mounted. This component used to
  * put **every** URL in `image_urls` into an `<img>` and hide all but one with

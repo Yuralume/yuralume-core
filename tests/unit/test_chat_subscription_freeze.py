@@ -4,6 +4,11 @@
 - legacy ``subscription_lapse``：保留 ``ChatSubscriptionFrozen`` fallback。
 - ``idle`` 凍結（與舊資料 ``None``）：使用者一聊天即自動解凍（回歸）。
 - ``manual`` 凍結：聊天不擋也不自動解凍（黏著，admin 主控台解凍）。
+- ``restore`` 凍結（CB A3）：備份還原落地中，聊天硬擋、不自動解凍；
+  還原成功才解凍、失敗清理直接刪列。
+- ``exclusive_contract_end`` 凍結（D7／EC10）：IP 合約終止，拍板語意是
+  「資料保留、不可互動」，聊天硬擋、不自動解凍；只有同一條 per-card
+  訊息的 unfreeze 能解，解完聊天即恢復。
 """
 
 from datetime import datetime, timezone
@@ -14,6 +19,8 @@ from kokoro_link.application.dto.character import CreateCharacterRequest
 from kokoro_link.application.dto.chat import SendChatMessageRequest
 from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.chat_service import (
+    ChatCharacterContractEndedError,
+    ChatCharacterRestoringError,
     ChatService,
     ChatSubscriptionFrozen,
 )
@@ -22,8 +29,10 @@ from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessLocked,
 )
 from kokoro_link.domain.entities.character import (
+    FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
     FREEZE_REASON_IDLE,
     FREEZE_REASON_MANUAL,
+    FREEZE_REASON_RESTORE,
     FREEZE_REASON_SUBSCRIPTION_LAPSE,
 )
 from kokoro_link.infrastructure.llm.fake import FakeChatModel
@@ -218,6 +227,37 @@ async def test_idle_freeze_still_thaws_on_chat() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_restore_freeze_blocks_chat_and_never_thaws(
+    streaming: bool,
+) -> None:
+    """CB A3 — a mid-restore character (frozen_reason='restore') is only
+    half there: memories / media are still landing, and any turn accepted
+    now would be destroyed by the restore's failure cleanup. Chat must
+    refuse with the typed error and must NOT auto-thaw."""
+    chat_service, character_service, repo = _build()
+    created = await _create(character_service)
+    await repo.set_frozen(
+        created.id, frozen=True, now=_FROZEN_AT,
+        reason=FREEZE_REASON_RESTORE,
+    )
+
+    method = (
+        chat_service.send_message_stream
+        if streaming
+        else chat_service.send_message
+    )
+    with pytest.raises(ChatCharacterRestoringError):
+        await method(
+            SendChatMessageRequest(character_id=created.id, message="在嗎？"),
+        )
+
+    stored = await repo.get(created.id)
+    assert stored.frozen is True
+    assert stored.frozen_reason == FREEZE_REASON_RESTORE
+
+
+@pytest.mark.asyncio
 async def test_manual_freeze_is_sticky_but_not_blocked() -> None:
     chat_service, character_service, repo = _build()
     created = await _create(character_service)
@@ -234,3 +274,71 @@ async def test_manual_freeze_is_sticky_but_not_blocked() -> None:
     stored = await repo.get(created.id)
     assert stored.frozen is True
     assert stored.frozen_reason == FREEZE_REASON_MANUAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_contract_end_freeze_blocks_chat_and_never_thaws(
+    streaming: bool,
+) -> None:
+    """D7 / EC10 — a card's IP contract ending means "資料保留、不可互動".
+
+    A sticky-but-chattable freeze (the ``manual`` shape) would leave the
+    player talking to a character the licensor has withdrawn, which is the
+    one outcome the contract-termination switch exists to prevent. The
+    error is its own type: borrowing ``ChatSubscriptionFrozen`` would tell
+    the player to renew a subscription that is not the problem."""
+    chat_service, character_service, repo = _build()
+    created = await _create(character_service)
+    await repo.set_frozen(
+        created.id, frozen=True, now=_FROZEN_AT,
+        reason=FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
+    )
+
+    method = (
+        chat_service.send_message_stream
+        if streaming
+        else chat_service.send_message
+    )
+    with pytest.raises(ChatCharacterContractEndedError):
+        await method(
+            SendChatMessageRequest(character_id=created.id, message="在嗎？"),
+        )
+
+    stored = await repo.get(created.id)
+    assert stored.frozen is True
+    assert stored.frozen_reason == FREEZE_REASON_EXCLUSIVE_CONTRACT_END
+
+
+@pytest.mark.asyncio
+async def test_contract_end_unfreeze_restores_chat() -> None:
+    """The block is exactly as reversible as the freeze: the per-card
+    ``unfreeze`` message clears the row and the next turn goes through."""
+    chat_service, character_service, repo = _build()
+    created = await _create(character_service)
+    await repo.set_frozen(
+        created.id, frozen=True, now=_FROZEN_AT,
+        reason=FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
+    )
+    await repo.set_frozen(created.id, frozen=False, now=_FROZEN_AT)
+
+    await chat_service.send_message(
+        SendChatMessageRequest(character_id=created.id, message="回來了"),
+    )
+    await chat_service.wait_for_pending()
+
+    stored = await repo.get(created.id)
+    assert stored.frozen is False
+    assert stored.frozen_reason is None
+
+
+@pytest.mark.asyncio
+async def test_contract_end_error_is_not_a_subscription_error() -> None:
+    """釘死型別分離：兩個凍結來源的錯誤不可互相被 except 攔到，
+    否則玩家會收到「續訂即可」這種與事實不符的指引。"""
+    assert not issubclass(
+        ChatCharacterContractEndedError, ChatSubscriptionFrozen,
+    )
+    assert not issubclass(
+        ChatSubscriptionFrozen, ChatCharacterContractEndedError,
+    )

@@ -1,6 +1,6 @@
 """scene-structure fields on story_arc_beats
 
-Phase 1 of ``docs/SCENE_BEAT_PLAN.md`` — adds ``scene_characters``
+Phase 1 of the scene-beat work — adds ``scene_characters``
 (JSON-encoded list as Text), ``location``, ``dramatic_question``,
 ``scene_type``, ``required`` so a beat carries the structure needed
 for the expander to compose a "play this scene" prompt instead of

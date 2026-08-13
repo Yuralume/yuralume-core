@@ -6,7 +6,6 @@ it: *is there something new*. The prose never crosses this boundary, so the
 notices stay in one place with one set of translations, and Core needs no
 announcement rendering, no locale fallback, and nothing to keep in sync.
 
-See ``Yuralume-Cloud/docs/plans/PORTAL_ANNOUNCEMENTS_PLAN.md`` §2.
 """
 
 from __future__ import annotations

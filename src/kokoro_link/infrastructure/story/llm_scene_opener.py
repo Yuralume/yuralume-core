@@ -8,7 +8,7 @@ back, and the character's first performed line.
 package degrades to a deterministic ``Null*`` scene when the model is
 unavailable, because those run in the background and a placeholder beats
 a stalled arc. This one runs in the foreground of a button the hosted
-player is charged a fixed price for (STORY_SCENE_PLAN §3.4 red line 2),
+player is charged a fixed price for (red line 2),
 so a template-assembled stand-in would mean charging for filler. Both
 implementations therefore answer ``None`` when they cannot produce a real
 opening, and the service turns that into a failed action that writes

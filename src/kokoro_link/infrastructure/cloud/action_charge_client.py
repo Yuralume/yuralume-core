@@ -76,6 +76,7 @@ class ActionChargeClient(ActionChargePort):
         interaction_id: str,
         action_kind: str = ACTION_KIND_USER_ACTION,
         expected_price_cr: float | None = None,
+        character_origin: str | None = None,
     ) -> ActionCharge:
         tenant = (tenant_id or "").strip()
         action = (action_key or "").strip()
@@ -95,6 +96,11 @@ class ActionChargeClient(ActionChargePort):
             # quoted free" are different claims, and the second one would bind
             # the charge to a price the back office may never have published.
             payload["expected_price_cr"] = float(expected_price_cr)
+        origin = (character_origin or "").strip()
+        if origin:
+            # EC7: omitted entirely for a non-managed character, matching the
+            # Gateway header discipline — no key, not an empty value.
+            payload["character_origin"] = origin
         response = await self._post(_CHARGE_PATH, payload=payload)
         if response.status_code == _INSUFFICIENT_CREDITS_STATUS:
             raise _insufficient_credits(response)

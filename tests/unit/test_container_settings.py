@@ -4,6 +4,7 @@ from kokoro_link.bootstrap.container import build_container
 from kokoro_link.bootstrap.settings import (
     AppSettings,
     CloudSettings,
+    MediaApiSettings,
     ObjectStorageSettings,
     PromptQualitySettings,
     UserTimezoneSettings,
@@ -79,6 +80,176 @@ def test_container_uses_cloud_active_llm_provider_in_cloud_mode() -> None:
 
     assert isinstance(container.active_llm_provider, MeteredActiveLLMProvider)
     assert isinstance(container.active_llm_provider.inner, CloudActiveLLMProvider)
+
+
+def _cloud_settings() -> AppSettings:
+    return AppSettings(
+        cloud=CloudSettings(
+            enabled=True,
+            user_service_url="https://users.example",
+            gateway_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+        ),
+    )
+
+
+def test_container_feed_video_enabled_follows_local_registry_in_self_host(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """Self-host red line: outside cloud mode, ``video_enabled`` must keep
+    following the local video-profile registry exactly as before — no local
+    video config still means no video option offered to the model, and the
+    hosted jobs knob has no say in it either."""
+    monkeypatch.setenv("KOKORO_VIDEO_JOBS_ENABLED", "true")
+    without_video = build_container(AppSettings(database_url=""))
+    assert (
+        without_video.feed_composer_service._composer._video_enabled  # noqa: SLF001
+        is False
+    )
+
+    with_video = build_container(
+        AppSettings(
+            database_url="",
+            video_api=MediaApiSettings(
+                base_url="https://video.example",
+                api_key="k",
+                model="wan2.2",
+            ),
+        ),
+    )
+    assert with_video.video_profile_registry.profile_ids != []
+    assert (
+        with_video.feed_composer_service._composer._video_enabled  # noqa: SLF001
+        is True
+    )
+
+
+def test_cloud_without_the_jobs_knob_offers_the_model_no_video_option(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """CV0-1, corrected: "a cloud video provider is wired" is not the same
+    question as "video can be produced here".
+
+    With the knob off the very same adapter only speaks the *synchronous*
+    ``/v1/videos/generations`` route — one await of up to 30 minutes that
+    holds the ``image`` capability slot for its whole duration. Offering
+    ``media_kind=video`` there does not enable a feature, it lets a single
+    post wedge the deployment's background media lane. Default-off must
+    therefore be byte-for-byte the pre-deployment behaviour: no video
+    option in the composer prompt at all.
+    """
+    monkeypatch.delenv("KOKORO_VIDEO_JOBS_ENABLED", raising=False)
+
+    container = build_container(_cloud_settings())
+
+    assert container.video_profile_registry.profile_ids == []
+    composer = container.feed_composer_service._composer  # noqa: SLF001
+    assert composer._video_enabled is False  # noqa: SLF001
+
+
+def test_cloud_with_the_jobs_knob_enables_feed_video_without_local_video_env(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The original CV0-1 bug, still fixed: hosted never configures
+    ``KOKORO_VIDEO_*`` (video routes through the Gateway), so the local
+    profile registry is empty and must not be what the flag reads. Once the
+    deferred pipeline is switched on, the model is offered the option."""
+    monkeypatch.setenv("KOKORO_VIDEO_JOBS_ENABLED", "true")
+
+    container = build_container(_cloud_settings())
+
+    assert container.video_profile_registry.profile_ids == []
+    composer = container.feed_composer_service._composer  # noqa: SLF001
+    assert composer._video_enabled is True  # noqa: SLF001
+
+
+def test_only_a_deployment_that_can_queue_renders_probes_for_pending_rows(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The composer's in-flight dedup probe is wired off the same condition
+    as the poll carriers, so a deployment that can never hold a pending row
+    never queries for one."""
+    monkeypatch.delenv("KOKORO_VIDEO_JOBS_ENABLED", raising=False)
+    self_host = build_container(AppSettings(database_url=""))
+    assert (
+        self_host.feed_composer_service._deferred_video_possible  # noqa: SLF001
+        is False
+    )
+
+    cloud_without_knob = build_container(_cloud_settings())
+    assert (
+        cloud_without_knob.feed_composer_service._deferred_video_possible  # noqa: SLF001
+        is False
+    )
+
+    monkeypatch.setenv("KOKORO_VIDEO_JOBS_ENABLED", "true")
+    cloud_with_knob = build_container(_cloud_settings())
+    assert (
+        cloud_with_knob.feed_composer_service._deferred_video_possible  # noqa: SLF001
+        is True
+    )
+
+
+def test_self_host_gets_no_video_poll_carrier(monkeypatch) -> None:  # noqa: ANN001
+    """CV4 self-host red line, at the wiring level.
+
+    The deferred pipeline object is always built (it is inert without an
+    async-capable provider), but the embedded *carrier* must not be: a
+    self-host tick may not gain even one query for rows it can never have.
+    """
+    monkeypatch.delenv("KOKORO_VIDEO_JOBS_ENABLED", raising=False)
+    container = build_container(AppSettings(database_url=""))
+
+    assert container.feed_video_job_service is not None
+    scheduler = container.proactive_scheduler
+    assert scheduler is not None
+    assert scheduler._feed_video_job_service is None  # noqa: SLF001
+
+
+def test_cloud_with_jobs_enabled_wires_the_embedded_poll_carrier(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The knob is what turns LumeGram video into the deferred pipeline: it
+    both flips the adapter's declared capability and wires the carrier that
+    finishes the posts."""
+    monkeypatch.setenv("KOKORO_VIDEO_JOBS_ENABLED", "true")
+    container = build_container(AppSettings(
+        cloud=CloudSettings(
+            enabled=True,
+            user_service_url="https://users.example",
+            gateway_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+        ),
+    ))
+
+    scheduler = container.proactive_scheduler
+    assert scheduler is not None
+    assert scheduler._feed_video_job_service is not None  # noqa: SLF001
+    assert (
+        scheduler._feed_video_job_service  # noqa: SLF001
+        is container.feed_video_job_service
+    )
+
+
+def test_cloud_without_the_knob_keeps_the_synchronous_video_route(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """Default-off: the media-jobs broker has to be deployed before Core may
+    start queueing renders, and until then the same adapter must keep using
+    the synchronous ``/v1/videos/generations`` route."""
+    monkeypatch.delenv("KOKORO_VIDEO_JOBS_ENABLED", raising=False)
+    container = build_container(AppSettings(
+        cloud=CloudSettings(
+            enabled=True,
+            user_service_url="https://users.example",
+            gateway_url="https://gateway.example",
+            deployment_token="ykl_deploy",
+        ),
+    ))
+
+    scheduler = container.proactive_scheduler
+    assert scheduler is not None
+    assert scheduler._feed_video_job_service is None  # noqa: SLF001
 
 
 def test_container_disables_tts_pregeneration_in_cloud_mode() -> None:

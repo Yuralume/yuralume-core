@@ -1,4 +1,4 @@
-"""DTOs for the player-side memoir page (docs/MEMOIR_PLAN.md)."""
+"""DTOs for the player-side memoir page."""
 
 from __future__ import annotations
 

@@ -20,11 +20,18 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
-#: The only content types an upload may declare. Deliberately narrower than
-#: ``image/*``: SVG is an image by that test and also a scripting container.
-ALLOWED_UPLOAD_IMAGE_CONTENT_TYPES: frozenset[str] = frozenset(
-    {"image/png", "image/jpeg", "image/webp", "image/gif"},
+# Single source of truth for the served-image allow-list (shared with the
+# ``.lumebackup`` restore media landing — see the module docstring there):
+# duplicating the frozenset is how the two surfaces drift apart.
+from kokoro_link.application.media_content_types import (
+    ALLOWED_UPLOAD_IMAGE_CONTENT_TYPES,
+    normalise_content_type,
 )
+
+__all__ = [
+    "ALLOWED_UPLOAD_IMAGE_CONTENT_TYPES",
+    "ensure_allowed_upload_content_type",
+]
 
 
 def ensure_allowed_upload_content_type(content_type: str | None) -> str:
@@ -34,7 +41,7 @@ def ensure_allowed_upload_content_type(content_type: str | None) -> str:
     upload that declined to declare one puts the app's name on a claim only the
     uploader was in a position to make.
     """
-    declared = (content_type or "").split(";", 1)[0].strip().lower()
+    declared = normalise_content_type(content_type)
     if declared not in ALLOWED_UPLOAD_IMAGE_CONTENT_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,

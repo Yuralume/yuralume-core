@@ -56,7 +56,7 @@ Yuralume 反過來做：角色 **有自己的日子** — 每天有 LLM 規劃�
 - **三層主動訊息把關** — cheap heuristic → LLM intention judge → LLM decider，加上每通道 opt-in 與每日上限。該說的時候說、不該說的時候閉嘴。
 - **跨通道同一個人** — 把角色綁到 Telegram、LINE、Discord bot 或部署內建 WhatsApp gateway；每個介面共用同一份記憶 / 狀態 / 行程。
 - **LumeGram 角色社群動態** — 每角色一條 IG 風時間流，scheduler 從六種訊號（行程 / 劇情 beat / 記憶 / 外界事件 / 沉默 / 狀態變化）自動發文，並尊重睡眠等高 busy 行程時段；留言回覆走 tick 不即時。
-- **真實世界事實注入** — 節日（`holidays`）、天氣（Open-Meteo 免 key）、外界 RSS 新聞以「事實段」形式進入 prompt，**由 LLM 自行判斷要不要反應**，不寫死「下雨一定提到」。
+- **真實世界事實注入** — 節日（`holidays`）、天氣（Open-Meteo 免 key）、外界 RSS 新聞以「事實段」形式進入 prompt，**由 LLM 自行判斷要不要反應**，不寫死「下雨一定提到」。角色主動提過的新聞會連同原文連結留在聊天上下文數天，玩家追問細節時角色可用 `web_fetch` 讀原文再回答。
 - **故事工具** — 角色故事弧、多角色融合短篇小說、分歧劇場（VN 風選擇分支）；已演出的 arc beat 會保留成歷程，完成 arc 會留下里程碑記憶。**「起幕」**讓玩家自己把劇情拉出來，不必等排程：按一次就在原本的聊天串裡開一段場景框（旁白開場＋角色第一句＋標題／地點／氛圍），玩家照常自由輸入，每輪附 2–3 個可選的行動建議；不論是角色把戲劇問題演完、玩家自己結束，還是閒置超時（預設 24 小時，`YURALUME_STORY_SCENE_IDLE_TIMEOUT_SECONDS`）自動收尾，演過的都會落成正史。收尾旁白絕不虛構玩家沒做過的行動。
 - **模型群組 × per-feature × per-character LLM 路由** — Admin 路由設定會寫入全站預設，先用群組配置常見模型層級，再針對聊天、記憶抽取、純文字聊天 / 創角草稿模型的圖片識別等例外單獨 pin；必要時可針對單一角色覆寫。BYOK provider key 從 Admin UI 設定、加密存放。
 - **生成用量帳本** — Admin Observability 可追蹤聊天、背景 / 輔助 LLM、圖片、影片、TTS 的生成用量，不存 prompt 或生成內容；可依功能 / provider / model 比較成本、快取命中、estimated / actual 標記，以及 hosted routing 時的 Cloud Gateway request id。
@@ -180,6 +180,8 @@ uv run python scripts/llm_capacity_probe.py core-chat --core-url http://127.0.0.
 把輸出的 `publicKey` 填到 `WEB_PUSH_VAPID_PUBLIC_KEY`，`privateKey` 填到 `WEB_PUSH_VAPID_PRIVATE_KEY`，`WEB_PUSH_VAPID_SUBJECT` 填聯絡 URI，例如 `mailto:admin@example.com`。private key 不要提交到 Git，也不要放進前端程式。正式環境的 browser push / service worker 建議使用實際 HTTPS `APP_BASE_URL`。
 
 **LLM / embedding / image / video / TTS 的 provider key 不放在 `.env`。** 從 **Admin → Provider Keys** 在 runtime 設定，加密存資料庫，GET API 不回明文。
+
+同一種 provider 可以保留多組連線——例如中轉商把不同模型拆在不同 API key 後面。第一組之後的每一組填一個**連線代號**（進階欄位）即可；代號會成為模型選單裡那個 id 的一部分（`custom_openai_compatible__relay-b`），每張卡片也會顯示自己的 id。留空就沿用原本的 provider id，既有安裝不受影響。此機制適用 LLM、生圖與影片；TTS、embedding 與搜尋仍是一次只掛一個後端（最後更新者生效，其餘為 standby）。
 
 TurnRecord 也作為 eval feedback 接縫：admin 可見的 assistant chat bubble 與 Admin → Observability 可把 `operator_feedback`（`out_of_character` / `felt_human`）掛到單筆 `TurnRecord`，並可用 `/admin/observability/turns?feedback_kind=...` 查回，供閉源側轉成 fixture 草稿。
 

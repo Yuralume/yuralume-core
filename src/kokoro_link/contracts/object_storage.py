@@ -30,7 +30,19 @@ DEFAULT_STREAM_CHUNK_BYTES = 64 * 1024
 #: A prefix restated in any of those three places instead of imported here is a
 #: second definition that can drift: a writer whose keys nobody sweeps, or a
 #: sweeper deleting a prefix nothing writes.
-EPHEMERAL_OBJECT_KEY_PREFIXES: tuple[str, ...] = ("draft-uploads/",)
+#:
+#: ``character-backups/`` (CB2) holds encrypted ``.lumebackup`` export
+#: artifacts awaiting download. Ephemeral on purpose (plan §8: 產物走
+#: ephemeral TTL，不常駐佔 hosted 儲存), and the variant decorator skipping
+#: it is load-bearing twice over: the artifact is not an image, and WebP
+#: renditions of an encrypted blob would be pure dead weight. The storage
+#: service sweeps it on a longer, download-window TTL than the draft
+#: staging prefix — see ``storage_service.app.EPHEMERAL_PREFIX_TTL_OVERRIDES``.
+BACKUP_EXPORT_OBJECT_KEY_PREFIX = "character-backups/"
+EPHEMERAL_OBJECT_KEY_PREFIXES: tuple[str, ...] = (
+    "draft-uploads/",
+    BACKUP_EXPORT_OBJECT_KEY_PREFIX,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,4 +145,63 @@ class SupportsObjectStream(Protocol):
         *lazily*, on first iteration. Callers that owe the client a real
         404 must ``stat()`` first: once a streaming response has begun,
         its headers are already on the wire.
+        """
+
+
+class SupportsPrefixPurge(Protocol):
+    """Optional capability: delete every object under a key prefix.
+
+    Deliberately kept **out** of :class:`ObjectStoragePort`, for the same
+    reason as :class:`SupportsObjectStream`: adapters written before this
+    existed, test doubles, and any decorator that wraps a port without
+    forwarding unknown attributes all remain valid ports. Callers detect
+    this capability with ``getattr(port, "purge_prefix", None)`` +
+    ``callable(...)`` before calling it — never with ``isinstance``.
+
+    Why this needs its own primitive instead of enumerate-then-``delete``:
+    content-addressed keys such as ``tts/{character_id}/{digest}.{ext}``
+    (built once, in ``application/services/tts_service.py``) are never
+    persisted to a DB row — the digest *is* the key, derived at read time
+    from generation parameters, not looked up. There is therefore no set
+    of keys any caller can enumerate to delete one at a time; the only way
+    to reclaim them is to remove everything under the character-scoped
+    prefix they all share.
+
+    Fallback semantics for a caller that finds no such capability (CD2):
+    skip the prefix cleanup and log it — never fail the surrounding
+    operation. A character delete's DB-tracked object keys (avatar,
+    gallery images, ...) are still removed individually through
+    :meth:`ObjectStoragePort.delete` regardless; only the untracked,
+    content-addressed remainder is left behind when this capability is
+    absent, which is strictly the pre-CD1 behaviour, not a regression.
+
+    Contrast with :meth:`ObjectStoragePort.delete` plus the variant
+    decorator's per-key fan-out: deleting one key there means deriving
+    each of its fixed variant suffixes and deleting those too, because a
+    variant lives at ``{object_key}.{variant_name}.webp`` — a key the
+    decorator must construct, not discover. A prefix purge needs no such
+    derivation: that variant key already starts with ``object_key``, so
+    it already starts with any prefix ``object_key`` starts with, and a
+    purge removes it for free as part of the same subtree.
+    """
+
+    async def purge_prefix(self, *, prefix: str) -> int:
+        """Delete every object whose key starts with ``prefix``.
+
+        Returns the number of objects removed — one per distinct object
+        *key* (a WebP variant such as ``{object_key}.{name}.webp`` is its
+        own key under the same subtree, so it counts too), never inflated
+        by adapter-internal bookkeeping: a backend that keeps a metadata
+        sidecar per object (one JSON file alongside each blob) purges that
+        sidecar as part of the same call but does not count it a second
+        time. A ``prefix`` that matches nothing is not an error — it
+        returns ``0``.
+
+        Implementations validate ``prefix`` the same way
+        :func:`~kokoro_link.infrastructure.storage.keys.validate_object_key`
+        validates a full key, plus the additional shape constraints in
+        :func:`~kokoro_link.infrastructure.storage.keys.validate_purge_prefix`
+        (trailing ``/``, at least two segments): a bulk, irreversible
+        delete must never be reachable with an empty or single-segment
+        prefix, which would purge far more than one character's objects.
         """

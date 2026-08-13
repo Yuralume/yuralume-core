@@ -23,7 +23,7 @@ export type ArcTemplateTension =
  * The operator's (player's) dramatic place in a beat (OP0). Closed
  * three-value enum; `null` = unjudged — never coerce a missing value
  * to `'absent'`, that's a judgement call only the LLM or the operator
- * gets to make (see docs/plans/ARC_PLAYER_POSITION_PLAN.md §3.1).
+ * gets to make.
  */
 export type OperatorPosition = 'absent' | 'present' | 'central'
 

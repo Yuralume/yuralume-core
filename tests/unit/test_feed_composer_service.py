@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +49,7 @@ from kokoro_link.contracts.feed import (
 )
 from kokoro_link.contracts.account_runtime_usage import (
     ACCOUNT_RUNTIME_EVENT_FEED_POST,
+    ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.feed_post import FeedPost
@@ -197,11 +199,19 @@ class _StaticActiveVideoProvider:
 class _RecordingVideoProvider:
     provider_id = "stub-video"
 
-    def __init__(self) -> None:
+    def __init__(self, *, reported_duration_seconds: float | None = None) -> None:
         self.positives: list[str] = []
+        # Mirrors the additive ``last_duration_seconds`` shape a real adapter
+        # (e.g. ``CloudGatewayVideoProvider``) sets after ``generate()`` —
+        # only set on the instance when a test opts in, so every existing
+        # caller that constructs this fake without the kwarg keeps hitting
+        # the ledger's fallback path unchanged.
+        self._reported_duration_seconds = reported_duration_seconds
 
     async def generate(self, **kwargs) -> bytes:  # noqa: ANN003
         self.positives.append(str(kwargs.get("positive") or ""))
+        if self._reported_duration_seconds is not None:
+            self.last_duration_seconds = self._reported_duration_seconds
         return b"\x00\x00\x00\x18ftypmp42"
 
 
@@ -996,6 +1006,525 @@ async def test_image_persists_when_portrait_generator_succeeds(
     assert row.output_bytes == len(b"\x89PNG fake")
 
 
+# ---------- CV2 characterization: render / persist / ledger ----------
+#
+# The feed picture used to be produced by one method that resolved the
+# provider, rendered bytes, wrote them to object storage and filed the
+# usage row in a single straight line. CV2 splits that line into a render
+# step (provider call only) and a persist step (``feed/{character_id}/``
+# write) so the async video pipeline can reuse the render half for the
+# clip's first frame. These tests pin every observable the old shape
+# produced — the returned prompt, whether an object landed, and the exact
+# ledger row per outcome — so the split can be proven to change nothing.
+
+
+class _RecordingImageProvider:
+    """Image provider fake that records the positives it was handed.
+
+    Mirrors ``ImageProviderPort.generate``'s keyword-only surface. The
+    scripted ``outcome`` is either the byte list to return or an
+    exception instance to raise.
+    """
+
+    provider_id = "stub-image"
+
+    def __init__(self, outcome: list[bytes] | Exception) -> None:
+        self._outcome = outcome
+        self.positives: list[str] = []
+        self.calls = 0
+
+    async def generate(self, **kwargs: Any) -> list[bytes]:
+        self.calls += 1
+        self.positives.append(str(kwargs.get("positive") or ""))
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return list(self._outcome)
+
+
+class _WriteFailingObjectStorage(InMemoryObjectStorage):
+    """Storage whose writes always fail — the ``_write_image_bytes``
+    ``except`` arm, which returns ``None`` while the render already
+    happened (and therefore still has to be billed)."""
+
+    async def put_bytes(self, **kwargs: Any) -> Any:
+        raise RuntimeError("bucket unreachable")
+
+
+def _image_service(
+    *,
+    provider: Any,
+    storage: Any,
+    usage_recorder: Any = None,
+    style_service: VisualGenerationStyleService | None = None,
+    composer_output: FeedComposerOutput | None = None,
+    image_required: bool = True,
+    tmp_path: Path | None = None,
+) -> tuple[FeedComposerService, InMemoryFeedPostRepository]:
+    from tests.unit._image_provider_stub import StaticActiveImageProvider
+
+    repo = InMemoryFeedPostRepository()
+    collector = _FakeCollector([_candidate(image_required=image_required)])
+    composer = _ScriptedComposer([
+        composer_output
+        or FeedComposerOutput(
+            content_text="今天的雲很好看。", image_prompt="masterpiece, sky",
+        ),
+    ])
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        image_provider=StaticActiveImageProvider(provider),
+        uploads_dir=tmp_path,
+        object_storage=storage,
+        usage_recorder=usage_recorder,
+        visual_style_service=style_service,
+    )
+    return service, repo
+
+
+_TICK_AT = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_image_skipped_when_candidate_does_not_require_one(
+    tmp_path: Path,
+) -> None:
+    """``image_required=False`` short-circuits before the provider is
+    even resolved — no bytes, no prompt echoed onto the row, no ledger."""
+    provider = _RecordingImageProvider([b"\x89PNG fake"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        image_required=False,
+        tmp_path=tmp_path,
+    )
+
+    post = await service.tick(replace(_make_character(), id="aiko"), now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt is None
+    assert provider.calls == 0
+    assert await usage_events.list_recent() == []
+
+
+@pytest.mark.asyncio
+async def test_image_skipped_when_composer_returned_a_blank_prompt(
+    tmp_path: Path,
+) -> None:
+    provider = _RecordingImageProvider([b"\x89PNG fake"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        composer_output=FeedComposerOutput(
+            content_text="今天的雲很好看。", image_prompt="   ",
+        ),
+        tmp_path=tmp_path,
+    )
+
+    post = await service.tick(replace(_make_character(), id="aiko"), now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt is None
+    assert provider.calls == 0
+    assert await usage_events.list_recent() == []
+
+
+@pytest.mark.asyncio
+async def test_unresolved_image_provider_echoes_the_unstyled_prompt(
+    tmp_path: Path,
+) -> None:
+    """No provider wired for this deployment: the row keeps the composer's
+    raw prompt (styling happens *after* the provider check) and nothing is
+    billed."""
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    style_service = VisualGenerationStyleService(
+        preferences=InMemoryPreferencesRepository(),
+    )
+    service, _ = _image_service(
+        provider=None,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        style_service=style_service,
+        tmp_path=tmp_path,
+    )
+    character = replace(_make_character(), id="aiko")
+    await style_service.set_style("realistic", user_id=character.user_id)
+
+    post = await service.tick(character, now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt == "masterpiece, sky"
+    assert await usage_events.list_recent() == []
+
+
+@pytest.mark.asyncio
+async def test_image_generation_error_files_a_failed_ledger_row(
+    tmp_path: Path,
+) -> None:
+    from kokoro_link.contracts.image_provider import ImageGenerationError
+
+    provider = _RecordingImageProvider(ImageGenerationError("comfy down"))
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    style_service = VisualGenerationStyleService(
+        preferences=InMemoryPreferencesRepository(),
+    )
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        style_service=style_service,
+        tmp_path=tmp_path,
+    )
+    character = replace(_make_character(), id="aiko")
+    await style_service.set_style("realistic", user_id=character.user_id)
+
+    post = await service.tick(character, now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    # The *styled* prompt is what was attempted, so it is what is kept.
+    assert post.image_prompt is not None
+    assert post.image_prompt == provider.positives[0]
+    assert "masterpiece, sky" in post.image_prompt
+    assert post.image_prompt != "masterpiece, sky"
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.capability == "image"
+    assert row.feature_key == "feed_image"
+    assert row.status == "failed"
+    assert row.error_code == "ImageGenerationError"
+    assert row.error_message == "feed image generation failed"
+    assert row.artifact_count == 0
+    assert row.output_bytes is None
+    assert row.quantity.input_quantity == 1
+    assert row.quantity.output_quantity == 0
+    assert row.quantity.billable_quantity == 0
+
+
+@pytest.mark.asyncio
+async def test_unexpected_image_crash_files_the_concrete_error_type(
+    tmp_path: Path,
+) -> None:
+    provider = _RecordingImageProvider(RuntimeError("boom"))
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    post = await service.tick(replace(_make_character(), id="aiko"), now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt == "masterpiece, sky"
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    assert rows[0].status == "failed"
+    assert rows[0].error_code == "RuntimeError"
+    assert rows[0].error_message == "boom"
+    assert rows[0].artifact_count == 0
+
+
+@pytest.mark.asyncio
+async def test_image_provider_returning_nothing_files_a_succeeded_empty_row(
+    tmp_path: Path,
+) -> None:
+    """The provider answered, it just had no picture. Not a failure — the
+    call still happened upstream and is still billed as a zero-artifact
+    success."""
+    provider = _RecordingImageProvider([])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    post = await service.tick(replace(_make_character(), id="aiko"), now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt == "masterpiece, sky"
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "succeeded"
+    assert row.error_code is None
+    assert row.artifact_count == 0
+    assert row.output_bytes is None
+    assert row.quantity.output_quantity == 0
+
+
+@pytest.mark.asyncio
+async def test_image_storage_write_failure_still_bills_the_render(
+    tmp_path: Path,
+) -> None:
+    """Bytes were rendered upstream and the bucket ate them. The post
+    degrades to text-only, but the render is billed with the byte count
+    it produced and zero artifacts."""
+    provider = _RecordingImageProvider([b"\x89PNG fake"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=_WriteFailingObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    post = await service.tick(replace(_make_character(), id="aiko"), now=_TICK_AT)
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.image_url is None
+    assert post.image_prompt == "masterpiece, sky"
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "succeeded"
+    assert row.artifact_count == 0
+    assert row.output_bytes == len(b"\x89PNG fake")
+    assert row.quantity.output_quantity == 1
+
+
+@pytest.mark.asyncio
+async def test_image_prompt_is_styled_before_the_provider_call(
+    tmp_path: Path,
+) -> None:
+    provider = _RecordingImageProvider([b"\x89PNG fake"])
+    style_service = VisualGenerationStyleService(
+        preferences=InMemoryPreferencesRepository(),
+    )
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    service, _ = _image_service(
+        provider=provider,
+        storage=storage,
+        style_service=style_service,
+        tmp_path=tmp_path,
+    )
+    character = replace(_make_character(), id="aiko")
+    await style_service.set_style("realistic", user_id=character.user_id)
+
+    post = await service.tick(character, now=_TICK_AT)
+
+    assert post is not None
+    assert provider.positives
+    assert "masterpiece, sky" in provider.positives[0]
+    assert provider.positives[0] != "masterpiece, sky"
+    assert post.image_prompt == provider.positives[0]
+    assert post.image_url is not None
+    key = storage.object_key_from_url(post.image_url)
+    assert key is not None
+    assert key.startswith("feed/aiko/")
+    assert key.endswith(".png")
+
+
+# ---------- CV2: the video pipeline's first frame ----------
+#
+# Deliberately unwired (CV4 threads it into ``_materialise``). Called
+# directly so the helper's contract — one render, one durable object, one
+# ledger row, url+key back for three downstream consumers — is pinned
+# before anything depends on it.
+
+
+@pytest.mark.asyncio
+async def test_first_frame_lands_in_feed_storage_and_bills_once(
+    tmp_path: Path,
+) -> None:
+    provider = _RecordingImageProvider([b"\x89PNG frame"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    style_service = VisualGenerationStyleService(
+        preferences=InMemoryPreferencesRepository(),
+    )
+    service, _ = _image_service(
+        provider=provider,
+        storage=storage,
+        usage_recorder=usage_recorder,
+        style_service=style_service,
+        tmp_path=tmp_path,
+    )
+    character = replace(_make_character(), id="aiko")
+    await style_service.set_style("realistic", user_id=character.user_id)
+
+    frame = await service.generate_video_first_frame(character, "masterpiece, sky")
+    await usage_recorder.flush()
+
+    assert frame is not None
+    # 1) the I2V reference URL, 2) the poster frame for the video post,
+    # 3) the picture of the degraded image post — one object, three uses.
+    assert frame.url.startswith("/uploads/feed/aiko/")
+    assert frame.object_key.startswith("feed/aiko/")
+    assert frame.object_key.endswith(".png")
+    assert storage.object_key_from_url(frame.url) == frame.object_key
+    assert await storage.get_bytes(object_key=frame.object_key) == b"\x89PNG frame"
+    assert frame.prompt == provider.positives[0]
+    assert "masterpiece, sky" in frame.prompt
+    assert frame.prompt != "masterpiece, sky"
+
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.capability == "image"
+    assert row.feature_key == "feed_image"
+    assert row.provider_id == "stub-image"
+    assert row.status == "succeeded"
+    assert row.artifact_count == 1
+    assert row.output_bytes == len(b"\x89PNG frame")
+
+
+@pytest.mark.asyncio
+async def test_first_frame_render_failure_returns_none_and_bills_the_attempt(
+    tmp_path: Path,
+) -> None:
+    from kokoro_link.contracts.image_provider import ImageGenerationError
+
+    provider = _RecordingImageProvider(ImageGenerationError("comfy down"))
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    frame = await service.generate_video_first_frame(
+        replace(_make_character(), id="aiko"), "masterpiece, sky",
+    )
+    await usage_recorder.flush()
+
+    assert frame is None
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    assert rows[0].status == "failed"
+    assert rows[0].error_code == "ImageGenerationError"
+    assert rows[0].artifact_count == 0
+
+
+@pytest.mark.asyncio
+async def test_first_frame_empty_render_returns_none(tmp_path: Path) -> None:
+    provider = _RecordingImageProvider([])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    frame = await service.generate_video_first_frame(
+        replace(_make_character(), id="aiko"), "masterpiece, sky",
+    )
+    await usage_recorder.flush()
+
+    assert frame is None
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    assert rows[0].status == "succeeded"
+    assert rows[0].artifact_count == 0
+
+
+@pytest.mark.asyncio
+async def test_first_frame_storage_failure_returns_none_but_bills(
+    tmp_path: Path,
+) -> None:
+    """No landed object means no poster and no I2V reference, so there is
+    nothing to submit — but the upstream render happened and is billed."""
+    provider = _RecordingImageProvider([b"\x89PNG frame"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service, _ = _image_service(
+        provider=provider,
+        storage=_WriteFailingObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+
+    frame = await service.generate_video_first_frame(
+        replace(_make_character(), id="aiko"), "masterpiece, sky",
+    )
+    await usage_recorder.flush()
+
+    assert frame is None
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    assert rows[0].status == "succeeded"
+    assert rows[0].artifact_count == 0
+    assert rows[0].output_bytes == len(b"\x89PNG frame")
+
+
+@pytest.mark.asyncio
+async def test_first_frame_returns_none_without_provider_storage_or_prompt(
+    tmp_path: Path,
+) -> None:
+    """Every pre-render gate returns ``None`` without touching the ledger —
+    self-host installs with no image stack must not grow a usage row from
+    a code path they never enter."""
+    provider = _RecordingImageProvider([b"\x89PNG frame"])
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    character = replace(_make_character(), id="aiko")
+
+    no_provider, _ = _image_service(
+        provider=None,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+    assert await no_provider.generate_video_first_frame(
+        character, "masterpiece, sky",
+    ) is None
+
+    no_storage, _ = _image_service(
+        provider=provider,
+        storage=None,
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+    assert await no_storage.generate_video_first_frame(
+        character, "masterpiece, sky",
+    ) is None
+
+    blank_prompt, _ = _image_service(
+        provider=provider,
+        storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        usage_recorder=usage_recorder,
+        tmp_path=tmp_path,
+    )
+    assert await blank_prompt.generate_video_first_frame(character, "  ") is None
+
+    await usage_recorder.flush()
+    assert provider.calls == 0
+    assert await usage_events.list_recent() == []
+
+
 @pytest.mark.asyncio
 async def test_video_generation_applies_visual_style_preference(
     tmp_path: Path,
@@ -1057,6 +1586,152 @@ async def test_video_generation_applies_visual_style_preference(
 
 
 @pytest.mark.asyncio
+async def test_video_post_publishes_event_with_video_url(
+    tmp_path: Path,
+) -> None:
+    """CV0-2: the SSE gap — ``_publish`` only ever set ``image_url`` on the
+    ``FeedPostEvent`` it broadcast, so a realtime subscriber had no way to
+    tell a video post apart from a text/image one until the next poll.
+    """
+    repo = InMemoryFeedPostRepository()
+    bus = FeedEventBus()
+    queue = bus.subscribe()
+    candidate = _candidate()
+    collector = _FakeCollector([candidate])
+    composer = _ScriptedComposer([
+        FeedComposerOutput(
+            content_text="想拍下這段路。",
+            media_kind="video",
+            video_prompt="walking through neon rain",
+            image_prompt="fallback still",
+        ),
+    ])
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    video_provider = _RecordingVideoProvider()
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        event_bus=bus,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=storage,
+    )
+    character = replace(_make_character(), id="aiko")
+
+    post = await service.tick(
+        character, now=datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc),
+    )
+
+    assert post is not None
+    assert post.video_url is not None
+    assert queue.qsize() == 1
+    event = queue.get_nowait()
+    assert isinstance(event, FeedPostEvent)
+    assert event.video_url == post.video_url
+
+
+@pytest.mark.asyncio
+async def test_video_usage_ledger_uses_provider_reported_duration(
+    tmp_path: Path,
+) -> None:
+    """CV0-3: the usage ledger hard-coded 81 frames / 6 seconds for every
+    video regardless of what the provider actually rendered. When the
+    active provider reports its real duration via the additive
+    ``last_duration_seconds`` attribute (mirroring the existing
+    ``last_request_id`` shape), the ledger must record that instead of the
+    hard-coded assumption.
+    """
+    repo = InMemoryFeedPostRepository()
+    candidate = _candidate()
+    collector = _FakeCollector([candidate])
+    composer = _ScriptedComposer([
+        FeedComposerOutput(
+            content_text="想拍下這段路。",
+            media_kind="video",
+            video_prompt="walking through neon rain",
+            image_prompt="fallback still",
+        ),
+    ])
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    video_provider = _RecordingVideoProvider(reported_duration_seconds=12.0)
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=storage,
+        usage_recorder=usage_recorder,
+    )
+    character = replace(_make_character(), id="aiko")
+
+    post = await service.tick(
+        character, now=datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc),
+    )
+    await usage_recorder.flush()
+
+    assert post is not None
+    assert post.video_url is not None
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.duration_seconds == Decimal("12.0")
+    assert row.quantity.billable_quantity == 12
+    assert "length_frames" not in row.metadata
+
+
+@pytest.mark.asyncio
+async def test_video_usage_ledger_falls_back_to_default_when_provider_silent(
+    tmp_path: Path,
+) -> None:
+    """Same fixture, but the provider never sets ``last_duration_seconds``
+    (every adapter except the ones wired to report it, and every existing
+    test double) — the ledger must fall back to the historical 81
+    frames / 16 fps assumption rather than record nothing or crash."""
+    repo = InMemoryFeedPostRepository()
+    candidate = _candidate()
+    collector = _FakeCollector([candidate])
+    composer = _ScriptedComposer([
+        FeedComposerOutput(
+            content_text="想拍下這段路。",
+            media_kind="video",
+            video_prompt="walking through neon rain",
+            image_prompt="fallback still",
+        ),
+    ])
+    storage = InMemoryObjectStorage(public_base_url="/uploads")
+    video_provider = _RecordingVideoProvider()
+    usage_events = InMemoryGenerationUsageRepository()
+    usage_recorder = BackgroundUsageEventRecorder(usage_events)
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=storage,
+        usage_recorder=usage_recorder,
+    )
+    character = replace(_make_character(), id="aiko")
+
+    post = await service.tick(
+        character, now=datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc),
+    )
+    await usage_recorder.flush()
+
+    assert post is not None
+    rows = await usage_events.list_recent()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.quantity.billable_quantity == 6
+    assert row.metadata["length_frames"] == 81
+    assert row.metadata["fps"] == 16
+
+
+@pytest.mark.asyncio
 async def test_demo_runtime_profile_disables_feed_video_generation(
     tmp_path: Path,
 ) -> None:
@@ -1099,6 +1774,159 @@ async def test_demo_runtime_profile_disables_feed_video_generation(
         since=datetime(2026, 4, 29, 9, 59, tzinfo=timezone.utc),
         until=datetime(2026, 4, 29, 10, 1, tzinfo=timezone.utc),
     ) == 1
+
+
+# ---------- CV5: video_daily_limit volume control ----------
+
+
+class _HostedVideoProfileResolver:
+    """Resolves to a hosted tier with a configurable ``video_daily_limit``."""
+
+    def __init__(self, *, video_daily_limit: int | None) -> None:
+        self._video_daily_limit = video_daily_limit
+
+    async def resolve_for_operator(self, operator_id: str):
+        return AccountRuntimeProfile(
+            name="hosted-test",
+            video_daily_limit=self._video_daily_limit,
+        )
+
+
+def _video_candidate_and_composer():
+    candidate = _candidate(source=FeedSource.beat("video-beat"))
+    composer = _ScriptedComposer([
+        FeedComposerOutput(
+            content_text="想拍下這段路。",
+            media_kind="video",
+            video_prompt="walking through neon rain",
+            image_prompt="fallback still",
+        ),
+    ])
+    return candidate, composer
+
+
+@pytest.mark.asyncio
+async def test_video_daily_limit_over_quota_falls_back_to_image_branch(
+    tmp_path: Path,
+) -> None:
+    """CV5: an operator who already used up today's video slots gets the
+    ordinary picture path — no first frame, no storyboard/provider call —
+    the moment ``_video_volume_allows`` sees the rolling-24h count at or
+    above the limit."""
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    when = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    character = replace(_make_character(), id="aiko")
+    # Pre-spend the single daily video slot within the rolling window.
+    await usage.record_event(
+        operator_id=character.user_id,
+        event_type=ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
+        occurred_at=when - timedelta(hours=1),
+    )
+    candidate, composer = _video_candidate_and_composer()
+    collector = _FakeCollector([candidate])
+    video_provider = _RecordingVideoProvider()
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        cooldown=timedelta(0),
+        account_runtime_profile_resolver=_HostedVideoProfileResolver(
+            video_daily_limit=1,
+        ),
+        account_runtime_usage_repository=usage,
+    )
+
+    post = await service.tick(character, now=when)
+
+    assert post is not None
+    assert post.video_url is None
+    assert video_provider.positives == []
+    # The over-quota check itself does not add a second video event.
+    assert await usage.count_events(
+        operator_id=character.user_id,
+        event_type=ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
+        since=when - timedelta(hours=24),
+        until=when,
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_video_daily_limit_none_is_unlimited(tmp_path: Path) -> None:
+    """CV5: ``video_daily_limit=None`` (the default, and every tier until an
+    operator opts in) never blocks — video generates exactly as it did
+    before this ticket. The ledger is never touched either: an unlimited
+    tier bails out of ``_video_volume_allows`` before the usage repository
+    is read, same as ``daily_chat_image_limit``'s ``None`` fast path."""
+    repo = InMemoryFeedPostRepository()
+    usage = InMemoryAccountRuntimeUsageRepository()
+    when = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    character = replace(_make_character(), id="aiko")
+    candidate, composer = _video_candidate_and_composer()
+    collector = _FakeCollector([candidate])
+    video_provider = _RecordingVideoProvider()
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        cooldown=timedelta(0),
+        account_runtime_profile_resolver=_HostedVideoProfileResolver(
+            video_daily_limit=None,
+        ),
+        account_runtime_usage_repository=usage,
+    )
+
+    post = await service.tick(character, now=when)
+
+    assert post is not None
+    assert post.video_url is not None
+    assert video_provider.positives
+    assert await usage.count_events(
+        operator_id=character.user_id,
+        event_type=ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
+        since=when - timedelta(hours=24),
+        until=when,
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_video_daily_limit_self_host_default_leaves_behavior_unchanged(
+    tmp_path: Path,
+) -> None:
+    """CV5: self-host (no cloud profile resolver, no usage ledger wired at
+    all) never sees ``video_daily_limit`` — the permissive default profile's
+    ``video_daily_limit`` is ``None``, so the volume check returns True
+    without ever touching the (absent) ledger, and video generation is
+    unaffected by this ticket."""
+    repo = InMemoryFeedPostRepository()
+    when = datetime(2026, 4, 29, 10, 0, tzinfo=timezone.utc)
+    character = replace(_make_character(), id="aiko")
+    candidate, composer = _video_candidate_and_composer()
+    collector = _FakeCollector([candidate])
+    video_provider = _RecordingVideoProvider()
+    service = FeedComposerService(
+        repository=repo,
+        candidates=collector,
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(video_provider),
+        uploads_dir=tmp_path,
+        object_storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        cooldown=timedelta(0),
+        # No account_runtime_profile_resolver / account_runtime_usage_repository
+        # — exactly the self-host wiring.
+    )
+
+    post = await service.tick(character, now=when)
+
+    assert post is not None
+    assert post.video_url is not None
+    assert video_provider.positives
 
 
 # ---------- self-memorialisation ----------
@@ -1463,3 +2291,46 @@ async def test_create_manual_post_publishes_event() -> None:
     assert len(seen) == 1
     assert seen[0].post_id == post.id
     assert seen[0].character_id == "aiko"
+
+
+@pytest.mark.asyncio
+async def test_composer_receives_recent_media_kinds_newest_first() -> None:
+    repo = InMemoryFeedPostRepository()
+    when = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+    prior_posts = (
+        FeedPost.create(
+            character_id="aiko", kind=FeedKind.MOOD, content_text="純文字",
+            source=FeedSource.state_shift("prior-none"),
+            created_at=when - timedelta(minutes=30),
+        ),
+        FeedPost.create(
+            character_id="aiko", kind=FeedKind.MOOD, content_text="影片",
+            source=FeedSource.state_shift("prior-video"),
+            image_url="https://example.test/poster.webp",
+            video_url="https://example.test/clip.mp4",
+            created_at=when - timedelta(minutes=60),
+        ),
+        FeedPost.create(
+            character_id="aiko", kind=FeedKind.MOOD, content_text="圖片",
+            source=FeedSource.state_shift("prior-image"),
+            image_url="https://example.test/image.webp",
+            created_at=when - timedelta(minutes=90),
+        ),
+    )
+    for post in prior_posts:
+        await repo.add(post)
+    composer = _ScriptedComposer([
+        FeedComposerOutput(content_text="新的貼文", media_kind="none"),
+    ])
+    service = FeedComposerService(
+        repository=repo,
+        candidates=_FakeCollector([_candidate()]),
+        composer=composer,
+        video_provider=_StaticActiveVideoProvider(None),
+        cooldown=timedelta(0),
+    )
+    character = replace(_make_character(feed_daily_limit=10), id="aiko")
+
+    await service.tick(character, now=when)
+
+    assert composer.inputs[0].recent_media_kinds == ("none", "video", "image")

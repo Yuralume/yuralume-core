@@ -28,8 +28,11 @@ from fastapi.testclient import TestClient
 
 from kokoro_link.api.dependencies import get_container, get_current_user_id
 from kokoro_link.api.routes._cloud_errors import (
+    COST_CAP_EXCEEDED_CODE,
     INSUFFICIENT_CREDITS_CODE,
     PRICE_CHANGED_CODE,
+    QUOTA_EXCEEDED_CODE,
+    fuse_tripped_detail,
     insufficient_credits_detail,
     insufficient_credits_guard,
     price_changed_detail,
@@ -569,3 +572,87 @@ def test_an_ordinary_error_still_passes_through_the_guard() -> None:
     with pytest.raises(ValueError):
         with insufficient_credits_guard():
             raise ValueError("unrelated")
+
+
+# -- the deployment safety fuse: cost cap / quota (429) -----------------
+
+
+@pytest.mark.parametrize("code", [COST_CAP_EXCEEDED_CODE, QUOTA_EXCEEDED_CODE])
+def test_a_tripped_fuse_becomes_a_429_carrying_its_own_code(code: str) -> None:
+    """Neither code is the player's fault, and neither is a fault at all —
+
+    the deployment's own circuit breaker tripped. 429 says "try later", not
+    "your request was bad" (400) or "we broke" (500).
+    """
+    with pytest.raises(HTTPException) as excinfo:
+        with insufficient_credits_guard():
+            raise _refusal(code)
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.detail == {
+        "code": code,
+        "message": "insufficient credits for this request",
+    }
+
+
+def test_a_tripped_fuse_with_no_reason_gets_a_fallback_message() -> None:
+    request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+    response = httpx.Response(
+        429,
+        request=request,
+        text=json.dumps({
+            "error": {
+                "code": COST_CAP_EXCEEDED_CODE,
+                "message": "",
+                "retryable": False,
+            },
+        }),
+    )
+    refusal = refusal_from_response(response, response.text)
+    assert refusal is not None
+    assert refusal.reason == ""
+
+    with pytest.raises(HTTPException) as excinfo:
+        with insufficient_credits_guard():
+            raise refusal
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.detail["code"] == COST_CAP_EXCEEDED_CODE
+    assert excinfo.value.detail["message"]  # non-empty fallback, not ""
+
+
+def test_fuse_tripped_detail_ignores_other_refusal_codes() -> None:
+    assert fuse_tripped_detail(_refusal("entitlement_denied")) is None
+    assert fuse_tripped_detail(_refusal(INSUFFICIENT_CREDITS_CODE)) is None
+    assert fuse_tripped_detail(_refusal(COST_CAP_EXCEEDED_CODE)) == {
+        "code": COST_CAP_EXCEEDED_CODE,
+        "message": "insufficient credits for this request",
+    }
+
+
+def test_other_refusal_codes_still_bubble_through_the_guard_untouched() -> None:
+    with pytest.raises(ExpectedCloudRefusal):
+        with insufficient_credits_guard():
+            raise _refusal("entitlement_denied")
+
+
+def test_a_tripped_fuse_is_found_through_a_deeply_rewrapped_error() -> None:
+    """Media routes re-wrap upstream failures into their own error type,
+
+    sometimes more than once (provider error → medium error → route-level
+    error) before the guard ever sees it.
+    """
+    try:
+        try:
+            raise TTSError("cloud TTS gateway error 429") from _refusal(
+                COST_CAP_EXCEEDED_CODE,
+            )
+        except TTSError as cause:
+            raise GenerationFailedError("synthesis unavailable") from cause
+    except GenerationFailedError as exc:
+        with pytest.raises(HTTPException) as excinfo:
+            with insufficient_credits_guard():
+                raise exc
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.detail["code"] == COST_CAP_EXCEEDED_CODE

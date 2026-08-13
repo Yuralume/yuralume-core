@@ -81,12 +81,55 @@ async def test_cloud_gateway_model_posts_openai_shape_with_cloud_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "chat"
     assert headers["x-yuralume-character"] == "chr_abc"
+    # EC7: no origin was bound on this identity, so the header must not
+    # appear at all — a non-managed character's request is byte-identical
+    # to before EC7 existed.
+    assert "x-yuralume-character-origin" not in headers
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("llm-")
     assert model.last_request_id == headers["x-request-id"]
     payload = seen["payload"]
     assert payload["model"] == "preset-fast"
     assert payload["messages"][1] == {"role": "user", "content": "Say hi"}
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_model_sends_origin_header_for_managed_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "choices": [
+                {"message": {"content": "hello from gateway"}},
+            ],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    model = CloudGatewayChatModel(
+        base_url="https://gateway.example/",
+        deployment_token="ykl_deploy",
+        default_model="preset-chat",
+        feature_key="chat",
+        identity=CloudGatewayIdentity(
+            operator_id="cloud:acct_1",
+            account_id="acct_1",
+            tenant_id="tenant_1",
+            character_ref="chr_abc",
+            character_origin="official-yumi",
+        ),
+    )
+
+    await model.generate("Say hi")
+
+    headers = seen["headers"]
+    assert headers["x-yuralume-character-origin"] == "official-yumi"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 """world system seam — empty tables + characters.world_id
 
-Phase 0 of ``docs/WORLD_SYSTEM_PLAN.md``. All eight new tables ship
+Phase 0 of the world-system seam. All eight new tables ship
 empty; characters get a nullable ``world_id`` seam. Zero behaviour
 change — the world layer is opt-in and characters not assigned to any
 world keep working exactly like today.

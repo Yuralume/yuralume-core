@@ -1,6 +1,6 @@
 """OperatorProfile — the human controlling Yuralume.
 
-Phase 1 of the world-system roadmap (see ``docs/TODO.md`` §🟣). For
+Phase 1 of the world-system roadmap. For
 now this is effectively singleton: ``DEFAULT_OPERATOR_ID`` names the
 single row most installs use. The entity nonetheless carries an ``id``
 so multi-operator deployments later won't need a schema migration —
@@ -49,9 +49,8 @@ DEFAULT_PRIMARY_LANGUAGE = "zh-TW"
 
 This is the **content** language for everything the LLM produces for
 this operator (chat, memory, persona summaries, story output, feed
-posts). It is fixed at registration / setup time — see
-``docs/FRONTEND_I18N_PLAN.md`` §使用者主要語言. The frontend UI locale
-is independent and may differ.
+posts). It is fixed at registration / setup time. The frontend UI
+locale is independent and may differ.
 
 Stored as-is on the entity; light normalisation (trim, language part
 lowercased, 2-letter region uppercased) happens in ``__post_init__``

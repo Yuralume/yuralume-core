@@ -6,7 +6,7 @@ pointer in this side table keyed by the source row's ``id`` plus the
 entry kind discriminator. The pin's only effect is to bubble the entry
 to the top of the player's timeline view.
 
-Per ``docs/MEMOIR_PLAN.md`` pins are strictly per-(character_id,
+Pins are strictly per-(character_id,
 operator_id): the same memory pinned by operator A is invisible to
 operator B, mirroring :class:`OperatorPersona` isolation. The unique
 constraint in the schema enforces this.

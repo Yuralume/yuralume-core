@@ -5,7 +5,7 @@ SillyTavern cards carry a character as free-text prose (``description`` /
 as structured fields (``personality: list[str]`` / ``interests`` /
 ``boundaries`` / ``aspirations`` / ``appearance`` / ``speaking_style``).
 
-Per CLAUDE.md's LLM-first rule (D4) this projection is an LLM semantic
+Per the LLM-first rule (D4) this projection is an LLM semantic
 transform, not regex/keyword splitting. This port mirrors the shape of
 ``CharacterDraftGeneratorPort``: a single ``normalize`` call that turns
 the ST prose into the structured Core fields.

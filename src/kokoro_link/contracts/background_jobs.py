@@ -3,8 +3,7 @@
 This is the *foundation only*: the schema, value objects and ports that
 the distributed Hosted topology (coordinator / worker) will consume in
 P2-B. Nothing here is wired into any running process — it is entirely
-additive and dormant. See
-``docs/plans/HOSTED_CORE_SCALING_ARCHITECTURE_PLAN.md`` §2.2/§3.
+additive and dormant.
 
 Design invariants that every adapter (in-memory + SQLAlchemy) MUST honour
 identically so the parity tests (§14) hold:

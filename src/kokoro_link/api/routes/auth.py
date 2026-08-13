@@ -133,9 +133,8 @@ class SetupRequest(BaseModel):
         max_length=16,
         description=(
             "BCP 47 tag for the operator's content language (LLM "
-            "output, memory, persona). Immutable after setup — see "
-            "docs/FRONTEND_I18N_PLAN.md §使用者主要語言. Defaults to "
-            "'zh-TW' for backward-compatible clients that haven't "
+            "output, memory, persona). Immutable after setup. Defaults "
+            "to 'zh-TW' for backward-compatible clients that haven't "
             "rolled out the i18n picker yet."
         ),
     )

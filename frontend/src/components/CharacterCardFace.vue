@@ -2,7 +2,11 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { UiBadge, UiButton, UiImage } from '@/components/ui'
-import { isCloudCard } from '@/utils/characterCardSource'
+import {
+  canInstallCard,
+  isCloudCard,
+  shouldShowCloudOnlyNotice,
+} from '@/utils/characterCardSource'
 import type { CharacterCardPreview } from '@/utils/api/characters'
 
 const props = withDefaults(
@@ -34,6 +38,13 @@ const intro = computed(() => props.card.summary || props.card.description)
 const activeImage = computed(() => props.card.image_urls[activeImageIndex.value] ?? '')
 const showImage = computed(() => activeImage.value && !failedImageIndexes.value.has(activeImageIndex.value))
 const initial = computed(() => (props.card.name || title.value || '?').trim().charAt(0).toUpperCase())
+
+// A cloud-exclusive card on a deployment that cannot install it: the card
+// stays on the shelf, the button stops pretending. Both come from the
+// backend's own verdict — the browser cannot see the credential that decides
+// it (EC4).
+const installBlocked = computed(() => !canInstallCard(props.card))
+const showCloudOnly = computed(() => shouldShowCloudOnlyNotice(props.card))
 
 const detailRows = computed(() => {
   const rows: Array<{ label: string; value: string }> = []
@@ -208,7 +219,13 @@ function markImageFailed() {
       </div>
 
       <div class="character-card-face__body">
-        <div v-if="card.tags.length" class="character-card-face__tags">
+        <div
+          v-if="card.tags.length || showCloudOnly"
+          class="character-card-face__tags"
+        >
+          <UiBadge v-if="showCloudOnly" variant="warning">
+            {{ t('playerSidebar.characterCards.cloudOnly.chip') }}
+          </UiBadge>
           <UiBadge v-for="tag in card.tags" :key="tag" variant="default">
             {{ tag }}
           </UiBadge>
@@ -260,12 +277,16 @@ function markImageFailed() {
           </div>
         </dl>
 
+        <p v-if="showCloudOnly" class="character-card-face__cloud-only">
+          {{ t('playerSidebar.characterCards.cloudOnly.hint') }}
+        </p>
+
         <UiButton
           v-if="actionLabel"
           variant="primary"
           block
           :loading="actionLoading"
-          :disabled="actionDisabled"
+          :disabled="actionDisabled || installBlocked"
           @click="emit('action')"
         >
           {{ actionLabel }}
@@ -462,6 +483,18 @@ function markImageFailed() {
   line-height: 1.6;
   white-space: pre-line;
   overflow-wrap: anywhere;
+}
+
+/* 「僅雲端版」說明：不是錯誤，是這張卡的事實，所以走提示色而非錯誤色。 */
+.character-card-face__cloud-only {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 209, 128, 0.28);
+  background: rgba(255, 209, 128, 0.08);
+  color: #ffd180;
+  font-size: var(--font-xs);
+  line-height: 1.6;
 }
 
 .character-card-face__details-toggle {

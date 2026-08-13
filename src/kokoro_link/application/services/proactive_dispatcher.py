@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date as date_type, datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -59,6 +59,12 @@ from kokoro_link.contracts.register_profile import (
 )
 from kokoro_link.contracts.reply_quality import ReplyDiversityEvidence
 from kokoro_link.contracts.tool import ToolRegistryPort
+from kokoro_link.contracts.character_event_mention import (
+    CharacterEventMentionRepositoryPort,
+)
+from kokoro_link.domain.entities.character_event_mention import (
+    CharacterEventMention,
+)
 from kokoro_link.contracts.proactive import (
     ProactiveAttemptRepositoryPort,
     ProactiveContext,
@@ -217,6 +223,27 @@ _RECENT_SENT_LIMIT = 8
 _SOURCE_LINE = "line"
 
 
+@dataclass(frozen=True, slots=True)
+class _ClaimedEventSeed:
+    """A world event this tick won the right to use, or the absence of one.
+
+    ``item_id`` addresses the inbox row (release it if nothing is sent);
+    ``world_event_id`` addresses the event itself (record the mention if
+    something is). They are different identities and both are needed —
+    the inbox row is per-character bookkeeping, the event is the shared
+    pool row chat later reads the link out of."""
+
+    title: str = ""
+    summary: str = ""
+    source: str = ""
+    locale: str = ""
+    item_id: str | None = None
+    world_event_id: str | None = None
+
+
+_NO_EVENT_SEED = _ClaimedEventSeed()
+
+
 class ProactiveDispatcher:
     def __init__(
         self,
@@ -242,6 +269,9 @@ class ProactiveDispatcher:
         event_bus: ProactiveEventBus | None = None,
         dialogue_summarizer: DialogueSummarizerPort | None = None,
         event_seed_dispenser: "EventSeedDispenser | None" = None,
+        event_mention_repository: (
+            "CharacterEventMentionRepositoryPort | None"
+        ) = None,
         calendar_context_port: CalendarContextPort | None = None,
         weather_context_port: "WeatherContextPort | None" = None,
         schedule_service: "ScheduleService | None" = None,
@@ -302,6 +332,7 @@ class ProactiveDispatcher:
         self._event_bus = event_bus
         self._dialogue_summarizer = dialogue_summarizer
         self._event_seed_dispenser = event_seed_dispenser
+        self._event_mentions = event_mention_repository
         self._calendar_context_port = calendar_context_port
         self._weather_context_port = weather_context_port
         self._schedule_service = schedule_service
@@ -386,7 +417,7 @@ class ProactiveDispatcher:
         # to before, so no existing proactive test changes.
         self._hosted_identity_resolver = hosted_identity_resolver
         # SC1-E — while a character is inside a 起幕 scene, it does not also
-        # message the player from outside it (STORY_SCENE_PLAN §3.2). Read
+        # message the player from outside it. Read
         # straight from the session repository rather than through the scene
         # service: this is one indexed lookup in the cheap-gate band, and
         # depending on the whole scene runtime here would make the proactive
@@ -501,6 +532,15 @@ class ProactiveDispatcher:
             await self._resolve_schedule(character, when)
         )
 
+        # T2 — a parked motive can carry its own appointment ("we agreed
+        # on 19:30"). An INTENTION_SKIPPED tick still advances the
+        # cooldown anchor, so a 19:22 "wait for the agreed time" verdict
+        # would otherwise blank the 19:30 window it was waiting for.
+        # One indexed read on the cheap side of the gate; empty for every
+        # character with no alarm pending, which is the normal case.
+        due_intents = await self._load_due_deferred_intents(
+            character_id=character.id, when=when,
+        )
         verdict = await self._gate.check(
             character=character,
             trigger=trigger,
@@ -512,6 +552,7 @@ class ProactiveDispatcher:
             idle_minutes=idle_minutes,
             current_activity=current_activity,
             local_tz=operator_tz,
+            cooldown_exempt=bool(due_intents),
         )
         if not verdict.passed:
             return await self._log(
@@ -521,6 +562,14 @@ class ProactiveDispatcher:
                 reason=verdict.reason,
                 now=when,
             )
+
+        # The alarm is spent the instant it buys a pass — win or lose
+        # downstream. Leaving it set would exempt every subsequent tick
+        # from the cooldown and burn one judge call each time. The motive
+        # itself stays parked and still reaches the judge below; if the
+        # judge skips again it writes a fresh row, possibly with a new
+        # appointment, which is the intended behaviour.
+        await self._spend_due_revisits(due_intents)
 
         # P3-Dedup §3.4 — claim the tick slot AFTER the gate passes and BEFORE
         # composing / delivering. A distributed reclaimed job racing the
@@ -588,9 +637,8 @@ class ProactiveDispatcher:
         active_arc, upcoming_beats, beat_awaiting_player = (
             await self._ensure_active_arc(character, when, operator_tz)
         )
-        seed_title, seed_summary, seed_source, seed_locale, seed_item_id = (
-            await self._claim_event_seed(character)
-        )
+        seed = await self._claim_event_seed(character)
+        seed_item_id = seed.item_id
 
         calendar_context = self._describe_calendar(
             when, operator_tz, operator=operator,
@@ -603,9 +651,16 @@ class ProactiveDispatcher:
             character,
         )
         # HUMANIZATION_ROADMAP §3.4 — surface still-active deferred motives
-        # so the intention judge can re-evaluate timing on a re-tick.
-        deferred_intents = await self._load_active_deferred_intents(
-            character_id=character.id, when=when,
+        # so the intention judge can re-evaluate timing on a re-tick. The
+        # alarms that bought this tick were already spent above, so the
+        # re-read rows come back alarm-less: overlay the pre-spend
+        # snapshots or the judge loses the one fact that distinguishes
+        # this tick from the one it skipped on (T2 / F2-1).
+        deferred_intents = _overlay_due_intents(
+            await self._load_active_deferred_intents(
+                character_id=character.id, when=when,
+            ),
+            due_intents,
         )
         # HUMANIZATION_ROADMAP §4.2 — observed register / address preference.
         address_preference = await self._load_address_preference(
@@ -654,10 +709,10 @@ class ProactiveDispatcher:
             beat_awaiting_player=beat_awaiting_player,
             recent_sent_attempts=recent_sent_attempts,
             unanswered_streak=unanswered_streak,
-            world_event_seed_title=seed_title,
-            world_event_seed_summary=seed_summary,
-            world_event_seed_source=seed_source,
-            world_event_seed_locale=seed_locale,
+            world_event_seed_title=seed.title,
+            world_event_seed_summary=seed.summary,
+            world_event_seed_source=seed.source,
+            world_event_seed_locale=seed.locale,
             operator_location_context=operator_location_context,
             calendar_context=calendar_context,
             weather_context=weather_context,
@@ -676,6 +731,7 @@ class ProactiveDispatcher:
                 intention = await self._intention_judge.judge(context)
             except Exception:
                 _LOGGER.exception("proactive intention judge crashed")
+                await self._restore_due_revisits(due_intents)
                 await self._release_event_seed(character_id, seed_item_id)
                 return await self._log(
                     character_id=character_id,
@@ -686,6 +742,13 @@ class ProactiveDispatcher:
                     now=when,
                 )
             if not intention.should_consume_slot:
+                # F2-3 — a fail-soft skip is not a decision: no motive is
+                # recorded on that path either, so without the restore
+                # the appointment simply vanishes. A judge that looked
+                # and still held back keeps its alarm spent — that skip
+                # is the character's own call.
+                if intention.judge_unavailable:
+                    await self._restore_due_revisits(due_intents)
                 # HUMANIZATION_ROADMAP §3.4 — park the motive so the
                 # next tick can re-evaluate timing instead of forgetting
                 # an authentic urge after one bad moment.
@@ -693,6 +756,7 @@ class ProactiveDispatcher:
                     character_id=character_id,
                     trigger=trigger,
                     decision=intention,
+                    local_tz=operator_tz,
                     now=when,
                 )
                 await self._release_event_seed(character_id, seed_item_id)
@@ -854,6 +918,13 @@ class ProactiveDispatcher:
         # character's pending motives into reality; mark them consumed
         # so they stop re-surfacing in subsequent judge calls.
         await self._consume_deferred_intents(context.deferred_intents, now=when)
+        # Something reached the player, so the seed's claim is now
+        # permanent: this is the last moment the event is still
+        # addressable from anywhere the player can see. Record it, or
+        # chat loses the material the moment the push lands.
+        await self._record_event_mention(
+            character_id=character_id, seed=seed, when=when,
+        )
         await self._notify_web_push(
             character=character,
             message=decision.message,
@@ -875,7 +946,7 @@ class ProactiveDispatcher:
             # Only the send path carries the prompt into the turn record:
             # skip / gate-blocked ticks fire every few minutes and would
             # otherwise flood the table with prompts for messages that
-            # never existed (see COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN
+            # never existed (
             # §2 P0). ``None`` from a decider that doesn't assemble a
             # prompt degrades to the previous empty-string behaviour.
             prompt_assembled=decision.prompt_assembled or "",
@@ -1796,22 +1867,20 @@ class ProactiveDispatcher:
 
     async def _claim_event_seed(
         self, character: Character,
-    ) -> tuple[str, str, str, str, str | None]:
+    ) -> _ClaimedEventSeed:
         """Try to claim a curated world event for the proactive surface.
 
-        Returns ``("", "", "", "", None)`` when no dispenser is wired, the
+        Returns :data:`_NO_EVENT_SEED` when no dispenser is wired, the
         character opted out of world awareness, or no fresh seed is
-        available. Tuple shape is ``(title, summary, source, locale,
-        item_id)``; ``item_id`` is the inbox item id of the claimed row
-        when the claim succeeded — the caller passes it to
-        :meth:`_release_event_seed` if the decider ends up not sending,
-        so the seed flows back to the next surface instead of being
-        burned silently.
+        available. ``item_id`` is the inbox row the claim won — the
+        caller hands it to :meth:`_release_event_seed` if the message
+        never goes out, so the seed flows back to the next surface
+        instead of being burned silently.
         """
         if self._event_seed_dispenser is None:
-            return "", "", "", "", None
+            return _NO_EVENT_SEED
         if not character.world_awareness_enabled:
-            return "", "", "", "", None
+            return _NO_EVENT_SEED
         try:
             claimed = await self._event_seed_dispenser.claim(
                 character_id=character.id, surface="proactive_message",
@@ -1820,16 +1889,61 @@ class ProactiveDispatcher:
             _LOGGER.exception(
                 "proactive: event seed claim failed character=%s", character.id,
             )
-            return "", "", "", "", None
+            return _NO_EVENT_SEED
         if claimed is None:
-            return "", "", "", "", None
-        return (
-            claimed.event.title or "",
-            claimed.event.summary or "",
-            claimed.event.source or "",
-            claimed.event.locale or "",
-            claimed.item.id,
+            return _NO_EVENT_SEED
+        return _ClaimedEventSeed(
+            title=claimed.event.title or "",
+            summary=claimed.event.summary or "",
+            source=claimed.event.source or "",
+            locale=claimed.event.locale or "",
+            item_id=claimed.item.id,
+            world_event_id=claimed.event.id,
         )
+
+    async def _record_event_mention(
+        self, *, character_id: str, seed: _ClaimedEventSeed, when: datetime,
+    ) -> None:
+        """Remember that this character used this event to reach out.
+
+        Called only after a delivery actually landed — the same point at
+        which the seed's claim becomes permanent. Chat reads these back
+        so a player who asks about the news the character just messaged
+        them about gets an answer instead of a blank stare: the claimed
+        inbox row is invisible to the chat peek forever after.
+
+        Best-effort by construction. A mention that fails to record
+        costs context on a later turn; raising here would cost the
+        proactive tick its outcome log after the message already went
+        out.
+
+        **Known gap — the hosted retry path.** A transient hosted
+        delivery failure leaves ``delivered == 0``, so this tick
+        releases the seed and records nothing; when
+        ``ProactiveDeliveryRetryWorker`` later succeeds off the durable
+        ledger, the player gets the message but no mention exists, so
+        chat cannot recall it. Closing it means carrying the event id
+        through ``ProactiveEnvelope`` and the ledger — i.e. changing the
+        delivery/retry contract — and it would still be recording a send
+        whose seed this tick already handed back to the other surfaces.
+        The direction matches what the seed release already chose: miss
+        the record rather than assert a send that may never happen."""
+        if seed.world_event_id is None or self._event_mentions is None:
+            return
+        try:
+            await self._event_mentions.record(
+                CharacterEventMention.create(
+                    character_id=character_id,
+                    world_event_id=seed.world_event_id,
+                    surface="proactive_message",
+                    mentioned_at=when,
+                ),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive: event mention record failed character=%s event=%s",
+                character_id, seed.world_event_id,
+            )
 
     async def _release_event_seed(
         self, character_id: str, item_id: str | None,
@@ -1901,7 +2015,7 @@ class ProactiveDispatcher:
         player in the room, so a due beat whose ``operator_position`` is
         ``central`` must be left waiting rather than attempted and
         (past the recheck threshold) written into canon unseen
-        (ARC_PLAYER_POSITION_PLAN §2 #5). The invitation this dispatcher
+The invitation this dispatcher
         may go on to send is what that beat is waiting for — playing it
         here would answer the invitation before it was made.
         """
@@ -1971,12 +2085,76 @@ class ProactiveDispatcher:
             )
             return None
 
+    async def _load_due_deferred_intents(
+        self,
+        *,
+        character_id: str,
+        when: datetime,
+    ) -> tuple:
+        """T2 helper — parked motives whose ``revisit_at`` alarm has rung.
+
+        Runs before the cheap gate, so it stays a single narrow query and
+        never triggers the GC sweep ``list_active`` does. All failures
+        collapse to an empty tuple: losing an exemption degrades to the
+        pre-T2 behaviour, while raising here would take the whole tick
+        down over a secondary signal.
+        """
+        if self._deferred_intents is None or not self._deferred_intents.enabled:
+            return ()
+        try:
+            intents = await self._deferred_intents.list_due(
+                character_id, DEFAULT_OPERATOR_ID, now=when,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "deferred_intent list_due crashed character=%s",
+                character_id,
+            )
+            return ()
+        return tuple(intents)
+
+    async def _spend_due_revisits(self, intents: "tuple") -> None:
+        """Clear the alarms that just bought a gate pass (single-use)."""
+        if self._deferred_intents is None or not intents:
+            return
+        try:
+            await self._deferred_intents.clear_revisit_many(
+                [intent.id for intent in intents],
+            )
+        except Exception:
+            _LOGGER.exception("deferred_intent clear_revisit_many crashed")
+
+    async def _restore_due_revisits(self, intents: "tuple") -> None:
+        """Give the alarms back when the tick they bought never produced
+        a judgement.
+
+        Spending is unconditional on purpose (a tick that reached the
+        judge must not be able to exempt the next one), but a tick where
+        the judge itself was unavailable never *asked the question* — the
+        appointment is still unkept, and burning the alarm there would
+        let one upstream 5xx cost the promise permanently. The restore is
+        best-effort and conditional in the store: a concurrent consume or
+        a fresher appointment wins.
+
+        A restored alarm re-fires on the next tick, so a sustained
+        outage retries once per tick instead of once — bounded by the
+        row's own TTL, and each retry is the same failing call the tick
+        would have made anyway.
+        """
+        if self._deferred_intents is None or not intents:
+            return
+        try:
+            await self._deferred_intents.restore_revisit_many(intents)
+        except Exception:
+            _LOGGER.exception("deferred_intent restore_revisit_many crashed")
+
     async def _record_deferred_intent(
         self,
         *,
         character_id: str,
         trigger: ProactiveTrigger,
         decision: ProactiveIntentionDecision,
+        local_tz: tzinfo,
         now: datetime,
     ) -> None:
         if self._deferred_intents is None:
@@ -1987,6 +2165,9 @@ class ProactiveDispatcher:
                 operator_id=DEFAULT_OPERATOR_ID,
                 trigger=trigger.value,
                 decision=decision,
+                revisit_at=_parse_revisit_at(
+                    decision.revisit_at_iso, local_tz=local_tz, now=now,
+                ),
                 now=now,
             )
         except Exception:
@@ -2395,7 +2576,7 @@ def _beat_awaiting_the_player(
 ) -> StoryArcBeat | None:
     """Earliest due beat whose scene is *about* the player, if any.
 
-    ARC_PLAYER_POSITION_PLAN §3.4 (OP3). ``central`` means the scene has
+    OP3. ``central`` means the scene has
     no content without the player, so the autonomous scan walks past it
     (OP2-B) and it simply sits there — this is the beat the character
     might reach out about.
@@ -2545,6 +2726,55 @@ def _format_intention_skip_reason(
     if len(reason) > 500:
         return reason[:497].rstrip() + "..."
     return reason
+
+
+def _overlay_due_intents(active: tuple, due: tuple) -> tuple:
+    """Show the judge the alarms as they stood when they rang.
+
+    ``_spend_due_revisits`` clears ``revisit_at`` the moment an alarm buys
+    a gate pass — before the context is assembled — so every row read
+    back from the store is alarm-less and the judge's 「已經到了」 line can
+    never render on the very tick it exists for. Overlaying the pre-spend
+    snapshots by id restores that signal for this evaluation only; the
+    store stays cleared, so the exemption is still single-use.
+
+    Rows that rang but fell outside the ``list_active`` window lead the
+    result — they are the reason this tick exists at all.
+    """
+    if not due:
+        return active
+    snapshots = {intent.id: intent for intent in due}
+    merged = [snapshots.pop(intent.id, intent) for intent in active]
+    return (*snapshots.values(), *merged)
+
+
+def _parse_revisit_at(
+    raw: str | None,
+    *,
+    local_tz: tzinfo,
+    now: datetime,
+) -> datetime | None:
+    """Parse ``ProactiveIntentionDecision.revisit_at_iso`` to aware UTC.
+
+    Same tolerance contract as ``chat_service._parse_promise_datetime``:
+    a naive value is read in the operator's civil timezone, then stored
+    as UTC. Anything unparseable — or already in the past — collapses to
+    ``None``, so a hallucinated or stale timestamp can never hand out a
+    cooldown exemption; the motive is still parked, just without an
+    alarm.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_tz)
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed <= ensure_utc(now):
+        return None
+    return parsed
 
 
 def _requires_user_started_interaction(trigger: ProactiveTrigger) -> bool:

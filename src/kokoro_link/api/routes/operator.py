@@ -1,7 +1,6 @@
 """Operator profile REST endpoints.
 
-Phase 1 of the world-system roadmap (see ``docs/TODO.md`` §🟣):
-single-row read/write for the human operator's display name +
+Phase 1 of the world-system roadmap: single-row read/write for the human operator's display name +
 aliases + pronouns. Service-level fallback means the GET endpoint
 never returns 404 — an unsaved profile renders as the placeholder.
 

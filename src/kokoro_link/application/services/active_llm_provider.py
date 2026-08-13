@@ -43,6 +43,9 @@ from kokoro_link.contracts.repositories import PreferencesRepositoryPort
 from kokoro_link.domain.entities.character import Character, FeatureModelOverride
 from kokoro_link.application.services.feature_keys import FEATURE_TO_GROUP
 from kokoro_link.application.services.nsfw_mode import NsfwModeService
+from kokoro_link.application.services.output_language_policy import (
+    OperatorOutputLanguageResolver,
+)
 from kokoro_link.application.services.routing_reasoning import (
     parse_reasoning_override,
 )
@@ -55,6 +58,9 @@ from kokoro_link.application.services.scoped_preferences import (
 from kokoro_link.domain.value_objects.content_flow import (
     CONTENT_TOLERANCE_COMMUNITY,
     normalize_content_tolerance,
+)
+from kokoro_link.infrastructure.llm.script_normalizer import (
+    bind_script_normalization,
 )
 
 
@@ -83,11 +89,13 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
         preferences: PreferencesRepositoryPort,
         default_provider_id: str,
         nsfw_mode_service: NsfwModeService | None = None,
+        output_language_resolver: OperatorOutputLanguageResolver | None = None,
     ) -> None:
         self._registry = registry
         self._preferences = preferences
         self._default_provider_id = default_provider_id
         self._nsfw_mode_service = nsfw_mode_service
+        self._output_language_resolver = output_language_resolver
 
     async def resolve(
         self,
@@ -97,7 +105,6 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
         operator_id: str | None = None,
         content_tolerance: str | None = None,
     ) -> ChatModelPort:
-        _ = operator_id
         provider_id = await self._read_preferred_provider_id(
             feature_key,
             character=character,
@@ -123,12 +130,41 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
             character=character,
             content_tolerance=content_tolerance,
         )
-        return await self._maybe_bind_vision(
+        model = await self._maybe_bind_vision(
             model,
             feature_key,
             character=character,
             content_tolerance=content_tolerance,
         )
+        return await self._maybe_bind_script_normalization(
+            model,
+            character=character,
+            operator_id=operator_id,
+        )
+
+    async def _maybe_bind_script_normalization(
+        self,
+        model: ChatModelPort,
+        *,
+        character: Character | None,
+        operator_id: str | None,
+    ) -> ChatModelPort:
+        """Bind Simplified→Traditional normalisation for players whose
+        content language wants it.
+
+        Outermost binding on purpose: it post-processes whatever the
+        rest of the chain produced. Without a language resolver wired
+        (unit tests, minimal containers) nothing is bound — the gate
+        fails closed, since normalising output for an unknown language
+        is worse than leaving it as the model wrote it.
+        """
+        if self._output_language_resolver is None:
+            return model
+        language_tag = await self._output_language_resolver.resolve(
+            character=character,
+            operator_id=operator_id,
+        )
+        return bind_script_normalization(model, language_tag=language_tag)
 
     async def resolve_model_id(
         self,

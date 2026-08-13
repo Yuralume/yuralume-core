@@ -1,6 +1,6 @@
 """LLMStoryArcPlanner tests — scene-structure parsing & robustness.
 
-Covers Phase 1 of ``docs/SCENE_BEAT_PLAN.md``:
+Covers Phase 1 of the scene-beat work:
 - Beats now carry ``scene_type`` / ``location`` / ``scene_characters`` /
   ``dramatic_question`` / ``required`` and a planner regression must not
   silently drop them.

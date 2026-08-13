@@ -8,7 +8,7 @@ have. This builder assembles that material for one character using only
 character-keyed, read-only APIs, so any background surface (no operator
 session, no user message) can call it.
 
-Design rails (ENCOUNTER_CHAT_PARITY_PLAN §Phase 1):
+Design rails:
 
 - Every source is fail-soft: a broken auxiliary read yields an empty
   bucket, never an exception into the caller.
@@ -288,7 +288,7 @@ class CharacterLifeContextBuilder:
         ``operator=`` argument here used to pin every player's characters
         to the site-level fallback — i.e. the site owner's city — so a
         Japanese player's encounter read out Taipei weather and TW
-        holidays (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §G-1).
+        holidays (G-1).
 
         Cross-player encounters (Route B, the two characters belonging to
         different players) resolve **one** ambient reference for the whole

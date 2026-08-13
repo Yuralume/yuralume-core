@@ -4,8 +4,8 @@ Revision ID: cw8b0c30073
 Revises: cv7a9b20072
 Create Date: 2026-05-25 09:00:00.000000
 
-docs/MEMOIR_PLAN.md — pinning lets the player promote a memoir entry to
-the top of their timeline. Unique on
+Pinning lets the player promote a memoir entry to the top of their
+timeline. Unique on
 ``(character_id, operator_id, entry_kind, entry_id)`` so re-pinning is a
 no-op and the per-(character, operator) isolation rule is enforced at
 the schema level.

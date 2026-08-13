@@ -210,6 +210,7 @@ class RealtimeEventRehydrator:
             kind=post.kind.value,
             content_text=post.content_text,
             image_url=post.image_url,
+            video_url=getattr(post, "video_url", None),
             created_at=post.created_at,
             event_id=stored.id,
         )

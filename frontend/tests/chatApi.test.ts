@@ -64,6 +64,47 @@ describe('chat API runtime limit errors', () => {
       message: 'hello',
     }, () => {})).rejects.toBeInstanceOf(ChatStreamProtocolError)
   })
+
+  it('maps a 429 cost_cap_exceeded to a typed error carrying the backend message', async () => {
+    mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(429, {
+      detail: { code: 'cost_cap_exceeded', message: 'monthly cost cap reached' },
+    }))
+
+    await expect(sendChatMessage({
+      character_id: 'char-1',
+      message: 'one more',
+    })).rejects.toMatchObject({
+      code: 'cost_cap_exceeded',
+      message: 'monthly cost cap reached',
+      statusCode: 429,
+    })
+  })
+
+  it('maps a 429 quota_exceeded to a typed error carrying the backend message', async () => {
+    mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(429, {
+      detail: { code: 'quota_exceeded', message: 'monthly quota reached' },
+    }))
+
+    await expect(sendChatMessageStream({
+      character_id: 'char-1',
+      message: 'one more',
+    }, () => {})).rejects.toMatchObject({
+      code: 'quota_exceeded',
+      message: 'monthly quota reached',
+      statusCode: 429,
+    })
+  })
+
+  it('cost_cap_exceeded and quota_exceeded errors are instances of ChatRuntimeLimitError', async () => {
+    mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(429, {
+      detail: { code: 'cost_cap_exceeded', message: 'monthly cost cap reached' },
+    }))
+
+    await expect(sendChatMessage({
+      character_id: 'char-1',
+      message: 'one more',
+    })).rejects.toBeInstanceOf(ChatRuntimeLimitError)
+  })
 })
 
 describe('chat API out-of-credits handling', () => {

@@ -4,10 +4,10 @@ A thin read-only directory index: it maps a stable ``pack_id`` (the
 filename stem) to the blob on disk. Unlike arc-template packs these are
 **not** synced into a shared DB table — installing one runs the import path
 to create a brand-new character *owned by the installer* (see
-``docs/CHARACTER_CARD_PLAN.md`` §8).
+``docs).
 
 ``src/kokoro_link/data/character_cards/`` **ships empty** since the official
-cards moved to the Cloud catalog (``OFFICIAL_CARD_CLOUD_CATALOG_PLAN`` D5).
+cards moved to the Cloud catalog.
 The mechanism stayed because it is the offline answer: a
 ``CHARACTER_CARD_PACK_DIR`` env override points a deployment at its own pack
 directory (e.g. a mounted volume) without rebuilding the image, and with the

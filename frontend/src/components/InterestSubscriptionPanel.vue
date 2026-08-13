@@ -9,9 +9,18 @@ const props = withDefaults(defineProps<{
   modelExcluded: string[]
   copyNamespace?: string
   categoryNamespace?: string
+  /**
+   * EC2-C: `excluded_topics` is not in `MANAGED_WRITABLE_UPDATE_FIELDS`
+   * (a managed character's world-topic filters are the licensor's to
+   * set) while `modelEnabled` / `modelCategories` are — so the caller
+   * (`WorldAdminEditor`) hides just this fieldset rather than the whole
+   * panel. Defaults `false`: every other consumer is unaffected.
+   */
+  hideExcluded?: boolean
 }>(), {
   copyNamespace: 'interestSubscriptionPanel',
   categoryNamespace: '',
+  hideExcluded: false,
 })
 
 const emit = defineEmits<{
@@ -126,7 +135,7 @@ function onExcludedKeydown(ev: KeyboardEvent) {
       </div>
     </fieldset>
 
-    <fieldset :disabled="!modelEnabled" class="sub-section">
+    <fieldset v-if="!hideExcluded" :disabled="!modelEnabled" class="sub-section">
       <legend class="field-label">{{ t(`${copyNamespace}.excludedLegend`) }}</legend>
       <div class="excluded-input-row">
         <input

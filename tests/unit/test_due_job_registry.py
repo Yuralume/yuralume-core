@@ -6,8 +6,13 @@ from kokoro_link.contracts.due_jobs import (
     BEAT_DUE_KIND,
     CHARACTER_UPKEEP_KIND,
     CHARACTER_KIND_REGISTRY,
+    DEFAULT_CAPABILITY_CAPS,
     FEED_COMMENT_REPLY_KIND,
     FEED_COMPOSE_KIND,
+    FEED_VIDEO_POLL_KIND,
+    POST_TURN_KIND,
+    capability_kind_sets,
+    kinds_for_capability,
     GOAL_REVIEW_KIND,
     JobCapability,
     KnobGate,
@@ -123,6 +128,53 @@ def test_pending_follow_up_release_is_one_shot_event_kind() -> None:
     assert PENDING_FOLLOW_UP_RELEASE_KIND not in character_chain_kinds()
     assert is_character_chain_kind(PENDING_FOLLOW_UP_RELEASE_KIND) is False
     assert is_character_chain_kind(BEAT_DUE_KIND) is True
+
+
+def test_feed_video_poll_never_competes_for_the_image_slot() -> None:
+    """CV4 red line: the deferred video poll must NOT ride ``image``.
+
+    ``image`` is capped at one in-flight job because it models a GPU. A
+    poll that took that slot would let one fifteen-minute clip block every
+    feed picture on the deployment — the exact failure the asynchronous
+    pipeline exists to remove.
+    """
+    spec = kind_spec(FEED_VIDEO_POLL_KIND)
+    assert spec is not None
+    assert spec.capability is JobCapability.VIDEO_POLL
+    assert spec.capability is not JobCapability.IMAGE
+    assert spec.chained is False
+    assert spec.character_scoped is False
+    assert spec.event_driven is True
+    assert FEED_VIDEO_POLL_KIND not in CHARACTER_KIND_REGISTRY
+    assert is_character_chain_kind(FEED_VIDEO_POLL_KIND) is False
+
+    # The capability the claim filter counts by kind: image stays exactly
+    # the set it was, and the poll gets its own, generously-capped one.
+    assert kinds_for_capability(JobCapability.IMAGE.value) == (FEED_COMPOSE_KIND,)
+    assert kinds_for_capability(JobCapability.VIDEO_POLL.value) == (
+        FEED_VIDEO_POLL_KIND,
+    )
+    caps = DEFAULT_CAPABILITY_CAPS
+    assert caps[JobCapability.VIDEO_POLL.value] > caps[JobCapability.IMAGE.value]
+    triples = dict(
+        (capability, kinds) for capability, _cap, kinds in capability_kind_sets()
+    )
+    assert triples[JobCapability.VIDEO_POLL.value] == frozenset(
+        {FEED_VIDEO_POLL_KIND},
+    )
+    assert FEED_VIDEO_POLL_KIND not in triples[JobCapability.IMAGE.value]
+
+
+def test_player_owed_one_shots_stay_exempt_from_the_llm_ceiling() -> None:
+    """The opt-in cap flag must not have quietly enrolled the existing
+    one-shot kinds: a follow-up release and a post-turn extraction are
+    player-owed and must never queue behind the background LLM ceiling."""
+    for kind in (PENDING_FOLLOW_UP_RELEASE_KIND, POST_TURN_KIND):
+        spec = kind_spec(kind)
+        assert spec is not None
+        assert spec.capability is JobCapability.LLM
+        assert spec.counts_toward_capability_cap is False
+        assert kind not in kinds_for_capability(JobCapability.LLM.value)
 
 
 def test_goal_review_is_a_daily_character_chain() -> None:

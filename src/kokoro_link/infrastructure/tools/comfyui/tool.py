@@ -31,6 +31,9 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_IMAGE_CHAT_TOOL,
 )
 from kokoro_link.application.services.image_usage import image_usage_parts_from_provider
+from kokoro_link.application.services.official_reference_attachments import (
+    official_reference_attachments,
+)
 from kokoro_link.application.services.visual_generation_style import (
     VisualGenerationStyleService,
 )
@@ -165,6 +168,7 @@ class ComfyImageTool(ToolPort):
                 # tool call — the model decides to draw mid-turn, so there is
                 # no second chance to ask the client.
                 quoted_price_cr=client_quoted_price(ACTION_IMAGE_CHAT_TOOL),
+                character_origin=ctx.character.origin_official_card_id,
             )
         except ExpectedCloudRefusal as exc:
             if exc.code != INSUFFICIENT_CREDITS_CODE:
@@ -211,7 +215,15 @@ class ComfyImageTool(ToolPort):
                 aspect=aspect,
                 batch=_CHAT_TOOL_BATCH_SIZE,
                 recent_dialogue=ctx.recent_dialogue,
-                user_attachment_urls=ctx.user_attachment_urls,
+                # EC6: the only entry point where the player also hands over
+                # pictures. The partner's reference art leads, the player's
+                # attachments follow — the card decides who is drawn, the
+                # photo still gets to direct what happens in the shot.
+                user_attachment_urls=official_reference_attachments(
+                    ctx.character,
+                    object_storage=self._object_storage,
+                    user_attachment_urls=ctx.user_attachment_urls,
+                ),
             )
         except ImageTimeoutError as exc:
             await self._record_usage_safely(

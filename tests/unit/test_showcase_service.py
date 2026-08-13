@@ -1,17 +1,15 @@
-"""Showcase pipeline — the red lines that keep a private feed private.
+"""Showcase pipeline — minimal structural filtering and tenant isolation.
 
 Four families, and the first two are the reason this file exists:
 
-1. **Mechanical filter.** Structural unfitness is decided by provenance,
-   not by reading the text: a ``silence`` post is about the owner's
-   cadence, and a ``schedule`` post inherits the privacy of the block it
-   narrates. Unresolvable provenance fails closed.
+1. **Mechanical filter.** Only unresolved source data, missing text and
+   missing images are rejected; provenance privacy never blocks publication.
 2. **Tenant scoping.** A character id is not authority. Pointing the
    pipeline at someone else's character would publish a paying player's
    private feed on the public front page, so every entry point resolves
    the tenant first and a mismatch is indistinguishable from "not found".
-3. **Snapshot schema.** Field names are the contract with the portal, and
-   a post missing any locale is dropped rather than half-shipped.
+3. **Snapshot schema.** Missing translations fall back to source text, while
+   missing render data is dropped.
 4. **Advisory review.** The reviewer can flag and propose a
    de-identifying rewrite; it can never approve, and every failure path
    lands on ``needs_manual_review`` rather than on a clean bill of health.
@@ -21,11 +19,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from kokoro_link.application.services.showcase.filters import (
-    REASON_SCHEDULE_NON_PUBLIC,
     REASON_SCHEDULE_UNRESOLVED,
     PublicActivity,
     ShowcaseCandidate,
@@ -62,6 +60,7 @@ from kokoro_link.domain.entities.schedule import (
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
 from kokoro_link.domain.value_objects.feed_source import FeedSource
+from kokoro_link.domain.value_objects.timezone import timezone_id_for
 
 NOW = datetime(2026, 8, 4, 22, 10, tzinfo=timezone.utc)
 TENANT = "tenant-showcase"
@@ -183,7 +182,7 @@ def make_post(
     text: str = "今天的天空很藍，我在窗邊坐了很久。",
     source: FeedSource | None = None,
     kind: FeedKind | None = None,
-    image_url: str | None = None,
+    image_url: str | None = "/v1/public/feed/default.png",
     created_at: datetime | None = None,
     character_id: str = "char-1",
 ) -> FeedPost:
@@ -236,7 +235,7 @@ def build_service(
 # --------------------------------------------------------------------------- #
 
 
-def test_filter_drops_silence_posts_and_keeps_the_rest():
+def test_filter_keeps_every_source_kind_when_required_content_exists():
     outcome = mechanical_filter(
         [
             make_post("p1"),
@@ -245,9 +244,26 @@ def test_filter_drops_silence_posts_and_keeps_the_rest():
         ],
     )
 
-    assert [c.id for c in outcome.candidates] == ["p1", "p3"]
-    assert outcome.excluded == {"source:silence": 1}
-    assert outcome.excluded_total == 1
+    assert [c.id for c in outcome.candidates] == ["p1", "p2", "p3"]
+    assert outcome.excluded == {}
+    assert outcome.excluded_total == 0
+
+
+def test_filter_rejects_posts_missing_text_or_image():
+    missing_text = make_post("p1")
+    object.__setattr__(missing_text, "content_text", "   ")
+    blank_image = make_post("p3")
+    object.__setattr__(blank_image, "image_url", "  ")
+    outcome = mechanical_filter(
+        [
+            missing_text,
+            make_post("p2", image_url=None),
+            blank_image,
+        ],
+    )
+
+    assert outcome.candidates == ()
+    assert outcome.excluded == {"empty_text": 1, "missing_image": 2}
 
 
 def test_filter_never_carries_internal_fields_out():
@@ -282,7 +298,7 @@ def _activity(
     )
 
 
-def test_strip_drops_operator_and_private_schedule_blocks():
+def test_strip_keeps_operator_and_private_schedule_blocks():
     base = datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
     schedule = DailySchedule.create(
         character_id="char-1",
@@ -309,12 +325,16 @@ def test_strip_drops_operator_and_private_schedule_blocks():
         schedule, now=base + timedelta(hours=7, minutes=30), local_tz=timezone.utc,
     )
 
-    assert [entry.text for entry in strip] == ["做早餐"]
+    assert [entry.text for entry in strip] == [
+        "做早餐",
+        "和飼主去吃拉麵",
+        "泡澡",
+    ]
     assert now_entry is not None
     assert now_entry.live is True
 
 
-def test_now_is_none_when_the_current_block_is_not_public():
+def test_now_includes_the_current_operator_block():
     base = datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
     schedule = DailySchedule.create(
         character_id="char-1",
@@ -338,17 +358,105 @@ def test_now_is_none_when_the_current_block_is_not_public():
         schedule, now=base + timedelta(hours=12, minutes=30), local_tz=timezone.utc,
     )
 
-    assert now_entry is None
-    assert strip == ()
+    assert now_entry is not None
+    assert now_entry.text == "和飼主去吃拉麵"
+    assert [entry.text for entry in strip] == ["和飼主去吃拉麵"]
 
 
-def test_filter_rejects_a_schedule_post_from_a_block_the_operator_is_in():
-    """The strip already refuses this activity; the post about it says more.
+def test_strip_entries_carry_an_end_so_a_gap_is_not_the_previous_block():
+    """Starts alone give the same answer at 09:30 as at 23:59.
 
-    "今天跟他一起去吃拉麵" reads as an ordinary character post — nothing in
-    the text tells anyone the owner was there. Only the provenance row
-    knows, so the mechanical filter has to answer, not the human queue.
+    A client that only knows where blocks *begin* can say "the most recent
+    block that has begun" and nothing more, so a snapshot keeps showing
+    做早餐 as what she is doing right now for the rest of the day. The end
+    bound is what lets an idle gap — and the stretch after the last block
+    — match nothing at all.
     """
+    base = datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
+    schedule = DailySchedule.create(
+        character_id="char-1",
+        date_=base.date(),
+        activities=[_activity("做早餐", hour=7), _activity("散步", hour=15)],
+    )
+
+    _, strip = select_public_activities(
+        schedule, now=base + timedelta(hours=7, minutes=30), local_tz=timezone.utc,
+    )
+
+    assert [(entry.time, entry.end) for entry in strip] == [
+        ("07:00", "08:00"),
+        ("15:00", "16:00"),
+    ]
+    # The consumer's rule, applied to an unscheduled gap and to bedtime.
+    for clock in ("09:30", "23:59"):
+        assert not [e for e in strip if e.time <= clock < e.end]
+    assert [e.text for e in strip if e.time <= "07:30" < e.end] == ["做早餐"]
+
+
+def test_a_block_running_to_day_end_reports_24_00_rather_than_00_00():
+    """"Until day end" is *stored* as next-day midnight, and "00:00" lies.
+
+    The planner clamps every activity into ``[00:00, 24:00)`` of its civil
+    day, so the last block's ``end_at`` is the following midnight.
+    Formatted naively that is ``"00:00"`` — a value below its own start, so
+    ``time <= clock < end`` never holds and the evening block is invisible
+    all evening instead of current.
+    """
+    taipei = ZoneInfo("Asia/Taipei")
+    base = datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
+    # 23:00–24:00 Taipei is 15:00–16:00 UTC — the end lands on 8/5 locally.
+    night = ScheduleActivity.create(
+        start_at=datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc),
+        end_at=datetime(2026, 8, 4, 16, 0, tzinfo=timezone.utc),
+        description="睡前看書",
+        category="休息",
+    )
+    schedule = DailySchedule.create(
+        character_id="char-1", date_=base.date(), activities=[night],
+    )
+
+    _, strip = select_public_activities(
+        schedule,
+        now=datetime(2026, 8, 4, 15, 30, tzinfo=timezone.utc),
+        local_tz=taipei,
+    )
+
+    entry = strip[0]
+    assert (entry.time, entry.end) == ("23:00", "24:00")
+    assert entry.time <= "23:30" < entry.end
+
+
+def test_a_block_the_day_clamp_did_not_reach_also_ends_at_24_00():
+    """23:00 → next-day 01:30 is not expressible as a same-day interval.
+
+    Reporting the true ``"01:30"`` wraps the interval — no clock satisfies
+    ``"23:00" <= clock < "01:30"`` — which empties it exactly the way
+    ``"00:00"`` would. The strip is a one-day surface, so the only honest
+    end for a block that outlives the day is the end of the day.
+    """
+    taipei = ZoneInfo("Asia/Taipei")
+    base = datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
+    # 23:00 on 8/4 → 01:30 on 8/5, Taipei local.
+    overnight = ScheduleActivity.create(
+        start_at=datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc),
+        end_at=datetime(2026, 8, 4, 17, 30, tzinfo=timezone.utc),
+        description="趕稿",
+        category="工作",
+    )
+    schedule = DailySchedule.create(
+        character_id="char-1", date_=base.date(), activities=[overnight],
+    )
+
+    _, strip = select_public_activities(
+        schedule,
+        now=datetime(2026, 8, 4, 15, 30, tzinfo=timezone.utc),
+        local_tz=taipei,
+    )
+
+    assert (strip[0].time, strip[0].end) == ("23:00", "24:00")
+
+
+def test_filter_keeps_schedule_posts_from_operator_and_private_blocks():
     solo = _activity("一個人做早餐", hour=7)
     with_owner = _activity(
         "和飼主去吃拉麵",
@@ -362,6 +470,7 @@ def test_filter_rejects_a_schedule_post_from_a_block_the_operator_is_in():
             ),
         ],
     )
+    private = _activity("泡澡", hour=22, scene_privacy=ScenePrivacy.INTIMATE)
 
     outcome = mechanical_filter(
         [
@@ -371,24 +480,13 @@ def test_filter_rejects_a_schedule_post_from_a_block_the_operator_is_in():
                 text="今天跟他一起去吃了拉麵，湯頭很濃。",
                 source=FeedSource.schedule(with_owner.id),
             ),
+            make_post("p3", source=FeedSource.schedule(private.id)),
         ],
-        activities={solo.id: solo, with_owner.id: with_owner},
+        activities={solo.id: solo, with_owner.id: with_owner, private.id: private},
     )
 
-    assert [c.id for c in outcome.candidates] == ["p1"]
-    assert outcome.excluded == {REASON_SCHEDULE_NON_PUBLIC: 1}
-
-
-def test_filter_rejects_a_schedule_post_from_a_private_block():
-    private = _activity("泡澡", hour=22, scene_privacy=ScenePrivacy.INTIMATE)
-
-    outcome = mechanical_filter(
-        [make_post("p1", source=FeedSource.schedule(private.id))],
-        activities={private.id: private},
-    )
-
-    assert outcome.candidates == ()
-    assert outcome.excluded == {REASON_SCHEDULE_NON_PUBLIC: 1}
+    assert [c.id for c in outcome.candidates] == ["p1", "p2", "p3"]
+    assert outcome.excluded == {}
 
 
 def test_filter_fails_closed_when_the_source_activity_is_unresolvable():
@@ -492,6 +590,7 @@ def _card() -> CharacterCard:
         days=214,
         memories=1820,
         stories=7,
+        timezone="Asia/Taipei",
     )
 
 
@@ -499,7 +598,7 @@ def _snapshot_post(
     post_id: str = "p1",
     *,
     text=None,  # noqa: ANN001
-    image_url: str | None = None,
+    image_url: str | None = "/v1/public/feed/default.png",
 ) -> SnapshotPost:
     return SnapshotPost(
         id=post_id,
@@ -515,8 +614,10 @@ def test_snapshot_matches_the_producer_consumer_contract():
     result = build_snapshot(
         card=_card(),
         posts=[_snapshot_post()],
-        now_entry=PublicActivity(time="22:10", text="看書", live=True),
-        schedule=[PublicActivity(time="07:30", text="做早餐", live=False)],
+        now_entry=PublicActivity(time="22:10", text="看書", end="23:30", live=True),
+        schedule=[
+            PublicActivity(time="07:30", text="做早餐", end="09:00", live=False),
+        ],
         base_url="https://play.yuralume.com/",
         locales=("zh", "en", "ja"),
         translate=passthrough_translator(),
@@ -528,9 +629,10 @@ def test_snapshot_matches_the_producer_consumer_contract():
 
     character = document["character"]
     assert set(character) == {
-        "name", "persona", "avatar_url", "portrait_url", "stats",
+        "name", "persona", "avatar_url", "portrait_url", "timezone", "stats",
     }
     assert character["name"] == {"zh": "米菈", "en": "[en] 米菈", "ja": "[ja] 米菈"}
+    assert character["timezone"] == "Asia/Taipei"
     assert character["stats"] == {"days": 214, "memories": 1820, "stories": 7}
     # Relative storage URLs become absolute; a trailing slash on the base
     # URL does not produce a double slash.
@@ -540,6 +642,8 @@ def test_snapshot_matches_the_producer_consumer_contract():
     )
     assert character["avatar_url"] == character["portrait_url"]
 
+    # ``now`` stays the reduced projection: bounds are strip business, so
+    # a consumer cannot re-derive a staler "current" from this object.
     assert document["now"] == {
         "time": "22:10",
         "text": {"zh": "看書", "en": "[en] 看書", "ja": "[ja] 看書"},
@@ -548,12 +652,16 @@ def test_snapshot_matches_the_producer_consumer_contract():
         {
             "time": "07:30",
             "text": {"zh": "做早餐", "en": "[en] 做早餐", "ja": "[ja] 做早餐"},
+            "end": "09:00",
             "live": False,
         },
     ]
 
     post = document["posts"][0]
-    assert set(post) == {"id", "kind", "created_at", "text"}
+    assert set(post) == {"id", "kind", "created_at", "text", "image_url"}
+    assert post["image_url"] == (
+        "https://play.yuralume.com/v1/public/feed/default.png"
+    )
     assert post["text"] == {
         "zh": "今天的天空很藍。",
         "en": "The sky is blue.",
@@ -561,7 +669,7 @@ def test_snapshot_matches_the_producer_consumer_contract():
     }
 
 
-def test_snapshot_absolutises_post_images_and_drops_unusable_ones():
+def test_snapshot_absolutises_post_images_and_skips_unusable_ones():
     result = build_snapshot(
         card=_card(),
         posts=[
@@ -579,12 +687,12 @@ def test_snapshot_absolutises_post_images_and_drops_unusable_ones():
         posts["p1"]["image_url"]
         == "https://play.yuralume.com/v1/public/feed/char-1/abc.png"
     )
-    # An unusable URL costs the image, not the post.
-    assert "image_url" not in posts["p2"]
+    assert "p2" not in posts
+    assert result.skipped_posts == ["p2"]
     assert any("無法絕對化" in warning for warning in result.warnings)
 
 
-def test_post_missing_a_locale_is_skipped_rather_than_half_shipped():
+def test_post_missing_a_locale_falls_back_to_source_text():
     result = build_snapshot(
         card=_card(),
         posts=[
@@ -597,9 +705,13 @@ def test_post_missing_a_locale_is_skipped_rather_than_half_shipped():
         translate=passthrough_translator(),
     )
 
-    assert [item["id"] for item in result.document["posts"]] == ["p1"]
-    assert result.skipped_posts == ["p2"]
-    assert any("缺 ja 譯文" in warning for warning in result.warnings)
+    assert [item["id"] for item in result.document["posts"]] == ["p1", "p2"]
+    assert result.document["posts"][1]["text"]["ja"] == "只有中文。"
+    assert result.skipped_posts == []
+    assert any(
+        "缺 ja 譯文" in warning and "沿用中文原文" in warning
+        for warning in result.warnings
+    )
 
 
 def test_ephemeral_strings_fall_back_to_chinese_with_a_warning():
@@ -639,6 +751,21 @@ def test_snapshot_rejects_a_relative_base_url():
             schedule=[],
             base_url="/v1/public",
         )
+
+
+def test_timezone_id_for_reads_back_the_zoneinfo_key():
+    """``timezone_id_for`` is the inverse ``_snapshot_context`` relies on to
+    turn the ``tzinfo`` it already resolves via ``timezone_for_character``
+    into the IANA string the snapshot ships — it must round-trip a real
+    zone rather than only handling the UTC sentinel."""
+    assert timezone_id_for(ZoneInfo("Asia/Taipei")) == "Asia/Taipei"
+
+
+def test_timezone_id_for_falls_back_to_utc_for_the_fixed_offset_sentinel():
+    """``timezone_for_id`` hands back the plain ``timezone.utc`` object (not
+    a ``ZoneInfo``) for the default zone — it carries no ``.key``, so the
+    inverse must still name it rather than raising or returning ``None``."""
+    assert timezone_id_for(timezone.utc) == "UTC"
 
 
 def test_source_hash_changes_with_the_text_it_fingerprints():
@@ -751,14 +878,13 @@ async def test_review_only_answers_for_posts_the_filter_kept():
         tenant_id=TENANT, character_id="char-1", post_ids=["p1", "p2"],
     )
 
-    assert [review.post_id for review in summary.reviews] == ["p1"]
-    assert provider.feature_keys == ["showcase_review"]
+    assert [review.post_id for review in summary.reviews] == ["p1", "p2"]
+    assert provider.feature_keys == ["showcase_review", "showcase_review"]
 
 
 @pytest.mark.asyncio
 async def test_translation_reports_the_locales_it_could_not_produce():
-    """The publisher's rule is that a post missing a locale does not ship,
-    and it can only apply that rule if failure is visible."""
+    """Failures stay visible for retry while the snapshot uses source text."""
     provider = ScriptedProvider(
         {
             "showcase_translate": ScriptedModel(

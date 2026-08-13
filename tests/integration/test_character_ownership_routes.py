@@ -232,6 +232,38 @@ def test_export_character_card_returns_lumecard_zip(
     assert manifest["character"]["name"] == "Alice Character"
 
 
+def test_export_character_card_refuses_managed_character(
+    app_with_two_users: tuple[TestClient, str, str, str, str],
+) -> None:
+    """EC3: a managed (IP-partner) character's full persona lives only on
+    the server — its owner still gets a 403, not the 404 cross-user
+    routes above use (this character *is* Alice's own, so 404 would
+    misrepresent the refusal). Alice's ordinary character is untouched
+    by this — see the previous test."""
+    import dataclasses
+
+    client, alice_token, _bob_token, alice_char_id, _bob_char_id = app_with_two_users
+    container = client.app.state.container
+
+    async def _mark_managed() -> None:
+        character = await container.character_repository.get(alice_char_id)
+        assert character is not None
+        await container.character_repository.save(
+            dataclasses.replace(
+                character, origin_official_card_id="cloud-card-alice",
+            ),
+        )
+
+    asyncio.run(_mark_managed())
+
+    response = client.get(
+        f"/api/v1/characters/{alice_char_id}/card",
+        headers=_auth(alice_token),
+    )
+
+    assert response.status_code == 403
+
+
 def test_import_character_card_creates_owned_copy(
     app_with_two_users: tuple[TestClient, str, str, str, str],
 ) -> None:

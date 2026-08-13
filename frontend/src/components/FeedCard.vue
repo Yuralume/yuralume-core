@@ -27,6 +27,7 @@ import { useAuth } from '@/composables/useAuth'
 import { useLocale } from '@/composables/useLocale'
 import { useTimezone } from '@/composables/useTimezone'
 import { formatDate, formatRelativeTime } from '@/i18n/formatters'
+import { safeMediaHref } from '@/utils/safeMediaUrl'
 
 const LOCAL_AUTHOR_ID = 'local'
 const { timeZone } = useTimezone()
@@ -319,7 +320,7 @@ function formatRelative(iso: string): string {
     </div>
     <a
       v-else-if="post.image_url"
-      :href="post.image_url"
+      :href="safeMediaHref(post.image_url)"
       target="_blank"
       rel="noopener noreferrer"
       class="feed-card-image-link"

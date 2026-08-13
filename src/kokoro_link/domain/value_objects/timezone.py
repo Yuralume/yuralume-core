@@ -35,6 +35,21 @@ def timezone_for_id(timezone_id: str | None) -> tzinfo:
     return ZoneInfo(value)
 
 
+def timezone_id_for(tz: tzinfo) -> str:
+    """The IANA name a resolved ``tzinfo`` came from.
+
+    Inverse of :func:`timezone_for_id` for the two shapes it can produce:
+    a ``ZoneInfo`` carries its construction key verbatim; the ``UTC``
+    fixed-offset sentinel has none, so it maps back to the same
+    ``"UTC"`` constant. Anything else (a caller-supplied ``tzinfo`` this
+    module never handed out) also falls back to ``"UTC"`` rather than
+    shipping a name nothing can parse back."""
+    key = getattr(tz, "key", None)
+    if isinstance(key, str) and key:
+        return key
+    return DEFAULT_TIMEZONE_ID
+
+
 def ensure_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)

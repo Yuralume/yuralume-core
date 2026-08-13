@@ -23,8 +23,10 @@ from kokoro_link.contracts.cloud_action_pricing import (
     ActionPricingPort,
     ActionPricingUnavailable,
     PublicPricing,
+    TierActionPricingPort,
     TierPricing,
 )
+from kokoro_link.infrastructure.cloud.internal_service_auth import outbound_headers
 
 _PATH = "/v1/public/pricing"
 
@@ -52,6 +54,67 @@ class ActionPricingClient(ActionPricingPort):
         if response.status_code >= 400:
             raise ActionPricingUnavailable(
                 f"cloud user service returned {response.status_code}",
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ActionPricingUnavailable(
+                "pricing response is not valid JSON",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ActionPricingUnavailable(
+                "pricing response is not a JSON object",
+            )
+        raw_tiers = payload.get("tiers")
+        if not isinstance(raw_tiers, list):
+            raise ActionPricingUnavailable(
+                "pricing response carries no tier list",
+            )
+        return PublicPricing(
+            tiers=tuple(
+                tier for tier in (_parse_tier(row) for row in raw_tiers)
+                if tier is not None
+            ),
+        )
+
+
+class TierActionPricingClient(TierActionPricingPort):
+    """Authenticated private read for one active, possibly unlisted tier."""
+
+    _PATH = "/internal/v1/runtime-config/action-pricing"
+
+    def __init__(
+        self, *, base_url: str, timeout_seconds: float = 5.0,
+        internal_token: str = "", internal_credential: str = "",
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+        self._internal_token = (internal_token or "").strip()
+        self._internal_credential = (internal_credential or "").strip()
+
+    async def fetch(self, tier_name: str) -> PublicPricing:
+        cleaned = (tier_name or "").strip()
+        if not self._base_url or not cleaned:
+            raise ActionPricingUnavailable(
+                "cloud user service URL or tier is empty",
+            )
+        headers = outbound_headers(
+            self._internal_credential, legacy_token=self._internal_token,
+        )
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url, timeout=self._timeout_seconds,
+            ) as client:
+                response = await client.get(
+                    self._PATH, params={"tier": cleaned}, headers=headers,
+                )
+        except httpx.HTTPError as exc:
+            raise ActionPricingUnavailable(
+                "cloud control-plane unavailable",
+            ) from exc
+        if response.status_code >= 400:
+            raise ActionPricingUnavailable(
+                f"cloud control-plane returned {response.status_code}",
             )
         try:
             payload = response.json()

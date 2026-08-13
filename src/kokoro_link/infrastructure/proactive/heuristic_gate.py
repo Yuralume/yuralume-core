@@ -8,7 +8,9 @@ Signals (all short-circuit, in order):
 2. Per-day rate limit (``character.proactive_daily_limit``) respected.
 3. Per-attempt cooldown (``character.proactive_cooldown_minutes``)
    since the last logged attempt of any outcome — keeps the dispatcher
-   from burning tokens evaluating every tick.
+   from burning tokens evaluating every tick. This is the only signal
+   ``cooldown_exempt`` can waive (a deferred motive's ``revisit_at``
+   alarm coming due).
 4. **Night-hours floor** — regardless of schedule, don't fire between
    ``_QUIET_HOUR_START`` and ``_QUIET_HOUR_END`` in the character's
    local time. This is a hard safety net so a server restart at 00:53
@@ -73,6 +75,7 @@ class HeuristicProactiveGate(ProactiveGatePort):
         idle_minutes: float | None,
         current_activity: ScheduleActivity | None,
         local_tz: tzinfo | None = None,
+        cooldown_exempt: bool = False,
     ) -> GateVerdict:
         # Promise-fulfilment triggers bypass every gate below. Two
         # flavours:
@@ -114,7 +117,14 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 ),
             )
 
-        if last_attempt_at is not None:
+        # A deferred motive whose own revisit_at has come due waives the
+        # cooldown and nothing else. The cooldown exists to stop the
+        # dispatcher burning tokens re-evaluating every tick — it is not
+        # a protection for the user, so it is the one throttle that may
+        # yield when the character has an appointment to keep. The
+        # exemption is spent (revisit_at cleared) by the dispatcher the
+        # moment this check passes, so it cannot repeat next tick.
+        if last_attempt_at is not None and not cooldown_exempt:
             elapsed = now - _ensure_aware(last_attempt_at)
             cooldown = timedelta(minutes=character.proactive_cooldown_minutes)
             if elapsed < cooldown:

@@ -16,7 +16,7 @@ fell back to ``""`` due to network error.
 tell the LLM how the character should react to the weather (no
 "if rain then skip outdoor activities"). The LLM decides; the port
 just supplies "外面在下雨，氣溫 23°C，今天高溫 26°C，低溫 21°C"-style
-sentences. This keeps the project's CLAUDE.md red line intact.
+sentences. This keeps the project's LLM-first red line intact.
 
 Returning an empty string means "weather unavailable" — callers must
 splice the block in unconditionally and let the empty case naturally

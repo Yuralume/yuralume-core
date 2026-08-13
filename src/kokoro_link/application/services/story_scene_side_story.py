@@ -27,7 +27,7 @@ What makes it different from the two layers above it:
   opener already holds is enough to act from. That is what "fail-soft"
   has to mean for the layer whose job is to catch everything.
 
-The ``dramatic`` seed pool being empty (STORY_SEED_ENRICHMENT_PLAN / SE3
+The ``dramatic`` seed pool being empty (SE3
 not yet imported on a given deployment) is therefore *normal operation*,
 not a degraded mode — the material simply narrows to relationship plus
 memory, exactly as the plan's residual note anticipates.

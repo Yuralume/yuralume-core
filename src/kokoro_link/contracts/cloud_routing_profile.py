@@ -29,6 +29,10 @@ class CloudRoutingProfile:
     # Optional until the User control-plane contract exposes embedding routes.
     # Missing field must remain a graceful env/default-preset fallback.
     embedding_feature_presets: dict[str, str] = field(default_factory=dict)
+    # ``web_search -> preset``. Unlike embedding this has NO env fallback: a search
+    # preset names a paid upstream, so an identity the control plane did not route
+    # must find the tool unavailable rather than reach a deployment default.
+    search_feature_presets: dict[str, str] = field(default_factory=dict)
     # ``preset_id -> supports_vision`` for the LLM presets whose control-plane
     # metadata pins the capability. Only explicitly annotated presets appear
     # here: hosted presets are concrete upstream models, and a text-only one
@@ -42,6 +46,7 @@ class CloudRoutingProfile:
             "image": self.image_feature_presets,
             "video": self.video_feature_presets,
             "embedding": self.embedding_feature_presets,
+            "search": self.search_feature_presets,
             "tts": self.tts_voice_defaults,
         }.get(capability, {})
         return mapping.get(feature_key)
@@ -82,6 +87,7 @@ class CloudRoutingProfile:
             image_feature_presets=_string_map(payload.get("image_feature_presets")),
             video_feature_presets=_string_map(payload.get("video_feature_presets")),
             embedding_feature_presets=_string_map(payload.get("embedding_feature_presets")),
+            search_feature_presets=_strict_string_map(payload.get("search_feature_presets")),
             llm_preset_vision=_bool_map(payload.get("llm_preset_vision")),
             tts_voice_defaults=_string_map(payload.get("tts_voice_defaults")),
             strict_no_fallback=bool(payload.get("strict_no_fallback", False)),
@@ -110,6 +116,28 @@ def _string_map(value: Any) -> dict[str, str]:
         if item is None:
             continue
         text = str(item).strip()
+        if text:
+            result[str(key)] = text
+    return result
+
+
+def _strict_string_map(value: Any) -> dict[str, str]:
+    """Like :func:`_string_map`, but refuses to coerce a non-string into a preset.
+
+    Every other capability tolerates coercion because a bogus preset id merely
+    fails at the Gateway and the caller falls back to its default. Search has no
+    fallback by design: "routed" and "not routed" are the whole decision, so a
+    ``{"web_search": 123}`` that ``str()`` turns into ``"123"`` would read as a
+    real route — and if that id happens to exist, it spends money on an upstream
+    the control plane never actually pointed here.
+    """
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
         if text:
             result[str(key)] = text
     return result

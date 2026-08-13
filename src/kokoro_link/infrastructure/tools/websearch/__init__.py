@@ -1,7 +1,7 @@
 """Web-search tool package.
 
 Ships the provider-neutral ``web_search`` ``ToolPort`` adapter
-(:class:`WebSearchTool`) plus three concrete :class:`SearchClientPort`
+(:class:`WebSearchTool`) plus the concrete :class:`SearchClientPort`
 backends:
 
 * :class:`TavilyClient` — paid, LLM-friendly full-web API.
@@ -11,6 +11,9 @@ backends:
 * :class:`OpenAIWebSearchClient` — OpenAI Responses API built-in web
   search; the model searches + synthesises server-side and returns a
   fused answer plus citations.
+* :class:`CloudGatewaySearchClient` — hosted mode, where Core holds no
+  provider keys: the Cloud Gateway owns the credential, the routing and
+  the billing, and answers the same provider-neutral shape.
 
 All adapters are HTTP-only — no dependency beyond ``httpx`` which is
 already pulled in for the OpenAI-compatible LLM client.
@@ -43,6 +46,9 @@ from kokoro_link.infrastructure.tools.websearch.duckduckgo_client import (
 from kokoro_link.infrastructure.tools.websearch.openai_web_search_client import (
     OpenAIWebSearchClient,
 )
+from kokoro_link.infrastructure.tools.websearch.cloud_gateway_client import (
+    CloudGatewaySearchClient,
+)
 
 __all__ = [
     "WebSearchTool",
@@ -54,6 +60,7 @@ __all__ = [
     "SearXNGSearchClient",
     "DuckDuckGoSearchClient",
     "OpenAIWebSearchClient",
+    "CloudGatewaySearchClient",
     # Back-compat aliases.
     "TavilyWebSearchTool",
     "TavilyClientPort",

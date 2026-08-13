@@ -52,8 +52,7 @@ Self-host asks about one or two locations forever, so the cache was originally
 an unbounded dict and that was fine. Hosted resolves weather **per player**
 (``describe(location=...)`` with each operator's own coordinates), which makes
 the key space grow with the player base — an unbounded dict there is a slow leak
-in every process that renders a prompt (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §0.2
-G-6). 512 entries of one small forecast payload is a few hundred KB at worst and
+in every process that renders a prompt (G-6). 512 entries of one small forecast payload is a few hundred KB at worst and
 comfortably covers an active cohort; evicting the least-recently-used one costs
 a single upstream fetch, which is exactly what an expired TTL costs anyway."""
 

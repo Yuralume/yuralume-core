@@ -146,6 +146,68 @@ async def test_translates_profile_prose_and_catalog_meta() -> None:
 
 
 @pytest.mark.asyncio
+async def test_translates_companions_and_personality_type_prose() -> None:
+    translator, model = _translator(
+        json.dumps(
+            {
+                "companions": [
+                    {
+                        "name": "Rinka Tachibana",
+                        "role": "Childhood friend",
+                        "brief_profile": "A dependable tennis teammate.",
+                        "relationship_snippet": "They grew up next door.",
+                        "personality_sketch": ["direct", "caring"],
+                    },
+                ],
+                "personality_type": {
+                    "rationale": "She gains energy from helping her friends.",
+                    "consistency_notes": ["Acts before she overthinks."],
+                },
+            },
+            ensure_ascii=False,
+        ),
+    )
+    source = {
+        "companions": [
+            {
+                "name": "橘凜香",
+                "role": "青梅竹馬",
+                "brief_profile": "可靠的網球隊友。",
+                "relationship_snippet": "兩人從小住在隔壁。",
+                "personality_sketch": ["直率", "體貼"],
+            },
+        ],
+        "personality_type": {
+            "code": "ENFP",
+            "rationale": "幫助朋友會讓她充滿活力。",
+            "consistency_notes": ["總是先行動再思考。"],
+        },
+    }
+
+    result = await translator.translate(source, target_language="en-US")
+
+    assert result.notes == ()
+    assert result.payload["companions"] == [
+        {
+            "name": "Rinka Tachibana",
+            "role": "Childhood friend",
+            "brief_profile": "A dependable tennis teammate.",
+            "relationship_snippet": "They grew up next door.",
+            "personality_sketch": ["direct", "caring"],
+        },
+    ]
+    assert result.payload["personality_type"] == {
+        "code": "ENFP",
+        "rationale": "She gains energy from helping her friends.",
+        "consistency_notes": ["Acts before she overthinks."],
+    }
+    prompt = model.calls[0][0]
+    assert '"companions"' in prompt
+    assert '"personality_type"' in prompt
+    assert '"code"' not in prompt
+
+
+@pytest.mark.asyncio
 async def test_fields_outside_the_allowlist_are_passed_through_and_never_sent() -> None:
     """``author`` is a handle, ``app_version`` is not language at all. The
     caller decides what its payload carries; this service decides what is
@@ -360,4 +422,6 @@ def test_allowlist_is_profile_prose_plus_the_four_catalog_meta_fields() -> None:
         "description",
         "tags",
         "note",
+        "companions",
+        "personality_type",
     }

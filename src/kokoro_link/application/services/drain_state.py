@@ -1,6 +1,6 @@
 """Per-replica drain switch for rolling deployments (GD1-A).
 
-``HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN`` §7.1 measured what a hosted
+The graceful-deploy work measured what a hosted
 ``--force-recreate`` costs today: the in-flight turn dies at the SIGKILL that
 follows the grace period, its conversation lease stays held until the 180s TTL
 lapses, and the action charge it reserved sits on the player's wallet until the

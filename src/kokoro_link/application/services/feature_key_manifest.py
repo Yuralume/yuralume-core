@@ -16,7 +16,7 @@ feature key without regenerating the artifact.
 
 Ownership: **Core owns the manifest; the control-plane consumes it as contract.**
 Only routable feature keys belong here — keys that map to an actual Gateway
-capability route (LLM / image / video / TTS). Usage-attribution-only labels
+capability route (LLM / image / video / TTS / search). Usage-attribution-only labels
 (``character_portrait``, ``feed_image``, ``auxiliary_llm`` …) are intentionally
 excluded because they never select a route.
 """
@@ -42,19 +42,29 @@ from kokoro_link.application.services.feature_keys import (
 # not by this number.
 MANIFEST_VERSION = 1
 
-# Capabilities the Cloud Gateway actually routes today. ``embedding`` / ``search``
-# are intentionally absent: the plan classifies them as net-new routing surface,
-# not part of the config migration, so they must not appear as if they already
-# route through the Gateway.
+# Capabilities the Cloud Gateway actually routes today. ``search`` joined on
+# 2026-08-10 (Gateway ``POST /v1/search`` + core-profile
+# ``search_feature_presets`` + ``credit_rule (tier, 'search', preset)``).
+# ``embedding`` is still absent on purpose: it routes through the Gateway, but
+# its preset is picked by the deployment's env default rather than by a
+# ``feature_routes`` row, so publishing a routable key for it would advertise a
+# control-plane knob that does not exist.
 CAPABILITY_LLM = "llm"
 CAPABILITY_IMAGE = "image"
 CAPABILITY_VIDEO = "video"
 CAPABILITY_TTS = "tts"
+CAPABILITY_SEARCH = "search"
 
 # The single routable TTS feature key. ``tts_translate`` is an *LLM* feature
 # (dubbing translation before synthesis) and already lives in GLOBAL_FEATURE_KEYS,
 # so it is not repeated here.
 TTS_FEATURE_KEYS: tuple[str, ...] = ("tts_synthesis",)
+
+# The single routable search feature key: the provider-neutral ``web_search``
+# tool. It is named after the tool rather than after a backend because the
+# operator picks the backend (OpenAI Responses, Tavily, SearXNG …) through the
+# preset the route resolves to — the key names the *ability*, not the vendor.
+SEARCH_FEATURE_KEYS: tuple[str, ...] = ("web_search",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +135,7 @@ def build_feature_key_manifest() -> FeatureKeyManifest:
         CAPABILITY_IMAGE: _sorted_unique(IMAGE_FEATURE_KEYS),
         CAPABILITY_VIDEO: _sorted_unique(VIDEO_FEATURE_KEYS),
         CAPABILITY_TTS: _sorted_unique(TTS_FEATURE_KEYS),
+        CAPABILITY_SEARCH: _sorted_unique(SEARCH_FEATURE_KEYS),
     }
     groups: dict[str, tuple[GroupSpec, ...]] = {
         CAPABILITY_LLM: _build_llm_groups(),

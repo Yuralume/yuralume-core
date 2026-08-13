@@ -46,13 +46,15 @@ PROFILE_LIST_FIELDS = (
 """Prose list fields. Same-length replacement only — see
 :func:`valid_translated_text_list`."""
 
-_COMPANION_SCALAR_FIELDS = (
+COMPANION_SCALAR_FIELDS = (
     "name",
     "role",
     "brief_profile",
     "relationship_snippet",
 )
-_COMPANION_LIST_FIELDS = ("personality_sketch",)
+COMPANION_LIST_FIELDS = ("personality_sketch",)
+PERSONALITY_TYPE_SCALAR_FIELDS = ("rationale",)
+PERSONALITY_TYPE_LIST_FIELDS = ("consistency_notes",)
 
 
 class LLMCharacterCardTranslator(CharacterCardTranslatorPort):
@@ -125,7 +127,7 @@ def _profile_payload(profile: CharacterCardProfile) -> dict[str, Any]:
     payload["companions"] = [
         {
             field: getattr(companion, field)
-            for field in _COMPANION_SCALAR_FIELDS + _COMPANION_LIST_FIELDS
+            for field in COMPANION_SCALAR_FIELDS + COMPANION_LIST_FIELDS
         }
         for companion in profile.companions
     ]
@@ -236,11 +238,11 @@ def _merge_companions(
             continue
         companion = companions[index]
         updates: dict[str, Any] = {}
-        for field in _COMPANION_SCALAR_FIELDS:
+        for field in COMPANION_SCALAR_FIELDS:
             value = valid_translated_text(raw_item.get(field))
             if value is not None:
                 updates[field] = value
-        for field in _COMPANION_LIST_FIELDS:
+        for field in COMPANION_LIST_FIELDS:
             value = valid_translated_text_list(
                 raw_item.get(field),
                 expected_length=len(getattr(companion, field)),
@@ -285,6 +287,10 @@ def valid_translated_text_list(
 
 
 __all__ = [
+    "COMPANION_LIST_FIELDS",
+    "COMPANION_SCALAR_FIELDS",
+    "PERSONALITY_TYPE_LIST_FIELDS",
+    "PERSONALITY_TYPE_SCALAR_FIELDS",
     "PROFILE_LIST_FIELDS",
     "PROFILE_SCALAR_FIELDS",
     "LLMCharacterCardTranslator",

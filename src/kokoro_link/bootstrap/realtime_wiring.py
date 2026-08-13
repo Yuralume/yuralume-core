@@ -1,4 +1,4 @@
-"""Phase 4 realtime-outbox wiring (HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §7.1).
+"""Phase 4 realtime-outbox wiring.
 
 Decides — from the process-role component matrix and the realtime backend — how
 the two in-process event buses are wired for a distributed deployment, replacing

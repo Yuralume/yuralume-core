@@ -15,6 +15,7 @@ import pytest
 from kokoro_link.application.services.album_service import (
     MAX_ALBUM_ITEMS_PER_CHARACTER,
     AlbumItemNotFoundError,
+    AlbumManagedError,
     AlbumService,
     StageFullError,
     StageImageNotFoundError,
@@ -74,6 +75,31 @@ async def _seed_character(
         state=CharacterState(
             emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
         ),
+    )
+    await repo.save(character)
+    return character
+
+
+async def _seed_managed_character(
+    repo: InMemoryCharacterRepository,
+    *,
+    name: str = "Mio",
+    image_urls: tuple[str, ...] = (),
+) -> Character:
+    """A managed (IP-partner) character — ``origin_official_card_id`` set
+    is the single signal ``AlbumService`` checks (EC2-C)."""
+    character = Character.create(
+        name=name,
+        summary="",
+        personality=[],
+        interests=[],
+        speaking_style="",
+        boundaries=[],
+        image_urls=list(image_urls),
+        state=CharacterState(
+            emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
+        ),
+        origin_official_card_id="cloud-card-mio",
     )
     await repo.save(character)
     return character
@@ -248,6 +274,29 @@ async def test_transfer_url_not_on_stage_raises(
         )
 
 
+@pytest.mark.asyncio
+async def test_transfer_from_stage_refuses_managed_character(
+    service: AlbumService,
+    character_repo: InMemoryCharacterRepository,
+) -> None:
+    """EC2-C: this endpoint writes ``image_urls`` directly (removes a
+    stage entry) — a second write path onto the field ``update_character``
+    already protects, and the album API never routes through it."""
+    stage_url = "/uploads/characters/mio/stage.png"
+    character = await _seed_managed_character(
+        character_repo, image_urls=(stage_url,),
+    )
+
+    with pytest.raises(AlbumManagedError):
+        await service.transfer_from_stage(
+            character_id=character.id, url=stage_url,
+        )
+
+    stored = await character_repo.get(character.id)
+    assert stored is not None
+    assert stored.image_urls == (stage_url,)
+
+
 # ---------- promote_to_stage ----------
 
 
@@ -292,6 +341,29 @@ async def test_promote_rejects_when_stage_full(
 async def test_promote_unknown_item_raises(service: AlbumService) -> None:
     with pytest.raises(AlbumItemNotFoundError):
         await service.promote_to_stage("no-such")
+
+
+@pytest.mark.asyncio
+async def test_promote_to_stage_refuses_managed_character(
+    service: AlbumService,
+    character_repo: InMemoryCharacterRepository,
+) -> None:
+    """EC2-C: ``AlbumPanel``'s "promote to stage" button writes
+    ``image_urls`` directly, bypassing ``update_character``'s managed
+    allowlist entirely — refuse here rather than trust the caller not to
+    hit this endpoint. The album row must survive the refusal (nothing
+    was consumed) so the player isn't left with neither copy."""
+    character = await _seed_managed_character(character_repo)
+    url = f"/uploads/characters/{character.id}/tools/fan-art.png"
+    item = await service.add_auto(character_id=character.id, url=url)
+
+    with pytest.raises(AlbumManagedError):
+        await service.promote_to_stage(item.id)
+
+    stored = await character_repo.get(character.id)
+    assert stored is not None
+    assert stored.image_urls == ()
+    assert await service.list_for_character(character.id) == [item]
 
 
 @pytest.mark.asyncio

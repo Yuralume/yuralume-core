@@ -14,7 +14,7 @@ Pure function — no IO, deterministic given inputs. Folding logic:
 5. ``top_events`` = events sorted by ``intensity * weight`` desc, take
    first ``top_k``.
 
-Why no behavioural branching here — per ``CLAUDE.md`` §LLM-first the
+Why no behavioural branching here — per the LLM-first rule the
 rule is "facts only; the LLM decides what to do with them". This module
 emits computed facts; how prompts react to them is the LLM's job.
 """

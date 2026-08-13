@@ -1,7 +1,7 @@
 """Unit tests for the pure WebP variant encoder (IV0).
 
-Covers ``docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md`` §5 IV0
-acceptance criteria: tier spec correctness (D1), never-upscale, fail-soft
+Covers the IV0 acceptance criteria: tier spec correctness (D1),
+never-upscale, fail-soft
 on bad/truncated/empty input, alpha preservation, and the object-key
 derivation rule that IV1 (storage decorator) and IV3 (backfill script)
 must both reuse rather than reimplement.

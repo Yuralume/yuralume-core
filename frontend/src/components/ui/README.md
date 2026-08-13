@@ -43,7 +43,7 @@
 
 `srcset` 只放兩個變體，是因為 `w` descriptor 需要真實像素寬，而前端不知道原圖尺寸；`full` 因此走單一 `src`。**佔位尺寸一律輸出**——它是離屏釋放的前置條件，少了它卸載瞬間高度會塌陷、捲動位置亂跳。
 
-根節點就是 `<img>` 本身（無 wrapper），所以 `.image-tile img` 這種既有後代選擇器仍然有效，`class` / `style` / `draggable` / `title` / 事件監聽全部 fallthrough。詳見 `docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md` D1/D2/D5。
+根節點就是 `<img>` 本身（無 wrapper），所以 `.image-tile img` 這種既有後代選擇器仍然有效，`class` / `style` / `draggable` / `title` / 事件監聽全部 fallthrough。
 
 ## 使用範例
 

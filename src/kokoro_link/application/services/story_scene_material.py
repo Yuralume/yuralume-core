@@ -102,8 +102,7 @@ class ForcedSeasonSceneMaterialProvider(StorySceneMaterialProviderPort):
     the player saying the 留白期 is over, and the season decider's entire
     job is judging *when* that should happen — so this layer asks
     ``StoryArcService.force_open_season`` for the same season the
-    scheduled path would eventually have planned, minus that one gate
-    (STORY_SCENE_PLAN §3.1).
+    scheduled path would eventually have planned, minus that one gate.
 
     Two consequences are the point rather than side effects:
 

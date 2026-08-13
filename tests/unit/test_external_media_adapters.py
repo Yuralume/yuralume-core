@@ -414,6 +414,38 @@ async def test_external_tts_adapter_lists_voices_and_synthesizes(
 
 
 @pytest.mark.asyncio
+async def test_external_tts_adapter_ignores_character_id_self_host_zero_regression(
+    restore_httpx: None,
+) -> None:
+    """EC5-C: a self-host/BYOK catalog has no exclusive-voice concept, so
+    passing ``character_id`` must be a no-op — same voices, same request
+    (no extra header, no extra call) as calling with no id at all."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "voices": [{"id": "marin", "label": "Marin", "is_complete": True}],
+        })
+
+    _patch_httpx(handler)
+    adapter = ExternalTTSAdapter(
+        base_url="https://gateway.example/v1",
+        api_key="tts-token",
+        default_voice_id="marin",
+        timeout_seconds=30,
+    )
+
+    voices = await adapter.list_voices(character_id="some-character")
+
+    assert [voice.id for voice in voices] == ["marin"]
+    # Only the pre-existing headers — no origin/character header appeared.
+    assert set(captured["headers"]) & {
+        "x-yuralume-character-origin", "x-yuralume-character",
+    } == set()
+
+
+@pytest.mark.asyncio
 async def test_openrouter_tts_adapter_defaults_and_dynamic_voices(
     restore_httpx: None,
 ) -> None:

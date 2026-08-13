@@ -36,6 +36,7 @@ import {
   updateStoryArcBeat,
   updateStoryArcMeta,
 } from '@/utils/api/storyArc'
+import { UiBadge } from '@/components/ui'
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { todayISOForTimezone } from '@/i18n/formatters'
@@ -61,6 +62,15 @@ const props = defineProps<{
    * sees a "世界觀不符" hint on incompatible templates.
    */
   worldFrame?: string | null
+  /**
+   * EC2-C: `arc_template_id` is not in `MANAGED_WRITABLE_UPDATE_FIELDS`
+   * for a managed (IP-partner) character — the binding is the
+   * licensor's to set. The active/past arc CRUD below (beats, meta,
+   * regenerate, abandon) is a *different* resource (`story_arc`, not
+   * `Character`) and is unaffected — only the template-bar binding
+   * control is gated.
+   */
+  managed?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -420,6 +430,11 @@ function beatHasSceneStructure(beat: StoryArcBeat): boolean {
 // ---- Template picker -------------------------------------------------
 
 function openTemplatePicker() {
+  // Guarded here (not just by hiding the trigger button below) so the
+  // hoisted ArcDiscoveryCard's "選擇範本" CTA — which drives this same
+  // exposed function through a ref, bypassing this component's own
+  // template entirely — can't reach the picker either.
+  if (props.managed) return
   pickerOpen.value = true
 }
 
@@ -458,9 +473,15 @@ defineExpose({
           {{ t('story.arcPanel.template.bound', { id: arcTemplateId }) }}
         </span>
         <span v-else class="template-pill llm">{{ pt('story.arcPanel.template.unbound') }}</span>
-        <button class="chip-btn small" @click="openTemplatePicker">
+        <!-- EC2-C：arc_template_id 對託管角色不在可調集，綁定由授權方
+             維護——唯讀顯示目前狀態，不給可觸發 PATCH 的按鈕。 -->
+        <button v-if="!managed" class="chip-btn small" @click="openTemplatePicker">
           {{ arcTemplateId ? t('story.arcPanel.template.changeOrClear') : t('story.arcPanel.template.choose') }}
         </button>
+      </div>
+      <div v-if="managed" class="managed-arc-notice">
+        <UiBadge variant="primary">{{ t('characterEdit.managed.arcBindingBadge') }}</UiBadge>
+        <p class="managed-arc-notice__text">{{ t('characterEdit.managed.arcBindingNotice') }}</p>
       </div>
     </div>
 
@@ -1188,6 +1209,25 @@ defineExpose({
 .chip-btn.small {
   padding: 3px 8px;
   font-size: 10px;
+}
+
+.managed-arc-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 10px;
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+}
+
+.managed-arc-notice__text {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 /* Scene-structure pills + block in beat rows */

@@ -1,6 +1,6 @@
 """Where the player stands in a beat, for the two beat-narrating writers.
 
-OP2-C of ``docs/plans/ARC_PLAYER_POSITION_PLAN.md``. A beat's narrative
+OP2-C. A beat's narrative
 prose is written by **two** independent writers — the autonomous beat
 scene writer (``story/beat_scene_writer``) and the expander's scene mode
 (``story/expander_scene``, used when a beat is realized through
@@ -24,8 +24,8 @@ Two rules this module exists to keep straight:
   explicit that an unjudged beat is answered by **derivation** — the
   model reads the cast, the dramatic question and the summary and
   decides for itself whether e.g. 「伴侶」 means the player. Writing a
-  keyword table for that is exactly what the LLM-first rule in
-  ``AGENTS.md`` forbids, so the ``None`` branch hands the judgment back
+  keyword table for that is exactly what the LLM-first rule
+  forbids, so the ``None`` branch hands the judgment back
   to the model instead of guessing in code.
 * **No player lines, ever.** Unlike the 起幕 closer (SC1-D), which at
   least has a transcript to check against, these two writers produce

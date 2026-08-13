@@ -1,7 +1,6 @@
 """add memory_items.participants_json + world_id + location
 
-Phase 2 of the world-system roadmap (see ``docs/TODO.md`` §🟣).
-The post-turn extractor now records every named person as a
+Phase 2 of the world-system roadmap. The post-turn extractor now records every named person as a
 structured ``ParticipantRef`` so cross-character prompts can later
 disambiguate "他/她" without re-running NLP. ``world_id`` and
 ``location`` are both nullable seams reserved for the eventual

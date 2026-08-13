@@ -1,9 +1,19 @@
 """Service-to-service Cloud→Core internal channel.
 
-Currently exposes the subscription-lapse freeze bridge: the Yuralume Cloud
-user-service calls this when a tenant's paid tier is downgraded (freeze) or
-restored (unfreeze), so the hosted Core freezes / thaws that tenant's
-characters.
+Exposes three sibling bridges, each its own scope on the same versioned
+credential:
+
+- ``/subscription-freeze`` — a tenant's whole paid tier is downgraded
+  (freeze) or restored (unfreeze); fans out to every operator's characters
+  under that tenant.
+- ``/tenant-tier`` — a tenant's exact tier is pushed so Core's per-tier
+  runtime profile takes effect without waiting for re-login.
+- ``/exclusive-card-freeze`` — one official card's IP-partner contract
+  starts/ends (D7 / EC10-A is the Cloud admin switch; EC10-B here is the
+  consumer), silencing every character installed from that card across
+  every tenant. Independent of the tenant channel above: keyed by card, not
+  tenant, and writes the orthogonal ``frozen`` / ``frozen_reason`` chain
+  rather than the ``subscription_locked`` projection.
 
 Auth uses a versioned service credential (caller, audience, scope and key id), not the operator JWT.
 The router is deliberately mounted without the get_current_user / require_admin
@@ -36,6 +46,21 @@ _LOG = logging.getLogger(__name__)
 
 _ACTION_FREEZE = "freeze"
 _ACTION_UNFREEZE = "unfreeze"
+
+_EXCLUSIVE_CARD_FREEZE_SCOPE = "card-freeze:write"
+"""Separate scope from ``freeze:write`` / ``tier:write`` (EC10-A/EC10-B):
+this switch silences every character built from one card across every
+tenant, which is a strictly wider blast radius than either tenant-scoped
+bridge, so a credential minted for those cannot also fire this one. The
+common single-Core deployment adds this scope to the same rotated
+descriptor used for the other two (see ``services/user`` README's
+``YURALUME_CORE_EXCLUSIVE_FREEZE_*`` env vars, which default to the
+subscription channel's own base-url/credential).
+
+**部署前置**：此 scope 必須加進兩側共用的 R1 credential descriptor，且
+Cloud 與 Core 同批更新——descriptor 少了 ``card-freeze:write`` 時，
+Cloud 的 per-card 凍結呼叫一律 401，凍結開關會靜靜地什麼都沒做（Cloud
+側 FU 票同批對齊）。"""
 
 
 def _configured_tokens() -> frozenset[str]:
@@ -147,6 +172,25 @@ async def require_internal_tier_credential(
         scope=scope,
     )
 
+
+async def require_internal_exclusive_card_credential(
+    authorization: str | None = Header(default=None),
+    service_token: str | None = Header(default=None, alias="X-Yuralume-Service-Token"),
+    key_id: str | None = Header(default=None, alias="X-Yuralume-Service-Key-Id"),
+    caller: str | None = Header(default=None, alias="X-Yuralume-Service-Caller"),
+    audience: str | None = Header(default=None, alias="X-Yuralume-Service-Audience"),
+    scope: str | None = Header(default=None, alias="X-Yuralume-Service-Scope"),
+) -> None:
+    await _require_internal_cloud_credential(
+        required_scope=_EXCLUSIVE_CARD_FREEZE_SCOPE,
+        authorization=authorization,
+        service_token=service_token,
+        key_id=key_id,
+        caller=caller,
+        audience=audience,
+        scope=scope,
+    )
+
 def _credential_matches(
     credentials: tuple[InternalServiceCredential, ...],
     *,
@@ -203,6 +247,27 @@ class SubscriptionFreezeRequest(BaseModel):
         cleaned = (value or "").strip()
         if not cleaned:
             raise ValueError("tenant_id must be non-empty")
+        return cleaned
+
+    @field_validator("action")
+    @classmethod
+    def _action_known(cls, value: str) -> str:
+        cleaned = (value or "").strip().lower()
+        if cleaned not in {_ACTION_FREEZE, _ACTION_UNFREEZE}:
+            raise ValueError("action must be 'freeze' or 'unfreeze'")
+        return cleaned
+
+
+class ExclusiveCardFreezeRequest(BaseModel):
+    card_id: str
+    action: str
+
+    @field_validator("card_id")
+    @classmethod
+    def _card_id_non_empty(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("card_id must be non-empty")
         return cleaned
 
     @field_validator("action")
@@ -303,3 +368,47 @@ async def tenant_tier(
         )
     result = await service.apply_tier(payload.tenant_id, payload.tier)
     return {"operators": result.operators, "updated": result.updated}
+
+
+@router.post(
+    "/exclusive-card-freeze",
+    dependencies=[Depends(require_internal_exclusive_card_credential)],
+)
+async def exclusive_card_freeze(
+    payload: ExclusiveCardFreezeRequest,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, int]:
+    """Freeze / thaw every character installed from one official card.
+
+    D7 / EC10-B — the Core-side consumer of the Cloud admin per-card
+    contract-termination switch (EC10-A). Keyed by ``card_id``, not tenant;
+    independent of ``/subscription-freeze`` above (writes ``frozen`` /
+    ``frozen_reason``, not ``subscription_locked``). Any per-character
+    repository failure is counted and returns 500 so the Cloud caller's
+    durable outbox retries. Re-running is idempotent."""
+    service = container.exclusive_card_freeze_service
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="exclusive card freeze subsystem not wired",
+        )
+    if payload.action == _ACTION_FREEZE:
+        result = await service.freeze_card(payload.card_id)
+        body = {
+            "characters": result.characters,
+            "frozen": result.frozen,
+            "failures": result.failures,
+        }
+    else:
+        result = await service.unfreeze_card(payload.card_id)
+        body = {
+            "characters": result.characters,
+            "unfrozen": result.unfrozen,
+            "failures": result.failures,
+        }
+    if result.failures:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "exclusive card freeze partially failed", **body},
+        )
+    return body

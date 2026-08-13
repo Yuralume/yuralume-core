@@ -10,8 +10,8 @@ exposes the operations the chat / REST / post-turn pipelines need:
 - ``start_new_arc`` — explicit creation (UI button / post-turn), takes
   optional ``hint`` text the operator provides.
 - ``force_open_season`` — ``ensure_active_arc`` minus the season
-  decider's timing judgement, for the 起幕 button (STORY_SCENE_PLAN
-  §3.1 layer 2). Series-aware, unlike ``start_new_arc``.
+  decider's timing judgement, for the 起幕 button (material layer 2).
+  Series-aware, unlike ``start_new_arc``.
 - ``abandon_arc`` — mark an arc abandoned + mark all its pending beats
   skipped. Idempotent.
 - ``realize_beat`` — called after a beat is performed and becomes a
@@ -332,7 +332,7 @@ class StoryArcService:
     ) -> StoryArc | None:
         """Open the character's next season **now**, skipping the decider.
 
-        The 起幕 button means "我現在就要劇情" (STORY_SCENE_PLAN §2 #2), and
+        The 起幕 button means "我現在就要劇情", and
         the season decider's job is precisely the judgement a player has
         just overruled: *when* the dormant gap should end. So this is
         ``ensure_active_arc`` with that one gate removed — same lock, same
@@ -715,7 +715,7 @@ class StoryArcService:
         """Roll ``dramatic`` story seeds as subject-matter candidates.
 
         The planner is the second ratified consumer of the dramatic tier
-        (STORY_SEED_ENRICHMENT_PLAN §1): the everyday gacha never draws
+the everyday gacha never draws
         these, so rolling them here costs the daily rotation nothing. The
         roll itself applies frame / region / cooldown filtering; on top of
         it we drop seeds the last few arcs already consumed, so a small
@@ -1263,14 +1263,14 @@ class StoryArcService:
         and returns the first one the policy allows. Returning ``None``
         at the first blocked candidate used to let one beat in backoff
         (or one with a spent budget) freeze every later beat of the arc
-        — head-of-line blocking, BACKGROUND_COST_CONTROL_PLAN §10 #4.
+        — head-of-line blocking.
 
         ``unattended=True`` means *nobody is watching*: the caller is
         about to play this beat with no player in the room. A beat whose
         ``operator_position`` is ``central`` cannot be played that way —
         the scene is about the player and has no content without them —
         so it is walked past, and the same walk-down hands back the next
-        candidate instead (ARC_PLAYER_POSITION_PLAN §5.1 OP2-B). The
+        candidate instead. The
         skip is a *pass*, not a failure: no attempt, no failure count,
         no backoff, no retirement. That beat is not broken, it is
         waiting, and the player-facing exits (起幕, chat) are what it is
@@ -1317,7 +1317,7 @@ class StoryArcService:
         forever: invisible to the autonomous scanner, still first in line
         for the chat path, and recorded nowhere as dead. It is flipped to
         ``skipped`` with ``retry_exhausted`` as its play result so the arc
-        moves on — "劇情不卡住" is the point (STORY_SCENE_PLAN §2 #6) —
+        moves on — "劇情不卡住" is the point —
         and a warning carries the ids, Core having no alert service.
 
         Deliberately *not* folded into ``next_beat_due``: that is a read

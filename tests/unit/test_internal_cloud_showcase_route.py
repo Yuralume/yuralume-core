@@ -95,6 +95,7 @@ def _seed(client: TestClient, *, tenant: str = _TENANT) -> str:
                     kind=FeedKind.DAILY,
                     content_text="今天的天空很藍。",
                     source=FeedSource.memory("mem-1"),
+                    image_url="/v1/public/feed/default.png",
                 ),
             ),
         )

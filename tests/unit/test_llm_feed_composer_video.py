@@ -23,12 +23,27 @@ from kokoro_link.infrastructure.feed.llm_composer import LLMFeedComposer
 
 
 class _StaticActiveLLM:
-    """Resolver stub: returns a model that echoes a fixed JSON blob."""
+    """Resolver stub: returns a model that echoes fixed answers.
 
-    def __init__(self, payload: str, *, is_fake: bool = False) -> None:
+    ``payload`` may be one blob (every call gets it) or a list, which is
+    consumed in order — the composer makes a second call of its own when
+    a video pick arrives without the still it has to start on, and the
+    two answers have different shapes."""
+
+    def __init__(
+        self, payload: str | list[str], *, is_fake: bool = False,
+    ) -> None:
         self._payload = payload
         self._fake = is_fake
         self.captured_prompt: str | None = None
+        self.captured_prompts: list[str] = []
+
+    def _next_payload(self) -> str:
+        if isinstance(self._payload, list):
+            if not self._payload:
+                return ""
+            return self._payload.pop(0)
+        return self._payload
 
     async def resolve(self, feature_key=None, *, character=None):
         return _EchoModel(self)
@@ -46,7 +61,8 @@ class _EchoModel:
 
     async def generate(self, prompt, *, model=None, character=None):
         self._owner.captured_prompt = prompt
-        return self._owner._payload
+        self._owner.captured_prompts.append(prompt)
+        return self._owner._next_payload()
 
 
 def _character() -> Character:
@@ -122,6 +138,118 @@ async def test_video_pick_with_empty_prompt_demotes_to_image() -> None:
     assert out.media_kind == "image"
     assert out.video_prompt == ""
     assert out.image_prompt.startswith("1girl")
+
+
+@pytest.mark.asyncio
+async def test_video_pick_without_a_still_asks_for_the_first_frame() -> None:
+    """The clip has to start on a picture, and only ``image_prompt``
+    describes one.
+
+    Leaving it empty used to hand the *video* prompt to the image model
+    as the opening frame. That prompt is mandated to read
+    "A → then B → finally C", the image model drew all three beats at
+    once as stacked panels, and the storyboard step pinned that layout as
+    a consistency anchor — one still turned the whole clip into a
+    three-tier contact sheet."""
+    composer_answer = json.dumps({
+        "content_text": "寫著寫著就發起呆了。",
+        "media_kind": "video",
+        "image_prompt": "",
+        "video_prompt": (
+            "Anime style, 5s clip, a girl writes in her notebook, then the "
+            "pen slows, finally she looks toward the window."
+        ),
+    })
+    provider = _StaticActiveLLM([
+        composer_answer, "1girl, solo, sitting at desk, holding pen, night",
+    ])
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    out = await composer.compose(_input())
+
+    assert out.media_kind == "video"
+    assert out.image_prompt == "1girl, solo, sitting at desk, holding pen, night"
+    assert "looks toward the window" in out.video_prompt
+
+    assert len(provider.captured_prompts) == 2
+    second = provider.captured_prompts[1]
+    assert "the pen slows" in second, "the beats it must collapse"
+    assert "第一幀" in second
+    assert "split screen" in second
+
+
+@pytest.mark.asyncio
+async def test_first_frame_pass_that_answers_with_junk_leaves_it_empty() -> None:
+    """Fail closed: no still means the video branch posts text rather
+    than animating something nobody described."""
+    composer_answer = json.dumps({
+        "content_text": "嘖。",
+        "media_kind": "video",
+        "image_prompt": "",
+        "video_prompt": "Anime style, 5s clip, she turns then smiles.",
+    })
+    provider = _StaticActiveLLM([composer_answer, "   "])
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    out = await composer.compose(_input())
+
+    assert out.media_kind == "video"
+    assert out.image_prompt == ""
+    assert out.video_prompt
+
+
+@pytest.mark.asyncio
+async def test_first_frame_pass_unwraps_a_json_envelope() -> None:
+    """Same model, same habit of wrapping answers — an envelope rendered
+    verbatim would put JSON keys into the picture."""
+    composer_answer = json.dumps({
+        "content_text": "嘖。",
+        "media_kind": "video",
+        "image_prompt": "",
+        "video_prompt": "Anime style, 5s clip, she turns then smiles.",
+    })
+    provider = _StaticActiveLLM([
+        composer_answer,
+        '```json\n{"image_prompt": "1girl, solo, smiling, window light"}\n```',
+    ])
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    out = await composer.compose(_input())
+
+    assert out.image_prompt == "1girl, solo, smiling, window light"
+
+
+@pytest.mark.asyncio
+async def test_image_post_without_an_image_prompt_makes_no_second_call() -> None:
+    """An image post with no ``image_prompt`` is the composer saying "no
+    picture" — a legitimate text-only post, not a gap to fill."""
+    provider = _StaticActiveLLM(json.dumps({
+        "content_text": "只想寫幾個字。",
+        "media_kind": "image",
+        "image_prompt": "",
+        "video_prompt": "",
+    }))
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    out = await composer.compose(_input())
+
+    assert out.image_prompt == ""
+    assert len(provider.captured_prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_composer_prompt_requires_a_still_for_every_video_pick() -> None:
+    provider = _StaticActiveLLM(json.dumps({
+        "content_text": "嘖。", "image_prompt": "1girl", "media_kind": "image",
+    }))
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    await composer.compose(_input())
+
+    prompt = provider.captured_prompt or ""
+    assert "image_prompt 是**必填**的" in prompt
+    assert "這張圖就是影片的第一幀" in prompt
+    assert "split screen" in prompt
 
 
 @pytest.mark.asyncio
@@ -251,3 +379,41 @@ async def test_prompt_includes_operator_local_current_time() -> None:
     prompt = provider.captured_prompt or ""
     assert "現在時間：2026-06-20 07:30" in prompt
     assert "清晨" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_includes_recent_media_cadence() -> None:
+    provider = _StaticActiveLLM(json.dumps({
+        "content_text": "新的貼文。",
+        "media_kind": "none",
+        "image_prompt": "",
+        "video_prompt": "",
+    }))
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+    payload = replace(
+        _input(),
+        recent_media_kinds=("image", "none", "image", "video"),
+    )
+
+    await composer.compose(payload)
+
+    prompt = provider.captured_prompt or ""
+    assert "近期貼文媒體節奏（由新到舊）" in prompt
+    assert "圖片、純文字、圖片、影片" in prompt
+    assert "最近連續 3 篇沒有影片" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_marks_empty_recent_media_history() -> None:
+    provider = _StaticActiveLLM(json.dumps({
+        "content_text": "第一篇。",
+        "media_kind": "none",
+        "image_prompt": "",
+        "video_prompt": "",
+    }))
+    composer = LLMFeedComposer(provider=provider, video_enabled=True)
+
+    await composer.compose(_input())
+
+    prompt = provider.captured_prompt or ""
+    assert "近期貼文媒體節奏：尚無貼文紀錄" in prompt

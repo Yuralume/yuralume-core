@@ -9,6 +9,12 @@ from kokoro_link.application.services.rss_ingestion_service import (
     RssIngestionService,
 )
 from kokoro_link.contracts.embedder import EmbedderError
+from kokoro_link.domain.entities.character_event_mention import (
+    CharacterEventMention,
+)
+from kokoro_link.infrastructure.repositories.in_memory_character_event_mentions import (  # noqa: E501
+    InMemoryCharacterEventMentionRepository,
+)
 from kokoro_link.contracts.rss_feed_fetcher import RawWorldEvent, RssFetchError
 from kokoro_link.domain.entities.rss_source import RssSource
 from kokoro_link.domain.entities.world_event import WorldEvent
@@ -490,3 +496,54 @@ async def test_post_fetch_failure_is_source_isolated_and_url_safe() -> None:
         "source_processing_error: RuntimeError"
     )
     assert (await sources.get("healthy")).last_success_at is not None
+
+
+@pytest.mark.asyncio
+async def test_gc_also_prunes_stale_event_mentions() -> None:
+    """Mentions point into the pool this GC empties.
+
+    PostgreSQL cascades them away with the event, but self-host SQLite
+    never enforces the foreign key, so without this sweep the mention
+    table is the one thing that only ever grows there.
+    """
+    mentions = InMemoryCharacterEventMentionRepository()
+    now = datetime.now(timezone.utc)
+    for event_id, age_days in (("old", 90), ("fresh", 1)):
+        await mentions.record(
+            CharacterEventMention.create(
+                character_id="char-1",
+                world_event_id=event_id,
+                surface="proactive_message",
+                mentioned_at=now - timedelta(days=age_days),
+            ),
+        )
+    service = RssIngestionService(
+        rss_source_repository=InMemoryRssSourceRepository(),
+        world_event_repository=InMemoryWorldEventRepository(),
+        feed_fetcher=_Fetcher(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        event_mention_repository=mentions,
+    )
+
+    await service.gc()
+
+    remaining = await mentions.list_recent("char-1")
+    assert [row.world_event_id for row in remaining] == ["fresh"]
+
+
+@pytest.mark.asyncio
+async def test_gc_survives_a_broken_mention_store() -> None:
+    class _Exploding(InMemoryCharacterEventMentionRepository):
+        async def delete_older_than(self, cutoff) -> int:  # noqa: ANN001
+            raise RuntimeError("mention store down")
+
+    events = InMemoryWorldEventRepository()
+    service = RssIngestionService(
+        rss_source_repository=InMemoryRssSourceRepository(),
+        world_event_repository=events,
+        feed_fetcher=_Fetcher(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        event_mention_repository=_Exploding(),
+    )
+
+    assert await service.gc() == 0

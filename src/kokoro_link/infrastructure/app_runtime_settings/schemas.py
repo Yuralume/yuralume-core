@@ -90,7 +90,7 @@ class WorldEventRuntimeConfig(BaseModel):
 
 class FusionMaterialRuntimeConfig(BaseModel):
     """Richness thresholds for the fusion character-picker material badge
-    (CREATOR_STUDIO_VALUE_LINE_PLAN §2.1-5, Creator Studio C1-P1).
+    (Creator Studio C1-P1).
 
     A character's badge tier (``rich`` / ``ok`` / ``sparse``) is decided
     by deterministic bookkeeping over the salience-ranked memory slice the

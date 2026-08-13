@@ -7,7 +7,7 @@ conditional logic (which sections to include based on context shape) is
 expected to stay in Python; templates only own *wording* and *variable
 substitution*.
 
-See ``docs/PROMPT_TEMPLATE_GUIDE.md`` for the migration playbook.
+for the migration playbook.
 """
 
 from kokoro_link.infrastructure.prompts.loader import (

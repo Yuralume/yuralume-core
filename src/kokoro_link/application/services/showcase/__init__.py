@@ -1,10 +1,10 @@
 """Public showcase pipeline.
 
-Core's contribution to the Cloud portal's public wall: read the
-character's own posts, filter the structurally unpublishable, advise on
-the rest with an LLM pre-review, translate what the owner approved, and
-render the snapshot document. Approval and storage belong to the Cloud
-control plane — see
+Core's contribution to the Cloud portal's public wall: read the character's
+own posts, reject only missing render data, advise on the rest with an LLM
+pre-review, translate with source-text fallback, and render the snapshot
+document. Publication decisions and storage belong to the Cloud control plane
+— see
 :mod:`kokoro_link.application.services.showcase.service`.
 """
 
@@ -12,7 +12,6 @@ from kokoro_link.application.services.showcase.filters import (
     FilterOutcome,
     PublicActivity,
     ShowcaseCandidate,
-    is_public_activity,
     mechanical_filter,
     select_public_activities,
 )
@@ -72,7 +71,6 @@ __all__ = [
     "TranslationResult",
     "build_showcase_service",
     "build_snapshot",
-    "is_public_activity",
     "mechanical_filter",
     "post_source_hash",
     "select_public_activities",

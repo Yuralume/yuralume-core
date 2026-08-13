@@ -11,6 +11,11 @@ the same physical file by name; deleting a LoRA from one character
 doesn't touch the file. Operator cleanup of orphaned files is a
 separate housekeeping concern — doing it automatically would risk
 breaking other characters that rely on the same weights.
+
+Every mutating entry point routes through ``_load_writable_character``,
+which refuses managed (IP-partner) characters — see
+:class:`LoraManagedError` for why that guard cannot live in the shared
+``update_character`` allowlist.
 """
 
 from __future__ import annotations
@@ -45,6 +50,22 @@ class LoraUploadDisabledError(CharacterLoraError):
 
 class LoraNotFoundError(CharacterLoraError):
     pass
+
+
+class LoraManagedError(CharacterLoraError):
+    """The character is a *managed* (IP-partner) character (EC2-A/EC3).
+
+    ``loras`` is one of the licensor-owned fields: ``CharacterService.
+    update_character`` already refuses non-blank writes to it
+    (``managed_character_update_policy``) and the managed projection masks
+    it out of every response. These four endpoints write the character row
+    directly and go through neither, so without this refusal a player can
+    bolt arbitrary weights onto a licensed character — and then not even
+    see what they attached, because the field is masked on the way back.
+
+    Mirrors :class:`AlbumManagedError`: the character exists and is the
+    caller's own, so this is a 403 ("exists, wrong kind, refuse"), not a
+    404."""
 
 
 class CharacterLoraService:
@@ -94,6 +115,11 @@ class CharacterLoraService:
                 + ", ".join(sorted(_ALLOWED_EXTENSIONS)),
             )
 
+        # Resolved *before* the bytes land: a refused write must not leave a
+        # file behind in ComfyUI's shared models directory, where every other
+        # character would then see it in the "attach existing" picker.
+        character = await self._load_writable_character(character_id)
+
         target = self._lora_dir / safe_name
         if not target.exists():
             target.write_bytes(data)
@@ -103,7 +129,6 @@ class CharacterLoraService:
                 safe_name,
             )
 
-        character = await self._load_character(character_id)
         existing = [lora for lora in character.loras if lora.name != safe_name]
         updated = character.with_loras(
             existing + [CharacterLora(name=safe_name, strength=strength)],
@@ -129,7 +154,7 @@ class CharacterLoraService:
             raise UnsupportedLoraTypeError(
                 "LoRA name must include a supported extension",
             )
-        character = await self._load_character(character_id)
+        character = await self._load_writable_character(character_id)
         existing = [lora for lora in character.loras if lora.name != safe]
         updated = character.with_loras(
             existing + [CharacterLora(name=safe, strength=strength)],
@@ -144,7 +169,7 @@ class CharacterLoraService:
         name: str,
         strength: float,
     ) -> Character:
-        character = await self._load_character(character_id)
+        character = await self._load_writable_character(character_id)
         target_name = name.strip()
         found = False
         new_loras: list[CharacterLora] = []
@@ -163,7 +188,7 @@ class CharacterLoraService:
         return updated
 
     async def remove(self, character_id: str, *, name: str) -> Character:
-        character = await self._load_character(character_id)
+        character = await self._load_writable_character(character_id)
         target_name = name.strip()
         remaining = [l for l in character.loras if l.name != target_name]
         if len(remaining) == len(character.loras):
@@ -192,6 +217,22 @@ class CharacterLoraService:
         character = await self._character_repository.get(character_id)
         if character is None:
             raise LoraNotFoundError("Character not found")
+        return character
+
+    async def _load_writable_character(self, character_id: str) -> Character:
+        """Load a character this caller is allowed to change ``loras`` on.
+
+        The single seam every mutating method goes through, so a fifth one
+        added later inherits the managed refusal instead of quietly
+        reopening the hole. Read-only ``list_available`` is deliberately
+        not gated — it scans the deployment's directory, not a character."""
+        character = await self._load_character(character_id)
+        if character.is_managed:
+            raise LoraManagedError(
+                f"Character {character_id!r} is a managed character; its "
+                "LoRA weights are managed by its licensor and cannot be "
+                "changed",
+            )
         return character
 
 

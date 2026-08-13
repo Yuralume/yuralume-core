@@ -102,6 +102,17 @@ class CharacterRepositoryPort(Protocol):
         passes ``DEFAULT_OPERATOR_ID`` so this is effectively the same
         as ``list()`` on a fresh install."""
 
+    async def list_by_origin_official_card_id(
+        self, card_id: str,
+    ) -> list[Character]:
+        """List every character installed from official card ``card_id``.
+
+        Cross-tenant by design (EC10-B): a card's Cloud-side
+        contract-termination freeze silences every character built from it
+        site-wide, not just one operator's roster, so this is the one
+        character lookup that is not scoped by owner. Self-host rows never
+        match — ``origin_official_card_id`` is always ``None`` there."""
+
     async def claim_consolidation_slot(
         self, character_id: str, *, cooldown: timedelta,
     ) -> bool:

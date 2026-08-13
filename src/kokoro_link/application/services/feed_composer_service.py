@@ -31,6 +31,13 @@ from kokoro_link.application.services.feed_event_bus import (
     FeedEventBus,
     FeedPostEvent,
 )
+from kokoro_link.application.services.feature_keys import FEATURE_VIDEO_FEED
+from kokoro_link.application.services.feed_video_job_service import (
+    SUBMIT_DEFERRED,
+    FeedVideoDraft,
+    FeedVideoJobService,
+    ResolvedVideoTarget,
+)
 from kokoro_link.application.services.image_usage import image_usage_parts_from_provider
 from kokoro_link.application.services.location_context import (
     calendar_region_from_operator,
@@ -38,6 +45,9 @@ from kokoro_link.application.services.location_context import (
     weather_location_from_operator,
 )
 from kokoro_link.application.services.memory_embedding import attach_embeddings
+from kokoro_link.application.services.official_reference_attachments import (
+    official_reference_attachments,
+)
 from kokoro_link.application.services.quota_overage_service import (
     FEED_POST_OVERAGE,
     OVERAGE_DENIED_TIER_OFF,
@@ -53,9 +63,18 @@ from kokoro_link.contracts.account_runtime_profile import (
 )
 from kokoro_link.contracts.account_runtime_usage import (
     ACCOUNT_RUNTIME_EVENT_FEED_POST,
+    ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
     AccountRuntimeUsageRepositoryPort,
 )
 from kokoro_link.contracts.embedder import EmbedderError, EmbedderPort
+from kokoro_link.contracts.feed_video_debug import (
+    STAGE_NO_ASYNC_TARGET,
+    STAGE_NO_FIRST_FRAME,
+    STAGE_NO_PIPELINE,
+    STAGE_VIDEO_DISABLED,
+    VideoTriggerReport,
+)
+from kokoro_link.contracts.feed_video_jobs import PendingFeedVideo
 from kokoro_link.contracts.feed import (
     FeedComposerInput,
     FeedComposerOutput,
@@ -72,7 +91,7 @@ from kokoro_link.contracts.novelty_gate import (
     NoveltyGatePort,
     NoveltyVerdict,
 )
-from kokoro_link.contracts.object_storage import ObjectStoragePort
+from kokoro_link.contracts.object_storage import ObjectStoragePort, StoredObject
 from kokoro_link.contracts.register_profile import (
     RegisterProfileContext,
     RegisterProfilePort,
@@ -91,7 +110,11 @@ from kokoro_link.domain.entities.generation_usage import (
 )
 from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID, OperatorProfile
-from kokoro_link.domain.value_objects.feed_source import FeedSource
+from kokoro_link.domain.value_objects.feed_kind import FeedKind
+from kokoro_link.domain.value_objects.feed_source import (
+    SOURCE_INTERNAL_TEST,
+    FeedSource,
+)
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.domain.value_objects.timezone import timezone_for_id, to_timezone
 from kokoro_link.infrastructure.localization.fallback_texts import (
@@ -118,6 +141,17 @@ based (low-attention surface) and we want some rhythm; loose enough
 that a 3/day limit + 5-minute tick isn't all clustered around morning.
 """
 
+_RECENT_MEDIA_HISTORY_LIMIT = 5
+
+_DEFAULT_TEST_VIDEO_PROMPT = (
+    "gentle idle motion, subtle camera drift, soft ambient light, "
+    "natural breathing"
+)
+"""CV6 fallback ``base_video_prompt`` for the
+admin test trigger, which has no LLM-composed draft to fall back to. The
+storyboard step reads the *rendered* first frame via vision, so this
+text only matters when the storyboard call itself cannot run."""
+
 _HIGH_BUSY_THRESHOLD = 0.85
 """Current-activity floor where automatic feed posting should wait.
 
@@ -132,6 +166,116 @@ unclaimed and can fire on a later tick when the schedule becomes reachable.
 class _RuntimeFeedQuotaDecision:
     allowed: bool
     claim_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedImage:
+    """One image-provider call, decoupled from storage and the ledger.
+
+    The render step deliberately does neither of the two things the old
+    single-method shape did on its way out: it never writes an object and
+    never files a usage row. It only carries back everything a caller
+    needs to do both — because the two callers disagree about *where* the
+    bytes go (a post's picture vs a clip's first frame) while agreeing
+    exactly on how the attempt is billed.
+
+    ``provider is None`` means no image provider resolved for this
+    deployment: nothing was attempted, so nothing may be billed, and
+    ``styled_prompt`` still holds the raw prompt (styling happens after
+    the provider check, and a prompt no model ever saw must not be
+    dressed up as one that was).
+    """
+
+    styled_prompt: str
+    started_at: datetime
+    provider: object | None = None
+    profile_id: str = ""
+    image_bytes: bytes | None = None
+    returned: int = 0
+    error: BaseException | None = None
+    """The exception the provider raised, kept so the *caller* can log it
+    with its own fallback narrative — "text-only post" and "no video job"
+    are different stories about the same failure."""
+    error_code: str | None = None
+    error_message: str | None = None
+    typed_failure: bool = False
+    """``ImageGenerationError`` (an upstream saying no) rather than an
+    unexpected crash. Only the log level and wording differ."""
+
+    @property
+    def status(self) -> str:
+        return STATUS_FAILED if self.error is not None else STATUS_SUCCEEDED
+
+    @property
+    def output_bytes(self) -> int | None:
+        return None if self.image_bytes is None else len(self.image_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class FeedFirstFrame:
+    """A rendered opening frame that already lives in feed storage.
+
+    Landed eagerly rather than held in memory because the async video
+    pipeline hands the same object to three
+    consumers with three different lifetimes: the I2V provider reads
+    ``url`` as the frame the clip must start on, a successful post keeps
+    it as the poster (``FeedPost.image_url``), and a job that times out,
+    fails or is refused becomes a plain image post using *these* bytes —
+    never a second render, never a second usage row.
+    """
+
+    url: str
+    object_key: str
+    prompt: str
+    """The styled prompt the frame was rendered from — what the degraded
+    image post stores as its ``image_prompt``."""
+    data: bytes = b""
+    """The frame's bytes, kept for the length of the submitting tick only.
+
+    The hosted job wire takes the start frame as bytes, not a URL: the
+    worker that renders the clip lives on somebody else's GPU and cannot
+    reach Core's object store at all (Media Jobs Service spec §2). They
+    are carried rather than re-read because the render just produced them
+    — and because a durable record must never hold image bytes, which is
+    why the pending row stores only ``url`` / ``object_key``."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TickOutcome:
+    """What one candidate produced.
+
+    ``post`` and ``deferred`` are two different kinds of "yes": a post was
+    published, or a video job was queued and the post will be published by
+    whichever poll sees it finish. The distinction only matters to the two
+    callers that decide whether the tick's quota slot was consumed — both
+    of those answers are "yes", while a plain ``None`` outcome means the
+    candidate produced nothing and the slot goes back.
+
+    ``first_frame`` rides along for the degrade path: the asynchronous
+    pipeline may come back with a rendered frame and no job (refused
+    queue, unsubmittable prompt), and the post it publishes right there
+    must reuse those exact bytes rather than render a second picture.
+    """
+
+    post: FeedPost | None = None
+    deferred: bool = False
+    first_frame: "FeedFirstFrame | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoBranch:
+    """What the video branch of one tick decided.
+
+    ``outcome is None`` is the self-host answer — *this deployment has no
+    asynchronous pipeline*, run the historical inline render — and
+    ``resolved`` is the resolution that answer came from, handed back so
+    the inline render does not repeat it. Before this existed the tick
+    resolved the video provider twice, which self-host paid for on every
+    single video post.
+    """
+
+    outcome: "_TickOutcome | None"
+    resolved: "ResolvedVideoTarget | None" = None
 
 
 class FeedComposerService:
@@ -179,6 +323,7 @@ class FeedComposerService:
         ) = None,
         character_repository: CharacterRepositoryPort | None = None,
         quota_overage: "QuotaOverageService | None" = None,
+        video_job_service: "FeedVideoJobService | None" = None,
     ) -> None:
         self._repo = repository
         self._candidates = candidates
@@ -226,9 +371,42 @@ class FeedComposerService:
         # for. ``None`` (self-host, legacy tests) means the tier's daily post
         # limit stays the hard wall it has always been.
         self._quota_overage = quota_overage
+        # CV4: the deferred video pipeline. ``None`` — and, when wired, a
+        # provider that renders synchronously — both mean the composer's
+        # historical video branch runs unchanged. Nothing about this field
+        # can change a self-host tick.
+        self._video_job_service = video_job_service
+        # Whether this deployment can queue a render at all. Off (self-host,
+        # and hosted until the broker knob is on) means a pending row cannot
+        # exist, so the tick must not spend a query looking for one — see
+        # ``_has_video_in_flight``.
+        self._deferred_video_possible = False
 
     def set_usage_recorder(self, recorder: UsageEventRecorderPort | None) -> None:
         self._usage_recorder = recorder
+
+    def set_video_job_service(
+        self,
+        service: "FeedVideoJobService | None",
+        *,
+        deferred_pipeline_possible: bool = False,
+    ) -> None:
+        """Close the composer ↔ pipeline cycle after construction.
+
+        The pipeline lands its posts *through* this service (it is the
+        lander), so the two cannot both be constructor arguments of each
+        other.
+
+        ``deferred_pipeline_possible`` is the deployment-level answer to
+        "can a render ever be queued here" — the same condition that
+        decides whether a poll carrier is wired at all. It defaults to the
+        conservative answer because the *service* is wired unconditionally
+        (it is inert without an async-capable provider), so its presence
+        alone cannot tell the tick whether pending rows are possible."""
+        self._video_job_service = service
+        self._deferred_video_possible = bool(
+            service is not None and deferred_pipeline_possible,
+        )
 
     async def tick(
         self,
@@ -238,6 +416,17 @@ class FeedComposerService:
     ) -> FeedPost | None:
         when = now or datetime.now(timezone.utc)
         if not self._is_feed_enabled(character):
+            return None
+        if await self._has_video_in_flight(character):
+            # A queued clip *is* this character's next post — it lands as
+            # the clip, or as the first frame it was already billed for,
+            # but it lands. Until then it holds no ``feed_posts`` row, so
+            # the cooldown and daily-count gates below cannot see it and
+            # would happily compose a second post minutes later: two posts
+            # for one slot, two first-frame renders, and a second video job
+            # occupying the queue. Skipping the whole tick (rather than
+            # only the video branch) is the point — the tick that submitted
+            # already consumed its slot and settled its quota.
             return None
         local_tz = await self._resolve_operator_timezone(character)
         if not await self._gate_passes(character, when, local_tz):
@@ -258,34 +447,68 @@ class FeedComposerService:
                 # the day simply staying quiet.
                 return None
         try:
-            post = await self._compose_first_viable(character, when, local_tz)
+            outcome = await self._compose_first_viable(character, when, local_tz)
         except BaseException:
             await self._discard_runtime_feed_post_claim(quota.claim_id)
             await self._release_feed_post_overage(overage)
             raise
-        if post is None:
+        if outcome.post is None and not outcome.deferred:
             await self._discard_runtime_feed_post_claim(quota.claim_id)
             await self._release_feed_post_overage(overage)
         else:
+            # A deferred tick settles like a published one. Once a video job
+            # is queued a post *will* appear — the clip if it lands, the
+            # first frame if it does not — so handing the slot (and the 螢火
+            # it may have cost) back here would give away a free post and let
+            # the same character compose again while the first is in flight.
             await self._settle_feed_post_overage(overage)
-        return post
+        return outcome.post
 
     async def _compose_first_viable(
         self, character: Character, when: datetime, local_tz: tzinfo,
-    ) -> FeedPost | None:
+    ) -> "_TickOutcome":
         candidates = await self._candidates.collect(
             character, now=when, local_tz=local_tz,
         )
         if not candidates:
-            return None
+            return _TickOutcome()
+        recent_media_kinds = (
+            await self._recent_media_kinds(character.id)
+            if self._video_provider is not None
+            else ()
+        )
         # Try candidates in priority order so a composer no-op on the
         # top pick doesn't lose the whole tick — second-best still
         # gets a shot.
         for candidate in candidates:
-            post = await self._materialise(character, candidate, when)
-            if post is not None:
-                return post
-        return None
+            outcome = await self._materialise(
+                character,
+                candidate,
+                when,
+                recent_media_kinds=recent_media_kinds,
+            )
+            if outcome.post is not None or outcome.deferred:
+                # A deferred candidate consumed the tick as surely as a
+                # published one did: its post is queued, and trying the
+                # next candidate would compose a *second* post for the
+                # same slot.
+                return outcome
+        return _TickOutcome()
+
+    async def _recent_media_kinds(self, character_id: str) -> tuple[str, ...]:
+        """Return published media outcomes newest-first, failing soft."""
+        try:
+            posts = await self._repo.list_for_character(
+                character_id,
+                limit=_RECENT_MEDIA_HISTORY_LIMIT,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "feed: recent media history lookup failed character=%s",
+                character_id,
+            )
+            return ()
+        return tuple(_published_media_kind(post) for post in posts)
 
     async def _authorise_feed_post_overage(
         self, character: Character, now: datetime,
@@ -345,6 +568,22 @@ class FeedComposerService:
         if today_count >= character.feed_daily_limit:
             return False
         return True
+
+    async def _has_video_in_flight(self, character: Character) -> bool:
+        """Is a deferred clip already queued for this character?
+
+        Gated on the deployment being able to queue one at all, and that
+        gate is what keeps the plan's promise that a self-host tick gains
+        **zero** extra queries: without it every tick of every deployment
+        would probe a table that, off the hosted broker path, can never
+        hold a row. Both execution modes (embedded sweep and distributed
+        due-job) share this composer, so one gate covers both."""
+        if not self._deferred_video_possible:
+            return False
+        service = self._video_job_service
+        if service is None:
+            return False
+        return await service.has_in_flight(character.id)
 
     async def _is_current_activity_high_busy(
         self, character: Character, now: datetime,
@@ -475,7 +714,9 @@ class FeedComposerService:
         character: Character,
         candidate: FeedCandidate,
         when: datetime,
-    ) -> FeedPost | None:
+        *,
+        recent_media_kinds: tuple[str, ...] = (),
+    ) -> "_TickOutcome":
         operator = await self._resolve_operator_profile(character)
         local_tz = _timezone_for_operator(operator)
         calendar_context = self._describe_calendar(
@@ -490,6 +731,7 @@ class FeedComposerService:
             source=candidate.source,
             hint=candidate.hint,
             context_snippets=candidate.context_snippets,
+            recent_media_kinds=recent_media_kinds,
             image_required=candidate.image_required,
             calendar_context=calendar_context,
             weather_context=weather_context,
@@ -505,10 +747,10 @@ class FeedComposerService:
                 "feed composer crashed character=%s source=%s",
                 character.id, candidate.source.kind,
             )
-            return None
+            return _TickOutcome()
         text = (output.content_text or "").strip()
         if not text:
-            return None
+            return _TickOutcome()
         output = await self._gate_feed_output(
             composer_input=composer_input,
             output=output,
@@ -516,7 +758,7 @@ class FeedComposerService:
         )
         text = (output.content_text or "").strip()
         if not text:
-            return None
+            return _TickOutcome()
         # Late-bind the world-event claim now that we know this candidate
         # is the one that produced text. Lost race (another surface
         # already claimed) → drop this candidate so the seed isn't
@@ -532,32 +774,62 @@ class FeedComposerService:
                     "feed: world-event commit crashed character=%s item=%s",
                     character.id, item_id,
                 )
-                return None
+                return _TickOutcome()
             if committed is None:
                 _LOGGER.info(
                     "feed: world-event seed lost race character=%s item=%s",
                     character.id, item_id,
                 )
-                return None
+                return _TickOutcome()
         # Branch on the LLM's media_kind pick. Video first when chosen
         # (and a provider is wired): success → ship as a video post.
         # Failure or fallback through to image generation so the post
         # still ships with *some* visual rather than an empty card.
         video_url: str | None = None
         video_prompt: str | None = None
-        if (
+        first_frame: FeedFirstFrame | None = None
+        skip_image_render = False
+        wants_video = (
             output.media_kind == "video"
-            and output.video_prompt
+            and bool(output.video_prompt)
             and self._video_provider is not None
             and await self._runtime_video_generation_enabled(character)
-        ):
-            video_url, video_prompt = await self._maybe_generate_video(
-                character, output.video_prompt,
+            # CV5 seam: volume control decides *before* any spend — no job,
+            # no storyboard call, no first frame. An over-quota character
+            # simply takes the ordinary picture path below.
+            and await self._video_volume_allows(character, when)
+        )
+        if wants_video:
+            branch = await self._try_deferred_video(
+                character, candidate, output, text, when,
             )
+            if branch.outcome is not None:
+                if branch.outcome.deferred:
+                    # Submitted. No post this tick — the poll publishes it.
+                    return branch.outcome
+                # The asynchronous pipeline ran and decided not to wait:
+                # publish now with whatever it managed to render. The image
+                # step is skipped either way — a frame already exists, or
+                # the render already failed and paying for a second attempt
+                # would bill the same picture twice.
+                first_frame = branch.outcome.first_frame
+                skip_image_render = True
+            else:
+                # Self-host: the same resolution the branch already made is
+                # handed on, so this tick resolves the video provider once.
+                video_url, video_prompt = await self._maybe_generate_video(
+                    character, output.video_prompt, resolved=branch.resolved,
+                )
 
         image_url: str | None = None
         image_prompt: str | None = None
-        if video_url is None and output.media_kind != "none":
+        if first_frame is not None:
+            image_url, image_prompt = first_frame.url, first_frame.prompt
+        elif (
+            video_url is None
+            and output.media_kind != "none"
+            and not skip_image_render
+        ):
             image_url, image_prompt = await self._maybe_generate_image(
                 character, candidate, output.image_prompt,
             )
@@ -600,11 +872,11 @@ class FeedComposerService:
                         "crashed character=%s item=%s",
                         character.id, item_id,
             )
-            return None
+            return _TickOutcome()
         await self._publish(post)
         await self._notify_web_push(character, post)
         await self._memorialize(character, post)
-        return post
+        return _TickOutcome(post=post)
 
     async def _claim_runtime_feed_post_quota(
         self,
@@ -993,6 +1265,8 @@ class FeedComposerService:
         candidate: FeedCandidate,
         composer_prompt: str,
     ) -> tuple[str | None, str | None]:
+        """The post's picture: render → persist → bill, degrading to a
+        text-only post at every step that can fail."""
         if not candidate.image_required:
             return None, None
         if self._image_provider is None or self._object_storage is None:
@@ -1000,11 +1274,117 @@ class FeedComposerService:
         prompt = (composer_prompt or "").strip()
         if not prompt:
             return None, None
+        render = await self._render_feed_image(character, prompt)
+        if render.provider is None:
+            return None, render.styled_prompt
+        if render.error is not None:
+            await self._record_image_render_usage(
+                character=character, render=render, artifact_count=0,
+            )
+            if render.typed_failure:
+                _LOGGER.warning(
+                    "feed image generation failed character=%s — falling back "
+                    "to text-only post",
+                    character.id, exc_info=render.error,
+                )
+            else:
+                _LOGGER.error(
+                    "feed image generation crashed character=%s",
+                    character.id, exc_info=render.error,
+                )
+            return None, render.styled_prompt
+        if render.image_bytes is None:
+            await self._record_image_render_usage(
+                character=character, render=render, artifact_count=0,
+            )
+            return None, render.styled_prompt
+        url = await self._write_image_bytes(character, render.image_bytes)
+        await self._record_image_render_usage(
+            character=character, render=render, artifact_count=1 if url else 0,
+        )
+        return url, render.styled_prompt
+
+    async def generate_video_first_frame(
+        self,
+        character: Character,
+        composer_prompt: str,
+    ) -> FeedFirstFrame | None:
+        """Render the opening frame of a clip and land it in feed storage.
+
+        The async video pipeline's entry point (
+        CV4): one render, one durable object, one image usage row, reused
+        as the I2V reference, the poster frame, and — when the job times
+        out, fails or is refused — the picture of the plain image post we
+        fall back to. Landing it *before* the job is submitted is what
+        makes that fallback free: the degraded post reuses these bytes
+        instead of paying for a second render minutes later.
+
+        ``None`` means no frame exists. There is then nothing to anchor an
+        I2V pass on and nothing to post a picture with, so the caller
+        drops straight to a text-only post without submitting a job —
+        never to the synchronous video path, which this method's presence
+        does not change in any way.
+        """
+        if self._image_provider is None or self._object_storage is None:
+            return None
+        prompt = (composer_prompt or "").strip()
+        if not prompt:
+            return None
+        render = await self._render_feed_image(character, prompt)
+        if render.provider is None:
+            return None
+        if render.error is not None:
+            await self._record_image_render_usage(
+                character=character, render=render, artifact_count=0,
+            )
+            _LOGGER.warning(
+                "feed video first frame render failed character=%s — no "
+                "video job will be submitted",
+                character.id, exc_info=render.error,
+            )
+            return None
+        if render.image_bytes is None:
+            await self._record_image_render_usage(
+                character=character, render=render, artifact_count=0,
+            )
+            return None
+        stored = await self._store_feed_image(character, render.image_bytes)
+        await self._record_image_render_usage(
+            character=character,
+            render=render,
+            artifact_count=1 if stored is not None else 0,
+        )
+        if stored is None:
+            return None
+        return FeedFirstFrame(
+            url=stored.url,
+            object_key=stored.object_key,
+            prompt=render.styled_prompt,
+            data=render.image_bytes,
+        )
+
+    async def _render_feed_image(
+        self,
+        character: Character,
+        prompt: str,
+    ) -> _RenderedImage:
+        """Render step — ask the active image provider for one picture.
+
+        Writes nothing and bills nothing; see :class:`_RenderedImage` for
+        why those belong to the caller. An unwired port collapses into the
+        same "no provider" result as an unresolved one, so a caller that
+        forgot its own gate degrades instead of crashing a background tick.
+        """
         from kokoro_link.application.services.feature_keys import (
             FEATURE_IMAGE_FEED,
         )
         from kokoro_link.contracts.image_provider import ImageGenerationError
 
+        if self._image_provider is None:
+            return _RenderedImage(
+                styled_prompt=prompt,
+                started_at=datetime.now(timezone.utc),
+            )
         provider = await self._image_provider.resolve(
             FEATURE_IMAGE_FEED, character=character,
         )
@@ -1012,7 +1392,10 @@ class FeedComposerService:
             FEATURE_IMAGE_FEED, character=character,
         )
         if provider is None:
-            return None, prompt
+            return _RenderedImage(
+                styled_prompt=prompt,
+                started_at=datetime.now(timezone.utc),
+            )
         styled_prompt = await self._styled_prompt(prompt, character=character)
         started_at = datetime.now(timezone.utc)
         try:
@@ -1022,70 +1405,455 @@ class FeedComposerService:
                 aspect="portrait",
                 batch=1,
                 use_runtime_state=True,
+                # EC6: the background of a managed character's post is drawn
+                # from the partner's reference art like every other surface —
+                # including when this render is the first frame a video job
+                # is later built on.
+                user_attachment_urls=official_reference_attachments(
+                    character, object_storage=self._object_storage,
+                ),
             )
-        except ImageGenerationError:
-            await self._record_image_usage_safely(
-                character=character,
+        except ImageGenerationError as exc:
+            return _RenderedImage(
+                styled_prompt=styled_prompt,
+                started_at=started_at,
                 provider=provider,
                 profile_id=profile_id or "",
-                returned=0,
-                artifact_count=0,
-                status=STATUS_FAILED,
+                error=exc,
                 error_code="ImageGenerationError",
                 error_message="feed image generation failed",
-                started_at=started_at,
+                typed_failure=True,
             )
-            _LOGGER.warning(
-                "feed image generation failed character=%s — falling back "
-                "to text-only post",
-                character.id, exc_info=True,
-            )
-            return None, styled_prompt
         except Exception as exc:
-            await self._record_image_usage_safely(
-                character=character,
+            return _RenderedImage(
+                styled_prompt=styled_prompt,
+                started_at=started_at,
                 provider=provider,
                 profile_id=profile_id or "",
-                returned=0,
-                artifact_count=0,
-                status=STATUS_FAILED,
+                error=exc,
                 error_code=type(exc).__name__,
                 error_message=str(exc),
-                started_at=started_at,
             )
-            _LOGGER.exception(
-                "feed image generation crashed character=%s",
-                character.id,
-            )
-            return None, styled_prompt
-        if not images:
-            await self._record_image_usage_safely(
-                character=character,
-                provider=provider,
-                profile_id=profile_id or "",
-                returned=0,
-                artifact_count=0,
-                status=STATUS_SUCCEEDED,
-                started_at=started_at,
-            )
-            return None, styled_prompt
-        url = await self._write_image_bytes(character, images[0])
-        await self._record_image_usage_safely(
-            character=character,
+        return _RenderedImage(
+            styled_prompt=styled_prompt,
+            started_at=started_at,
             provider=provider,
             profile_id=profile_id or "",
-            returned=len(images),
-            artifact_count=1 if url else 0,
-            status=STATUS_SUCCEEDED,
-            output_bytes=len(images[0]) if images else None,
-            started_at=started_at,
+            image_bytes=images[0] if images else None,
+            returned=len(images) if images else 0,
         )
-        return url, styled_prompt
+
+    async def _record_image_render_usage(
+        self,
+        *,
+        character: Character,
+        render: _RenderedImage,
+        artifact_count: int,
+    ) -> None:
+        """File the ledger row for one render. ``artifact_count`` is the
+        caller's business — it is the only fact the render step cannot
+        know, because it depends on whether the persist step landed."""
+        await self._record_image_usage_safely(
+            character=character,
+            provider=render.provider,
+            profile_id=render.profile_id,
+            returned=render.returned,
+            artifact_count=artifact_count,
+            status=render.status,
+            error_code=render.error_code,
+            error_message=render.error_message,
+            output_bytes=render.output_bytes,
+            started_at=render.started_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Deferred (asynchronous) video — CV4
+    # ------------------------------------------------------------------
+
+    async def _video_volume_allows(
+        self, character: Character, when: datetime,
+    ) -> bool:
+        """Volume control seam for CV5 (``AccountRuntimeProfile.video_daily_limit``).
+
+        A separate decision point rather than a check folded into the submit
+        path: the plan's requirement is that an over-quota character spends
+        *nothing* — no storyboard call, no first frame, no queued job — so
+        the answer has to be known before the pipeline is entered at all
+        (this gates both the deferred pipeline in ``_try_deferred_video``
+        *and* the legacy synchronous ``_maybe_generate_video`` fallback,
+        since both live behind the same ``wants_video`` flag in
+        ``_materialise``).
+
+        Same rolling-24h check-then-record shape as
+        ``ChatService._reserve_runtime_chat_image_quota``
+        (``daily_chat_image_limit``): resolve the profile, bail out cheaply
+        when the tier has no limit (``None`` — self-host, and every hosted
+        tier until an operator opts in — never touches the ledger), else
+        count this operator's video attempts in the last 24h and record one
+        more the moment the check passes. Recording *before* the pipeline
+        runs (rather than after a successful submit) is deliberate: the
+        spend this knob bounds — first-frame render, storyboard call — happens
+        regardless of whether the async job later lands, degrades, or is
+        rejected by the broker, so counting the decision is the only point
+        that cannot be bypassed by a downstream failure.
+
+        Fail-closed on an unreadable ledger or a missing repository, same
+        direction as every other hosted pacing wall in this file: an
+        account that configured a limit must not silently get an unbounded
+        one because a query broke.
+        """
+        try:
+            profile = (
+                await self._account_runtime_profile_resolver.resolve_for_operator(
+                    character.user_id,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "feed video volume profile check failed (operator=%s)",
+                character.user_id,
+            )
+            return False
+        limit = profile.video_daily_limit
+        if limit is None:
+            return True
+        usage = self._account_runtime_usage_repository
+        if usage is None:
+            _LOGGER.error(
+                "feed video volume ledger is not configured (operator=%s)",
+                character.user_id,
+            )
+            return False
+        try:
+            used = await usage.count_events(
+                operator_id=character.user_id,
+                event_type=ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
+                since=when - timedelta(hours=24),
+                until=when,
+            )
+            if used >= limit:
+                return False
+            await usage.record_event(
+                operator_id=character.user_id,
+                event_type=ACCOUNT_RUNTIME_EVENT_FEED_VIDEO,
+                occurred_at=when,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "feed video volume check failed (operator=%s)",
+                character.user_id,
+            )
+            return False
+        return True
+
+    async def _try_deferred_video(
+        self,
+        character: Character,
+        candidate: FeedCandidate,
+        output: FeedComposerOutput,
+        text: str,
+        when: datetime,
+    ) -> "_VideoBranch":
+        """Run the asynchronous pipeline, or decline to.
+
+        ``outcome is None`` means *this deployment has no asynchronous
+        pipeline* — the resolved provider renders synchronously (every
+        self-host adapter) — and the caller runs the historical branch
+        untouched, reusing the ``resolved`` provider carried back with
+        that answer. That single return is the self-host red line in this
+        file.
+
+        Otherwise the post is not published by this tick: either the job
+        was queued (``deferred``) or the pipeline gave up early and handed
+        back the frame it had already rendered, which the caller publishes
+        as a picture post right now.
+        """
+        service = self._video_job_service
+        if service is None:
+            return _VideoBranch(outcome=None)
+        resolved = await service.resolve_target(
+            character, feature_key=FEATURE_VIDEO_FEED,
+        )
+        target = resolved.async_target
+        if target is None:
+            return _VideoBranch(outcome=None, resolved=resolved)
+        # The clip's opening frame is a *still*, and only the image prompt
+        # describes one. The video prompt is not a stand-in for it: its
+        # mandated shape is a three-beat "A → then B → finally C" action,
+        # and an image model asked to draw three beats at once returns one
+        # picture holding three stacked panels. The storyboard step then
+        # reads that composition off the frame and pins it as a
+        # consistency anchor ("preserving vertically stacked three-tier
+        # composition"), so the clip comes out as a contact sheet that
+        # never moves as one scene. The composer fills this field for
+        # every video pick — including a second pass when its first answer
+        # left it empty — so an empty one here means both attempts failed
+        # and there is no still worth rendering.
+        frame_prompt = (output.image_prompt or "").strip()
+        if not frame_prompt:
+            _LOGGER.warning(
+                "video post has no first-frame prompt character=%s — "
+                "posting text only instead of animating a still the "
+                "composer never described",
+                character.id,
+            )
+            return _VideoBranch(outcome=_TickOutcome(), resolved=resolved)
+        frame = await self.generate_video_first_frame(character, frame_prompt)
+        if frame is None:
+            # No frame: nothing to anchor an I2V pass on and nothing to
+            # publish as a picture. The render was already billed, so the
+            # caller must not try again — text-only post.
+            return _VideoBranch(outcome=_TickOutcome(), resolved=resolved)
+        result = await service.submit(
+            character=character,
+            target=target,
+            draft=FeedVideoDraft(
+                content_text=text,
+                post_kind=candidate.kind.value,
+                source_kind=candidate.source.kind,
+                source_ref_id=candidate.source.ref_id,
+                base_video_prompt=(output.video_prompt or "").strip(),
+                context_snippets=tuple(candidate.context_snippets or ()),
+            ),
+            first_frame_url=frame.url,
+            first_frame_key=frame.object_key,
+            first_frame_bytes=frame.data,
+            first_frame_prompt=frame.prompt,
+            now=when,
+        )
+        if result.outcome == SUBMIT_DEFERRED:
+            return _VideoBranch(
+                outcome=_TickOutcome(deferred=True), resolved=resolved,
+            )
+        return _VideoBranch(
+            outcome=_TickOutcome(first_frame=frame), resolved=resolved,
+        )
+
+    # ------------------------------------------------------------------
+    # CV6 — internal full-chain video test trigger
+    # ------------------------------------------------------------------
+
+    async def trigger_internal_video_test(
+        self,
+        character: Character,
+        *,
+        dry_run: bool = True,
+        timeout_seconds: int | None = None,
+        pipeline_override: str | None = None,
+        now: datetime | None = None,
+    ) -> VideoTriggerReport:
+        """Admin-only full-chain video trigger (D11 / CV6).
+
+        Runs the exact production pipeline — first frame → storyboard →
+        submit — bypassing only the two decisions a real tick makes
+        *before* entering it: the LLM's ``media_kind`` pick and the CV5
+        volume gate (``_video_volume_allows``). There is no candidate and
+        no composer call here at all — this is a synthetic post, not a
+        real tick, so there is no ``media_kind`` to bypass so much as
+        there is none to begin with. Every other gate stays, most
+        importantly ``_runtime_video_generation_enabled``: an operator
+        who switched video off for their account is not silently
+        overridden by an admin diagnostic.
+
+        Never runs the synchronous self-host branch. A deployment with no
+        asynchronous target (no provider, or one that only implements the
+        synchronous ``VideoProviderPort.generate()``) has nothing this
+        endpoint can usefully exercise, and driving a 30-minute
+        synchronous render from an HTTP debug call would be its own
+        footgun — so it stops with :data:`STAGE_NO_ASYNC_TARGET` instead.
+
+        See :meth:`FeedVideoJobService.submit` for what ``dry_run`` and
+        ``timeout_seconds`` actually do — this method is a thin,
+        traced assembly of already-public building blocks
+        (:meth:`generate_video_first_frame`, ``submit``), not a second
+        implementation of the pipeline.
+        """
+        from uuid import uuid4
+
+        when = now if now is not None else datetime.now(timezone.utc)
+        trigger_id = uuid4().hex
+
+        def report(**kwargs: object) -> VideoTriggerReport:
+            return VideoTriggerReport(
+                character_id=character.id,
+                trigger_id=trigger_id,
+                dry_run=dry_run,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
+        service = self._video_job_service
+        if service is None:
+            return report(available=False, stage=STAGE_NO_PIPELINE)
+        if not await self._runtime_video_generation_enabled(character):
+            return report(available=False, stage=STAGE_VIDEO_DISABLED)
+        target = await service.resolve_async_target(
+            character, feature_key=FEATURE_VIDEO_FEED,
+        )
+        if target is None:
+            return report(available=False, stage=STAGE_NO_ASYNC_TARGET)
+
+        image_prompt = (
+            character.appearance or character.summary or character.name
+        ).strip()
+        content_text = (
+            f"（內部測試貼文）{character.name} 的影片管線全鏈觸發測試 "
+            f"（trigger={trigger_id[:8]}）。"
+        )
+        frame = await self.generate_video_first_frame(character, image_prompt)
+        if frame is None:
+            return report(available=True, stage=STAGE_NO_FIRST_FRAME)
+
+        draft = FeedVideoDraft(
+            content_text=content_text,
+            post_kind=FeedKind.DAILY.value,
+            # A raw string, not ``FeedSource.INTERNAL_TEST``: this dataclass
+            # is ``slots=True`` and its ``ClassVar`` ints/strs resolve to
+            # ``member_descriptor`` when read directly off the class on this
+            # Python version (a pre-existing quirk shared by every other
+            # ``FeedSource.*`` constant — nothing else in the codebase reads
+            # them that way either, only through the ``FeedSource.xxx()``
+            # factory methods, which build the string themselves).
+            source_kind=SOURCE_INTERNAL_TEST,
+            source_ref_id=trigger_id,
+            base_video_prompt=_DEFAULT_TEST_VIDEO_PROMPT,
+        )
+        extra_metadata = (
+            {"pipeline_override": pipeline_override}
+            if pipeline_override else None
+        )
+        result = await service.submit(
+            character=character,
+            target=target,
+            draft=draft,
+            first_frame_url=frame.url,
+            first_frame_key=frame.object_key,
+            first_frame_bytes=frame.data,
+            first_frame_prompt=frame.prompt,
+            now=when,
+            timeout_seconds=timeout_seconds,
+            dry_run=dry_run,
+            capture_trace=True,
+            extra_metadata=extra_metadata,
+        )
+        trace = result.trace
+        return report(
+            available=True,
+            stage=result.outcome,
+            first_frame_url=frame.url,
+            first_frame_key=frame.object_key,
+            first_frame_prompt=frame.prompt,
+            first_frame_bytes=len(frame.data),
+            storyboard_input=trace.storyboard_input if trace else None,
+            storyboard_output=trace.storyboard_output if trace else None,
+            storyboard_source=trace.storyboard_source if trace else None,
+            storyboard_reason=trace.storyboard_reason if trace else None,
+            job_payload=trace.job_payload if trace else None,
+            submitted=trace.submitted if trace else False,
+            job_id=trace.job_id if trace else None,
+            poll_after_seconds=trace.poll_after_seconds if trace else None,
+            pending_id=trace.pending_id if trace else None,
+            failure_reason=trace.failure_reason if trace else "",
+            rejected_code=trace.rejected_code if trace else None,
+            error=trace.error if trace else None,
+        )
+
+    # --- PendingFeedVideoLanderPort ------------------------------------
+    #
+    # The three things the poll path cannot do for itself. Public because
+    # they are a port, not because anything else may call them.
+
+    async def store_feed_video(
+        self, character: Character, blob: bytes,
+    ) -> str | None:
+        return await self._write_video_bytes(character, blob)
+
+    async def record_feed_video_usage(
+        self,
+        *,
+        character: Character,
+        provider: object,
+        profile_id: str,
+        artifact_count: int,
+        output_bytes: int | None,
+        status: str,
+        started_at: datetime,
+        duration_seconds: Decimal | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        await self._record_video_usage_safely(
+            character=character,
+            provider=provider,
+            profile_id=profile_id,
+            artifact_count=artifact_count,
+            output_bytes=output_bytes,
+            status=status,
+            started_at=started_at,
+            duration_seconds=duration_seconds,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    async def land_pending_feed_video_post(
+        self,
+        *,
+        character: Character,
+        pending: "PendingFeedVideo",
+        video_url: str | None,
+        when: datetime,
+    ) -> FeedPost | None:
+        """Publish a post the composer drafted minutes ago.
+
+        Same tail as :meth:`_materialise` — persist, publish, notify,
+        remember — and deliberately nothing else: the LLM, the gates, the
+        quota claim and the world-event commit all happened at submit
+        time and must not run twice.
+
+        The first frame is the post's ``image_url`` on **both** exits: as
+        the clip's poster when the video landed, and as the picture itself
+        when it did not. ``created_at`` is the landing instant rather than
+        the submit instant so the post appears in the feed at the moment
+        it actually becomes visible.
+        """
+        post = FeedPost.create(
+            character_id=pending.character_id,
+            kind=pending.post_kind,
+            content_text=pending.content_text,
+            source=FeedSource(
+                kind=pending.source_kind, ref_id=pending.source_ref_id,
+            ),
+            image_url=pending.first_frame_url or None,
+            image_prompt=pending.image_prompt or None,
+            video_url=video_url,
+            # Only a post that actually carries a clip carries the prompt
+            # that produced one; a degraded post is a picture post and
+            # saying otherwise would misread as a broken video.
+            video_prompt=(pending.video_prompt or None) if video_url else None,
+            created_at=when,
+        )
+        try:
+            await self._repo.add(post)
+        except Exception:
+            # The (character, source) unique index caught a duplicate: a
+            # racing carrier already published this draft. Benign.
+            _LOGGER.warning(
+                "feed video: deferred post persist skipped (likely race) "
+                "character=%s source=%s",
+                pending.character_id, pending.source_kind,
+                exc_info=True,
+            )
+            return None
+        await self._publish(post)
+        await self._notify_web_push(character, post)
+        await self._memorialize(character, post)
+        return post
 
     async def _maybe_generate_video(
         self,
         character: Character,
         composer_prompt: str,
+        *,
+        resolved: "ResolvedVideoTarget | None" = None,
     ) -> tuple[str | None, str | None]:
         """Resolve the active video provider and render a Wan2.2 clip.
 
@@ -1093,7 +1861,12 @@ class FeedComposerService:
         any failure so the caller can decide whether to fall back to an
         image post or drop the visual entirely. The prompt is echoed so
         the post row still stores what was attempted, even when the
-        upstream couldn't render — useful for debugging mid-rollout."""
+        upstream couldn't render — useful for debugging mid-rollout.
+
+        ``resolved`` is the deferred branch's already-made resolution, so
+        the tick that fell through to here does not repeat it. Left
+        ``None`` (no pipeline wired at all) this resolves for itself,
+        exactly as it always did."""
         if self._video_provider is None or self._object_storage is None:
             return None, None
         prompt = (composer_prompt or "").strip()
@@ -1104,12 +1877,16 @@ class FeedComposerService:
         )
         from kokoro_link.contracts.video_provider import VideoGenerationError
 
-        provider = await self._video_provider.resolve(
-            FEATURE_VIDEO_FEED, character=character,
-        )
-        profile_id = await self._video_provider.resolve_profile_id(
-            FEATURE_VIDEO_FEED, character=character,
-        )
+        if resolved is None:
+            provider = await self._video_provider.resolve(
+                FEATURE_VIDEO_FEED, character=character,
+            )
+            profile_id = await self._video_provider.resolve_profile_id(
+                FEATURE_VIDEO_FEED, character=character,
+            )
+        else:
+            provider = resolved.provider
+            profile_id = resolved.profile_id
         if provider is None:
             # No video profile wired for this deployment; let the caller
             # fall back to image generation by signalling "no video".
@@ -1216,28 +1993,40 @@ class FeedComposerService:
             )
             return None
 
-    async def _write_image_bytes(
+    async def _store_feed_image(
         self, character: Character, blob: bytes,
-    ) -> str | None:
+    ) -> StoredObject | None:
+        """Persist step — land one picture under ``feed/{character_id}/``.
+
+        Returns the whole :class:`StoredObject` rather than just its URL
+        because the video pipeline needs the object key too (the worker
+        is handed a key, not a browser-facing URL). ``None`` on any
+        storage failure, same fail-soft contract as before.
+        """
         from uuid import uuid4
 
         filename = f"{uuid4().hex}.png"
         if self._object_storage is None:
             return None
         try:
-            stored = await self._object_storage.put_bytes(
+            return await self._object_storage.put_bytes(
                 object_key=f"feed/{character.id}/{filename}",
                 content=blob,
                 content_type="image/png",
                 metadata={"character_id": character.id, "kind": "feed-image"},
             )
-            return stored.url
         except Exception:
             _LOGGER.exception(
                 "feed image object write failed character=%s",
                 character.id,
             )
             return None
+
+    async def _write_image_bytes(
+        self, character: Character, blob: bytes,
+    ) -> str | None:
+        stored = await self._store_feed_image(character, blob)
+        return None if stored is None else stored.url
 
     async def _record_image_usage_safely(
         self,
@@ -1300,14 +2089,45 @@ class FeedComposerService:
         output_bytes: int | None,
         status: str,
         started_at: datetime,
+        duration_seconds: Decimal | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
         if self._usage_recorder is None:
             return
         completed_at = datetime.now(timezone.utc)
-        length_frames = 81
-        duration = Decimal(length_frames) / Decimal(16)
+        # CV0-3: this used to hard-code 81 frames / 16 fps for every video
+        # regardless of what actually rendered. ``last_duration_seconds`` is
+        # an additive, provider-optional signal — same shape as
+        # ``last_request_id`` read just below — that a concrete adapter
+        # (e.g. ``CloudGatewayVideoProvider``) sets after ``generate()``
+        # once it knows the real duration. Adapters that don't set it (and
+        # every existing test double) fall back to the historical
+        # frames/fps assumption rather than record a lie.
+        default_length_frames = 81
+        default_fps = 16
+        duration = Decimal(default_length_frames) / Decimal(default_fps)
+        metadata: dict[str, object] = {"aspect": "portrait"}
+        # CV4: the asynchronous path knows the real clip length only when the
+        # artifact arrives — minutes after ``generate()`` would have set the
+        # provider-side signal, and on a different process. An explicit
+        # override therefore wins over the provider attribute, which stays
+        # the synchronous path's channel and is untouched when this is None.
+        reported_seconds = (
+            duration_seconds if duration_seconds is not None
+            else getattr(provider, "last_duration_seconds", None)
+        )
+        if reported_seconds is not None:
+            try:
+                reported_duration = Decimal(str(reported_seconds))
+            except (ArithmeticError, ValueError, TypeError):
+                reported_duration = None
+            if reported_duration is not None and reported_duration > 0:
+                duration = reported_duration
+                metadata["reported_duration_seconds"] = float(reported_duration)
+        if "reported_duration_seconds" not in metadata:
+            metadata["length_frames"] = default_length_frames
+            metadata["fps"] = default_fps
         billable_seconds = int(duration.to_integral_value(rounding="ROUND_CEILING"))
         try:
             await self._usage_recorder.record(UsageEventDraft(
@@ -1335,11 +2155,7 @@ class FeedComposerService:
                 artifact_count=artifact_count,
                 output_bytes=output_bytes,
                 duration_seconds=duration,
-                metadata={
-                    "aspect": "portrait",
-                    "length_frames": length_frames,
-                    "fps": 16,
-                },
+                metadata=metadata,
                 completed_at=completed_at,
             ))
         except Exception:  # noqa: BLE001
@@ -1355,6 +2171,7 @@ class FeedComposerService:
                 kind=post.kind.value,
                 content_text=post.content_text,
                 image_url=post.image_url,
+                video_url=post.video_url,
                 created_at=post.created_at,
             ))
         except Exception:
@@ -1482,3 +2299,12 @@ def _timezone_for_operator(operator: OperatorProfile | None) -> tzinfo:
         return timezone_for_id(getattr(operator, "timezone_id", None))
     except Exception:  # pragma: no cover - defensive
         return timezone.utc
+
+
+def _published_media_kind(post: FeedPost) -> str:
+    """Classify what readers actually received, not what the LLM requested."""
+    if (post.video_url or "").strip():
+        return "video"
+    if (post.image_url or "").strip():
+        return "image"
+    return "none"

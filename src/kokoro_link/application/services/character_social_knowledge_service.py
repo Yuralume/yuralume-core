@@ -48,7 +48,7 @@ Deliberately small (was 4): after the first encounter the most recent
 peer-tagged memories are dominated by the previous encounter's own
 summary/hearsay output, so a large window turns the encounter dialogue
 into an echo chamber — the pair keeps re-discussing whatever they
-discussed last time (ENCOUNTER_CHAT_PARITY_PLAN §1). Fresh material now
+discussed last time. Fresh material now
 comes from CharacterLifeContextBuilder instead; recent encounter
 summaries are injected separately as "already discussed" negative
 examples by the encounter service."""

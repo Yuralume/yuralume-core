@@ -574,7 +574,7 @@ class PersonaSettings:
 
 @dataclass(frozen=True, slots=True)
 class HumanizationSettings:
-    """Feature flags for the P1 擬人化 backlog (`docs/HUMANIZATION_ROADMAP.md`).
+    """Feature flags for the P1 擬人化 backlog.
 
     Every dream-time / proactive-time LLM job introduced under §3 mounts
     behind one of these flags. All default ``True`` so a fresh install
@@ -756,7 +756,7 @@ class PromptQualitySettings:
 
 @dataclass(frozen=True, slots=True)
 class MemoirSettings:
-    """Player-side memoir thresholds and limits (docs/MEMOIR_PLAN.md).
+    """Player-side memoir thresholds and limits.
 
     All defaults are conservative and tuned for the MVP — they're exposed
     as env vars so operators can adjust without redeploying once real
@@ -932,7 +932,7 @@ class CloudSettings:
     embedding_preset: str = "text-embedding-bge-m3"
     # When true (cloud mode), resolve feature_key -> preset from the control-plane
     # routing profile instead of the env preset map (which becomes a deprecated
-    # one-release fallback). See docs/CLOUD_CONTROL_PLANE_CONFIG_PLAN.md Phase 3.
+    # one-release fallback).
     runtime_config_enabled: bool = False
     # Optional shared secret sent as ``X-Internal-Token`` on Core's
     # runtime-config pulls (core-profile + per-tier runtime-profile). When set
@@ -944,7 +944,7 @@ class CloudSettings:
     # where any active account may log in. ``demo`` is always allowed.
     require_paid_tier: bool = False
     # Customer-facing Cloud Portal origin served to the SPA at runtime
-    # (HOSTED_PLAYER_UX_PLAN §3 / U2) so a hosted player always has a way back
+    # so a hosted player always has a way back
     # to the account centre. Runtime config, not a Vite build-time bake — the
     # SPA image is shared across hosted environments. Deliberately NOT part of
     # the cloud fail-fast required set: the Cloud-side deployment preflight
@@ -1013,7 +1013,7 @@ DEFAULT_OFFICIAL_CARD_CATALOG_URL = (
 
 They used to ship inside this repo as binaries; now every deployment reads
 them from one anonymous public endpoint, hosted or self-hosted alike
-(OFFICIAL_CARD_CLOUD_CATALOG_PLAN D1). The path includes the portal edge's
+The path includes the portal edge's
 ``/api/user`` prefix because that is the address a browser and a Core
 process can both reach.
 """

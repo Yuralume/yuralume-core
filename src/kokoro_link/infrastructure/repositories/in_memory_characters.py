@@ -50,6 +50,14 @@ class InMemoryCharacterRepository(CharacterRepositoryPort):
             if not c.frozen and not c.subscription_locked
         ]
 
+    async def list_by_origin_official_card_id(
+        self, card_id: str,
+    ) -> list[Character]:
+        return [
+            c for c in self._characters.values()
+            if c.origin_official_card_id == card_id
+        ]
+
     async def get(self, character_id: str) -> Character | None:
         return self._characters.get(character_id)
 

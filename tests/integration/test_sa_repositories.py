@@ -295,6 +295,31 @@ async def test_character_get_nonexistent(session_factory: sessionmaker) -> None:
 
 
 @pytest.mark.asyncio
+async def test_character_list_by_origin_official_card_id_is_cross_tenant(
+    session_factory: sessionmaker,
+) -> None:
+    # EC10-B: the per-card freeze lookup is deliberately not scoped by
+    # ``user_id`` — a card's freeze applies across every operator who
+    # installed it, not one roster.
+    repo = SACharacterRepository(session_factory)
+    operator_repo = SAOperatorProfileRepository(session_factory)
+    for op_id in ("op-a", "op-b"):
+        await operator_repo.save(
+            OperatorProfile(id=op_id, display_name=op_id, auth_provider="local")
+        )
+    ours_a = Character.create(name="A", summary="", personality=[], interests=[], speaking_style="", boundaries=[], user_id="op-a", state=CharacterState(emotion="neutral", affection=50, fatigue=0, trust=50, energy=100), origin_official_card_id="hoshino-himari")
+    ours_b = Character.create(name="B", summary="", personality=[], interests=[], speaking_style="", boundaries=[], user_id="op-b", state=CharacterState(emotion="neutral", affection=50, fatigue=0, trust=50, energy=100), origin_official_card_id="hoshino-himari")
+    other_card = Character.create(name="Other", summary="", personality=[], interests=[], speaking_style="", boundaries=[], user_id="op-a", state=CharacterState(emotion="neutral", affection=50, fatigue=0, trust=50, energy=100), origin_official_card_id="another-card")
+    self_hosted = Character.create(name="SelfHosted", summary="", personality=[], interests=[], speaking_style="", boundaries=[], user_id="op-a", state=CharacterState(emotion="neutral", affection=50, fatigue=0, trust=50, energy=100))
+    for c in (ours_a, ours_b, other_card, self_hosted):
+        await repo.save(c)
+
+    result = await repo.list_by_origin_official_card_id("hoshino-himari")
+
+    assert {c.id for c in result} == {ours_a.id, ours_b.id}
+
+
+@pytest.mark.asyncio
 async def test_messaging_account_polling_lock_is_exclusive(
     session_factory: sessionmaker,
 ) -> None:

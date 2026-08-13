@@ -36,6 +36,43 @@ class InMemoryDeferredIntentRepository(DeferredIntentRepositoryPort):
         matches.sort(key=lambda r: r.created_at, reverse=True)
         return matches[: max(1, limit)]
 
+    async def list_due_for(
+        self,
+        character_id: str,
+        operator_id: str,
+        *,
+        now: datetime,
+        limit: int = 5,
+    ) -> list[DeferredIntent]:
+        matches = [
+            row for row in self._rows
+            if row.character_id == character_id
+            and row.operator_id == operator_id
+            and row.is_due_at(now)
+        ]
+        matches.sort(key=lambda r: r.created_at, reverse=True)
+        return matches[: max(1, limit)]
+
+    async def clear_revisit(self, intent_id: str) -> bool:
+        for idx, row in enumerate(self._rows):
+            if row.id == intent_id and row.revisit_at is not None:
+                self._rows[idx] = row.without_revisit()
+                return True
+        return False
+
+    async def restore_revisit(
+        self, intent_id: str, *, revisit_at: datetime,
+    ) -> bool:
+        for idx, row in enumerate(self._rows):
+            if (
+                row.id == intent_id
+                and row.status == STATUS_ACTIVE
+                and row.revisit_at is None
+            ):
+                self._rows[idx] = row.with_revisit(revisit_at)
+                return True
+        return False
+
     async def mark_consumed(
         self, intent_id: str, *, now: datetime,
     ) -> bool:

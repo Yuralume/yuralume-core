@@ -15,7 +15,10 @@ from kokoro_link.contracts.object_storage import (
     ObjectStorageUnavailableError,
     StoredObject,
 )
-from kokoro_link.infrastructure.storage.keys import validate_object_key
+from kokoro_link.infrastructure.storage.keys import (
+    validate_object_key,
+    validate_purge_prefix,
+)
 
 
 class HttpObjectStorage:
@@ -142,6 +145,23 @@ class HttpObjectStorage:
             raise ObjectNotFoundError(source)
         data = self._parse_response(response)
         return _stored_from_json(data, public_base_url=self._public_base_url)
+
+    async def purge_prefix(self, *, prefix: str) -> int:
+        """CD1 ``SupportsPrefixPurge``: delete every object under ``prefix``.
+
+        Validated client-side with :func:`validate_purge_prefix` before it
+        ever leaves this process — the server re-validates independently,
+        but a caller building a bad prefix deserves a local error, not a
+        round trip that comes back 400.
+        """
+        safe_prefix = validate_purge_prefix(prefix)
+        response = await self._send(
+            "POST",
+            f"{self._base_url}/v1/objects/purge-prefix",
+            json={"prefix": safe_prefix},
+        )
+        data = self._parse_response(response)
+        return int(data.get("deleted") or 0)
 
     async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Issue one storage request; translate transport failures.

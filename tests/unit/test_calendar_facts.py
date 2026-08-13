@@ -115,7 +115,7 @@ def test_seasons_map_to_civil_quarters() -> None:
 
 
 def test_block_never_prescribes_behavior() -> None:
-    """Per project CLAUDE.md: calendar layer delivers facts only, must
+    """Per the LLM-first rule: calendar layer delivers facts only, must
     not tell the LLM what the character should do on this date."""
     facts = _facts(date(2026, 1, 1), {date(2026, 1, 1): "開國紀念日"})
     block = facts.to_prompt_block()

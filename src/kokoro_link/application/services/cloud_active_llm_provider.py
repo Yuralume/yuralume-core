@@ -12,6 +12,9 @@ from kokoro_link.application.services.cloud_identity_context import (
 from kokoro_link.application.services.cloud_identity_resolver import (
     CloudOperatorIdentityResolver,
 )
+from kokoro_link.application.services.output_language_policy import (
+    OperatorOutputLanguageResolver,
+)
 from kokoro_link.contracts.account_runtime_profile import (
     AccountRuntimeProfileResolverPort,
 )
@@ -26,6 +29,9 @@ from kokoro_link.contracts.cloud_routing_profile import (
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.infrastructure.llm.script_normalizer import (
+    bind_script_normalization,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +62,7 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             AccountRuntimeProfileResolverPort | None
         ) = None,
         routing_profile_port: CloudRoutingProfilePort | None = None,
+        output_language_resolver: OperatorOutputLanguageResolver | None = None,
     ) -> None:
         self._identity_resolver = identity_resolver
         self._model_factory = model_factory
@@ -65,6 +72,7 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             or PermissiveAccountRuntimeProfileResolver()
         )
         self._routing_profile_port = routing_profile_port
+        self._output_language_resolver = output_language_resolver
 
     async def resolve(
         self,
@@ -88,13 +96,41 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             operator_id=operator_id,
         )
         model = self._model_factory(resolved_feature_key, identity, preset)
-        if supports_vision is None:
-            return model
-        return _bind_vision(
+        if supports_vision is not None:
+            model = _bind_vision(
+                model,
+                supports_vision,
+                feature_key=resolved_feature_key,
+            )
+        return await self._maybe_bind_script_normalization(
             model,
-            supports_vision,
-            feature_key=resolved_feature_key,
+            character=character,
+            operator_id=operator_id,
         )
+
+    async def _maybe_bind_script_normalization(
+        self,
+        model: ChatModelPort,
+        *,
+        character: Character | None,
+        operator_id: str | None,
+    ) -> ChatModelPort:
+        """Bind Simplified→Traditional normalisation for players whose
+        content language wants it.
+
+        Mirrors ``PreferenceBackedActiveLLMProvider`` — hosted players
+        are the ones most exposed to the drift, since they can be routed
+        onto whichever upstream the tier preset points at. Unwired
+        resolver means no binding: the gate fails closed rather than
+        normalising output for a language it could not confirm.
+        """
+        if self._output_language_resolver is None:
+            return model
+        language_tag = await self._output_language_resolver.resolve(
+            character=character,
+            operator_id=operator_id,
+        )
+        return bind_script_normalization(model, language_tag=language_tag)
 
     async def resolve_model_id(
         self,
@@ -219,9 +255,12 @@ class CloudActiveLLMProvider(ActiveLLMProviderPort):
             character=character,
             operator_id=operator_id,
         )
-        if context is None:
-            return None
-        return await self._identity_resolver.resolve_context(context)
+        if context is not None:
+            return await self._identity_resolver.resolve_context(context)
+        ambient = current_cloud_actor()
+        if ambient is not None and ambient.gateway_identity is not None:
+            return ambient.gateway_identity
+        return None
 
     @staticmethod
     def _resource_context(

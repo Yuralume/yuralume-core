@@ -99,6 +99,9 @@ class _FakeCatalog(OfficialCardCatalogPort):
             return None
         return _artifact() if self.artifact is None else self.artifact
 
+    async def download_image(self, *, url: str) -> bytes | None:
+        return None
+
 
 def _artifact() -> bytes:
     manifest = CharacterCardManifest(

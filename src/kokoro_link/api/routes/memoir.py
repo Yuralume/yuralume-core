@@ -2,7 +2,7 @@
 
 Three endpoints — view, pin, unpin. The view is the only read side; all
 pin mutations are owner-only and idempotent / 404-safe so the UI can be
-fire-and-forget. See ``docs/MEMOIR_PLAN.md`` for the design rationale.
+fire-and-forget.
 """
 
 from __future__ import annotations

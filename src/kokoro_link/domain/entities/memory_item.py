@@ -66,8 +66,7 @@ class MemoryItem:
     participants: tuple[ParticipantRef, ...] = field(default_factory=tuple)
     """Who this memory is *about*, beyond the character themselves.
 
-    Phase 2 of the world-system roadmap (see ``docs/TODO.md`` §🟣):
-    the post-turn extractor records every named person that appeared
+    Phase 2 of the world-system roadmap: the post-turn extractor records every named person that appeared
     in the memory's content as a structured reference. This unblocks
     cross-character disambiguation later — A's memory of "B took the
     operator to ramen" carries actor_ids for both B (character) and

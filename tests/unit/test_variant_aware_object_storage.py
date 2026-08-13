@@ -680,6 +680,48 @@ def test_absent_capability_is_forwarded_as_absent() -> None:
         storage.iter_bytes  # noqa: B018
 
 
+@pytest.mark.asyncio
+async def test_purge_prefix_survives_the_decorator() -> None:
+    """CD1 ``SupportsPrefixPurge``: forwarded like ``iter_bytes`` — the
+    decorator declares no ``purge_prefix`` of its own, so ``__getattr__``
+    is the only thing standing between a caller and the inner adapter's
+    capability."""
+    inner = InMemoryObjectStorage()
+    storage = VariantAwareObjectStorage(inner)
+    await storage.put_bytes(
+        object_key=_ORIGINAL_KEY, content=_png_bytes(), content_type="image/png",
+    )
+
+    assert callable(getattr(storage, "purge_prefix", None))
+    deleted = await storage.purge_prefix(prefix="characters/char-1/")
+
+    assert deleted > 0
+    assert await inner.stat(object_key=_ORIGINAL_KEY) is None
+    for variant_key in _variant_keys(_ORIGINAL_KEY):
+        assert await inner.stat(object_key=variant_key) is None
+
+
+def test_purge_prefix_absent_on_inner_is_forwarded_as_absent() -> None:
+    """The counterpart to the write-side pin above: wrapping an adapter
+    that cannot purge a prefix must not appear to gain the capability —
+    an unconditional ``purge_prefix`` here would pass a caller's
+    ``getattr`` probe and then blow up (or silently no-op) for adapters
+    that never implemented it."""
+
+    class _CorePortOnly:
+        async def stat(self, *, object_key):  # noqa: ANN001, ANN202
+            return None
+
+        async def get_bytes(self, *, object_key):  # noqa: ANN001, ANN202
+            return b""
+
+    storage = VariantAwareObjectStorage(_CorePortOnly())  # type: ignore[arg-type]
+
+    assert getattr(storage, "purge_prefix", None) is None
+    with pytest.raises(AttributeError):
+        storage.purge_prefix  # noqa: B018
+
+
 def test_private_attributes_are_not_forwarded() -> None:
     """Keeps the wrapped adapter's internals encapsulated and keeps
     ``__getattr__`` from recursing on a half-built instance."""

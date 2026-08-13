@@ -46,6 +46,13 @@ class JobCapability(StrEnum):
 
     LLM = "llm"
     IMAGE = "image"
+    VIDEO_POLL = "video_poll"
+    """Observing an already-queued render — an HTTP GET plus, at most, one
+    artifact download. Deliberately NOT ``IMAGE``: that capability is
+    capped at 1 in-flight because it models a GPU, and letting a poll take
+    that slot would let a fifteen-minute clip block every feed picture on
+    the deployment. The work itself is cheap, so
+    its cap exists to bound sockets, not GPUs."""
     NONE = "none"
 
 
@@ -82,6 +89,18 @@ PENDING_FOLLOW_UP_RELEASE_KIND = "pending_follow_up_release"
 #: turn record id. The payload carries ids / flags ONLY — the worker re-reads the
 #: conversation to rebuild the turn text (§3.1 / §11 payload red line).
 POST_TURN_KIND = "post_turn"
+
+
+#: One observation of one in-flight LumeGram video job (CV4).
+#: Event-driven and **not** a per-character chain on purpose: a chain
+#: would make every character pay a due job every minute forever to serve the
+#: rare character that is actually waiting on a clip. Instead the submit point
+#: mints the first job, each poll that finds the job still running mints the
+#: next, and the coordinator's reconcile sweep re-mints any that were lost —
+#: the same "event first, reconcile as the safety net" shape as
+#: ``pending_follow_up_release``. The payload carries the pending row id only;
+#: the handler re-reads the row and re-verifies it is still pending.
+FEED_VIDEO_POLL_KIND = "feed_video_poll"
 
 
 # -- character-scoped kinds (the character_tick 8-step split) ---------------- #
@@ -135,6 +154,15 @@ class KindSpec:
     character_scoped: bool = True
     chained: bool = True
     event_driven: bool = False
+    #: Consulted for **one-shot** kinds only: whether this kind counts against
+    #: its capability's §5 concurrency ceiling. Chain kinds are always counted
+    #: (registry membership is the signal); one-shot kinds are exempt by
+    #: default — a player-owed release or a post-turn extraction must not queue
+    #: behind the background LLM ceiling. ``feed_video_poll`` opts in because
+    #: its ceiling is what bounds outbound sockets when a lot of clips are in
+    #: flight at once, and nothing is owed to a waiting player by polling
+    #: three seconds sooner.
+    counts_toward_capability_cap: bool = False
     #: A pair-scoped chain (``encounter_tick``): the chain key is a canonical pair
     #: id (relationship id), not a single character id, and the handler takes an
     #: atomic two-character pair lease. Mutually exclusive with
@@ -244,7 +272,7 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         # (last activity + the configured window), so the chain carries an
         # ``explicit_next_due`` rather than drifting on rechecks. It also
         # produces player-visible output the player already paid for
-        # (STORY_SCENE_PLAN §3.4 #2), which puts it above the deferrable
+        # which puts it above the deferrable
         # feed / upkeep tiers.
         priority=2,
         # The wrap-up is a model call (narration + the canon summary), so
@@ -315,6 +343,28 @@ EVENT_ONE_SHOT_KIND_REGISTRY: dict[str, KindSpec] = {
         character_scoped=False,
         chained=False,
         event_driven=True,
+    ),
+    FEED_VIDEO_POLL_KIND: KindSpec(
+        kind=FEED_VIDEO_POLL_KIND,
+        # Priority 4 — the feed tier, same as ``feed_compose``: this job is
+        # literally the second half of one, and a post that is already
+        # composed and paid for should not outrank a beat or a follow-up.
+        priority=4,
+        capability=JobCapability.VIDEO_POLL,
+        # One-shot: due at the pending row's ``next_poll_at``. The interval is
+        # unused (the chain never advances itself through the calculator —
+        # each poll mints the next job explicitly) but kept 0 to make that
+        # explicit.
+        base_interval_seconds=0.0,
+        handler="feed_video_poll",
+        # NOT background-gated. The clip was already rendered on somebody's
+        # GPU; stretching the observation cadence for an idle account would
+        # only leave a finished post unpublished for longer.
+        knob_gate=KnobGate.NONE,
+        character_scoped=False,
+        chained=False,
+        event_driven=True,
+        counts_toward_capability_cap=True,
     ),
 }
 
@@ -441,6 +491,13 @@ def social_pair_chain_kinds() -> tuple[str, ...]:
 DEFAULT_CAPABILITY_CAPS: dict[str, int] = {
     JobCapability.LLM.value: 3,
     JobCapability.IMAGE.value: 1,
+    # A video poll is one HTTP GET (and, on the one poll that finds a
+    # finished job, one artifact download). The ceiling is deliberately
+    # loose — it bounds concurrent sockets, not GPU time — because the
+    # whole reason this capability exists is that ``image``'s cap of 1
+    # would serialise every in-flight clip on the deployment. Env knob:
+    # ``YURALUME_BG_CAP_VIDEO_POLL``.
+    JobCapability.VIDEO_POLL.value: 8,
 }
 
 
@@ -453,13 +510,27 @@ def kinds_for_capability(capability: str) -> tuple[str, ...]:
     the character-scoped and cross-character social chains — a background encounter
     / dream / peer consolidation is an LLM job and must count against the §5 LLM
     ceiling just like proactive / beat. Returned in a stable order (character kinds
-    first, then social); empty for an unknown / uncapped capability."""
-    return tuple(
+    first, then social, then opted-in one-shots); empty for an unknown / uncapped
+    capability.
+
+    One-shot kinds are included only when they set
+    ``counts_toward_capability_cap``. The default ``False`` preserves the
+    historical exemption for the player-owed follow-up release and the
+    post-turn extraction — neither may queue behind the background LLM
+    ceiling."""
+    chained = tuple(
         kind
         for registry in (CHARACTER_KIND_REGISTRY, SOCIAL_KIND_REGISTRY)
         for kind, spec in registry.items()
         if spec.capability.value == capability
     )
+    one_shot = tuple(
+        kind
+        for kind, spec in EVENT_ONE_SHOT_KIND_REGISTRY.items()
+        if spec.counts_toward_capability_cap
+        and spec.capability.value == capability
+    )
+    return (*chained, *one_shot)
 
 
 def capability_kind_sets(

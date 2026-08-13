@@ -2,8 +2,8 @@
  * Centralised date / time / duration formatters keyed to the active
  * UI locale.
  *
- * Why centralised: docs/FRONTEND_I18N_PLAN.md §Formatter 規則 calls
- * out the risk of every component hand-writing `分鐘前` / `toLocaleString`.
+ * Why centralised: every component hand-writing `分鐘前` /
+ * `toLocaleString` is the drift this module exists to prevent.
  * One module = one place to tune.
  *
  * Time-zone strategy: callers pass the active user IANA timezone.

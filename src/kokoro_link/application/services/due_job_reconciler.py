@@ -97,6 +97,7 @@ class DueJobReconciler:
         reseed_jitter_seconds: int = _DEFAULT_RESEED_JITTER_SECONDS,
         follow_up_reconciler=None,  # noqa: ANN001 - PendingFollowUpReleaseReconciler
         social_reconciler=None,  # noqa: ANN001 - SocialDueJobReconciler
+        feed_video_reconciler=None,  # noqa: ANN001 - FeedVideoPollReconciler
     ) -> None:
         self._queue = queue
         self._characters = character_repository
@@ -115,6 +116,11 @@ class DueJobReconciler:
         # encounter) rides the same cadence + leader gate. Optional so the character
         # -chain reconcile keeps working where the social split is not wired.
         self._social_reconciler = social_reconciler
+        # CV4: in-flight LumeGram video jobs whose poll job was lost. Unlike a
+        # missed chain link — which costs one late tick — a lost poll means a
+        # composed, already-paid-for post that never appears at all, so this
+        # sweep is the difference between "late" and "gone".
+        self._feed_video_reconciler = feed_video_reconciler
 
     async def run_once(self, *, now: datetime | None = None) -> ReconcileResult:
         resolved = self._resolve_now(now)
@@ -203,6 +209,13 @@ class DueJobReconciler:
                 await self._social_reconciler.run_once(now=resolved)
             except Exception:
                 _LOGGER.exception("due-job reconciler: social sweep failed")
+        # Same leader, same cadence: re-mint the poll job for any in-flight
+        # video whose one-shot job went missing. Fail-soft, same as above.
+        if self._feed_video_reconciler is not None:
+            try:
+                await self._feed_video_reconciler.run_once(now=resolved)
+            except Exception:
+                _LOGGER.exception("due-job reconciler: feed video sweep failed")
         return ReconcileResult(
             reseeded=reseeded,
             skipped_chained=skipped_chained,

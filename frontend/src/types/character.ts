@@ -273,6 +273,19 @@ export interface Character {
    * ``""`` 等同未設定（沒有 prompt 注入）。
    */
   operator_pace_preference: OperatorPacePreference
+  /**
+   * EC 系列（雲端專屬角色）——``true`` 只在這是一張 IP 合作託管角色時
+   * 出現；後端刻意只在 ``true`` 時序列化這個 key，自架與一般角色的回應
+   * 完全不帶這個欄位，所以永遠用 ``character.managed`` 這種真值判斷、
+   * 不要假設 key 一定存在。為 ``true`` 時，上方大多數人設欄位
+   * （personality／interests／speaking_style／boundaries／aspirations／
+   * appearance／視覺生成欄位／personality_type／world_topics／
+   * excluded_topics 等）已被後端遮蔽為空值，玩家可調的只剩
+   * state／companions／disposition／proactive 節奏／
+   * operator_pace_preference 等欄位（見
+   * ``managed_character_update_policy.MANAGED_WRITABLE_UPDATE_FIELDS``）。
+   */
+  managed?: boolean
 }
 
 export interface CreateCharacterRequest {

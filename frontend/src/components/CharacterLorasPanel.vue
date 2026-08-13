@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { Character } from '@/types/character'
 import {
@@ -9,12 +9,23 @@ import {
   setCharacterLoraStrength,
   uploadCharacterLora,
 } from '@/utils/api/characters'
-import { UiButton } from '@/components/ui'
+import { UiButton, UiBadge } from '@/components/ui'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
 const props = defineProps<{
   character: Character
 }>()
+
+/**
+ * EC2-B/EC2-C gate. `loras` is licensor-owned on a managed (IP-partner)
+ * character: the server refuses all four mutating LoRA endpoints
+ * (`LoraManagedError` → 403, same family as `AlbumManagedError`), and the
+ * managed projection masks the field out of the response anyway — so the
+ * list this panel renders would be empty no matter what was attached.
+ * Showing the controls would offer writes that round-trip a 403 and then
+ * appear to have done nothing. Replaced with the standard notice instead.
+ */
+const isManaged = computed(() => props.character.managed === true)
 
 const emit = defineEmits<{
   updated: [char: Character]
@@ -31,6 +42,12 @@ const attachName = ref('')
 const attachStrength = ref(1.0)
 
 async function refreshAvailable() {
+  if (isManaged.value) {
+    // Nothing on this panel is actionable for a managed character, so the
+    // picker's backing list is never rendered — don't fetch it.
+    available.value = []
+    return
+  }
   try {
     available.value = await listAvailableLoras(props.character.id)
   } catch {
@@ -127,7 +144,7 @@ function extractError(err: unknown): string | null {
   <div class="loras-panel">
     <div class="loras-header">
       <h3 class="section-title">{{ t('characterLorasPanel.title') }}</h3>
-      <p class="field-hint">
+      <p v-if="!isManaged" class="field-hint">
         {{ t('characterLorasPanel.hintPrefix') }}
         <code>models/loras/</code>
         {{ t('characterLorasPanel.hintMiddle') }}
@@ -136,6 +153,12 @@ function extractError(err: unknown): string | null {
       </p>
     </div>
 
+    <div v-if="isManaged" class="managed-lora-notice">
+      <UiBadge variant="primary">{{ t('characterEdit.managed.loraBadge') }}</UiBadge>
+      <p class="managed-lora-notice__text">{{ t('characterEdit.managed.loraNotice') }}</p>
+    </div>
+
+    <template v-else>
     <div v-if="character.loras.length === 0" class="loras-empty">
       {{ t('characterLorasPanel.emptyPrefix') }} <code>.safetensors</code> {{ t('characterLorasPanel.emptySuffix') }}
     </div>
@@ -203,6 +226,7 @@ function extractError(err: unknown): string | null {
     </div>
 
     <div v-if="errorMsg" class="loras-error">{{ errorMsg }}</div>
+    </template>
   </div>
 </template>
 
@@ -224,6 +248,20 @@ function extractError(err: unknown): string | null {
 
 .field-hint {
   margin: 0;
+}
+
+.managed-lora-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2, 8px);
+}
+
+.managed-lora-notice__text {
+  margin: 0;
+  font-size: var(--font-sm, 13px);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 .field-hint code {

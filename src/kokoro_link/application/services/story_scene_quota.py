@@ -1,6 +1,6 @@
 """Per-tier daily ceiling on 起幕 (story scene) openings (SC3-B).
 
-STORY_SCENE_PLAN §2 #3 is deliberately "no hard cap in code, only a
+The design is deliberately "no hard cap in code, only a
 control-plane knob": hosted play already self-limits through per-action
 螢火 spend (§3.4 red line 2), so ``story_scene_daily_limit`` exists purely as
 an optional pacing guard rail an operator may dial in — the default (``None``)
@@ -18,7 +18,7 @@ timedelta(hours=24)``) and ``daily_overage_limit``
 "N per day" means from one of those does not get a different meaning here.
 
 **What counts.** A scene counts the moment it opens, whether it is later
-played to a close or abandoned (STORY_SCENE_PLAN §4.1 SC3-B: "按下去成功開場
+played to a close or abandoned (SC3-B: "按下去成功開場
 就算一次，玩家自己棄置不退還額度") — the count comes straight from
 ``StorySceneSessionRepositoryPort.count_opened_since``, which does not filter
 by status, so there is nothing here that could double- or under-count a
@@ -26,7 +26,7 @@ closed row.
 
 **Scope.** The ceiling is per *player* (operator), not per character: an
 operator with several characters shares one daily budget across all of them
-(STORY_SCENE_PLAN §4.1 SC3-B), so :meth:`StorySceneQuotaGuard.check` looks up
+so :meth:`StorySceneQuotaGuard.check` looks up
 every character the calling character's operator owns before counting.
 
 **Fail-closed on infrastructure failure.** If the operator's character list

@@ -28,6 +28,9 @@ from kokoro_link.contracts.rss_feed_fetcher import (
     RssFetchError,
 )
 from kokoro_link.contracts.rss_source import RssSourceRepositoryPort
+from kokoro_link.contracts.character_event_mention import (
+    CharacterEventMentionRepositoryPort,
+)
 from kokoro_link.contracts.world_event import WorldEventRepositoryPort
 from kokoro_link.domain.entities.rss_source import RssSource
 from kokoro_link.domain.entities.world_event import WorldEvent
@@ -75,12 +78,20 @@ class RssIngestionService:
         feed_fetcher: RssFeedFetcherPort,
         embedder: EmbedderPort,
         max_age_days: int = 7,
+        event_mention_repository: (
+            "CharacterEventMentionRepositoryPort | None"
+        ) = None,
     ) -> None:
         self._sources = rss_source_repository
         self._events = world_event_repository
         self._fetcher = feed_fetcher
         self._embedder = embedder
         self._max_age_days = max_age_days
+        # Mentions point into the pool this service prunes. PostgreSQL
+        # cascades them away with the event; self-host SQLite does not
+        # enforce foreign keys at all, so the same sweep has to say so
+        # explicitly or the table only ever grows there.
+        self._event_mentions = event_mention_repository
 
     async def ingest_all(self) -> IngestionReport:
         sources = await self._sources.list_all(enabled_only=True)
@@ -342,9 +353,20 @@ class RssIngestionService:
         """Delete events older than the retention window. The curator
         already filters out stale events from prompt injection, but
         the table grows unbounded if nothing prunes; running GC after
-        each ingest pass keeps it small."""
+        each ingest pass keeps it small.
+
+        Returns the number of *events* deleted — the mention sweep rides
+        along on the same cutoff (a mention of an event nobody can look
+        up is dead weight) and is best-effort: losing it costs disk, and
+        must never take the event GC down with it."""
         cutoff = datetime.now(timezone.utc) - _days(self._max_age_days * 2)
-        return await self._events.delete_older_than(cutoff)
+        deleted = await self._events.delete_older_than(cutoff)
+        if self._event_mentions is not None:
+            try:
+                await self._event_mentions.delete_older_than(cutoff)
+            except Exception:
+                logger.exception("world-event mention gc failed")
+        return deleted
 
 
 # A publish timestamp at or before this instant is a broken feed, not a

@@ -10,20 +10,39 @@ a section of the public page, so the shape is written out once, in
 {
   "generated_at": "…",
   "character": {"name": {…}, "persona": {…}, "avatar_url": "…",
-                "portrait_url": "…", "stats": {"days", "memories", "stories"}},
+                "portrait_url": "…", "timezone": "Asia/Taipei",
+                "stats": {"days", "memories", "stories"}},
   "now": {"time": "22:10", "text": {…}} | null,
-  "schedule": [{"time": "07:30", "text": {…}, "live": false}],
+  "schedule": [{"time": "07:30", "text": {…}, "end": "09:00", "live": false}],
   "posts": [{"id", "kind", "created_at", "text": {…}, "image_url"?}]
 }
 ```
 
+``character.timezone`` is the IANA name the character's schedule resolves
+against (see ``timezone_for_character`` in
+:mod:`kokoro_link.application.services.showcase.service`). It lets the
+portal pick the *current* schedule entry client-side instead of trusting
+whichever block was "live" at publish time — a snapshot that is hours or
+a day old otherwise freezes "now" at the moment it was generated. A
+consumer built before this field existed simply doesn't read it; nothing
+here depends on it being present.
+
+``schedule[].time`` and ``schedule[].end`` are local wall-clock ``HH:MM``
+in that timezone, and the interval is **end-exclusive**: the block in
+progress is the one satisfying ``time <= clock < end``. That is what
+makes an unscheduled gap and a finished day render as *nothing* rather
+than as the previous block still running — with starts alone a client
+can only ever say "the most recent block that has begun", which is the
+same answer at 09:00 and at 23:00. ``end`` is ``"24:00"`` for a block
+that runs to the end of the civil day: the stored instant is next-day
+midnight, and the literal ``"00:00"`` would compare below its own start
+and empty the interval (see ``filters._end_label``).
+
 Two rules the builder enforces rather than trusts:
 
-* **No partial locales on a post.** A post arriving without every target
-  locale is dropped with a warning. A wall where the Japanese visitor
-  hits a Chinese paragraph mid-scroll is worse than a shorter wall. The
-  caller (the control plane) owns the translation cache and decides when
-  to pay for a missing locale; this function decides what ships.
+* **Translation is fail-open.** A missing target locale is retried by the
+  control plane on the next sync, but the current wall uses the Chinese
+  source text with a warning instead of delaying the post.
 * **Absolute URLs only.** Stored media URLs are server-relative
   (``/v1/public/…``); a page on another origin cannot resolve those, so
   ``base_url`` is applied here and a URL that cannot be made absolute is
@@ -76,6 +95,14 @@ class CharacterCard:
     """Defaults to the portrait when unset: both come from
     ``characters.image_urls[0]``, and the portal picks a rendition via the
     existing ``?v=`` variant query rather than being handed two files."""
+    timezone: str = "UTC"
+    """IANA name the character's schedule resolves against — the same
+    value :func:`~kokoro_link.application.services.showcase.service.
+    ShowcaseService._snapshot_context` already resolves via
+    ``timezone_for_character`` to pick the schedule's "now" entry, just
+    carried as a string instead of consumed. ``"UTC"`` is the same
+    fallback ``timezone_for_character`` itself returns when no schedule
+    service is wired."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +169,7 @@ def build_snapshot(
             ),
             "avatar_url": avatar or "",
             "portrait_url": portrait or "",
+            "timezone": card.timezone,
             "stats": {
                 "days": card.days,
                 "memories": card.memories,
@@ -149,7 +177,7 @@ def build_snapshot(
             },
         },
         "now": _activity_json(
-            now_entry, resolved_locales, translate, result, include_live=False,
+            now_entry, resolved_locales, translate, result, strip_entry=False,
         ),
         "schedule": [
             entry
@@ -159,7 +187,7 @@ def build_snapshot(
                     resolved_locales,
                     translate,
                     result,
-                    include_live=True,
+                    strip_entry=True,
                 )
                 for activity in schedule
             )
@@ -179,31 +207,37 @@ def _posts_json(
     out: list[dict[str, object]] = []
     for post in posts:
         text: dict[str, str] = {}
+        source_text = (post.text.get(SOURCE_LOCALE) or "").strip()
+        if not source_text:
+            result.skipped_posts.append(post.id)
+            result.warnings.append(f"post {post.id}: 缺原文，跳過")
+            continue
         missing: list[str] = []
         for locale in locales:
             value = (post.text.get(locale) or "").strip()
             if value:
                 text[locale] = value
             else:
+                text[locale] = source_text
                 missing.append(locale)
         if missing:
-            result.skipped_posts.append(post.id)
             result.warnings.append(
-                f"post {post.id}: 缺 {','.join(missing)} 譯文，跳過"
-                "（不出殘缺語系）",
+                f"post {post.id}: 缺 {','.join(missing)} 譯文，沿用中文原文",
             )
+        image = _absolute(
+            post.image_url, root, result, label=f"post {post.id} image_url",
+        )
+        if not image:
+            result.skipped_posts.append(post.id)
+            result.warnings.append(f"post {post.id}: 缺可用圖片，跳過")
             continue
         payload: dict[str, object] = {
             "id": post.id,
             "kind": post.kind,
             "created_at": post.created_at,
             "text": text,
+            "image_url": image,
         }
-        image = _absolute(
-            post.image_url, root, result, label=f"post {post.id} image_url",
-        )
-        if image:
-            payload["image_url"] = image
         out.append(payload)
     return out
 
@@ -214,18 +248,25 @@ def _activity_json(
     translate,  # noqa: ANN001
     result: SnapshotResult,
     *,
-    include_live: bool,
+    strip_entry: bool,
 ) -> dict[str, object] | None:
-    """``include_live=False`` for ``now``: the contract gives that object
-    ``time`` + ``text`` only, and "the current block is live" is a
-    tautology anyway."""
+    """``strip_entry=False`` for ``now``, which the contract gives
+    ``time`` + ``text`` only.
+
+    Both extra fields are strip business. ``live`` is a tautology on
+    ``now``, and ``end`` is there so a *client* can work out its own
+    current block from the strip — ``now`` is the publish-time answer to
+    that same question, so handing it bounds would just invite a consumer
+    to re-derive a staler answer than the strip already supports.
+    """
     if activity is None:
         return None
     payload: dict[str, object] = {
         "time": activity.time,
         "text": _live_text(activity.text, locales, translate, result),
     }
-    if include_live:
+    if strip_entry:
+        payload["end"] = activity.end
         payload["live"] = bool(activity.live)
     return payload
 

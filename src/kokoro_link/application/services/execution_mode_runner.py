@@ -78,6 +78,7 @@ from kokoro_link.contracts.character_relationship import (
 )
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
 from kokoro_link.contracts.due_jobs import (
+    FEED_VIDEO_POLL_KIND,
     PENDING_FOLLOW_UP_RELEASE_KIND,
     POST_TURN_KIND,
     is_character_chain_kind,
@@ -165,6 +166,7 @@ class ExecutionModeRunner:
         ) = None,
         pending_follow_up_release_handler=None,  # noqa: ANN001 - PendingFollowUpReleaseHandler
         post_turn_handler=None,  # noqa: ANN001 - PostTurnHandler
+        feed_video_poll_handler=None,  # noqa: ANN001 - FeedVideoPollHandler
     ) -> None:
         self._queue = queue
         self._characters = character_repository
@@ -197,6 +199,11 @@ class ExecutionModeRunner:
         # ``post_turn`` job is routed here (rebuild turn text from ids + run the shared
         # ``_do_post_turn``) instead of the tick body.
         self._post_turn_handler = post_turn_handler
+        # CV4: the event-driven one-shot poll of an in-flight LumeGram video
+        # job. Wired only where the deferred pipeline can run (a video
+        # provider that takes jobs); unwired everywhere else, and a claimed
+        # job of that kind then reports "handler unwired" like any other.
+        self._feed_video_poll_handler = feed_video_poll_handler
 
     async def execute(
         self,
@@ -217,6 +224,7 @@ class ExecutionModeRunner:
         # legacy whole-tick kinds keep their existing bodies (redrive compat).
         is_release_kind = kind == PENDING_FOLLOW_UP_RELEASE_KIND
         is_post_turn_kind = kind == POST_TURN_KIND
+        is_video_poll_kind = kind == FEED_VIDEO_POLL_KIND
         is_character_kind = is_character_chain_kind(kind)
         is_social_kind = is_social_chain_kind(kind)
         if (
@@ -224,6 +232,7 @@ class ExecutionModeRunner:
             and not is_social_kind
             and not is_release_kind
             and not is_post_turn_kind
+            and not is_video_poll_kind
             and kind not in (
                 CHARACTER_TICK_KIND, CHARACTER_WARMUP_KIND, SOCIAL_TICK_KIND,
             )
@@ -254,6 +263,11 @@ class ExecutionModeRunner:
                 "execution runner: post-turn job=%s but handler unwired", kind,
             )
             return self._handler_unwired(kind)
+        if is_video_poll_kind and self._feed_video_poll_handler is None:
+            _LOGGER.warning(
+                "execution runner: video poll job=%s but handler unwired", kind,
+            )
+            return self._handler_unwired(kind)
         # social_tick + the social per-kind chains are cross-character / pair work
         # (an ``encounter_tick`` job's character_id slot is a canonical pair id, not
         # a character, so the worker's single-character ``would_run`` never applies);
@@ -261,10 +275,19 @@ class ExecutionModeRunner:
         # frozen re-gating (post-turn re-verifies the character inside
         # ``run_post_turn_for_record``). Each of these owns its own per-target
         # validation in its handler.
+        #
+        # ``feed_video_poll`` joins them for a different reason: the post it
+        # lands was composed, gated and paid for at submit time. A character
+        # that has since gone quiet, busy or over its cadence must still get
+        # the post it is already owed — re-applying the tick's would-run here
+        # would strand it until the job timed out into a picture.
         effective_would_run = (
             True
             if kind in (
-                SOCIAL_TICK_KIND, PENDING_FOLLOW_UP_RELEASE_KIND, POST_TURN_KIND,
+                SOCIAL_TICK_KIND,
+                PENDING_FOLLOW_UP_RELEASE_KIND,
+                POST_TURN_KIND,
+                FEED_VIDEO_POLL_KIND,
             )
             or is_social_kind
             else would_run
@@ -283,6 +306,8 @@ class ExecutionModeRunner:
                 return await self._release_follow_up(job, resolved, abort)
             if is_post_turn_kind:
                 return await self._post_turn(job, resolved, abort)
+            if is_video_poll_kind:
+                return await self._feed_video_poll(job, resolved, abort)
             if is_character_kind:
                 return await self._character_kind(job, bucket, resolved, abort)
             if is_social_kind:
@@ -461,6 +486,26 @@ class ExecutionModeRunner:
         if abort.is_set():
             return {"executed": False, "kind": job.kind, "reason": "aborted"}
         result = await self._post_turn_handler.handle(job, now=now)
+        return {
+            "executed": result.executed,
+            "kind": job.kind,
+            "reason": result.reason,
+        }
+
+    async def _feed_video_poll(
+        self, job: ClaimedJob, now: datetime, abort: _AbortFlag,
+    ) -> Mapping[str, Any]:
+        """CV4: one observation of an in-flight LumeGram video job (one-shot).
+
+        A lost lease before we start skips: the row stays pending and due,
+        so the reclaiming worker — or the reconcile sweep — picks it up
+        unchanged. Mid-run the compare-and-swap on the pending row is the
+        real guard: only the poll that flips it out of ``pending`` may
+        publish, so even a duplicate observation cannot double-post."""
+        assert self._feed_video_poll_handler is not None
+        if abort.is_set():
+            return {"executed": False, "kind": job.kind, "reason": "aborted"}
+        result = await self._feed_video_poll_handler.handle(job, now=now)
         return {
             "executed": result.executed,
             "kind": job.kind,

@@ -1,7 +1,7 @@
 /**
  * Admin → Developer Docs registry.
  *
- * Single source of truth per D9 (CUSTOM_MEDIA_GATEWAY_SPEC_AND_COMFYUI_PLAN.md):
+ * Single source of truth per D9:
  * doc content is `?raw`-imported straight from the repo's `docs/*.md` files at
  * build time, so the Admin page is always byte-identical to the shipped repo
  * document — no separate copy to keep in sync.

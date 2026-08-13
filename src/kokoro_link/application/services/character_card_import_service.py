@@ -1,6 +1,6 @@
 """Import a ``.lumecard`` blob into a brand-new character.
 
-Pipeline (see ``docs/CHARACTER_CARD_PLAN.md`` §4):
+Pipeline:
 
 1. Unpack + validate the zip (schema_version, manifest schema).
 2. Land each bundled arc template as a row owned by the importer,
@@ -114,6 +114,20 @@ class CharacterCardImportError(CharacterCardError):
 class UnsupportedCardSchemaError(CharacterCardImportError):
     """The card declares a ``schema_version`` newer than this build can
     read — refuse rather than silently dropping fields we don't know."""
+
+
+@dataclass(frozen=True, slots=True)
+class LandedArcMaterial:
+    """Outcome of landing bundled arc templates + series (CB3 seam).
+
+    ``template_id_map`` / ``series_id_map`` only carry entries whose id
+    had to be remapped on collision; ``landed_*_ids`` are the ids that
+    actually exist as importer-owned rows afterwards."""
+
+    template_id_map: dict[str, str]
+    landed_template_ids: list[str]
+    series_id_map: dict[str, str]
+    landed_series_ids: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +258,52 @@ class CharacterCardImportService:
             landed_arc_series_ids=landed_series_ids,
         )
 
+    async def land_arc_material(
+        self,
+        *,
+        arc_templates: dict[str, str],
+        bundled_series: list[CharacterCardArcSeriesBundle],
+        user_id: str,
+        target_character_ref_map: dict[str, str],
+        landed_template_sink: list[str] | None = None,
+        landed_series_sink: list[str] | None = None,
+    ) -> LandedArcMaterial:
+        """Land bundled arc templates + series for a non-card caller.
+
+        The `.lumebackup` restore (CB3) carries the exact same YAML
+        template members and ``CharacterCardArcSeriesBundle`` shapes as a
+        ``.lumecard`` and must land them identically — collision remap,
+        GF6 cloud tone folding, member-ref rewiring included — so this is
+        the two private landing steps exposed as one seam instead of a
+        second copy of their logic. No translation (a backup restores the
+        owner's own prose verbatim).
+
+        ``landed_template_sink`` / ``landed_series_sink`` are appended to
+        *as each item lands* (A8): a caller whose failure cleanup needs
+        the landed ids must see them even when this call raises midway —
+        returning the lists only at the end left every id landed before
+        the exception invisible to the cleanup, i.e. orphaned rows.
+        """
+        arc_id_map, landed_template_ids = await self._land_arc_templates(
+            arc_templates,
+            user_id=user_id,
+            target_character_ref_map=target_character_ref_map,
+            sink=landed_template_sink,
+        )
+        series_id_map, landed_series_ids = await self._land_arc_series(
+            bundled_series,
+            arc_id_map=arc_id_map,
+            landed_template_ids=landed_template_ids,
+            user_id=user_id,
+            sink=landed_series_sink,
+        )
+        return LandedArcMaterial(
+            template_id_map=arc_id_map,
+            landed_template_ids=landed_template_ids,
+            series_id_map=series_id_map,
+            landed_series_ids=landed_series_ids,
+        )
+
     async def preview_card(
         self,
         blob: bytes,
@@ -369,6 +429,7 @@ class CharacterCardImportService:
         target_character_ref_map: dict[str, str],
         translate: bool = False,
         target_language: str | None = None,
+        sink: list[str] | None = None,
     ) -> tuple[dict[str, str], list[str]]:
         """Parse + persist each bundled template as a row owned by the
         importer.
@@ -382,12 +443,15 @@ class CharacterCardImportService:
         Returns ``(id_map, landed_ids)`` where ``id_map`` maps an
         original bundled id to its remapped id (only when a collision
         forced a rename) and ``landed_ids`` are the ids actually written
-        (post-remap), in filename order."""
+        (post-remap), in filename order.
+
+        ``sink``, when given, is used AS the landed-ids list so appends
+        are visible to the caller mid-flight (A8)."""
+        landed_ids: list[str] = sink if sink is not None else []
         if not arc_templates or self._arc_template_repository is None:
-            return {}, []
+            return {}, landed_ids
 
         id_map: dict[str, str] = {}
-        landed_ids: list[str] = []
         for filename in sorted(arc_templates):
             yaml_text = arc_templates[filename]
             fallback_id = PurePosixPath(filename).stem
@@ -461,18 +525,22 @@ class CharacterCardImportService:
         arc_id_map: dict[str, str],
         landed_template_ids: list[str],
         user_id: str,
+        sink: list[str] | None = None,
     ) -> tuple[dict[str, str], list[str]]:
         """Persist bundled series as importer-owned rows.
 
         Member refs are rewired to the landed template ids. A series is
         skipped if any member template failed to land, preventing dangling
         authoring refs from entering the importer's workspace.
+
+        ``sink``, when given, is used AS the landed-ids list so appends
+        are visible to the caller mid-flight (A8).
         """
+        landed_ids: list[str] = sink if sink is not None else []
         if not bundled_series or self._arc_series_repository is None:
-            return {}, []
+            return {}, landed_ids
 
         id_map: dict[str, str] = {}
-        landed_ids: list[str] = []
         for bundled in bundled_series:
             member_ids: list[str] = []
             missing_ref = False
@@ -625,5 +693,6 @@ __all__ = [
     "CharacterCardImportService",
     "ImportedCard",
     "InvalidCharacterCardError",
+    "LandedArcMaterial",
     "UnsupportedCardSchemaError",
 ]

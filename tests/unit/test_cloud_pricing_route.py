@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from kokoro_link.api.app import create_app
+from kokoro_link.api.dependencies import get_current_user
 from kokoro_link.api.routes.cloud_pricing import router as cloud_pricing_router
 from kokoro_link.bootstrap.settings import AppSettings, CloudSettings
 from kokoro_link.application.services.cloud_pricing_service import (
@@ -31,10 +32,10 @@ from kokoro_link.contracts.cloud_action_pricing import (
 class _StubPricingService:
     def __init__(self, snapshot: PricingSnapshot | None) -> None:
         self._snapshot = snapshot
-        self.calls: list[bool] = []
+        self.calls: list[tuple[str, bool]] = []
 
-    async def get_pricing(self, *, refresh: bool = False):
-        self.calls.append(refresh)
+    async def get_pricing(self, tier_name: str, *, refresh: bool = False):
+        self.calls.append((tier_name, refresh))
         return self._snapshot
 
 
@@ -66,7 +67,11 @@ def _client(
     app.include_router(cloud_pricing_router, prefix="/api/v1")
     app.state.container = SimpleNamespace(
         app_settings=SimpleNamespace(cloud=SimpleNamespace(active=cloud_active)),
-        cloud_pricing_service=service,
+        cloud_tier_pricing_service=service,
+        cloud_pricing_service=None,
+    )
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        cloud_tenant_tier="internal_test",
     )
     return TestClient(app)
 
@@ -102,7 +107,7 @@ def test_refresh_is_forwarded_to_the_cache() -> None:
 
     client.get("/api/v1/cloud/pricing", params={"refresh": "true"})
 
-    assert service.calls == [True]
+    assert service.calls == [("internal_test", True)]
 
 
 def test_stale_is_reported_rather_than_hidden() -> None:

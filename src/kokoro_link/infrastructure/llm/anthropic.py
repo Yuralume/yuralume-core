@@ -65,9 +65,17 @@ class AnthropicChatModel(ChatModelPort):
         supports_vision: bool = True,
         max_tokens: int = 4096,
         thinking_budget_tokens: int | None = None,
+        provider_id: str | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("AnthropicChatModel requires an api_key")
+        # Registry identity. Defaults to the class-level ``"anthropic"``;
+        # a BYOK row with a connection slug passes its row-scoped id so
+        # two Anthropic connections (e.g. two accounts) can coexist in the
+        # registry instead of overwriting each other. ``copy.copy`` in the
+        # override binders carries the instance attribute along.
+        if provider_id:
+            self.provider_id = provider_id
         self.supports_vision = supports_vision
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")

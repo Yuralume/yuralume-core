@@ -1,4 +1,4 @@
-"""Scheduler metrics registry (HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §12 / Phase 0).
+"""Scheduler metrics registry.
 
 A tiny, dependency-free Prometheus exposition source for the proactive
 scheduler. It records the timing + character-count shape of the most recent

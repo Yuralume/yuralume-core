@@ -545,3 +545,130 @@ async def test_a_failed_artifact_download_is_none_and_never_cached() -> None:
 
     reader.failure = OfficialCardCatalogUnavailable("cloud is down")
     assert await cache.download_artifact("mio-cafe") is None
+
+
+# --------------------------------------------------------------------------- #
+# cloud-exclusive cards (EC4)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_row_carries_its_distribution() -> None:
+    body = {
+        **_CATALOG_BODY,
+        "cards": [{**_CATALOG_BODY["cards"][0], "distribution": "cloud_exclusive"}],
+    }
+
+    cards = await _client(lambda _r: _json_response(body)).fetch_catalog(
+        locale="ja",
+    )
+
+    assert cards[0].distribution == "cloud_exclusive"
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_the_field_is_read_as_public() -> None:
+    # A catalog that predates exclusivity has no exclusive cards to
+    # describe; defaulting the other way would grey out every install.
+    cards = await _client(lambda _r: _json_response(_CATALOG_BODY)).fetch_catalog(
+        locale="ja",
+    )
+
+    assert cards[0].distribution == "public"
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_artifact_url_is_how_a_detail_says_cloud_exclusive(
+) -> None:
+    body = {
+        **_DETAIL_BODY,
+        "card": {**_DETAIL_BODY["card"], "artifact_url": None, "profile": {}},
+    }
+
+    detail = await _client(lambda _r: _json_response(body)).fetch_card(
+        "mio-cafe", locale="ja",
+    )
+
+    assert detail.artifact_published is False
+    assert detail.cloud_exclusive is True
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_detail_is_not_exclusive() -> None:
+    detail = await _client(lambda _r: _json_response(_DETAIL_BODY)).fetch_card(
+        "mio-cafe", locale="ja",
+    )
+
+    assert detail.cloud_exclusive is False
+
+
+@pytest.mark.asyncio
+async def test_a_detail_with_no_artifact_key_at_all_is_not_exclusive() -> None:
+    # A missing key is a Cloud from before exclusivity existed, where every
+    # published card had an artifact — different from a key set to null.
+    card = {key: value for key, value in _DETAIL_BODY["card"].items()
+            if key != "artifact_url"}
+
+    detail = await _client(
+        lambda _r: _json_response({**_DETAIL_BODY, "card": card}),
+    ).fetch_card("mio-cafe", locale="ja")
+
+    assert detail.cloud_exclusive is False
+
+
+@pytest.mark.asyncio
+async def test_stage_image_bytes_download_from_the_catalogs_own_origin() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=b"\x89PNG")
+
+    data = await _client(handler).fetch_image(
+        "https://app.yuralume.com/api/user"
+        "/v1/public/official-cards/mio-cafe/images/0",
+    )
+
+    assert data == b"\x89PNG"
+    assert seen == [
+        "https://app.yuralume.com/api/user"
+        "/v1/public/official-cards/mio-cafe/images/0",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    # A different host that merely starts with the same characters.
+    "https://app.yuralume.com.evil.test/api/user/v1/public/x/images/0",
+    # A different host entirely.
+    "https://evil.test/v1/public/official-cards/mio-cafe/images/0",
+    # The right host, outside the mount prefix.
+    "https://app.yuralume.com/internal/secrets",
+    # Not http at all.
+    "file:///etc/passwd",
+])
+async def test_an_image_url_outside_the_asset_origin_is_never_fetched(
+    url: str,
+) -> None:
+    # The URL arrives inside a document, and a document is data: without
+    # this a catalog answer could aim an outbound request from inside the
+    # deployment at anywhere at all.
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError(f"must not fetch {request.url}")
+
+    with pytest.raises(OfficialCardCatalogUnavailable):
+        await _client(handler).fetch_image(url)
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_image_is_hung_up_on_rather_than_held() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=b"x" * (official_card_catalog_client.MAX_IMAGE_BYTES + 1),
+        )
+
+    with pytest.raises(OfficialCardCatalogUnavailable):
+        await _client(handler).fetch_image(
+            "https://app.yuralume.com/api/user"
+            "/v1/public/official-cards/mio-cafe/images/0",
+        )

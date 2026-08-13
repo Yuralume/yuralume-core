@@ -6,7 +6,7 @@ import { UiBadge, UiCard } from '@/components/ui'
 import { DEV_DOCS, resolveDevDoc } from '@/utils/devDocs'
 import { renderDevDocMarkdown } from '@/utils/devDocsMarkdown'
 
-// Admin → Developer Docs (D9/D10, CUSTOM_MEDIA_GATEWAY_SPEC_AND_COMFYUI_PLAN.md):
+// Admin → Developer Docs (D9/D10):
 // a small registry-backed reader for repo-shipped developer specs. Doc list
 // UI chrome is i18n; the markdown body stays English (D6) — it is developer
 // -facing spec content, not app UI copy.
@@ -133,7 +133,7 @@ function selectDoc(slug: string): void {
 /* Rendered markdown body: scoped layout only (spacing/scroll), no color or
    font overrides here — those come from the shared markdown typography
    below so headings/code/links stay legible on the dark theme without
-   duplicating base visual styles per CLAUDE.md's global-form-style rule. */
+   duplicating base visual styles per the global form-style rule. */
 .dev-docs__body {
   max-width: 78ch;
   overflow-x: auto;

@@ -1,7 +1,6 @@
 """SQLAlchemy memoir pin repository.
 
-See ``docs/MEMOIR_PLAN.md`` for the design rationale and
-``src/kokoro_link/contracts/memoir.py`` for the port spec.
+See ``src/kokoro_link/contracts/memoir.py`` for the port spec.
 """
 
 from __future__ import annotations

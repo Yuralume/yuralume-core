@@ -2,6 +2,9 @@
 
 from datetime import datetime, timedelta
 
+from kokoro_link.application.services.messaging_failure_reporter import (
+    MAX_ERROR_LENGTH,
+)
 from kokoro_link.contracts.messaging import MessagingAccountRepositoryPort
 from kokoro_link.domain.entities.messaging_account import MessagingAccount
 from kokoro_link.domain.value_objects.delivery_mode import DeliveryMode
@@ -187,8 +190,13 @@ class InMemoryMessagingAccountRepository(MessagingAccountRepositoryPort):
         account = self._by_id.get(account_id)
         if account is None or account.polling_lock_owner != owner_id:
             return False
+        # Truncate to match SAMessagingAccountRepository's column
+        # truncation — otherwise this dev/test double stores errors the
+        # real repository would have cut short, and a bug that only
+        # surfaces past the truncation boundary would never reproduce
+        # against this repository.
         self._by_id[account_id] = account.with_polling_progress(
-            checked_at=at, error=error, now=at,
+            checked_at=at, error=error[:MAX_ERROR_LENGTH], now=at,
         )
         return True
 

@@ -6,7 +6,6 @@ never mirrors that state — it proxies a display-only snapshot so the in-game
 badge can answer the one question the player has mid-play: *how much is left?*
 Every detail view (per-charge ledger, top-up) stays in the Portal.
 
-See ``Yuralume-Cloud/docs/plans/HOSTED_PLAYER_UX_PLAN.md`` §4.
 """
 
 from __future__ import annotations

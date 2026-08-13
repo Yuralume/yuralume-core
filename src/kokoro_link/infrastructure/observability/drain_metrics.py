@@ -1,6 +1,6 @@
 """Prometheus rendering for the rolling-deploy drain surface (GD1-A).
 
-``HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN`` §7.3 GD1 step 3 makes these two series
+GD1 step 3 makes these two series
 load-bearing rather than merely informative: after the router stops sending the
 replica traffic and the drain request lands, ``deploy.sh`` polls
 ``yuralume_core_active_turns`` down to zero (capped at 180s, §7.2-2) before it

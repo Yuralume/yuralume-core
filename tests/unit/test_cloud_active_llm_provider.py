@@ -8,12 +8,14 @@ from kokoro_link.application.services.cloud_active_llm_provider import (
 from kokoro_link.application.services.cloud_identity_resolver import (
     CloudOperatorIdentityResolver,
 )
+from kokoro_link.application.services.cloud_identity_context import cloud_actor_scope
 from kokoro_link.application.services.account_runtime_profile import (
     AccountRuntimeProfileResolver,
 )
 from kokoro_link.application.services.feature_keys import (
     FEATURE_CHARACTER_DRAFT,
     FEATURE_CHAT,
+    FEATURE_OFFICIAL_CARD_TRANSLATE,
     FEATURE_POST_TURN,
 )
 from kokoro_link.application.services.cloud_routing_profile_cache import (
@@ -278,6 +280,47 @@ async def test_profile_mode_resolves_preset_with_no_env_presets() -> None:
     # The profile is fetched for the demo-tier scope of the forwarded identity, with
     # user_id = the player's cloud account id so user-scope preferences resolve (§6).
     assert port.scopes == [("tenant_1", "acct_1", "acct_1", "demo")]
+
+
+@pytest.mark.asyncio
+async def test_profile_mode_uses_request_scoped_gateway_identity_without_operator_projection() -> None:
+    repo = InMemoryOperatorProfileRepository()
+    port = _RecordingProfilePort(
+        _routing_profile(
+            llm_presets={FEATURE_OFFICIAL_CARD_TRANSLATE: "official-preset"},
+            strict=True,
+        )
+    )
+    factory_calls: list[tuple[str, CloudGatewayIdentity | None, str]] = []
+
+    def factory(feature_key, identity, default_model):
+        factory_calls.append((feature_key, identity, default_model))
+        return _model_factory(feature_key, identity, default_model)
+
+    provider = CloudActiveLLMProvider(
+        identity_resolver=CloudOperatorIdentityResolver(repository=repo),
+        model_factory=factory,
+        model_presets={},
+        routing_profile_port=port,
+    )
+    identity = CloudGatewayIdentity(
+        operator_id="cloud:owner-account",
+        account_id="owner-account",
+        tenant_id="owner-tenant",
+        character_ref="official-card-catalog",
+        tenant_tier="internal_test",
+    )
+
+    with cloud_actor_scope(gateway_identity=identity):
+        model = await provider.resolve(FEATURE_OFFICIAL_CARD_TRANSLATE)
+
+    assert await model.list_models() == ["official-preset"]
+    assert port.scopes == [
+        ("owner-tenant", "owner-account", "owner-account", "internal_test")
+    ]
+    assert factory_calls == [
+        (FEATURE_OFFICIAL_CARD_TRANSLATE, identity, "official-preset")
+    ]
 
 
 @pytest.mark.asyncio

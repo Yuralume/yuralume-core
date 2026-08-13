@@ -88,7 +88,7 @@ FEATURE_STORY_SCENE_CLOSE = "story_scene_close"
 Shared by the manual "end scene" button and the idle-timeout closer, so
 the scene always lands as canon with the same voice. Never invents player
 actions — the closing narration takes the "after you left, she…"
-perspective (STORY_SCENE_PLAN §3.4 red line 1).
+perspective (red line 1).
 """
 
 FEATURE_STORY_SCENE_CHIPS = "story_scene_chips"
@@ -177,6 +177,26 @@ Scoped to feed-only for now — chat-tool clips and branching-drama
 scene videos are future surfaces that'll add their own keys when /
 if we decide to ship them. Wan2.2 generation takes minutes and costs
 real GPU time, so each new surface needs an explicit budget decision."""
+
+FEATURE_VIDEO_STORYBOARD = "video_storyboard"
+"""I2V storyboard author for LumeGram short clips.
+
+An **LLM** key, not a video-profile one (``video_feed`` above picks the
+renderer; this one picks the model that writes what the renderer is
+told to do). It reads the already-rendered first frame *as an image*,
+plus the post draft and the character's appearance context, and returns
+one detailed English cinematography prompt for the 5-second image-to-
+video pass: camera move, subject motion, environment, lighting, beat
+pacing and ambient audio cues.
+
+Vision is a hard requirement — the whole point is that the clip must
+start from the exact frame the image step produced, so the model has to
+see it. Route it to a vision-capable preset; when nothing is routed the
+caller falls back to the composer's own ``video_prompt`` rather than
+blocking the post.
+
+Background work: the character posts on its own tick, so this key never
+raises a hosted charge."""
 
 FEATURE_ARC_TEMPLATE_INTAKE = "arc_template_intake"
 """Wizard-driven arc template authoring (Phase 2.7). Per-step LLM
@@ -587,6 +607,7 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_ARC_CONTINUATION_DRAFT,
     FEATURE_FEED_COMPOSE,
     FEATURE_FEED_COMMENT_REPLY,
+    FEATURE_VIDEO_STORYBOARD,
     FEATURE_ACTIVITY_AFTERMATH,
     FEATURE_SCHEDULE_WEATHER_DRIFT,
     FEATURE_IDLE_DRIFT,
@@ -696,6 +717,7 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_ARC_CONTINUATION_DRAFT: "ArcSeries next-season draft",
     FEATURE_FEED_COMPOSE: "動態貼文撰寫",
     FEATURE_FEED_COMMENT_REPLY: "動態留言回覆",
+    FEATURE_VIDEO_STORYBOARD: "短影片：起始圖分鏡撰寫",
     FEATURE_ACTIVITY_AFTERMATH: "行程情緒尾韻",
     FEATURE_SCHEDULE_WEATHER_DRIFT: "行程天氣脫節矯正",
     FEATURE_IDLE_DRIFT: "久未互動的情緒漂移",
@@ -774,7 +796,8 @@ FEATURE_GROUP_DESCRIPTIONS: dict[str, str] = {
         "玩家會直接看到或感受到的角色聲音，重點是角色語感、情緒連續性與文字品質。"
     ),
     FEATURE_GROUP_MULTIMODAL_PERCEPTION: (
-        "把使用者上傳圖片轉成詳細文字脈絡，讓純文字聊天與創角草稿模型仍能理解圖片。"
+        "看圖說話的任務：把圖片轉成詳細文字脈絡或分鏡指示，"
+        "讓純文字聊天、創角草稿與影片生成都能接上畫面內容。"
     ),
     FEATURE_GROUP_HIGH_REASONING_GATES: (
         "錯誤會破壞節奏、長期規劃或安全邊界的判斷型任務。"
@@ -844,6 +867,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
     ),
     FEATURE_GROUP_MULTIMODAL_PERCEPTION: (
         FEATURE_IMAGE_RECOGNITION,
+        FEATURE_VIDEO_STORYBOARD,
     ),
     FEATURE_GROUP_HIGH_REASONING_GATES: (
         FEATURE_PROACTIVE_INTENTION,

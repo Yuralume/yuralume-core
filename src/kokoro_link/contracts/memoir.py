@@ -5,7 +5,7 @@ the only memoir-specific persistence — chapters and timeline entries are
 projected on-the-fly from the existing memory / reflection / emotion
 repositories.
 
-Per ``docs/MEMOIR_PLAN.md`` repositories MUST enforce per-(character_id,
+Repositories MUST enforce per-(character_id,
 operator_id) isolation; the SA implementation does this via a unique
 constraint, the in-memory implementation by composite-key filtering.
 """

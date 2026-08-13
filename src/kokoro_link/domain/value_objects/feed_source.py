@@ -30,6 +30,10 @@ SOURCE_WORLD_EVENT = "world_event"
 SOURCE_BIRTHDAY = "birthday"
 """角色生日當天，由 birthday collector 觸發的一次性貼文（``ref_id``
 為當年的西元年字串，使每年只發一次、跨年自動重啟）。"""
+SOURCE_INTERNAL_TEST = "internal_test"
+"""CV6（D11）admin 全鏈觸發端點產出的測試貼文——
+從未由任何生產路徑寫入，僅供人工核對影片管線用。``ref_id`` 是每次觸發
+的隨機 trigger id，同一角色可重複測試而不撞 dedup。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +51,7 @@ class FeedSource:
     MANUAL: "ClassVar[str]" = SOURCE_MANUAL
     WORLD_EVENT: "ClassVar[str]" = SOURCE_WORLD_EVENT
     BIRTHDAY: "ClassVar[str]" = SOURCE_BIRTHDAY
+    INTERNAL_TEST: "ClassVar[str]" = SOURCE_INTERNAL_TEST
 
     def __post_init__(self) -> None:
         if not self.kind or not self.kind.strip():
@@ -91,3 +96,10 @@ class FeedSource:
         the SA repo's ``find_by_source`` dedup probe yield once per
         year so a tick storm can't double-post."""
         return cls(kind=SOURCE_BIRTHDAY, ref_id=str(year))
+
+    @classmethod
+    def internal_test(cls, trigger_id: str) -> "FeedSource":
+        """CV6 admin full-chain video test trigger. ``trigger_id`` is a
+        fresh id per call, so repeated tests on the same character never
+        collide on the ``(character, source)`` dedup index."""
+        return cls(kind=SOURCE_INTERNAL_TEST, ref_id=trigger_id)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -13,6 +15,7 @@ from kokoro_link.infrastructure.storage.in_memory import InMemoryObjectStorage
 from kokoro_link.infrastructure.storage.keys import (
     safe_key_segment,
     validate_object_key,
+    validate_purge_prefix,
 )
 
 
@@ -184,7 +187,7 @@ def _patch_httpx_connect_error(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operation",
-    ["put_bytes", "get_bytes", "stat", "delete", "copy"],
+    ["put_bytes", "get_bytes", "stat", "delete", "copy", "purge_prefix"],
 )
 async def test_http_object_storage_network_failure_names_storage_host(
     monkeypatch: pytest.MonkeyPatch,
@@ -217,6 +220,9 @@ async def test_http_object_storage_network_failure_names_storage_host(
         "copy": lambda: storage.copy(
             source_key="characters/char-1/a.png",
             destination_key="characters/char-1/b.png",
+        ),
+        "purge_prefix": lambda: storage.purge_prefix(
+            prefix="characters/char-1/",
         ),
     }
 
@@ -361,6 +367,182 @@ async def test_in_memory_object_storage_iter_bytes_round_trip() -> None:
     with pytest.raises(ObjectNotFoundError):
         async for _ in storage.iter_bytes(object_key="feed/char-1/missing.png"):
             pass
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "characters/char-1",  # no trailing slash
+        "characters/",  # single segment
+        "/",  # empty after stripping the slash
+        "/characters/char-1/",  # leading slash
+        "characters//",  # empty segment
+        "characters/../char-1/",  # traversal segment
+        "characters/./char-1/",  # "." segment
+        "characters/.../",  # F5: all-dots segment beyond ".."
+        "characters/..../",  # F5: all-dots segment, longer run
+        "a\\b/",
+        "characters/space bad/",  # unsafe char
+    ],
+)
+def test_validate_purge_prefix_rejects_unsafe_or_shallow_prefixes(
+    prefix: str,
+) -> None:
+    with pytest.raises(ObjectStorageError):
+        validate_purge_prefix(prefix)
+
+
+def test_validate_purge_prefix_accepts_a_two_segment_prefix() -> None:
+    assert (
+        validate_purge_prefix("characters/char-1/")
+        == "characters/char-1/"
+    )
+
+
+def test_validate_purge_prefix_accepts_deeper_prefixes() -> None:
+    assert (
+        validate_purge_prefix("tts/char-1/")
+        == "tts/char-1/"
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_memory_purge_prefix_deletes_only_matching_keys() -> None:
+    storage = InMemoryObjectStorage()
+    await storage.put_bytes(
+        object_key="tts/char-1/aaa.wav",
+        content=b"WAV1",
+        content_type="audio/wav",
+    )
+    await storage.put_bytes(
+        object_key="tts/char-1/bbb.wav",
+        content=b"WAV2",
+        content_type="audio/wav",
+    )
+    await storage.put_bytes(
+        object_key="tts/char-2/ccc.wav",
+        content=b"WAV3",
+        content_type="audio/wav",
+    )
+
+    deleted = await storage.purge_prefix(prefix="tts/char-1/")
+
+    assert deleted == 2
+    assert await storage.stat(object_key="tts/char-1/aaa.wav") is None
+    assert await storage.stat(object_key="tts/char-1/bbb.wav") is None
+    with pytest.raises(ObjectNotFoundError):
+        await storage.get_bytes(object_key="tts/char-1/aaa.wav")
+    # sibling character's objects under a similarly-named prefix survive.
+    assert await storage.stat(object_key="tts/char-2/ccc.wav") is not None
+
+
+@pytest.mark.asyncio
+async def test_in_memory_purge_prefix_sweeps_variant_siblings_for_free() -> None:
+    """A derived variant key (``{object_key}.{name}.webp``) always starts
+    with the same prefix as its original, so a prefix purge removes it
+    without any variant-specific logic — unlike ``delete()``, which the
+    variant decorator has to fan out per suffix."""
+    storage = InMemoryObjectStorage()
+    await storage.put_bytes(
+        object_key="characters/char-1/stage/a.png",
+        content=b"PNG",
+        content_type="image/png",
+    )
+    await storage.put_bytes(
+        object_key="characters/char-1/stage/a.png.w320.webp",
+        content=b"WEBP",
+        content_type="image/webp",
+    )
+
+    deleted = await storage.purge_prefix(prefix="characters/char-1/")
+
+    assert deleted == 2
+    assert await storage.stat(object_key="characters/char-1/stage/a.png") is None
+    assert (
+        await storage.stat(object_key="characters/char-1/stage/a.png.w320.webp")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_memory_purge_prefix_of_nothing_returns_zero() -> None:
+    storage = InMemoryObjectStorage()
+
+    assert await storage.purge_prefix(prefix="characters/never-written/") == 0
+
+
+@pytest.mark.asyncio
+async def test_in_memory_purge_prefix_rejects_unsafe_prefix() -> None:
+    storage = InMemoryObjectStorage()
+
+    with pytest.raises(ObjectStorageError):
+        await storage.purge_prefix(prefix="characters/")
+
+
+@pytest.mark.asyncio
+async def test_http_object_storage_purge_prefix_posts_validated_prefix_and_parses_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"deleted": 3})
+
+    _patch_httpx_transport(monkeypatch, handler)
+    storage = HttpObjectStorage(
+        base_url="http://storage-local:9000",
+        api_key="secret",
+    )
+
+    deleted = await storage.purge_prefix(prefix="tts/char-1/")
+
+    assert deleted == 3
+    assert len(seen) == 1
+    assert seen[0].method == "POST"
+    assert seen[0].url.path == "/v1/objects/purge-prefix"
+    assert json.loads(seen[0].content) == {"prefix": "tts/char-1/"}
+
+
+@pytest.mark.asyncio
+async def test_http_object_storage_purge_prefix_rejects_unsafe_prefix_before_any_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"deleted": 0})
+
+    _patch_httpx_transport(monkeypatch, handler)
+    storage = HttpObjectStorage(
+        base_url="http://storage-local:9000",
+        api_key="secret",
+    )
+
+    with pytest.raises(ObjectStorageError):
+        await storage.purge_prefix(prefix="characters/")
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_http_object_storage_purge_prefix_surfaces_backend_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "disk full"}})
+
+    _patch_httpx_transport(monkeypatch, handler)
+    storage = HttpObjectStorage(
+        base_url="http://storage-local:9000",
+        api_key="secret",
+    )
+
+    with pytest.raises(ObjectStorageError) as exc_info:
+        await storage.purge_prefix(prefix="tts/char-1/")
+
+    assert "disk full" in str(exc_info.value)
 
 
 def test_http_object_storage_stores_app_relative_url_from_upload_response() -> None:

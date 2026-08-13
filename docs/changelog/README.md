@@ -19,6 +19,9 @@ Plain-language release notes for everyday users — what each update actually fe
 
 | 版本 / Version | 繁中 | EN | 日本語 |
 |---|---|---|---|
+| 2026.08.12 — 同一家供應商可留多組連線、答應的事會回來赴約、回覆語言更穩 / several connections per provider, promises are kept on time, steadier reply language / 同一プロバイダーの接続を複数保持・約束はちゃんと果たされる・返信言語がより安定 | [zh-TW](zh-TW/2026-08-12.md) | [en-US](en-US/2026-08-12.md) | [ja-JP](ja-JP/2026-08-12.md) |
+| 2026.08.11 — 角色可整隻加密備份帶著走、提過的新聞追問得下去、聊天捲動與串接錯誤提示改善 / full encrypted character backup, follow up on news she shared, chat scrolling & connection error hints / キャラ丸ごと暗号化バックアップ・話したニュースを聞き返せる・スクロールと連携エラー表示改善 | [zh-TW](zh-TW/2026-08-11.md) | [en-US](en-US/2026-08-11.md) | [ja-JP](ja-JP/2026-08-11.md) |
+| 2026.08.07 — 影片貼文改成背景生成不卡流程、刪除角色時相關資料一次收乾淨 / video posts generate in the background, deleting a character clears everything that belonged to it / 動画投稿はバックグラウンド生成に・キャラ削除時に関連データをまとめて片付け | [zh-TW](zh-TW/2026-08-07.md) | [en-US](en-US/2026-08-07.md) | [ja-JP](ja-JP/2026-08-07.md) |
 | 2026.08.05 — 官方角色新增 7 位、藝廊與官方目錄同步、官方卡三語內建零翻譯 / seven new official characters, gallery syncs with the official catalog, cards ship in three languages / 公式キャラ7人追加・ギャラリーは公式カタログと同期・カードは3言語内蔵 | [zh-TW](zh-TW/2026-08-05.md) | [en-US](en-US/2026-08-05.md) | [ja-JP](ja-JP/2026-08-05.md) |
 | 2026.08.02 — 起幕按鈕隨時開戲、你住進她的故事、圖片與清單大提速 / start a scene any time, you live inside her story now, images & lists get fast / 「幕開け」でいつでも物語・あなたが物語の登場人物に・画像とリストが軽快に | [zh-TW](zh-TW/2026-08-02.md) | [en-US](en-US/2026-08-02.md) | [ja-JP](ja-JP/2026-08-02.md) |
 | 2026.07.31 — 同場想來就來不再審核、角色照自己的行程反應、劇情章節不重複 / same-scene needs no permission, characters react from their own schedule, story chapters stop repeating / 同席は許可不要に・キャラは自分の予定どおりに反応・ストーリーは繰り返さない | [zh-TW](zh-TW/2026-07-31.md) | [en-US](en-US/2026-07-31.md) | [ja-JP](ja-JP/2026-07-31.md) |

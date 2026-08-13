@@ -36,6 +36,46 @@ class CloudGatewayIdentity:
     tenant_id: str
     character_ref: str
     tenant_tier: str = "standard"
+    character_origin: str | None = None
+    """The official card slug this character was installed from (EC2-A
+    ``Character.origin_official_card_id``), or ``None`` for every ordinary
+    (non-managed) character and every self-host install. Adapters use this —
+    never ``character_ref`` — to decide whether to send the
+    ``X-Yuralume-Character-Origin`` header at all (EC7)."""
+
+
+#: Header name for EC7 origin attribution. Sent only when
+#: ``CloudGatewayIdentity.character_origin`` is set; absent entirely
+#: otherwise, so a non-managed character's request is byte-identical to
+#: before this field existed.
+CHARACTER_ORIGIN_HEADER_NAME = "X-Yuralume-Character-Origin"
+
+
+def character_origin_header(character_origin: str | None) -> dict[str, str]:
+    """The EC7 origin header for a card slug known directly.
+
+    The value-level half of :func:`character_origin_headers`, for the one
+    caller that has a card but no character to read it off: the
+    cloud-exclusive install, choosing the voice a character will be created
+    with (EC5-D). Blank and absent are the same declaration — none — which
+    matches how the receiving service reads the header.
+    """
+    origin = (character_origin or "").strip()
+    if not origin:
+        return {}
+    return {CHARACTER_ORIGIN_HEADER_NAME: origin}
+
+
+def character_origin_headers(identity: "CloudGatewayIdentity") -> dict[str, str]:
+    """The optional EC7 origin header, as a dict to merge with ``**``.
+
+    Empty — not a header with an empty value — when the identity carries no
+    origin, which is the case for every non-managed character and every
+    self-host call. Centralised so the five Gateway adapters (llm/image/
+    video/embedding/tts) cannot drift on the header name or the "only when
+    present" rule.
+    """
+    return character_origin_header(identity.character_origin)
 
 
 @dataclass(frozen=True, slots=True)

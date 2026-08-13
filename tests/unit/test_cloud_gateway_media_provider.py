@@ -45,6 +45,9 @@ class _MockAsyncClient(httpx.AsyncClient):
 
 
 class _IdentityResolver:
+    def __init__(self, *, character_origin: str | None = None) -> None:
+        self._character_origin = character_origin
+
     async def resolve_context(
         self, context: CloudResourceContext
     ) -> CloudGatewayIdentity:
@@ -53,6 +56,7 @@ class _IdentityResolver:
             account_id="acct_1",
             tenant_id="tenant_1",
             character_ref="chr_abc",
+            character_origin=self._character_origin,
         )
 
 
@@ -146,6 +150,8 @@ async def test_cloud_gateway_image_provider_sends_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "image_portrait"
     assert headers["x-yuralume-character"] == "chr_abc"
+    # EC7: non-managed character — no origin header at all.
+    assert "x-yuralume-character-origin" not in headers
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("img-")
     assert provider.last_request_id == headers["x-request-id"]
@@ -308,6 +314,8 @@ async def test_cloud_gateway_video_provider_sends_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-feature"] == "feed_video"
     assert headers["x-yuralume-character"] == "chr_abc"
+    # EC7: non-managed character — no origin header at all.
+    assert "x-yuralume-character-origin" not in headers
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("vid-")
     assert provider.last_request_id == headers["x-request-id"]
@@ -315,6 +323,50 @@ async def test_cloud_gateway_video_provider_sends_identity_headers(
     assert payload["model"] == "yuralume-video"
     assert payload["aspect_ratio"] == "16:9"
     assert payload["duration_seconds"] == 5
+    # CV0-3: the feed usage ledger hard-coded 81 frames / 6 seconds for every
+    # video regardless of what was actually requested/rendered. This adapter
+    # is the only one wired to a cloud billing gateway, so it must expose the
+    # real duration via the same additive-attribute shape as
+    # ``last_request_id`` above, for the ledger to read.
+    assert provider.last_duration_seconds == 5
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_video_provider_prefers_gateway_reported_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the Gateway response itself reports a ``duration_seconds`` (e.g.
+    the upstream renderer trimmed/extended the clip), that value is the
+    ground truth — prefer it over what we merely requested."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "duration_seconds": 8,
+            "data": [{"b64_json": base64.b64encode(b"mp4").decode()}],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    provider = CloudGatewayVideoProvider(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        preset="yuralume-video",
+        feature_key="feed_video",
+        identity_resolver=_IdentityResolver(),
+    )
+
+    with generation_trigger_scope(GenerationTrigger.BACKGROUND):
+        result = await provider.generate(
+            character=_character(),
+            positive="walking through town",
+            length_frames=80,
+        )
+
+    assert result == b"mp4"
+    assert provider.last_duration_seconds == 8
 
 
 @pytest.mark.asyncio
@@ -370,6 +422,8 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
     # feature or Gateway deliberately treats it as unknown/no-charge.
     assert headers["x-yuralume-feature"] == "tts_synthesis"
     assert headers["x-yuralume-character"] == "chr_abc"
+    # EC7: non-managed character — no origin header at all.
+    assert "x-yuralume-character-origin" not in headers
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("tts-")
     assert adapter.last_request_id == headers["x-request-id"]
@@ -378,6 +432,112 @@ async def test_cloud_gateway_tts_adapter_sends_identity_headers(
     assert payload["feature_key"] == "tts"
     assert payload["voice_id"] == "voice_default"
     assert payload["options"]["text_lang"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_image_provider_sends_origin_for_managed_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b"png").decode()}],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    provider = CloudGatewayImageProvider(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        preset="yuralume-anime",
+        feature_key="image_portrait",
+        identity_resolver=_IdentityResolver(character_origin="official-yumi"),
+    )
+
+    await provider.generate(
+        character=_character(),
+        positive="at a cafe",
+        aspect="square",
+    )
+
+    assert seen["headers"]["x-yuralume-character-origin"] == "official-yumi"
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_video_provider_sends_origin_for_managed_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b"mp4").decode()}],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    provider = CloudGatewayVideoProvider(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        preset="yuralume-video",
+        feature_key="feed_video",
+        identity_resolver=_IdentityResolver(character_origin="official-yumi"),
+    )
+
+    await provider.generate(
+        character=_character(),
+        positive="walking through town",
+        aspect="landscape",
+        length_frames=80,
+    )
+
+    assert seen["headers"]["x-yuralume-character-origin"] == "official-yumi"
+
+
+@pytest.mark.asyncio
+async def test_cloud_gateway_tts_adapter_sends_origin_for_managed_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(
+            200, content=b"wav", headers={"content-type": "audio/wav"},
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    repo = InMemoryCharacterRepository()
+    character = _character()
+    await repo.save(character)
+    adapter = CloudGatewayTTSAdapter(
+        base_url="https://gateway.example",
+        deployment_token="ykl_deploy",
+        default_voice_id="voice_default",
+        character_repository=repo,
+        identity_resolver=_IdentityResolver(character_origin="official-yumi"),
+    )
+
+    await adapter.synthesize(TTSRequest(
+        text="hello",
+        character_id=character.id,
+        text_lang="en",
+    ))
+
+    assert seen["headers"]["x-yuralume-character-origin"] == "official-yumi"
 
 
 @pytest.mark.asyncio

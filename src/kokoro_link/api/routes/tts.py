@@ -132,15 +132,51 @@ async def synthesize_character_tts(
     return TTSSynthResponse(audio_url=result.audio_url, cached=result.cached)
 
 
+async def _resolve_owned_character_id(
+    *,
+    character_id: str | None,
+    current_user_id: str,
+    container: ServiceContainer,
+) -> str | None:
+    """Scope an optional ``character_id`` query param to its owner (EC5-C).
+
+    A missing, unknown, or foreign-owned id degrades to ``None`` (no
+    character context) rather than raising — this is a catalog-listing
+    convenience endpoint, not an authorization boundary, so a stale id
+    (e.g. a deleted character) should never fail the whole picker. It
+    just loses the one benefit an id would have added: seeing that
+    character's own bound exclusive voice.
+    """
+    if not character_id:
+        return None
+    repository = getattr(container, "character_repository", None)
+    if repository is None:
+        return None
+    character = await repository.get(character_id)
+    if character is None or character.user_id != current_user_id:
+        return None
+    return character.id
+
+
 @router.get("/tts/assets", response_model=TTSAssetCatalogResponse)
 async def list_tts_assets(
+    character_id: str | None = None,
     container: ServiceContainer = Depends(get_container),
+    current_user_id: str = Depends(get_current_user_id),
 ) -> TTSAssetCatalogResponse:
     """Enumerate external voice options.
 
     The historical route name is kept for compatibility, but the app no
     longer scans local GPT-SoVITS files. Voices come from the configured
     provider's catalog API.
+
+    ``character_id`` is an optional query param (EC5-C): a voice reserved
+    for a cloud-exclusive card is excluded from this listing by default,
+    and only included when the request names the character it is bound
+    to (ownership-checked below). Self-host and BYOK catalogs ignore the
+    parameter entirely — they carry no exclusive-voice concept — so this
+    is byte-identical to the pre-EC5-C response for every deployment
+    without a cloud-exclusive voice catalog.
     """
     catalog = container.tts_voice_catalog
     if catalog is None:
@@ -152,8 +188,13 @@ async def list_tts_assets(
             sovits_weights=[],
             voice_presets=[],
         )
+    owned_character_id = await _resolve_owned_character_id(
+        character_id=character_id,
+        current_user_id=current_user_id,
+        container=container,
+    )
     try:
-        voices = await catalog.list_voices()
+        voices = await catalog.list_voices(character_id=owned_character_id)
     except TTSUnavailable:
         voices = []
     return TTSAssetCatalogResponse(

@@ -9,7 +9,7 @@
  * pixels it displayed, and every one of those decoded bitmaps costs ~6 MB of
  * resident memory for as long as it stays in the DOM.
  *
- * Delivery contract (IMAGE_DELIVERY_AND_PAGINATION_PLAN D2): the object route
+ * Delivery contract: the object route
  * takes `?v=w320|w768|full` and **falls back to the original** when the variant
  * does not exist. That is why this component can ship before the encoder and
  * the backfill do — on un-backfilled data every URL here resolves to exactly

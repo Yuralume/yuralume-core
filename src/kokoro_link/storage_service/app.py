@@ -25,10 +25,14 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from kokoro_link.contracts.object_storage import (
+    BACKUP_EXPORT_OBJECT_KEY_PREFIX,
     EPHEMERAL_OBJECT_KEY_PREFIXES,
     ObjectStorageError,
 )
-from kokoro_link.infrastructure.storage.keys import validate_object_key
+from kokoro_link.infrastructure.storage.keys import (
+    validate_object_key,
+    validate_purge_prefix,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +49,19 @@ _LOGGER = logging.getLogger(__name__)
 EPHEMERAL_PREFIXES: tuple[str, ...] = EPHEMERAL_OBJECT_KEY_PREFIXES
 EPHEMERAL_TTL_ENV = "YURALUME_STORAGE_EPHEMERAL_TTL_SECONDS"
 DEFAULT_EPHEMERAL_TTL_SECONDS = 3600
+
+# CB2 (.lumebackup export artifacts): the encrypted archive has to survive
+# a *download window*, not just an in-flight upstream fetch — the player is
+# told the export finished and then goes to fetch a possibly-GB file — so
+# it gets its own, longer TTL instead of the staging default above. 24h is
+# the same rolling window the hosted export throttle counts over, which
+# makes "your download link lives about a day" line up with "you can
+# re-export tomorrow". The artifact is encrypted, so a longer lifetime
+# costs disk, not confidentiality.
+BACKUP_EXPORT_TTL_SECONDS = 24 * 3600
+EPHEMERAL_PREFIX_TTL_OVERRIDES: dict[str, int] = {
+    BACKUP_EXPORT_OBJECT_KEY_PREFIX: BACKUP_EXPORT_TTL_SECONDS,
+}
 # A staged object must outlive any in-flight call that is still relying on it:
 # the cloud gateway's own read timeout is 300s, so an upstream provider can
 # legitimately still be fetching the URL that long after the write. Two times
@@ -58,6 +75,10 @@ class CopyRequest(BaseModel):
     source_key: str
     destination_key: str
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class PurgePrefixRequest(BaseModel):
+    prefix: str
 
 
 class LocalStorageSettings(BaseModel):
@@ -213,6 +234,28 @@ def create_app() -> FastAPI:
             metadata=request.metadata,
         )
 
+    # A static sibling of ``DELETE /v1/objects/{object_key:path}``, not a
+    # variant of it: that route deletes one known key, this one deletes an
+    # unbounded, unenumerated set (CD1 — content-addressed TTS cache keys
+    # are never persisted to a DB row, so there is nothing to enumerate).
+    # Kept as its own POST route with a JSON body — never a query param or
+    # a path-converter segment on the existing DELETE route — precisely so
+    # it cannot be reached by any client that only ever passes a single
+    # object key where this expects a validated prefix.
+    @app.post("/v1/objects/purge-prefix")
+    async def purge_prefix_route(
+        request: PurgePrefixRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_auth(settings, authorization)
+        prefix = _safe_purge_prefix(request.prefix)
+        # A purge can walk tens of thousands of files (CD1's whole reason to
+        # exist: content-addressed TTS cache keys accumulate unbounded). Run
+        # it off the event loop, same as ``sweep_once`` above, so one purge
+        # doesn't stall every other request this process is serving.
+        deleted = await asyncio.to_thread(store.purge_prefix, prefix)
+        return {"deleted": deleted}
+
     @app.get("/v1/public/{object_key:path}")
     @app.head("/v1/public/{object_key:path}")
     async def public_object(object_key: str) -> FileResponse:
@@ -305,6 +348,37 @@ class _LocalVolumeStore:
             root=self._settings.root,
             ttl_seconds=self._settings.ephemeral_ttl_seconds,
         )
+
+    def purge_prefix(self, prefix: str) -> int:
+        """Delete every object (and metadata sidecar) under ``prefix``.
+
+        Unconditional, unlike :meth:`sweep_ephemeral`: no mtime cutoff,
+        and it targets whatever caller-validated prefix it is given
+        rather than the fixed ephemeral set. A prefix that resolves to no
+        directory on either tree removes nothing and returns ``0`` — a
+        missing prefix is not an error (CD1: the caller may be purging a
+        character that never wrote any TTS cache).
+
+        Returns the count of *objects* removed — files under the
+        ``objects/`` tree only (this includes any WebP variant files,
+        since a variant lives at its own key under the same subtree), per
+        :meth:`SupportsPrefixPurge.purge_prefix`'s "number of objects
+        removed" contract. The ``metadata/`` tree is a sidecar, one JSON
+        file per object, and is still purged in full here — it is just
+        not counted a second time: a caller asking "how many objects did
+        that remove" should get the same number regardless of which
+        adapter (this one or :class:`InMemoryObjectStorage`, which has no
+        separate metadata tree to double-count) answered.
+        """
+        removed_objects = 0
+        for base_name in ("objects", "metadata"):
+            target = _resolve_prefix_dir(self._settings.root / base_name, prefix)
+            if target is None:
+                continue
+            count = _purge_all_files(target)
+            if base_name == "objects":
+                removed_objects = count
+        return removed_objects
 
     def metadata_for(self, object_key: str) -> dict:
         key = _safe_key(object_key)
@@ -427,8 +501,14 @@ def sweep_ephemeral_objects(
     ttl_seconds: int,
     prefixes: tuple[str, ...] = EPHEMERAL_PREFIXES,
     now: float | None = None,
+    ttl_overrides: dict[str, int] | None = None,
 ) -> int:
-    """Delete files older than ``ttl_seconds`` under the ephemeral prefixes.
+    """Delete files older than their prefix's TTL under the ephemeral prefixes.
+
+    ``ttl_seconds`` is the default; ``ttl_overrides`` (defaulting to
+    :data:`EPHEMERAL_PREFIX_TTL_OVERRIDES`) lets a prefix whose contents
+    legitimately outlive staging scratch — today only the encrypted backup
+    artifacts — keep a longer lifetime without a second sweeper.
 
     Walks both the object and the metadata tree, and touches nothing outside
     ``prefixes``. Best-effort throughout and never raises — a sweep that
@@ -437,10 +517,14 @@ def sweep_ephemeral_objects(
 
     Returns the number of files removed.
     """
-    cutoff = (time.time() if now is None else now) - ttl_seconds
+    overrides = (
+        EPHEMERAL_PREFIX_TTL_OVERRIDES if ttl_overrides is None else ttl_overrides
+    )
+    base_now = time.time() if now is None else now
     removed = 0
     for base_name in ("objects", "metadata"):
         for prefix in prefixes:
+            cutoff = base_now - overrides.get(prefix, ttl_seconds)
             try:
                 target = _resolve_prefix_dir(root / base_name, prefix)
                 if target is None:
@@ -469,18 +553,42 @@ def _resolve_prefix_dir(base: Path, prefix: str) -> Path | None:
     Same containment discipline as ``_LocalVolumeStore._safe_path``: the sweep
     deletes files, so it must never be able to walk out of the prefix even if
     someone adds a malformed entry to ``EPHEMERAL_PREFIXES``.
+
+    Beyond plain containment, this also guards against OS path normalisation
+    silently *shortening* the resolved path relative to what was asked for.
+    Win32 drops a trailing-dot path component during normalisation, so
+    ``base/"tts/.../"`` resolves on disk to ``base/"tts"`` — still inside
+    ``base`` (containment above would happily pass it), but one segment
+    shallower than the caller's two-segment request. ``validate_purge_prefix``
+    already rejects all-dots segments before this is ever reached, but this
+    check is a second, independent line of defence: it does not trust that
+    every caller of this function went through that validator, and it does
+    not trust that dot-collapsing is the only way a resolved path could end
+    up shallower than requested.
     """
     relative = prefix.strip("/")
     if not relative:
         return None
+    expected_parts = tuple(relative.split("/"))
     try:
         base_resolved = base.resolve()
         target = (base_resolved / relative).resolve()
-        target.relative_to(base_resolved)
+        resolved_parts = target.relative_to(base_resolved).parts
     except (OSError, ValueError):
         _LOGGER.warning("ephemeral prefix %r is not inside %s", prefix, base)
         return None
     if target == base_resolved or not target.is_dir():
+        return None
+    if tuple(p.lower() for p in resolved_parts) != tuple(
+        p.lower() for p in expected_parts
+    ):
+        _LOGGER.warning(
+            "prefix %r resolved to unexpected path %r under %s (depth or "
+            "segment mismatch); refusing",
+            prefix,
+            resolved_parts,
+            base,
+        )
         return None
     return target
 
@@ -519,11 +627,59 @@ def _sweep_expired_files(target: Path, cutoff: float) -> int:
     return removed
 
 
+def _purge_all_files(target: Path) -> int:
+    """Unconditionally remove every file under ``target``, then prune dirs.
+
+    Same walk discipline as :func:`_sweep_expired_files` — bottom-up,
+    symlinks never followed, so it can only ever delete inside the
+    already-containment-checked ``target`` — minus the mtime cutoff: a
+    purge is a "this prefix is being retired", not a TTL sweep, so
+    everything under it goes regardless of age.
+
+    Unlike the ephemeral sweep, which deliberately leaves its top-level
+    prefix directory (``draft-uploads/``) standing because it is a
+    permanent, reused structural directory, ``target`` here *is* the
+    caller-requested prefix — e.g. ``characters/{id}/`` — and once empty
+    it has no reason to persist, so it is pruned too.
+    """
+    removed = 0
+    try:
+        walked = list(os.walk(target, topdown=False, followlinks=False))
+    except OSError as exc:
+        _LOGGER.warning("prefix purge could not walk %s: %r", target, exc)
+        return 0
+    for dirpath, _dirnames, filenames in walked:
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                path.unlink()
+            except OSError as exc:
+                _LOGGER.warning(
+                    "prefix purge could not delete %s: %r", path, exc,
+                )
+                continue
+            removed += 1
+        # Best-effort tidy-up, same as the sweep: rmdir only succeeds on an
+        # already-empty directory, so anything still populated is left.
+        with suppress(OSError):
+            os.rmdir(dirpath)
+    return removed
+
+
 def _safe_key(raw: str) -> str:
     try:
         return validate_object_key(raw)
     except ObjectStorageError as exc:
         raise _error(status.HTTP_400_BAD_REQUEST, "unsafe_key", str(exc)) from exc
+
+
+def _safe_purge_prefix(raw: str) -> str:
+    try:
+        return validate_purge_prefix(raw)
+    except ObjectStorageError as exc:
+        raise _error(
+            status.HTTP_400_BAD_REQUEST, "unsafe_prefix", str(exc),
+        ) from exc
 
 
 def _require_auth(settings: LocalStorageSettings, authorization: str | None) -> None:

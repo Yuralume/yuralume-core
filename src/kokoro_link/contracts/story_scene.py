@@ -159,8 +159,7 @@ class StorySceneSessionRepositoryPort(ABC):
         """How many sessions with ``character_id`` in ``character_ids`` were
         opened at or after ``since``, regardless of current status.
 
-        SC3-B's per-tier daily ceiling on 起幕 openings (STORY_SCENE_PLAN
-        §3.3 / §4.1 SC3-B): once a scene is opened the player has spent the
+        SC3-B's per-tier daily ceiling on 起幕 openings: once a scene is opened the player has spent the
         slot, whether they play it to a close or abandon it — a closed row
         must count exactly like an open one, or the ceiling could be ground
         down by opening and immediately walking away. ``character_ids``
@@ -263,7 +262,7 @@ class StorySceneOpenerPort(ABC):
     Returns ``None`` when it cannot produce a real opening. There is no
     synthesized-placeholder fallback here, unlike the autonomous beat
     scene writer: the opening is what the hosted player is charged a
-    fixed price for (STORY_SCENE_PLAN §3.4 red line 2), so a scaffolded
+    fixed price for (red line 2), so a scaffolded
     stand-in would be billing them for filler. No opening → the whole
     action fails and nothing is written.
     """
@@ -302,7 +301,7 @@ class StorySceneChipsWriterPort(ABC):
     returns ``()`` instead of raising, and why implementations must not
     let a model failure escape.
 
-    LLM-first red line (STORY_SCENE_PLAN §3.4 #5): the chips are written
+    LLM-first red line: the chips are written
     by a model reading the scene. No keyword table, no phrasebook, no
     "if scene_type == conflict" branch anywhere behind this seam.
     """
@@ -376,7 +375,7 @@ class StorySceneCloserPort(ABC):
       the close. The session is closed regardless and the scene lands
       with whatever canon the caller can honestly assemble. The wrap-up's
       obligation is that the player is never stuck, not that prose always
-      exists (STORY_SCENE_PLAN §3.4 #2: the one price bought the opening).
+      exists (the one price bought the opening).
 
     **Red line (§3.4 #1): the wrap-up must never invent player actions.**
     Implementations own both halves of enforcing that — instructing the

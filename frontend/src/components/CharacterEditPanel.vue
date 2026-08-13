@@ -25,13 +25,12 @@ import type {
   CharacterPersonalityType,
   CharacterPersonalityTypeCode,
   CharacterPersonalityTypeSource,
-  CharacterVisualGenerationStyle,
   CharacterState,
-  UpdateCharacterRequest,
+  CharacterVisualGenerationStyle,
   VisualSubjectType,
 } from '@/types/character'
 import type { ToolDescriptor } from '@/types/tool'
-import { UiButton } from '@/components/ui'
+import { UiBadge, UiButton } from '@/components/ui'
 import {
   generateCompanions,
   resetCharacterData,
@@ -39,6 +38,7 @@ import {
 } from '@/utils/api/characters'
 import { listTools } from '@/utils/api/tools'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { buildManagedAwareUpdateRequest } from '@/utils/characterEditRequest'
 import CharacterIdentityFields from './CharacterIdentityFields.vue'
 import CharacterRelationshipsPanel from './CharacterRelationshipsPanel.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
@@ -104,8 +104,23 @@ const companionGenError = ref<string | null>(null)
 const companionGenHint = ref('')
 const shouldShowStateSettings = computed(() => props.showStateSettings !== false)
 const shouldShowAdminLinks = computed(() => props.showAdminLinks !== false)
-const shouldShowImageTriggerInfo = computed(() => props.showImageTriggerInfo !== false)
 const shouldShowTechnicalHints = computed(() => props.showTechnicalHints !== false)
+
+/**
+ * EC2-B — IP 合作託管角色（`character.managed === true`）的人設欄位由
+ * 授權方擁有：伺服端已把它們遮蔽為空值，PATCH 帶非空值也會被 400 拒絕
+ * （`managed_character_update_policy.MANAGED_WRITABLE_UPDATE_FIELDS`）。
+ * 前端整段隱藏這些欄位而非灰掉——避免玩家對著空白表單以為「本來就沒
+ * 設定」而動手填寫，送出後才被拒。一般角色（`managed` 不存在或
+ * `false`）在這個旗標下逐位元零變化。
+ */
+const isManaged = computed(() => props.character.managed === true)
+
+// 生圖觸發說明談的是「自訂 appearance 觸發生圖」——託管角色的 appearance
+// 已被遮蔽、生圖走官方參考圖（EC6），這段說明對它不成立，一併隱藏。
+const shouldShowImageTriggerInfo = computed(
+  () => props.showImageTriggerInfo !== false && !isManaged.value,
+)
 
 function emptyCompanion(): CharacterCompanion {
   return {
@@ -302,39 +317,18 @@ async function handleSave() {
       energy: form.value.energy,
       current_intent: props.character.state.current_intent ?? null,
     }
-    const req: UpdateCharacterRequest = {
-      name: form.value.name,
-      summary: form.value.summary,
-      personality: splitList(form.value.personality),
-      interests: splitList(form.value.interests),
-      speaking_style: form.value.speaking_style,
-      boundaries: splitList(form.value.boundaries),
-      aspirations: splitList(form.value.aspirations),
-      appearance: form.value.appearance,
-      gender_identity: form.value.gender_identity.trim(),
-      third_person_pronoun: form.value.third_person_pronoun.trim(),
-      visual_gender_presentation: form.value.visual_gender_presentation.trim(),
-      visual_subject_type: form.value.visual_subject_type,
-      visual_generation_style: form.value.visual_generation_style,
-      date_of_birth: form.value.date_of_birth.trim() ? form.value.date_of_birth : null,
-      personality_type: buildPersonalityType(),
+    // 只送可調欄：託管角色的人設欄位受伺服端 allowlist 保護，帶非空值
+    // 會整包被 400 拒絕。前端不依賴「靜默丟棄」，直接不組進 payload——
+    // 一般角色（!isManaged）維持原本的全欄位 PATCH，逐位元零變化。
+    // 組 payload 的邏輯抽成純函式（見 `@/utils/characterEditRequest`），方便單獨測試。
+    const req = buildManagedAwareUpdateRequest({
+      form: form.value,
       state,
-      companions: companions.value
-        .filter(c => c.name.trim())
-        .map(c => ({
-          id: c.id,
-          name: c.name.trim(),
-          role: c.role.trim(),
-          brief_profile: c.brief_profile.trim(),
-          personality_sketch: c.personality_sketch
-            .map(p => p.trim())
-            .filter(Boolean),
-          relationship_snippet: c.relationship_snippet.trim(),
-        })),
-    }
-    if (props.showToolSettings !== false) {
-      req.allowed_tools = normalisedAllowedToolsForSave()
-    }
+      companions: companions.value,
+      personalityType: buildPersonalityType(),
+      isManaged: isManaged.value,
+      allowedTools: props.showToolSettings !== false ? normalisedAllowedToolsForSave() : null,
+    })
     const updated = await updateCharacter(props.character.id, req)
     emit('updated', updated)
   } finally {
@@ -443,7 +437,12 @@ function handleClearAll() {
       {{ t('characterEdit.links.suffix') }}
     </p>
 
-    <div class="form-section">
+    <div v-if="isManaged" class="managed-notice">
+      <UiBadge variant="primary">{{ t('characterEdit.managed.badge') }}</UiBadge>
+      <p class="managed-notice__text">{{ t('characterEdit.managed.notice') }}</p>
+    </div>
+
+    <div v-if="!isManaged" class="form-section">
       <h3 class="section-title">{{ t('characterEdit.sections.basic') }}</h3>
       <label class="field-label">{{ t('characterCreate.fields.name.label') }}</label>
       <input v-model="form.name" class="field-input" :placeholder="t('characterCreate.fields.name.placeholder')" />
@@ -817,6 +816,23 @@ function handleClearAll() {
 .reset-feedback {
   font-size: var(--font-xs);
   color: var(--color-text-secondary);
+}
+
+.managed-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+}
+.managed-notice__text {
+  margin: 0;
+  font-size: var(--font-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 .admin-link-hint {

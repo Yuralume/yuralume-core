@@ -3,7 +3,7 @@
 Official cards no longer ship inside this repo. They live in the Yuralume
 Cloud control plane, and every deployment — hosted or self-hosted — reads
 them from one anonymous public endpoint
-(``OFFICIAL_CARD_CLOUD_CATALOG_PLAN`` §3.5 / D1). This module is the seam:
+This module is the seam:
 the DTOs Core actually renders, the port the pack service depends on, and
 the **one** definition of how the two repos' locale vocabularies line up.
 
@@ -115,6 +115,29 @@ def parse_cloud_pack_ref(pack_ref: str) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
+DISTRIBUTION_PUBLIC = "public"
+DISTRIBUTION_CLOUD_EXCLUSIVE = "cloud_exclusive"
+"""How a published official card may be obtained (Cloud EC0 / plan D1).
+
+A ``public`` card publishes its ``.lumecard`` to everybody; a
+``cloud_exclusive`` one is an IP-partner character whose text and artifact
+exist only on the hosted side, reachable through the authenticated
+:class:`~kokoro_link.contracts.official_card_exclusive.OfficialCardExclusivePayloadPort`.
+Both are **listed** identically — the name, the one-line summary and the
+portrait are the shop window — so the distribution is what tells a
+deployment which of the two it must not offer an install button for.
+
+An unknown value from a newer Cloud is treated as ``cloud_exclusive`` by
+:func:`is_installable_distribution`: refusing an install this build does
+not understand is the recoverable mistake.
+"""
+
+
+def is_installable_distribution(distribution: str) -> bool:
+    """Whether a card with this distribution installs through the public path."""
+    return (distribution or "").strip() == DISTRIBUTION_PUBLIC
+
+
 @dataclass(frozen=True, slots=True)
 class OfficialCardSummary:
     """One row of the Cloud catalog — everything the browse grid needs.
@@ -132,6 +155,11 @@ class OfficialCardSummary:
     localized: bool = False
     image_url: str | None = None
     image_count: int = 0
+    distribution: str = DISTRIBUTION_PUBLIC
+    """``public`` / ``cloud_exclusive`` — see :data:`DISTRIBUTION_PUBLIC`.
+
+    Defaults to ``public`` so a catalog that predates the field keeps
+    behaving exactly as it did: every row installable, no chip, no gate."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +208,29 @@ class OfficialCardDetail:
     available_locales: tuple[str, ...] = ()
     profile: Mapping[str, object] = field(default_factory=dict)
     images: tuple[OfficialCardImage, ...] = ()
+    artifact_published: bool = True
+    """Whether the document advertised a downloadable ``.lumecard``.
+
+    **This is how a detail read learns a card is cloud-exclusive.** The
+    detail document carries no ``distribution`` field — only the catalog
+    rows do — but Cloud withholds the artifact URL and the profile prose
+    together for an exclusive card, as "the same secret said twice". The
+    URL is the half that survives the masking as a *signal*: an empty
+    profile is also what a card with no approved translation yet looks
+    like, whereas a published public card always advertises its artifact.
+
+    Only the presence is kept, never the URL: the download address is
+    derived by the adapter from the card id (it always was), and a second
+    source for it is a second thing to keep in step.
+
+    Defaults ``True`` so a Cloud that predates the field is read as an
+    ordinary public catalog — which is what it is."""
+
+    @property
+    def cloud_exclusive(self) -> bool:
+        """Whether this card can only be installed through the authenticated
+        exclusive-payload endpoint (plan D1)."""
+        return not self.artifact_published
 
 
 class OfficialCardCatalogUnavailable(RuntimeError):
@@ -243,10 +294,31 @@ class OfficialCardCatalogPort(ABC):
         the card is not published.
         """
 
+    @abstractmethod
+    async def download_image(self, *, url: str) -> bytes | None:
+        """One stage image's bytes, by the URL a document handed out.
+
+        Used by the cloud-exclusive install (EC4), which lands the official
+        art in this deployment's own object storage instead of leaving the
+        image-generation hot path pointed at Cloud.
+
+        Takes a URL rather than ``(card_id, index)`` because the documents
+        are what name the assets: reconstructing the route here would be a
+        second copy of a path Cloud owns. Implementations must refuse a URL
+        outside the catalog's own asset origin — a document is data, and a
+        URL inside it must not become an arbitrary outbound fetch.
+
+        ``None`` when the download failed or the URL was refused; the caller
+        treats a missing image the way the importer treats a missing bundled
+        one — skip it, keep the install.
+        """
+
 
 __all__ = [
     "CLOUD_LOCALE_BY_LANGUAGE_TAG",
     "CLOUD_PACK_REF_PREFIX",
+    "DISTRIBUTION_CLOUD_EXCLUSIVE",
+    "DISTRIBUTION_PUBLIC",
     "LANGUAGE_TAG_BY_CLOUD_LOCALE",
     "OfficialCardCatalogPort",
     "OfficialCardCatalogUnavailable",
@@ -255,6 +327,7 @@ __all__ = [
     "OfficialCardNotFound",
     "OfficialCardSummary",
     "cloud_pack_ref",
+    "is_installable_distribution",
     "parse_cloud_pack_ref",
     "to_cloud_locale",
     "to_language_tag",

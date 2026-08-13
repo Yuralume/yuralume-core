@@ -4,7 +4,7 @@ For each character, build an interest vector once and rank the recent
 event window against it. High-similarity events go into the per-character
 inbox where dispensers can claim them later.
 
-Design principles (from CLAUDE.md):
+Design principles (LLM-first):
 
 - LLM-first / embedding-first matching: there are no keyword rules
   hard-coding which interest matches which category. Categories are a

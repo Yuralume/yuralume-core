@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,13 @@ from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
 from kokoro_link.application.services.image_usage import image_usage_parts_from_provider
+from kokoro_link.application.services.official_character_art import (
+    is_official_art_key,
+    official_art_object_key,
+)
+from kokoro_link.application.services.official_reference_attachments import (
+    official_reference_attachments,
+)
 from kokoro_link.contracts.active_image import ActiveImageProviderPort
 from kokoro_link.contracts.cloud_action_billing import ACTION_IMAGE_PORTRAIT
 from kokoro_link.contracts.account_runtime_profile import (
@@ -88,6 +96,23 @@ _CANDIDATES_SUBDIR = "candidates"
 
 
 @dataclass(frozen=True, slots=True)
+class OfficialCardArtImage:
+    """One stage image an official-card install is landing (EC4).
+
+    ``index`` is the card's own carousel position, which becomes part of
+    the object key so a re-install overwrites rather than accumulates.
+    ``reference`` marks the images Cloud designated as the likeness lock —
+    the flag is carried in the key too, because ``image_urls`` is a list of
+    bare strings with nowhere else to put it.
+    """
+
+    index: int
+    data: bytes
+    content_type: str
+    reference: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedAlbumCandidate:
     """A candidate the operator sent straight to the album.
 
@@ -118,6 +143,16 @@ class TooManyImagesError(CharacterImageError):
 
 class ImageNotFoundError(CharacterImageError):
     pass
+
+
+class OfficialArtProtectedError(CharacterImageError):
+    """Refusal to delete art that came with an IP-partner card (EC4).
+
+    Distinct from :class:`ImageNotFoundError` because the image very much
+    exists — the answer is "not yours", not "not there" — and the route
+    layer owes the caller a different status for it (409, the same one an
+    image cap already answers with) than a 404 that would suggest retrying.
+    """
 
 
 class GenerationDisabledError(CharacterImageError):
@@ -235,6 +270,85 @@ class CharacterImageService:
         await self._character_repository.save(updated)
         return updated
 
+    async def attach_official_card_art(
+        self,
+        character_id: str,
+        *,
+        images: Sequence[OfficialCardArtImage],
+    ) -> Character:
+        """Land an IP-partner card's stage images on a fresh character (EC4).
+
+        Deliberately **not** :meth:`add_image` in a loop. That path mints a
+        random key per upload, which is right for a player's own art and
+        wrong here twice over: the key is where "this is the partner's" and
+        "this one is the likeness lock" are recorded, and a deterministic
+        key makes a repeated install idempotent instead of leaving orphans
+        behind. What it shares with the upload path is everything about
+        limits and fail-softness — same per-image size cap, same carousel
+        ceiling, and one unusable image skipped rather than the whole set
+        refused, because a character short one portrait is recoverable and a
+        half-created one is not.
+
+        Appends in the order given, which is the card's carousel order.
+        """
+        character = await self._load_character(character_id)
+        if self._object_storage is None:
+            raise CharacterImageError("Object storage is not configured")
+        urls = list(character.image_urls)
+        for image in images:
+            if len(urls) >= MAX_IMAGES_PER_CHARACTER:
+                _LOGGER.warning(
+                    "official card art: character %s is at the %d image cap "
+                    "— dropping the rest of the card's art",
+                    character_id, MAX_IMAGES_PER_CHARACTER,
+                )
+                break
+            if len(image.data) > MAX_IMAGE_BYTES:
+                _LOGGER.warning(
+                    "official card art %s/%s exceeds the %d MB limit — "
+                    "skipping", character_id, image.index,
+                    MAX_IMAGE_BYTES // (1024 * 1024),
+                )
+                continue
+            extension = self._pick_extension(image.content_type, None)
+            if extension is None:
+                _LOGGER.warning(
+                    "official card art %s/%s has an unsupported type %r — "
+                    "skipping", character_id, image.index, image.content_type,
+                )
+                continue
+            object_key = official_art_object_key(
+                character_id,
+                index=image.index,
+                extension=extension,
+                reference=image.reference,
+            )
+            try:
+                stored = await self._object_storage.put_bytes(
+                    object_key=object_key,
+                    content=image.data,
+                    content_type=image.content_type,
+                    metadata={
+                        "character_id": character_id,
+                        "kind": "official-card-art",
+                    },
+                )
+            except ObjectStorageUnavailableError as exc:
+                # Unlike a per-image skip, storage being down means none of
+                # the rest will land either — stop and let the caller report
+                # a character installed without its art.
+                _LOGGER.exception(
+                    "official card art: object storage unreachable "
+                    "(character=%s)", character_id,
+                )
+                raise StorageUnavailableError(str(exc)) from exc
+            urls.append(stored.url)
+        if list(character.image_urls) == urls:
+            return character
+        updated = character.with_image_urls(tuple(urls))
+        await self._character_repository.save(updated)
+        return updated
+
     async def remove_image(
         self,
         character_id: str,
@@ -244,6 +358,16 @@ class CharacterImageService:
         character = await self._load_character(character_id)
         if url not in character.image_urls:
             raise ImageNotFoundError("Image URL not associated with this character")
+        if self._is_official_art(url):
+            # EC4: a managed character's official art is the partner's
+            # identity, landed by the install, and the one thing the player
+            # is looking at that is not theirs. The edit panel hides the
+            # delete control for it; this is the half that a direct API call
+            # walks into. Anything the player added themselves — a generated
+            # portrait, a gacha pick — still deletes normally.
+            raise OfficialArtProtectedError(
+                "Official card art cannot be removed from a managed character",
+            )
 
         new_urls = tuple(u for u in character.image_urls if u != url)
         updated = character.with_image_urls(new_urls)
@@ -319,6 +443,7 @@ class CharacterImageService:
             ACTION_IMAGE_PORTRAIT,
             operator_id=getattr(character, "user_id", "") or "",
             quoted_price_cr=quoted_price_cr,
+            character_origin=character.origin_official_card_id,
         ):
             return await self._generate_portrait(
                 character,
@@ -368,6 +493,11 @@ class CharacterImageService:
             images = await provider.generate(
                 character=character, positive=styled_positive, aspect=aspect,
                 use_runtime_state=False,
+                # EC6: a managed character is always drawn from the partner's
+                # reference art; a player's own character passes ``()``.
+                user_attachment_urls=official_reference_attachments(
+                    character, object_storage=self._object_storage,
+                ),
             )
         except ImageTimeoutError as exc:
             await self._record_image_usage_safely(
@@ -565,6 +695,7 @@ class CharacterImageService:
             ACTION_IMAGE_PORTRAIT,
             operator_id=getattr(character, "user_id", "") or "",
             quoted_price_cr=quoted_price_cr,
+            character_origin=character.origin_official_card_id,
         ):
             return await self._generate_candidates(
                 character, positive=positive, aspect=aspect,
@@ -604,6 +735,12 @@ class CharacterImageService:
                 aspect=aspect,
                 batch=clamped_count,
                 use_runtime_state=False,
+                # EC6: every candidate in the batch is anchored to the same
+                # partner reference art, so the gacha picker is a choice of
+                # scene rather than a choice of which face the card has.
+                user_attachment_urls=official_reference_attachments(
+                    character, object_storage=self._object_storage,
+                ),
             )
         except ImageTimeoutError as exc:
             await self._record_image_usage_safely(
@@ -1019,6 +1156,27 @@ class CharacterImageService:
         updated = character.with_image_urls(tuple(url_order))
         await self._character_repository.save(updated)
         return updated
+
+    def _is_official_art(self, url: str) -> bool:
+        """Whether ``url`` points at art an official card install landed.
+
+        Answered from the object key rather than from a flag on the
+        character, because the fact is per-image and ``image_urls`` is a
+        list of bare strings: the install writes official art under its own
+        key prefix precisely so this question has an answer later (see
+        :mod:`official_character_art`).
+
+        A deployment with no object storage wired cannot have installed a
+        cloud-exclusive card in the first place, so ``False`` there is not a
+        gap — it is the absence of the thing being guarded.
+        """
+        if self._object_storage is None:
+            return False
+        try:
+            object_key = self._object_storage.object_key_from_url(url)
+        except Exception:  # noqa: BLE001 — adapters differ on malformed urls
+            return False
+        return is_official_art_key(object_key)
 
     async def _load_character(self, character_id: str) -> Character:
         character = await self._character_repository.get(character_id)

@@ -11,9 +11,8 @@ invite. Two defences, tested here:
    the only defence available when the material is an older, already
    polluted memory rather than a live activity.
 
-The tuned overlay in the parent repo (``prompt-packs/tuned/feed/composer``)
-carries the same rule in its own wording; this pins the baseline that
-ships with Core, per the CF6b convention.
+A tuned prompt overlay may carry the same rule in its own wording; this
+pins the baseline that ships with Core, per the CF6b convention.
 """
 
 from __future__ import annotations

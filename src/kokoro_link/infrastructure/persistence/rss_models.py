@@ -104,6 +104,48 @@ class RssSourceRow(Base):
     )
 
 
+class CharacterEventMentionRow(Base):
+    """One row per (character, world event) the character actually raised.
+
+    ``ON DELETE CASCADE`` on both parents keeps the table consistent on
+    PostgreSQL — including the world-event GC sweep, which hard-deletes
+    the pool rows these point at. Self-host SQLite does not enforce
+    foreign keys, so the repository's own ``delete_older_than`` sweep is
+    what bounds the table there, and every reader must tolerate a
+    dangling ``world_event_id``."""
+
+    __tablename__ = "character_event_mentions"
+    __table_args__ = (
+        Index(
+            "ix_character_event_mentions_unique",
+            "character_id",
+            "world_event_id",
+            unique=True,
+        ),
+        Index(
+            "ix_character_event_mentions_recent",
+            "character_id",
+            "mentioned_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    world_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("world_events.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    surface: Mapped[str] = mapped_column(String(32), nullable=False)
+    mentioned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
 class CharacterEventInboxRow(Base):
     __tablename__ = "character_event_inbox"
     __table_args__ = (

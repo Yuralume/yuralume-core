@@ -5,7 +5,7 @@ to serve players from everywhere, whose timezone and content language are
 guessed from GeoIP at first login and are sometimes simply wrong (VPN,
 travelling, a shared exit node).
 
-Owner-ratified design (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §4.1-2, §7-3) is
+Owner-ratified design is
 two-layered:
 
 1. **First-login confirmation is the main line of defence.** Before any

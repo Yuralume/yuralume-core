@@ -11,7 +11,7 @@ export interface AuthUser {
    * True when `display_name` is still the seeded `操作者` placeholder
    * (operator skipped naming). Render a localized label instead of the
    * raw sentinel at the display boundary — the stored value is never
-   * mutated (see SHIPPED_CONTENT_LOCALIZATION_PLAN #6).
+   * mutated.
    */
   display_name_is_placeholder?: boolean
   email: string | null

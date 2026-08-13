@@ -30,6 +30,8 @@ from kokoro_link.application.dto.external_chat import ExternalChatTurnCommand
 from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
     ChatService,
+    ChatCharacterContractEndedError,
+    ChatCharacterRestoringError,
     ChatSubscriptionFrozen,
 )
 from kokoro_link.application.services.external_chat.canonical_hash import (
@@ -229,7 +231,14 @@ class ExternalChatTurnService:
             await self._chat_service.send_message(
                 request, current_user_id=operator.id, external_turn=adapter,
             )
-        except ChatSubscriptionFrozen:
+        except (
+            ChatSubscriptionFrozen,
+            ChatCharacterRestoringError,
+            ChatCharacterContractEndedError,
+        ):
+            # A restoring character (CB A3) and one whose licensor contract
+            # ended (D7 / EC10) are treated exactly like a frozen one on this
+            # surface: not interactable, answered opaquely.
             return await self._fail_terminal(
                 fence, status=404, code="not_found",
                 message=_OPAQUE_NOT_FOUND_MESSAGE,

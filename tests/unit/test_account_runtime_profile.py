@@ -394,3 +394,49 @@ def test_story_scene_daily_limit_missing_key_is_zero_impact_for_self_host() -> N
     """self-host never sends this knob at all -- confirms the fail-open default
     stays unlimited with no payload change required."""
     assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.story_scene_daily_limit is None
+
+
+# --- video_daily_limit (CV5) -------------------------------------------
+
+
+def test_video_daily_limit_defaults_to_unlimited() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {})
+
+    assert profile.video_daily_limit is None
+
+
+def test_video_daily_limit_parsed_from_control_plane() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "video_daily_limit": 3,
+    })
+
+    assert profile.video_daily_limit == 3
+
+
+def test_video_daily_limit_rejects_zero_and_negative() -> None:
+    """Same shape as story_scene_daily_limit: 0 is not a second spelling of
+    "unlimited" (that's already video_generation_enabled=False's job), so an
+    invalid 0/negative value falls back to the default (None)."""
+    zero = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "video_daily_limit": 0,
+    })
+    assert zero.video_daily_limit is None
+
+    negative = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "video_daily_limit": -1,
+    })
+    assert negative.video_daily_limit is None
+
+
+def test_video_daily_limit_explicit_null_stays_unlimited() -> None:
+    profile = AccountRuntimeProfile.from_control_plane_payload("plus", {
+        "video_daily_limit": None,
+    })
+
+    assert profile.video_daily_limit is None
+
+
+def test_video_daily_limit_missing_key_is_zero_impact_for_self_host() -> None:
+    """self-host never sends this knob at all -- confirms the fail-open default
+    stays unlimited with no payload change required."""
+    assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.video_daily_limit is None

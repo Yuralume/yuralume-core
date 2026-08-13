@@ -1,6 +1,6 @@
 """Operator language → story-seed region resolution.
 
-STORY_SEED_ENRICHMENT_PLAN §1 (owner-ratified): the player's seed region
+Owner-ratified: the player's seed region
 is derived from the operator's ``primary_language`` — zh* → ``tw``,
 ja* → ``jp``, en* → ``west``. Anything else (or no language at all)
 resolves to ``None``, which the gacha reads as "only ``global`` seeds",

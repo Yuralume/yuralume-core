@@ -1,0 +1,20 @@
+你的任務：替一支 ${clip_seconds} 秒的短片補出它**第一幀**的靜止畫面 prompt。
+
+下面這段是這支短片的動作描述（英文），它刻意寫成「A → then B → finally C」
+的三步小動作。影片模型會從第一幀出發把這三步演完，所以第一幀只有**一個瞬間**：
+A 還沒發生、或正要發生的那一刻。**不要把 A、B、C 三個時刻同時畫進同一張圖。**
+
+影片動作描述：
+${video_prompt}
+
+角色視覺資料（用來確定外觀，不要把中文抄進 tag）：
+${character_block}
+
+輸出規則：
+- 只輸出 30-80 個英文 danbooru 風格 tag，逗號分隔。不要 JSON、不要 markdown、
+  不要任何解釋文字或前後綴。
+- 這是**一張完整的單一畫面**：禁止 comic、4koma、multiple views、split screen、
+  sequence、panels、borders、before and after 這類把多個時刻拼進同一張圖的 tag，
+  也不要用 then / after / finally 之類的順序詞描述動作。
+- 聚焦角色在那個瞬間的姿態 / 場景 / 光線 / 表情，只加入符合上面視覺主體類型的
+  基礎 tag。

@@ -14,6 +14,9 @@ import pytest
 from kokoro_link.application.services.cloud_pricing_service import (
     CloudPricingService,
 )
+from kokoro_link.application.services.cloud_tier_pricing_service import (
+    CloudTierPricingService,
+)
 from kokoro_link.contracts.cloud_action_pricing import (
     ActionPrice,
     ActionPricingUnavailable,
@@ -22,6 +25,7 @@ from kokoro_link.contracts.cloud_action_pricing import (
 )
 from kokoro_link.infrastructure.cloud.action_pricing_client import (
     ActionPricingClient,
+    TierActionPricingClient,
 )
 
 
@@ -250,3 +254,86 @@ async def test_invalidate_drops_the_quote_the_user_service_refused() -> None:
     assert service.quoted_price_cr(tier_name="standard", action_key="chat") is None
     await service.get_pricing()
     assert client.calls == 2  # refetched rather than serving the stale list
+
+
+@pytest.mark.asyncio
+async def test_private_tier_client_reads_unlisted_price_with_internal_auth(
+    monkeypatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["tier"] = request.url.params.get("tier")
+        seen["token"] = request.headers.get("x-internal-token")
+        return httpx.Response(200, json={
+            "tiers": [{
+                "tier_name": "internal_test",
+                "billing_shape": "action_fixed",
+                "actions": [{
+                    "action_key": "chat",
+                    "unit": "per_message",
+                    "price_cr": 4,
+                    "overage": False,
+                }],
+            }],
+        })
+
+    _install(monkeypatch, handler)
+    pricing = await TierActionPricingClient(
+        base_url="https://user.example", internal_token="runtime-secret",
+    ).fetch("internal_test")
+
+    assert seen == {
+        "path": "/internal/v1/runtime-config/action-pricing",
+        "tier": "internal_test",
+        "token": "runtime-secret",
+    }
+    assert pricing.tiers[0].actions[0].price_cr == 4
+
+
+class _StubTierClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.fail = False
+
+    async def fetch(self, tier_name: str) -> PublicPricing:
+        self.calls.append(tier_name)
+        if self.fail:
+            raise ActionPricingUnavailable("down")
+        price = 4.0 if tier_name == "internal_test" else 6.0
+        return PublicPricing(tiers=(TierPricing(
+            tier_name=tier_name,
+            billing_shape="action_fixed",
+            actions=(ActionPrice(
+                action_key="chat", unit="per_message", price_cr=price,
+            ),),
+        ),))
+
+
+@pytest.mark.asyncio
+async def test_private_tier_cache_never_substitutes_the_public_tier() -> None:
+    client = _StubTierClient()
+    service = CloudTierPricingService(client=client)
+
+    internal = await service.get_pricing("internal_test")
+    general = await service.get_pricing("general")
+
+    assert internal is not None
+    assert internal.pricing.tiers[0].actions[0].price_cr == 4
+    assert general is not None
+    assert general.pricing.tiers[0].actions[0].price_cr == 6
+    assert client.calls == ["internal_test", "general"]
+
+
+@pytest.mark.asyncio
+async def test_private_tier_cache_resolves_one_action_quote() -> None:
+    client = _StubTierClient()
+    service = CloudTierPricingService(client=client)
+
+    price = await service.quote_price_cr(
+        tier_name="internal_test", action_key="chat",
+    )
+
+    assert price == 4.0
+    assert client.calls == ["internal_test"]

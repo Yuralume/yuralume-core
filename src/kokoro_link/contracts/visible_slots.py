@@ -21,8 +21,8 @@ from typing import Protocol, runtime_checkable
 
 SLOT_KIND_PROACTIVE = "proactive"
 SLOT_KIND_FEED_REPLY = "feed_reply_pass"
-#: One at-most-once claim per (character, civil day) daily goal review (CF2 /
-#: COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P2a). ``slot`` is the operator's
+#: One at-most-once claim per (character, civil day) daily goal review
+#: (CF2 / P2a). ``slot`` is the operator's
 #: local ISO date, so the same character is reviewed at most once a day no
 #: matter how many embedded ticks, distributed due-jobs and chat turns race for
 #: it — the dedup is a DB unique index, never a per-process flag. Goals are

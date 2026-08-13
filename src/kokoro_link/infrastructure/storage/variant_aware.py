@@ -22,7 +22,7 @@ supported state, not a broken one. That fallback is also why this module
 never retries and never queues: a missed variant costs bandwidth, not
 correctness.
 
-See ``docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md`` §2 D1/D3.
+Ships D1/D3 of the image-delivery work.
 """
 
 from __future__ import annotations

@@ -151,8 +151,7 @@ class SchedulePlannerPort(Protocol):
 
         ``recent_story_events`` are the character's story events (gacha
         rolls + realized arc beats) for the civil days around ``date_``
-        — the day being planned and the days just before it (SE1,
-        STORY_SEED_ENRICHMENT_PLAN §3). Each carries a short LLM-written
+        — the day being planned and the days just before it (SE1). Each carries a short LLM-written
         first-person narrative of something that happened to the
         character. They are supplied as **inspiration, never
         instructions**: the planner may let the day continue, respond to

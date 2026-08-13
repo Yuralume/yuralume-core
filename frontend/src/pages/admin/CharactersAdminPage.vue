@@ -2,7 +2,9 @@
 /**
  * /admin/characters — 角色卡（A 層靜態設定）單一編輯入口。
  *
- * - 頂部：新增角色 / 匯入角色卡（.lumecard）按鈕
+ * - 頂部：新增角色 / 匯入角色卡（.lumecard）按鈕，緊接著是從 `.lumebackup`
+ *   還原（CharacterBackupRestorePanel）——還原永遠建立全新角色（D4），跟
+ *   前兩者一樣不需要先有既有角色，所以掛在同一層而非 picker 底下。
  * - 每位角色：AdminCharacterPicker 選角 → 掛 CharacterCardEditor，把原本
  *   散落在 /admin/world、/admin/dispositions、/admin/proactive、story 區與
  *   舞台圖的 A 層設定收斂成四個折疊段（身分人格 / 世界觀行為 / 主線劇情 /
@@ -15,7 +17,10 @@
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { notification } from 'ant-design-vue'
+import { CloseOutlined } from '@ant-design/icons-vue'
 import type { Character } from '@/types/character'
+import CharacterBackupPanel from '@/components/CharacterBackupPanel.vue'
+import CharacterBackupRestorePanel from '@/components/CharacterBackupRestorePanel.vue'
 import CharacterCardEditor from '@/components/admin/CharacterCardEditor.vue'
 import CharacterCardMarketplace from '@/components/admin/CharacterCardMarketplace.vue'
 import CharacterCreateModal from '@/components/CharacterCreateModal.vue'
@@ -30,6 +35,7 @@ const createModalOpen = ref(false)
 const exportingId = ref<string | null>(null)
 const importFileRef = ref<HTMLInputElement | null>(null)
 const importing = ref(false)
+const backupPanelCharacter = ref<Character | null>(null)
 
 async function handleExportCard(character: Character) {
   exportingId.value = character.id
@@ -109,6 +115,19 @@ function handleDataReset(_char: Character) {
   // 清空記憶 / 對話不會改動 Character 本身，所以這裡不需要 patch picker
   // list；保留 hook 以便未來想刷新 status badge 之類的時候可以接。
 }
+
+function openBackupPanel(character: Character) {
+  backupPanelCharacter.value = character
+}
+
+function closeBackupPanel() {
+  backupPanelCharacter.value = null
+}
+
+async function handleBackupImported(_char: Character) {
+  // 還原＝建立一位全新角色，跟市集安裝一樣要刷新 picker 讓它出現在下拉裡。
+  await pickerRef.value?.refresh()
+}
 </script>
 
 <template>
@@ -152,6 +171,10 @@ function handleDataReset(_char: Character) {
       />
     </UiCard>
 
+    <UiCard>
+      <CharacterBackupRestorePanel @imported="handleBackupImported" />
+    </UiCard>
+
     <CharacterCardMarketplace @installed="handleCardInstalled" />
 
     <AdminCharacterPicker
@@ -173,6 +196,13 @@ function handleDataReset(_char: Character) {
             >
               {{ t('admin.page.characters.exportCardAction') }}
             </UiButton>
+            <UiButton
+              variant="secondary"
+              size="sm"
+              @click="openBackupPanel(character)"
+            >
+              {{ t('characterBackup.sectionTitle') }}
+            </UiButton>
           </template>
           <CharacterCardEditor
             :key="character.id"
@@ -190,6 +220,39 @@ function handleDataReset(_char: Character) {
       @close="closeCreateModal"
       @created="handleCharacterCreated"
     />
+
+    <Teleport to="body">
+      <div
+        v-if="backupPanelCharacter"
+        class="characters-admin__backup-backdrop"
+        @click.self="closeBackupPanel"
+      >
+        <section
+          class="characters-admin__backup-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="characters-admin-backup-title"
+        >
+          <header class="characters-admin__backup-header">
+            <h2 id="characters-admin-backup-title" class="characters-admin__card-title">
+              {{ t('characterBackup.sectionTitle') }} — {{ backupPanelCharacter.name }}
+            </h2>
+            <UiButton
+              variant="ghost"
+              size="sm"
+              :aria-label="t('common.actions.close')"
+              @click="closeBackupPanel"
+            >
+              <CloseOutlined aria-hidden="true" />
+            </UiButton>
+          </header>
+          <CharacterBackupPanel
+            :key="backupPanelCharacter.id"
+            :character="backupPanelCharacter"
+          />
+        </section>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -241,5 +304,37 @@ function handleDataReset(_char: Character) {
 }
 .characters-admin__import-input {
   display: none;
+}
+.characters-admin__backup-backdrop {
+  position: fixed;
+  inset: 0;
+  height: 100dvh;
+  z-index: 920;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+}
+.characters-admin__backup-modal {
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(92dvh, 760px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  border: 1px solid rgba(64, 156, 255, 0.34);
+  border-radius: 8px;
+  padding: var(--space-4);
+  background: rgba(24, 33, 50, 0.98);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.46);
+  overflow-y: auto;
+}
+.characters-admin__backup-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
 }
 </style>

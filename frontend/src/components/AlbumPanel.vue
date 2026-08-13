@@ -6,7 +6,7 @@
  * - 點圖預覽（新分頁開啟原圖）
  * - 刪除（檔案一起刪）
  * - 晉升為舞台圖（加回 image_urls）
- * - 往下捲載入更多（keyset 分頁，見 IMAGE_DELIVERY_AND_PAGINATION_PLAN.md D8/IV9）
+ * - 往下捲載入更多（keyset 分頁，）
  *
  * 跟 CharacterImagesPanel 分開：此面板處理的是「長期收藏」，
  * 舞台面板處理的是「目前輪播中」。兩邊互相移動資料。
@@ -16,7 +16,7 @@ import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type { AlbumItem } from '@/types/album'
-import { UiButton, UiImage } from '@/components/ui'
+import { UiBadge, UiButton, UiImage } from '@/components/ui'
 import {
   deleteAlbumItem,
   listAlbum,
@@ -25,9 +25,20 @@ import {
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { formatDateTime } from '@/i18n/formatters'
+import { safeMediaHref } from '@/utils/safeMediaUrl'
 
 const props = defineProps<{
   characterId: string | null
+  /**
+   * EC2-C: `image_urls` is licensor-owned on a managed (IP-partner)
+   * character — the server refuses this panel's own "promote to stage"
+   * write path (`AlbumManagedError`, same family as
+   * `CharacterCardManagedError`) exactly like it already refuses PATCH.
+   * The button is hidden rather than left to round-trip a 403, matching
+   * every other EC2-B/EC2-C managed-character gate. Deletion is
+   * untouched — the album is the player's own collection either way.
+   */
+  managed?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -207,6 +218,14 @@ defineExpose({ reload })
       </p>
     </div>
 
+    <!-- EC2-C：託管角色的舞台圖是授權方資產，「晉升為舞台圖」會把相簿圖片
+         寫回 image_urls——伺服端已拒絕，這裡先一步不給誤按的機會。刪除不
+         受影響，相簿本身仍是玩家自己的收藏。 -->
+    <div v-if="managed" class="managed-album-notice">
+      <UiBadge variant="primary">{{ t('characterEdit.managed.albumBadge') }}</UiBadge>
+      <p class="managed-album-notice__text">{{ t('characterEdit.managed.albumNotice') }}</p>
+    </div>
+
     <div v-if="!characterId" class="album-empty">
       {{ t('albumPanel.noCharacter') }}
     </div>
@@ -221,7 +240,7 @@ defineExpose({ reload })
         class="album-tile"
       >
         <a
-          :href="item.url"
+          :href="safeMediaHref(item.url)"
           target="_blank"
           rel="noopener noreferrer"
           class="album-image-link"
@@ -247,6 +266,7 @@ defineExpose({ reload })
           </div>
           <div class="album-actions">
             <UiButton
+              v-if="!managed"
               size="sm"
               class="album-action-btn"
               :disabled="busyItemId === item.id"
@@ -306,6 +326,24 @@ defineExpose({ reload })
   color: var(--color-text-secondary);
   line-height: 1.5;
   margin: 0;
+}
+
+.managed-album-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.managed-album-notice__text {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 
 .album-empty {

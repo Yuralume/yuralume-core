@@ -105,11 +105,27 @@ class ArcAdjustmentSignal:
 
 @dataclass(frozen=True, slots=True)
 class MessagePromise:
-    """A character promise to message the user at a specific future time.
+    """A commitment that obliges the character to open a conversation at
+    a specific future time.
 
-    Extracted from conversation by the post-turn LLM when the user
-    explicitly asked the character to text/wake/remind them at some
-    moment (例: "明天 10 點叫我起床" / "中午記得提醒我吃飯").
+    Extracted from conversation by the post-turn LLM whenever the user
+    will be *waiting on the character to speak first*. Three shapes, all
+    carried by the same three fields (the semantic difference lives in
+    ``intent``, not in the schema):
+
+    - **errand** — the user asked to be texted/woken/reminded at a moment
+      (例: "明天 10 點叫我起床" / "中午記得提醒我吃飯").
+    - **rendezvous** — both sides agreed to *do something together* at a
+      concrete time (例: "19:30 一起上線核對任務"). The character has to
+      show up and open the conversation, otherwise the user waits alone;
+      recording this only as a :class:`ScheduleAdjustment` leaves the
+      appointment silent.
+    - **completion** — the user asked the character to come back after
+      finishing something ("查完資料再找我") with *no* agreed time. The
+      extractor estimates a natural completion moment for
+      ``scheduled_for_iso`` so the promise still enters the mechanism
+      instead of drifting forever.
+
     Routes through :class:`PendingFollowUp` (``kind=scheduled_promise``)
     so the proactive dispatcher actually sends the message — bypassing
     quiet_hours / daily_limit / cooldown gates because this is a
@@ -133,8 +149,12 @@ class MessagePromise:
     intent: str
     """Natural-language description of what the character promised to
     do at ``scheduled_for_iso`` (例: "叫使用者起床" / "提醒使用者吃
-    午餐"). The composer reads this and writes the actual message
-    interpretation through the character's persona."""
+    午餐" / "到約定時間主動找使用者一起上線核對任務" / "查完資料後回頭
+    向使用者回報結果"). The composer reads this and writes the actual
+    message interpretation through the character's persona — it is the
+    only carrier of *which shape* of promise this is, so a rendezvous
+    states the joining action and a completion states both the finishing
+    condition and what to report back."""
     source_text: str = ""
     """Original user-side wording that produced the promise (例: "明天
     10 點叫我起床嘛"). Optional — empty when the post-turn LLM can't
@@ -164,7 +184,7 @@ class PeerMeetIntent:
 @dataclass(frozen=True, slots=True)
 class AddressChangeSignal:
     """A chat-observed change in how the operator and character address
-    each other (HUMANIZATION / ADDRESS_RESOLVER_PLAN).
+    each other (HUMANIZATION).
 
     When the user says something like 「今天開始叫我森森」 (direction
     ``player``: the *character* should address the *user* as 森森) or

@@ -114,7 +114,14 @@ class ComfyVideoGenerator(VideoProviderPort):
         length_frames: int = 0,
         recent_dialogue: str = "",
         use_runtime_state: bool = True,
+        first_frame_url: str | None = None,
     ) -> bytes:
+        # Accepted for port conformance only. The module docstring above
+        # calls i2v the right answer to identity drift, but the shipped
+        # Wan2.2 workflow graph is t2v and rewiring it would change every
+        # self-host render. Self-host i2v is a
+        # separate ticket via CUSTOM_MEDIA_GATEWAY_SPEC.
+        del first_frame_url
         positive_clean = (positive or "").strip()
         if not positive_clean:
             raise VideoGenerationError("缺少 video positive prompt")

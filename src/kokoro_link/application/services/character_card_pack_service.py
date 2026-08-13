@@ -1,6 +1,6 @@
 """Character-card catalogue — browse + install, from Cloud and from disk.
 
-The plan (``docs/CHARACTER_CARD_PLAN.md`` §7) named this
+The plan named this
 ``CharacterCardPackSyncService`` by analogy with the arc-template pack
 sync, but the two work differently: arc-template packs are upserted into
 a shared ``user_id IS NULL`` table, whereas a character card has no
@@ -12,7 +12,7 @@ uploaded ``.lumecard`` go through exactly the same A-layer-only path.
 Runtime never travels with the card; only the local install request may
 attach an importer-confirmed starting relationship seed.
 
-Since ``OFFICIAL_CARD_CLOUD_CATALOG_PLAN`` (D1/D5) the catalogue has two
+Since D1/D5 the catalogue has two
 sources and this service is where they meet:
 
 * **Cloud** — the official cards, read anonymously from the public catalog

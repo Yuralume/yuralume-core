@@ -21,6 +21,13 @@ from kokoro_link.infrastructure.provider_settings.live_probe import (
     ProbeReport,
     probe_connection,
 )
+from kokoro_link.infrastructure.provider_settings.runtime_ids import (
+    CONNECTION_SLUG_FIELD_KEY,
+    IDENTITY_SCOPED_CAPABILITIES,
+    RUNTIME_ID_SEPARATOR,
+    normalize_connection_slug,
+    runtime_provider_id,
+)
 from kokoro_link.infrastructure.security.error_sanitizer import (
     sanitize_error as _sanitize_error,
 )
@@ -38,6 +45,11 @@ class ProviderConnectionError(ValueError):
 class ProviderConnectionView:
     id: str
     provider: str
+    #: Id this row occupies in the runtime registries (preset id, or
+    #: ``preset__slug`` when a connection slug is set). Read-only mirror of
+    #: ``runtime_ids.runtime_provider_id`` so the admin UI can tell the
+    #: operator which entry of the model selector is this connection.
+    runtime_provider_id: str
     label: str
     enabled: bool
     capabilities: tuple[str, ...]
@@ -216,6 +228,13 @@ class ProviderConnectionService:
             enabled=enabled,
             capabilities=cleaned_capabilities,
         )
+        await self._assert_runtime_id_available(
+            entry,
+            config=cleaned_config,
+            capabilities=cleaned_capabilities,
+            enabled=bool(enabled),
+            exclude_id=None,
+        )
         encrypted_secret, fingerprint = self._encrypt_secret(cleaned_secret)
         now = datetime.now(timezone.utc)
         row = ProviderConnection(
@@ -287,6 +306,13 @@ class ProviderConnectionService:
             has_existing_secret=bool(encrypted_secret),
             enabled=current.enabled if enabled is None else bool(enabled),
             capabilities=cleaned_capabilities,
+        )
+        await self._assert_runtime_id_available(
+            entry,
+            config=cleaned_config,
+            capabilities=cleaned_capabilities,
+            enabled=current.enabled if enabled is None else bool(enabled),
+            exclude_id=current.id,
         )
         row = ProviderConnection(
             id=current.id,
@@ -566,6 +592,67 @@ class ProviderConnectionService:
                 f"{entry.id} secret requires field: {field.key}",
             )
 
+    async def _assert_runtime_id_available(
+        self,
+        entry: ProviderCatalogEntry,
+        *,
+        config: dict[str, Any],
+        capabilities: tuple[str, ...] | list[str],
+        enabled: bool,
+        exclude_id: str | None,
+    ) -> None:
+        """Refuse a row that would take a runtime id another row already has.
+
+        ``llm`` / ``image`` / ``video`` adapters live in registries keyed by
+        id, so two rows resolving to the same id do not coexist — the later
+        sync silently replaces the earlier registration and the admin UI
+        still shows both as enabled. Catching it here turns that invisible
+        loss into a save-time error naming the fix (``connection_slug``).
+
+        Scope of the check mirrors the runtime exactly: same preset, same
+        derived id, both enabled, and at least one *registry-keyed*
+        capability in common. An ``openai`` llm row and an ``openai`` image
+        row keep coexisting (different registries), and tts / embedding /
+        search rows are untouched — extra rows there are standby by design.
+        """
+        scoped = set(capabilities) & IDENTITY_SCOPED_CAPABILITIES
+        raw_slug = config.get(CONNECTION_SLUG_FIELD_KEY)
+        slug = normalize_connection_slug(raw_slug)
+        if raw_slug not in ("", None) and not slug:
+            raise ProviderConnectionError(
+                f"{CONNECTION_SLUG_FIELD_KEY} must contain ASCII letters or "
+                "digits (it becomes part of the provider id used by the "
+                "model selector)",
+            )
+        if not enabled or not scoped:
+            return
+        desired = (
+            f"{entry.id}{RUNTIME_ID_SEPARATOR}{slug}" if slug else entry.id
+        )
+        for other in await self._repository.list_all():
+            if other.id == exclude_id or not other.enabled:
+                continue
+            if other.provider != entry.id:
+                continue
+            if not scoped.intersection(other.capabilities):
+                continue
+            other_slug = normalize_connection_slug(
+                other.config.get(CONNECTION_SLUG_FIELD_KEY),
+            )
+            other_id = (
+                f"{other.provider}{RUNTIME_ID_SEPARATOR}{other_slug}"
+                if other_slug
+                else other.provider
+            )
+            if other_id != desired:
+                continue
+            raise ProviderConnectionError(
+                f"connection {other.label!r} already serves "
+                f"{sorted(scoped.intersection(other.capabilities))[0]} as "
+                f"{desired!r}; give this one a distinct "
+                f"{CONNECTION_SLUG_FIELD_KEY} so both can run at once",
+            )
+
     def _clean_label(self, label: str, entry: ProviderCatalogEntry) -> str:
         value = str(label or "").strip()
         return value or entry.display_name
@@ -582,6 +669,7 @@ class ProviderConnectionService:
         return ProviderConnectionView(
             id=row.id,
             provider=row.provider,
+            runtime_provider_id=runtime_provider_id(row),
             label=row.label,
             enabled=row.enabled,
             capabilities=row.capabilities,

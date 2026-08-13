@@ -34,6 +34,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 
 from kokoro_link.contracts.official_card_catalog import (
+    DISTRIBUTION_PUBLIC,
     OfficialCardCatalogPort,
     OfficialCardCatalogUnavailable,
     OfficialCardDetail,
@@ -98,6 +99,14 @@ downstream works that out. Counted **as the bytes arrive** (see
 :meth:`OfficialCardCatalogClient.fetch_artifact`) — measuring a body that
 has already been read would make this a description of the allocation
 rather than a limit on it."""
+
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+"""Matched to ``CharacterImageService.MAX_IMAGE_BYTES``.
+
+An official stage image that this deployment would refuse to store is not
+worth holding in memory first, so the two caps are the same number for the
+same reason the artifact cap matches the importer's."""
 
 
 class OfficialCardCatalogClient:
@@ -171,7 +180,38 @@ class OfficialCardCatalogClient:
             # translator on both sides of the wire, not to this adapter.
             profile=dict(profile) if isinstance(profile, Mapping) else {},
             images=self._as_images(raw_card.get("images")),
+            # Presence only. Cloud nulls this field (together with the
+            # profile prose) for a cloud-exclusive card, and that is the one
+            # place a *detail* read can learn the distribution — the catalog
+            # rows carry the field itself, the detail document does not.
+            # A *missing* key is a different thing from a null one and reads
+            # as "published": that is a Cloud from before exclusivity
+            # existed, where every published card had an artifact.
+            artifact_published=(
+                "artifact_url" not in raw_card
+                or bool(_text(raw_card.get("artifact_url")))
+            ),
         )
+
+    async def fetch_image(self, url: str) -> bytes:
+        """Download one stage image the catalog documents pointed at.
+
+        Anonymous, like every other read here: official-card images were
+        never behind the exclusivity mask, so the cloud-exclusive install
+        lands its art through the very same public route a browsing visitor
+        renders it from.
+
+        **The URL is checked against this client's own asset origin before
+        anything is fetched.** It arrives inside a document, and a document
+        is data: without this, a catalog answer could aim an outbound
+        request from inside the deployment at anywhere at all, on a path an
+        ordinary player triggers by pressing Install.
+        """
+        if not self._is_own_asset_url(url):
+            raise OfficialCardCatalogUnavailable(
+                "official card image url is outside the catalog asset origin",
+            )
+        return await self._read_capped(url, limit=MAX_IMAGE_BYTES)
 
     async def fetch_artifact(self, card_id: str) -> bytes:
         """Download one ``.lumecard``, counting as it arrives.
@@ -190,7 +230,14 @@ class OfficialCardCatalogClient:
         Left to the transport it is one decoded block, which for a gzipped
         body is a number the *sender* picks.
         """
-        url = f"{self._card_url(card_id)}/artifact"
+        return await self._read_capped(
+            f"{self._card_url(card_id)}/artifact", limit=MAX_ARTIFACT_BYTES,
+        )
+
+    # -- internals ---------------------------------------------------------- #
+
+    async def _read_capped(self, url: str, *, limit: int) -> bytes:
+        """Stream ``url`` into memory, hanging up the moment it overruns."""
         chunks: list[bytes] = []
         received = 0
         async with self._stream(url) as response:
@@ -198,21 +245,38 @@ class OfficialCardCatalogClient:
                 chunk_size=ARTIFACT_CHUNK_BYTES,
             ):
                 received += len(chunk)
-                if received > MAX_ARTIFACT_BYTES:
+                if received > limit:
                     # Leaving the ``async with`` closes the response, which
                     # is what actually hangs up on the sender.
                     raise OfficialCardCatalogUnavailable(
-                        f"official card artifact is larger than "
-                        f"{MAX_ARTIFACT_BYTES} bytes",
+                        f"official card download from {url} is larger than "
+                        f"{limit} bytes",
                     )
                 chunks.append(chunk)
         if not received:
             raise OfficialCardCatalogUnavailable(
-                "official card artifact response is empty",
+                f"official card download from {url} is empty",
             )
         return b"".join(chunks)
 
-    # -- internals ---------------------------------------------------------- #
+    def _is_own_asset_url(self, url: str) -> bool:
+        """Whether ``url`` is one this client's own catalog origin serves.
+
+        Compared on the parsed origin rather than by string prefix: a
+        ``https://app.yuralume.com.evil.test/...`` starts with the same
+        characters as the real origin and is a different host entirely.
+        """
+        origin = (self._asset_origin or "").strip()
+        if not origin:
+            return False
+        expected = urlsplit(origin)
+        actual = urlsplit((url or "").strip())
+        return (
+            actual.scheme == expected.scheme
+            and actual.netloc == expected.netloc
+            and bool(actual.path)
+            and actual.path.startswith(expected.path or "/")
+        )
 
     @asynccontextmanager
     async def _stream(self, url: str) -> AsyncIterator[httpx.Response]:
@@ -377,6 +441,10 @@ class OfficialCardCatalogClient:
             localized=entry.get("localized") is True,
             image_url=self.absolutise(_text(entry.get("image_url"))) or None,
             image_count=_count(entry.get("image_count")),
+            # Absent → ``public``: a catalog that predates the field has no
+            # exclusive cards to describe, and defaulting the other way
+            # would grey out every install button on it.
+            distribution=_text(entry.get("distribution")) or DISTRIBUTION_PUBLIC,
         )
 
     def _as_images(self, raw: object) -> tuple[OfficialCardImage, ...]:
@@ -490,6 +558,22 @@ class CachedOfficialCardCatalog(OfficialCardCatalogPort):
             )
             return None
 
+    async def download_image(self, *, url: str) -> bytes | None:
+        """Uncached, for the same reason artifacts are.
+
+        An install is a rare, deliberate act and these bytes go straight
+        into this deployment's own object storage — caching them in every
+        worker process would hold a second copy of something that now has a
+        permanent local home."""
+        try:
+            return await self._client.fetch_image(url)
+        except OfficialCardCatalogUnavailable:
+            _LOGGER.warning(
+                "official card image %s could not be downloaded", url,
+                exc_info=True,
+            )
+            return None
+
     async def _read(
         self,
         key: tuple[str, str],
@@ -590,6 +674,7 @@ __all__ = [
     "ARTIFACT_CHUNK_BYTES",
     "CATALOG_SCHEMA_VERSION",
     "MAX_ARTIFACT_BYTES",
+    "MAX_IMAGE_BYTES",
     "CachedOfficialCardCatalog",
     "OfficialCardCatalogClient",
 ]

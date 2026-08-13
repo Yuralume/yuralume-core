@@ -12,9 +12,9 @@
 busy decider 等程式分支條件。它們只能渲染成 prompt 中的事實層描述，由 LLM
 自行決定如何在當下對話中展現。如果出現
 ``if disposition.sharing_drive == "high": …`` 這種程式判斷，那就是違反
-``CLAUDE.md`` 第一條紅線的退化。
+專案第一條紅線（LLM-first）的退化。
 
-設計理由（見 ``docs/SESSION_HANDOFF.md`` 對應段、與作者對話脈絡）：
+設計理由：
 ``Character.personality`` 是描述性人格（外向、體貼），對 LLM 的引導力其實
 飄忽；本 VO 把「行為傾向」獨立成可控、可單測、可前端調整的維度。
 

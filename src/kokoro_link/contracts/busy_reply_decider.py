@@ -14,7 +14,7 @@ high ``busy_score`` activity, the chat path asks this port to decide:
   hints at when the dispatcher should try to release the queued row;
   the actual release is double-gated on the current busy_score.
 
-Per the project's top directive (``CLAUDE.md``), the judgement is the
+Per the project's top directive (LLM-first), the judgement is the
 LLM's. The decider port enumerates **nothing** — no busy-score
 threshold, no category list, no keyword catalogue. The implementation
 LLM sees the persona, the current activity, the message, and writes

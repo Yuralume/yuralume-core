@@ -10,6 +10,7 @@ every path where it does not.
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +169,17 @@ class _Fixture:
         )
         return created.id
 
+    async def managed_character_id(self) -> str:
+        """EC7: a character installed from an official card (origin set)."""
+        character_id = await self.character_id()
+        character = await self.characters.get(character_id)
+        assert character is not None
+        managed = dataclasses.replace(
+            character, origin_official_card_id="official-yumi",
+        )
+        await self.characters.save(managed)
+        return character_id
+
 
 async def test_one_turn_takes_one_charge_and_settles_it() -> None:
     fixture = _Fixture(model=_ServingModel())
@@ -180,8 +192,22 @@ async def test_one_turn_takes_one_charge_and_settles_it() -> None:
 
     assert len(fixture.client.charges) == 1
     assert fixture.client.charges[0]["action_key"] == "chat"
+    assert fixture.client.charges[0]["character_origin"] is None
     assert fixture.client.settled == ["chg-1"]
     assert fixture.client.released == []
+
+
+async def test_a_managed_characters_turn_charge_carries_its_origin() -> None:
+    """EC7: the official card slug rides the chat action charge."""
+    fixture = _Fixture(model=_ServingModel())
+    chat = fixture.chat()
+    character_id = await fixture.managed_character_id()
+
+    await chat.send_message(
+        SendChatMessageRequest(character_id=character_id, message="哈囉"),
+    )
+
+    assert fixture.client.charges[0]["character_origin"] == "official-yumi"
 
 
 async def test_external_turn_reuses_its_stable_id_for_action_billing(

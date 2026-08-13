@@ -1,6 +1,6 @@
 """Idle 起幕 scenes wrap themselves up (SC1-E).
 
-A player can walk away mid-scene, and STORY_SCENE_PLAN §2 #5 says what
+A player can walk away mid-scene, and the design says what
 happens then: after a configurable idle window (24h by default) the scene
 closes on its own, the wrap-up writer narrates 「你離開之後…」, and the
 beat lands as canon. Two promises depend on it — the hosted one price

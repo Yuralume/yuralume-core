@@ -1,6 +1,6 @@
 """IV3 — existing-stock WebP variant backfill.
 
-Covers ``docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md`` §5 IV3: the DB
+Covers IV3: the DB
 is the only possible inventory (and the same picture is referenced twice),
 already-done work is skipped, one bad image does not end the batch,
 ``--dry-run`` writes nothing, and ``--prune-originals`` is off unless

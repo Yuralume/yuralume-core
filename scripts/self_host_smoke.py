@@ -1,6 +1,6 @@
 """Self-host compose smoke verification.
 
-Walks the DoD in ``docs/SELF_HOST_COMPOSE_READY_TASK.md``:
+Walks the self-host compose readiness DoD:
 
 * container basics: app /health, storage /health, SPA fallback
 * auth config probe (honours AUTH_ENABLED + needs_setup)
@@ -605,7 +605,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Self-host Docker Compose smoke for Yuralume. Walks the "
-            "DoD in docs/SELF_HOST_COMPOSE_READY_TASK.md."
+            "self-host compose readiness DoD."
         ),
     )
     p.add_argument(

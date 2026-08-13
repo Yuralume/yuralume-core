@@ -1,6 +1,6 @@
 """character.arc_template_id
 
-Phase 2 of ``docs/SCENE_BEAT_PLAN.md`` — characters can opt into a
+Phase 2 of the scene-beat work — characters can opt into a
 hand-written arc template (YAML in ``data/arc_templates/``); the
 ``StoryArcService`` materialises the template instead of LLM-planning a
 fresh arc when this field is set. NULL = legacy LLM-only behaviour.

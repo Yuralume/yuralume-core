@@ -5,7 +5,7 @@ import type { UpdateCharacterRequest } from '@/types/character'
 import { updateCharacter } from '@/utils/api/characters'
 import InterestSubscriptionPanel from '@/components/InterestSubscriptionPanel.vue'
 import WorldAwarenessPanel from '@/components/WorldAwarenessPanel.vue'
-import { UiCard, UiButton } from '@/components/ui'
+import { UiBadge, UiCard, UiButton } from '@/components/ui'
 import { useI18n } from 'vue-i18n'
 
 /**
@@ -60,6 +60,20 @@ const copyRoot = computed(() => (
   isPlayerSurface.value ? 'playerAuthoring.worldEditor' : 'admin.worldEditor'
 ))
 
+/**
+ * EC2-C: `world_frame` / `world_topics` / `excluded_topics` are not in
+ * `MANAGED_WRITABLE_UPDATE_FIELDS` (backend:
+ * `managed_character_update_policy.py`) — only `world_awareness_enabled`
+ * and `subscribed_categories` are. `world_frame` in particular always
+ * carries a real value (the select defaults to `'modern'`, never blank),
+ * so every save on a managed character would 400 if this editor kept
+ * sending it. Hide the protected controls and drop the protected fields
+ * from the payload instead of relying on the server's blank-tolerance —
+ * same rule `CharacterEditPanel.buildManagedAwareUpdateRequest` (EC2-B)
+ * follows for the persona fields.
+ */
+const isManaged = computed(() => props.character.managed === true)
+
 function copy(path: string, params?: Record<string, unknown>): string {
   return t(`${copyRoot.value}.${path}`, params ?? {})
 }
@@ -72,11 +86,13 @@ async function handleSave() {
     const payload: UpdateCharacterRequest = {
       world_awareness_enabled: form.value.world_awareness_enabled,
       subscribed_categories: [...form.value.subscribed_categories],
-      excluded_topics: [...form.value.excluded_topics],
-      world_topics: [...form.value.world_topics],
     }
-    if (props.includeWorldFrame) {
-      payload.world_frame = form.value.world_frame
+    if (!isManaged.value) {
+      payload.excluded_topics = [...form.value.excluded_topics]
+      payload.world_topics = [...form.value.world_topics]
+      if (props.includeWorldFrame) {
+        payload.world_frame = form.value.world_frame
+      }
     }
     const updated = await updateCharacter(props.character.id, payload)
     props.patch(updated)
@@ -103,7 +119,20 @@ watch(successMsg, (next) => {
         <h2 class="world-editor__card-title">{{ copy('worldFrameTitle') }}</h2>
       </template>
 
-      <div class="world-editor__field">
+      <!-- EC2-C：world_frame 對託管角色可見但不可寫（不在 allowlist 內，
+           且 select 恆帶真值，PATCH 一定會被伺服端拒絕）——唯讀顯示目前
+           設定，不給可編輯的控件。 -->
+      <div v-if="isManaged" class="world-editor__field">
+        <label class="field-label">{{ copy('worldFrameLabel') }}</label>
+        <div class="world-editor__readonly-value">
+          {{ t(`characterCreate.fields.worldFrame.options.${form.world_frame}`) }}
+        </div>
+        <div class="managed-world-notice">
+          <UiBadge variant="primary">{{ t('characterEdit.managed.worldBadge') }}</UiBadge>
+          <p class="managed-world-notice__text">{{ t('characterEdit.managed.worldFrameNotice') }}</p>
+        </div>
+      </div>
+      <div v-else class="world-editor__field">
         <label class="field-label">{{ copy('worldFrameLabel') }}</label>
         <select v-model="form.world_frame" class="field-select">
           <option value="modern">{{ t('characterCreate.fields.worldFrame.options.modern') }}</option>
@@ -126,6 +155,7 @@ watch(successMsg, (next) => {
         v-model:model-enabled="form.world_awareness_enabled"
         v-model:model-categories="form.subscribed_categories"
         v-model:model-excluded="form.excluded_topics"
+        :hide-excluded="isManaged"
       />
     </UiCard>
 
@@ -139,10 +169,19 @@ watch(successMsg, (next) => {
         v-model:model-excluded="form.excluded_topics"
         copy-namespace="playerAuthoring.interestSubscriptionPanel"
         category-namespace="interestSubscriptionPanel.categories"
+        :hide-excluded="isManaged"
       />
     </section>
 
-    <UiCard v-if="!isPlayerSurface" size="lg">
+    <!-- EC2-C：world_topics／excluded_topics 都不在託管角色的 allowlist
+         內，伺服端已把它們遮蔽為空值——整段隱藏編輯控件，不是留著讓玩家
+         對空清單動手（動手也會被拒）。 -->
+    <div v-if="isManaged" class="managed-world-notice managed-world-notice--block">
+      <UiBadge variant="primary">{{ t('characterEdit.managed.worldBadge') }}</UiBadge>
+      <p class="managed-world-notice__text">{{ t('characterEdit.managed.worldTopicsNotice') }}</p>
+    </div>
+
+    <UiCard v-else-if="!isPlayerSurface" size="lg">
       <template #header>
         <h2 class="world-editor__card-title">{{ copy('eventPoolTitle') }}</h2>
       </template>
@@ -218,6 +257,34 @@ watch(successMsg, (next) => {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+.world-editor__readonly-value {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-sm);
+  color: var(--color-text);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+}
+.managed-world-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: var(--space-2);
+}
+.managed-world-notice--block {
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 0;
+}
+.managed-world-notice__text {
+  margin: 0;
+  font-size: var(--font-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 .world-editor__note {
   margin: 0 0 var(--space-2);

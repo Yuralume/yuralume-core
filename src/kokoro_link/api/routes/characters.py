@@ -63,11 +63,13 @@ from kokoro_link.application.services.character_image_service import (
     ImageNotFoundError,
     ImageTooLargeError,
     MAX_IMAGE_BYTES,
+    OfficialArtProtectedError,
     StorageUnavailableError,
     TooManyImagesError,
     UnsupportedImageTypeError,
 )
 from kokoro_link.application.services.character_card_export_service import (
+    CharacterCardManagedError,
     CharacterCardNotFoundError,
 )
 from kokoro_link.application.dto.character_card import CharacterCardPreview
@@ -100,6 +102,7 @@ from kokoro_link.application.services.character_creation_intake_service import (
 )
 from kokoro_link.application.services.character_lora_service import (
     CharacterLoraError,
+    LoraManagedError,
     LoraNotFoundError,
     LoraTooLargeError,
     LoraUploadDisabledError,
@@ -505,7 +508,7 @@ async def import_character_card(
     images) cross over; B-layer routing and all C-layer runtime data are
     intentionally absent. The multipart request may include an
     importer-confirmed ``initial_relationship`` JSON payload for the new
-    local character/operator pair. See ``docs/CHARACTER_CARD_PLAN.md``."""
+    local character/operator pair."""
     service = container.character_card_import_service
     if service is None:  # pragma: no cover — wired in build_container
         raise HTTPException(
@@ -544,6 +547,17 @@ async def import_character_card(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
         ) from exc
     except (InvalidCharacterCardError, CharacterCardImportError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+        ) from exc
+    except CharacterValidationError as exc:
+        # An import *creates a character*, so it walks into the same wall
+        # ``POST /characters`` does — an account's character-slot cap, or
+        # its daily create limit. A player at their limit importing a card
+        # is an ordinary, expected refusal; it reads as 400 here for the
+        # same reason it does there, rather than as a crash (this used to
+        # escape as a 500 — the ``character_cards.py`` install path had
+        # the mapping, this one didn't).
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
         ) from exc
@@ -792,8 +806,7 @@ async def export_character_card(
     templates and stage images) as a downloadable ``.lumecard`` blob.
 
     B-layer routing (voice / loras / profiles) and all C-layer runtime
-    accumulation are intentionally left out — see
-    ``docs/CHARACTER_CARD_PLAN.md``. Ownership is enforced inside the
+    accumulation are intentionally left out. Ownership is enforced inside the
     service (cross-user → 404, collapsed to avoid enumeration)."""
     service = container.character_card_export_service
     if service is None:  # pragma: no cover — wired in build_container
@@ -811,6 +824,17 @@ async def export_character_card(
     except CharacterCardNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Character not found",
+        ) from exc
+    except CharacterCardManagedError as exc:
+        # EC3: the character exists and is the caller's own — a 404 here
+        # would be a lie, not an anti-enumeration measure. Mirrors the
+        # story-seed "exists, wrong kind, refuse" 403.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This character's persona is managed by its licensor and "
+                "cannot be exported"
+            ),
         ) from exc
 
     # The slug can be CJK, which isn't valid in a bare ``filename=`` token,
@@ -1079,6 +1103,13 @@ async def delete_character_image(
         updated = await container.character_image_service.remove_image(
             character_id, url=url,
         )
+    except OfficialArtProtectedError as exc:
+        # The image exists and belongs to the IP partner, not to the player
+        # — "not yours", not "not there", so not the 404 below.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     except ImageNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1107,6 +1138,26 @@ async def reorder_character_images(
             detail=str(exc),
         ) from exc
     return CharacterResponse.from_domain(updated)
+
+
+_LORA_MANAGED_DETAIL = (
+    "This character's LoRA weights are managed by its licensor "
+    "and cannot be changed"
+)
+
+
+def _lora_managed_http_error() -> HTTPException:
+    """EC2-C shape, shared by all four mutating LoRA routes.
+
+    403, not 404: the character exists and is in the caller's own roster,
+    so hiding it would be a lie rather than anti-enumeration. Mirrors
+    ``AlbumManagedError`` / ``CharacterCardManagedError``. The detail is a
+    fixed player-facing sentence rather than the exception text, which
+    names the internal character id."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=_LORA_MANAGED_DETAIL,
+    )
 
 
 @router.get(
@@ -1160,6 +1211,8 @@ async def upload_character_lora(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+    except LoraManagedError as exc:
+        raise _lora_managed_http_error() from exc
     except LoraNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1188,6 +1241,8 @@ async def attach_existing_lora(
         updated = await container.character_lora_service.attach_existing(
             character_id, name=name, strength=strength,
         )
+    except LoraManagedError as exc:
+        raise _lora_managed_http_error() from exc
     except LoraNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -1214,6 +1269,8 @@ async def update_lora_strength(
         updated = await container.character_lora_service.set_strength(
             character_id, name=name, strength=strength,
         )
+    except LoraManagedError as exc:
+        raise _lora_managed_http_error() from exc
     except LoraNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -1235,6 +1292,8 @@ async def remove_character_lora(
         updated = await container.character_lora_service.remove(
             character_id, name=name,
         )
+    except LoraManagedError as exc:
+        raise _lora_managed_http_error() from exc
     except LoraNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),

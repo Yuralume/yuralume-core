@@ -124,6 +124,10 @@ from kokoro_link.application.services.vision_media import (
 from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_event_service import StoryEventService
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
+from kokoro_link.application.services.world_event_prompt_lines import (
+    render_event_candidate_line,
+    render_event_recall_line,
+)
 from kokoro_link.contracts.turn_journal import TurnJournalRepositoryPort
 from kokoro_link.contracts.account_runtime_profile import (
     AccountRuntimeProfileResolverPort,
@@ -271,10 +275,16 @@ from kokoro_link.contracts.story_scene import (
     StorySceneChipsWriterPort,
     StorySceneSessionRepositoryPort,
 )
+from kokoro_link.contracts.character_event_mention import (
+    CharacterEventMentionRepositoryPort,
+)
 from kokoro_link.contracts.tool import ToolRegistryPort
+from kokoro_link.contracts.world_event import WorldEventRepositoryPort
 from kokoro_link.domain.entities.behavioral_pattern import KIND_PHRASE_HABIT
 from kokoro_link.domain.entities.character import (
     CHAT_THAWABLE_FREEZE_REASONS,
+    FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
+    FREEZE_REASON_RESTORE,
     FREEZE_REASON_SUBSCRIPTION_LAPSE,
     Character,
 )
@@ -361,7 +371,7 @@ This is a **perf gate, not a behavior gate** — the decider remains the
 sole authority on whether to defer. The floor just stops us from
 spending an LLM call on patently idle states (a character lounging at
 ``busy_score=0.2`` is not going to defer no matter what the model says).
-``CLAUDE.md`` forbids using thresholds / keywords to **decide** the
+The LLM-first rule forbids using thresholds / keywords to **decide** the
 outcome; using them to **gate the LLM invocation** for cost reasons is
 fine and is the same pattern used by the idle-drift judge."""
 
@@ -396,6 +406,17 @@ over budget we drop the oldest images first. Set to 0 to disable
 history vision entirely."""
 _IMAGE_RECOGNITION_CONTEXT_MAX_CHARS = 4000
 """Maximum image-recognition text injected into the main chat prompt."""
+_WORLD_EVENT_RECALL_LIMIT = 3
+"""How many already-used world events chat carries back into the prompt.
+
+Matched to the candidate peek's limit: the two blocks are the same kind
+of material and together they should not crowd out the turn."""
+_WORLD_EVENT_RECALL_MAX_AGE_DAYS = 3
+"""How long a mention stays worth re-stating.
+
+Shorter than the seed window (5 days) on purpose — a follow-up question
+lands in the hours after the push, and week-old news re-injected every
+turn is just prompt weight."""
 _MAX_TOOL_HOPS = 4
 """Cap on tool-call iterations per turn.
 
@@ -441,6 +462,33 @@ class ChatSubscriptionFrozen(RuntimeError):
     character thawing. This exception keeps unresolved legacy
     ``frozen_reason='subscription_lapse'`` rows fail-closed during upgrades.
     The API layer maps both paths to the same structured 403 response."""
+
+
+class ChatCharacterContractEndedError(RuntimeError):
+    """The character's source card is under an IP-partner contract freeze.
+
+    D7 / EC10: when a licensor's contract for an official card ends, every
+    character installed from that card is frozen with
+    ``frozen_reason='exclusive_contract_end'``. The pinned semantics are
+    "資料保留、不可互動" — the row and its history survive intact, but the
+    player may not keep talking to a character the licensor has withdrawn.
+
+    Deliberately *not* a subclass of (or an alias for)
+    :class:`ChatSubscriptionFrozen`: the player's own subscription is fine,
+    and telling them to renew it would send them to a payment page that
+    cannot fix anything. The API layer maps this to its own structured 403;
+    only a matching per-card ``unfreeze`` lifts it."""
+
+
+class ChatCharacterRestoringError(RuntimeError):
+    """The character is still being landed by a ``.lumebackup`` restore.
+
+    A restore lands the character row minutes before its memories / media /
+    conversations follow (CB A3): any turn accepted in that window runs
+    against a hollow character and is destroyed by the restore's failure
+    cleanup. The row is frozen with ``frozen_reason='restore'`` for the
+    duration; the API layer maps this to a structured 409 — the restore
+    either finishes (unfreezing the character) or fails (deleting it)."""
 
 
 def _compute_idle_minutes(state: CharacterState, now: datetime) -> float | None:
@@ -916,6 +964,10 @@ class ChatService:
             AccountRuntimeUsageRepositoryPort | None
         ) = None,
         event_seed_dispenser=None,  # noqa: ANN001 - optional EventSeedDispenser
+        event_mention_repository: (
+            CharacterEventMentionRepositoryPort | None
+        ) = None,
+        world_event_repository: WorldEventRepositoryPort | None = None,
         clock: ClockPort | None = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
         turn_lease: ChatTurnLease | None = None,
@@ -1042,6 +1094,12 @@ class ChatService:
         )
         self._account_runtime_usage_repository = account_runtime_usage_repository
         self._event_seed_dispenser = event_seed_dispenser
+        # Recall needs the event pool directly: a mention points at a
+        # world event whose inbox row is already claimed, so the
+        # dispenser (which only ever hands out unclaimed rows) cannot
+        # resolve it.
+        self._event_mentions = event_mention_repository
+        self._world_events = world_event_repository
         self._clock = clock
         self._subscription_access_guard = subscription_access_guard
         # Per-conversation turn mutex. ``None`` → the historical unguarded
@@ -1836,6 +1894,7 @@ class ChatService:
                         external_turn.stable_turn_id()
                         if external_turn is not None else None
                     ),
+                    character_origin=prelude.character.origin_official_card_id,
                 ):
                     if external_turn is not None:
                         return await self._send_message_turn(
@@ -1903,6 +1962,9 @@ class ChatService:
         weather_context = await self._describe_weather(today_local, operator=operator)
         world_event_context = await self._load_world_event_context(
             character, operator,
+        )
+        world_event_recall = await self._load_world_event_recall(
+            character, now=now_utc,
         )
         upcoming_day_schedules = await self._load_upcoming_day_schedules(
             character.id, today_local=today_local,
@@ -2068,6 +2130,7 @@ class ChatService:
             calendar_context=calendar_context,
             weather_context=weather_context,
             world_event_context=world_event_context,
+            world_event_recall=world_event_recall,
             upcoming_day_schedules=upcoming_day_schedules,
             presence_frame=presence_frame,
             content_tolerance=_content_tolerance_for_model(
@@ -2397,6 +2460,9 @@ class ChatService:
         world_event_context = await self._load_world_event_context(
             character, operator,
         )
+        world_event_recall = await self._load_world_event_recall(
+            character, now=now_utc,
+        )
         upcoming_day_schedules = await self._load_upcoming_day_schedules(
             character.id, today_local=today_local,
         )
@@ -2556,6 +2622,7 @@ class ChatService:
                 calendar_context=calendar_context,
                 weather_context=weather_context,
                 world_event_context=world_event_context,
+                world_event_recall=world_event_recall,
                 upcoming_day_schedules=upcoming_day_schedules,
                 presence_frame=presence_frame,
                 content_tolerance=_content_tolerance_for_model(
@@ -2741,6 +2808,7 @@ class ChatService:
                 calendar_context=calendar_context,
                 weather_context=weather_context,
                 world_event_context=world_event_context,
+                world_event_recall=world_event_recall,
                 upcoming_day_schedules=upcoming_day_schedules,
                 emotion_events=emotion_events,
                 self_reflections=self_reflections,
@@ -3051,13 +3119,29 @@ class ChatService:
           回合稍後的 ``save`` 不會用 stale 的 ``frozen=True`` 覆寫回去）。
         - legacy ``subscription_lapse`` → 升級期間無法解析 tenant 的相容
           硬鎖，丟 :class:`ChatSubscriptionFrozen`，不自動解凍。
+        - ``restore`` → 備份還原落地中（CB A3），角色只有半個；丟
+          :class:`ChatCharacterRestoringError` 硬擋聊天入口，還原完成
+          自動解凍、失敗清理直接刪列。
         - ``manual`` → admin 刻意凍結，聊天不自動解凍（黏著），但也不擋
-          聊天入口；由 admin 主控台解凍。"""
+          聊天入口；由 admin 主控台解凍。
+        - ``exclusive_contract_end`` → Cloud per-card 凍結（D7 / EC10）：
+          IP 合約終止，拍板語意是「資料保留、**不可互動**」，所以丟
+          :class:`ChatCharacterContractEndedError` 硬擋聊天入口，且不自動
+          解凍；只由對應的 per-card ``unfreeze`` 訊息解凍。與 ``manual``
+          的差別就在這裡——``manual`` 只是背景休眠，這條是撤下。"""
         if not character.frozen:
             return character
         if character.frozen_reason == FREEZE_REASON_SUBSCRIPTION_LAPSE:
             raise ChatSubscriptionFrozen(
                 "character is frozen for a lapsed subscription",
+            )
+        if character.frozen_reason == FREEZE_REASON_RESTORE:
+            raise ChatCharacterRestoringError(
+                "character is still being restored from a backup",
+            )
+        if character.frozen_reason == FREEZE_REASON_EXCLUSIVE_CONTRACT_END:
+            raise ChatCharacterContractEndedError(
+                "character's source card is frozen by its licensor",
             )
         if character.frozen_reason not in CHAT_THAWABLE_FREEZE_REASONS:
             # e.g. ``manual`` — sticky freeze, admin-cleared only. Chat is
@@ -3788,6 +3872,7 @@ class ChatService:
         calendar_context: str = "",
         weather_context: str = "",
         world_event_context: tuple[str, ...] = (),
+        world_event_recall: tuple[str, ...] = (),
         upcoming_day_schedules: list | None = None,
         presence_frame: PresenceFrame | None = None,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
@@ -3968,6 +4053,7 @@ class ChatService:
                     calendar_context=calendar_context,
                     weather_context=weather_context,
                     world_event_context=world_event_context,
+                    world_event_recall=world_event_recall,
                     upcoming_day_schedules=upcoming_day_schedules,
                     emotion_events=emotion_events,
                     self_reflections=self_reflections,
@@ -4205,6 +4291,7 @@ class ChatService:
                 calendar_context=calendar_context,
                 weather_context=weather_context,
                 world_event_context=world_event_context,
+                world_event_recall=world_event_recall,
                 upcoming_day_schedules=upcoming_day_schedules,
                 emotion_events=emotion_events,
                 self_reflections=self_reflections,
@@ -4541,6 +4628,7 @@ class ChatService:
                 calendar_context=calendar_context,
                 weather_context=weather_context,
                 world_event_context=world_event_context,
+                world_event_recall=world_event_recall,
                 upcoming_day_schedules=upcoming_day_schedules,
                 emotion_events=emotion_events,
                 self_reflections=self_reflections,
@@ -4856,21 +4944,71 @@ class ChatService:
         if location:
             lines.append(f"- {location}")
         for seed in seeds:
-            event = seed.event
-            title = (event.title or "").strip()
-            if not title:
+            rendered = render_event_candidate_line(seed.event)
+            if rendered is None:
                 continue
-            parts = [f"標題：{_clip(title, 160)}"]
-            source = (event.source or "").strip()
-            if source:
-                parts.append(f"來源：{_clip(source, 80)}")
-            locale = (event.locale or "").strip()
-            if locale:
-                parts.append(f"來源地區：{_clip(locale, 40)}")
-            summary = (event.summary or "").strip()
-            if summary:
-                parts.append(f"摘要：{_clip(summary, 240)}")
-            lines.append("- " + "；".join(parts))
+            lines.append(f"- {rendered}")
+        return tuple(lines)
+
+    async def _load_world_event_recall(
+        self, character: Character, *, now: datetime,
+    ) -> tuple[str, ...]:
+        """Events this character used to reach out, newest first.
+
+        The counterpart to :meth:`_load_world_event_context`: that one
+        shows what the character *could* raise, this one what it already
+        did. They cannot be one query — a consumed event's inbox row is
+        claimed, and the peek only ever returns unclaimed rows, so
+        without this the material behind a proactive push vanishes from
+        chat at the instant the push is delivered.
+
+        Fail-soft throughout, and tolerant of a dangling event id: the
+        world-event GC hard-deletes pool rows, and self-host SQLite does
+        not enforce the cascade that would clean the mention with it.
+        """
+        if self._event_mentions is None or self._world_events is None:
+            return ()
+        if not getattr(character, "world_awareness_enabled", False):
+            return ()
+        try:
+            # Over-fetch for the same reason the inbox peek does: rows
+            # drop out here (event GC'd, pool read failed, no title), and
+            # asking for exactly the limit would let one dangling row
+            # cost a slot a live event behind it could have filled.
+            mentions = await self._event_mentions.list_recent(
+                character.id, limit=_WORLD_EVENT_RECALL_LIMIT * 2,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "chat: world-event recall lookup failed character=%s",
+                character.id,
+            )
+            return ()
+        cutoff = now - timedelta(days=_WORLD_EVENT_RECALL_MAX_AGE_DAYS)
+        lines: list[str] = []
+        for mention in mentions:
+            if mention.mentioned_at < cutoff:
+                # Older than the window the player could plausibly be
+                # following up on; keep the prompt for live material.
+                continue
+            try:
+                event = await self._world_events.get(mention.world_event_id)
+            except Exception:
+                _LOGGER.exception(
+                    "chat: world-event recall fetch failed character=%s "
+                    "event=%s", character.id, mention.world_event_id,
+                )
+                continue
+            if event is None:
+                continue
+            rendered = render_event_recall_line(
+                event, mentioned_at=mention.mentioned_at, now=now,
+            )
+            if rendered is None:
+                continue
+            lines.append(f"- {rendered}")
+            if len(lines) >= _WORLD_EVENT_RECALL_LIMIT:
+                break
         return tuple(lines)
 
     async def _ensure_story_arc(

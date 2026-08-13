@@ -1,4 +1,4 @@
-"""Process-role → component matrix (HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §2.1).
+"""Process-role → component matrix.
 
 The matrix is the single source of truth for *what a role starts*. ``app.py``
 gates router registration and lifespan ``.start()`` calls off these flags;

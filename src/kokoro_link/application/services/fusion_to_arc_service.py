@@ -67,7 +67,7 @@ class FusionToArcDraftService:
         """Adapt one ready fusion story into an unsaved template draft.
 
         ``operator_mode`` is the creator's answer to "how do I enter this
-        story" (ARC_PLAYER_POSITION_PLAN 拍板 #2). ``None`` means nobody
+        story" (拍板 #2). ``None`` means nobody
         answered and resolves to the plan's protocol default; an
         off-vocabulary value raises rather than picking a branch on the
         caller's behalf.

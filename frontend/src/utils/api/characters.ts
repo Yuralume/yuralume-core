@@ -551,6 +551,17 @@ export interface CharacterCardPreview {
   /** Whether this text is already in the operator's own language. Only the
    *  Cloud catalog claims it; a local pack always reports false. */
   localized?: boolean
+  /** 'public' for a card anyone can install, 'cloud_exclusive' for an
+   *  IP-partner character whose text lives only on Yuralume Cloud. Always
+   *  'public' for a local pack or an uploaded file. Says *why* an install is
+   *  unavailable — it is not what the button reads. */
+  distribution?: 'public' | 'cloud_exclusive'
+  /** Whether THIS deployment can complete an install of this card. False
+   *  only for a cloud-exclusive card on a deployment holding no
+   *  exclusive-read credential (a self-hosted one, always). The backend
+   *  folds the card's licence and the deployment's credential together
+   *  because the browser can see neither. */
+  installable?: boolean
   /** 'lumecard' for the native path (and bundled packs), 'sillytavern' when
    *  the upload was a converted SillyTavern card. */
   source_format?: string

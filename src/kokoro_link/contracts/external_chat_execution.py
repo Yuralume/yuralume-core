@@ -8,7 +8,7 @@ is the thin seam the turn service injects so ChatService can hand every
 *conversation write* and every *stable identity / anchor* decision to the durable
 layer — while the LLM pipeline itself is untouched.
 
-Design contract (``HOSTED_OFFICIAL_LINE_CHANNEL_LH2_DESIGN.md`` — "Seam 介面"):
+Design contract ("Seam 介面"):
 
 * ``external_turn=None`` → ChatService is bit-identical to the pre-LH2 web path.
   Every hook below fires only inside ``if external_turn is not None:``.

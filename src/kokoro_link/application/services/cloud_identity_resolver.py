@@ -39,18 +39,24 @@ class CloudOperatorIdentityResolver:
         if self._subscription_access_guard is not None:
             await self._subscription_access_guard.ensure_tenant_allowed(tenant_id)
         character_ref = ""
+        character_origin: str | None = None
         if context.character is not None:
             character_ref = _character_ref(
                 tenant_id=tenant_id,
                 account_id=account_id,
                 character_id=context.character.id,
             )
+            # EC7: the origin card slug is plaintext (unlike character_ref,
+            # which is a hash) and only ever set for managed characters —
+            # ordinary characters and every self-host install keep this None.
+            character_origin = context.character.origin_official_card_id
         return CloudGatewayIdentity(
             operator_id=operator.id,
             account_id=account_id,
             tenant_id=tenant_id,
             character_ref=character_ref,
             tenant_tier=(operator.cloud_tenant_tier or "standard").strip() or "standard",
+            character_origin=character_origin,
         )
 
 

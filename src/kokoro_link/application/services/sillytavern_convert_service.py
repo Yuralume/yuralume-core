@@ -1,7 +1,7 @@
 """Convert a parsed SillyTavern card into a ``CharacterCardManifest``.
 
 This is the Phase-2 front layer of the SillyTavern import feature (see
-``docs/SILLYTAVERN_CARD_IMPORT_PLAN.md``). It sits between the pure parser
+``docs). It sits between the pure parser
 (``infrastructure/character_card/sillytavern.py``) and the unchanged
 ``.lumecard`` import pipeline: the route packs the manifest this service
 builds into an in-memory ``.lumecard`` and feeds it back through the

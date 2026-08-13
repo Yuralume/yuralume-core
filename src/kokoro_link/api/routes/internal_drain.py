@@ -2,7 +2,7 @@
 
 ``POST /api/internal/v1/drain`` — the request ``deploy.sh`` sends to a single api
 replica's loopback management port after the router has already removed it from
-the upstream pool (``HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN`` §7.3 GD1 step 2).
+the upstream pool (GD1 step 2).
 It flips this process's :class:`DrainState`, which closes the long-lived SSE
 streams gently and refuses new turns; the deploy then polls
 ``yuralume_core_active_turns`` on the metrics scrape to zero before recreating

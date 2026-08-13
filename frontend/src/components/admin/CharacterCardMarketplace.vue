@@ -5,7 +5,7 @@
  *
  * 安裝走後端 `POST /character-cards/{id}/install`，與手動匯入同一條路徑；
  * 成功後 emit ``installed`` 讓父頁刷新角色 picker。市集來源目前是 repo
- * 出貨；遠端 registry 列在 backlog（見 docs/CHARACTER_CARD_PLAN.md §8）。
+ * 出貨；遠端 registry 列在 backlog（）。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -17,8 +17,10 @@ import {
   type CharacterCardPackSummary,
 } from '@/utils/api/characters'
 import {
+  canInstallCard,
   isCloudCard,
   shouldOfferInstallTranslateToggle,
+  shouldShowCloudOnlyNotice,
 } from '@/utils/characterCardSource'
 import { UiCard, UiButton, UiBadge } from '@/components/ui'
 
@@ -55,6 +57,10 @@ async function load() {
 }
 
 async function install(pack: CharacterCardPackSummary) {
+  // The button is already disabled for these; this is the keyboard / stale
+  // list path, and the backend refuses too. Three layers because the middle
+  // one is the only one that can explain itself.
+  if (!canInstallCard(pack)) return
   installingId.value = pack.pack_id
   try {
     const { character, landed_arc_template_ids } = await installCharacterCard(
@@ -140,11 +146,24 @@ onMounted(load)
           {{ t('admin.page.characters.marketplace.officialTranslated') }}
         </p>
 
+        <!--
+          A cloud-exclusive card this deployment holds no credential for.
+          The row stays — the console should show the whole shelf — but the
+          install button would fail at the far end (EC4).
+        -->
+        <p
+          v-if="shouldShowCloudOnlyNotice(pack)"
+          class="marketplace__official-note"
+        >
+          {{ t('playerSidebar.characterCards.cloudOnly.hint') }}
+        </p>
+
         <UiButton
           variant="primary"
           size="sm"
           block
           :loading="installingId === pack.pack_id"
+          :disabled="!canInstallCard(pack)"
           @click="install(pack)"
         >
           {{ t('admin.page.characters.marketplace.installAction') }}

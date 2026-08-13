@@ -5,7 +5,7 @@ may this ``(tenant_id, account_id)`` pair chat with, and how do I render
 them?" before it fans an inbound message out to a picker. This service is
 the single read-only answer.
 
-Design invariants (``HOSTED_OFFICIAL_LINE_CHANNEL_LH2_DESIGN``):
+Design invariants:
 
 - **Paired identity, fail-closed.** The tenant and account must both point
   at the *same* local cloud operator projection. Any mismatch resolves to

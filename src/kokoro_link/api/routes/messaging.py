@@ -45,6 +45,9 @@ from kokoro_link.application.services.messaging_public_url import (
     MESSAGING_PUBLIC_BASE_URL_KEY as _MESSAGING_PUBLIC_BASE_URL_KEY,
     normalize_public_base_url as _normalize_public_base_url,
 )
+from kokoro_link.application.services.telegram_polling_service import (
+    MISSING_BOT_TOKEN_ERROR as _TELEGRAM_MISSING_BOT_TOKEN_ERROR,
+)
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.contracts.messaging import InboundMessage
 from kokoro_link.domain.entities.messaging_account import MessagingAccount
@@ -65,6 +68,11 @@ _LOGGER = logging.getLogger(__name__)
 _TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 _LINE_SIGNATURE_HEADER = "X-Line-Signature"
 _MESSAGING_TELEGRAM_DELIVERY_MODE_KEY = "messaging.telegram_delivery_mode"
+_LINE_MISSING_CHANNEL_ACCESS_TOKEN_ERROR = (
+    "This LINE account has no channel access token. Get the channel access "
+    "token from LINE Developers Console and paste it into this account's "
+    "settings."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +701,9 @@ async def register_webhook(
         token = account.credentials.get("bot_token", "")
         if not token:
             return WebhookRegisterResponse(
-                ok=False, webhook_url=webhook_url, message="Missing bot_token",
+                ok=False,
+                webhook_url=webhook_url,
+                message=_TELEGRAM_MISSING_BOT_TOKEN_ERROR,
             )
         result = await TelegramAdapter().set_webhook(
             bot_token=token,
@@ -716,7 +726,7 @@ async def register_webhook(
         if not token:
             return WebhookRegisterResponse(
                 ok=False, webhook_url=webhook_url,
-                message="Missing channel_access_token",
+                message=_LINE_MISSING_CHANNEL_ACCESS_TOKEN_ERROR,
             )
         result = await LineAdapter().set_webhook_endpoint(
             channel_access_token=token, webhook_url=webhook_url,
@@ -754,7 +764,9 @@ async def get_webhook_status(
     if account.platform == Platform.TELEGRAM:
         token = account.credentials.get("bot_token", "")
         if not token:
-            return WebhookStatusResponse(ok=False, message="Missing bot_token")
+            return WebhookStatusResponse(
+                ok=False, message=_TELEGRAM_MISSING_BOT_TOKEN_ERROR,
+            )
         result = await TelegramAdapter().get_webhook_info(bot_token=token)
         return WebhookStatusResponse(
             ok=bool(result.get("ok")),
@@ -766,7 +778,7 @@ async def get_webhook_status(
         token = account.credentials.get("channel_access_token", "")
         if not token:
             return WebhookStatusResponse(
-                ok=False, message="Missing channel_access_token",
+                ok=False, message=_LINE_MISSING_CHANNEL_ACCESS_TOKEN_ERROR,
             )
         result = await LineAdapter().get_webhook_endpoint(
             channel_access_token=token,

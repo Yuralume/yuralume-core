@@ -4,7 +4,7 @@ Three routes reach this module and all three run the same steps in the
 same order — the verdict after an in-scene turn, the player's 「結束場景」
 button, and (SC1-E) the idle-timeout sweep. Sharing the core is not
 tidiness: the red line that a wrap-up must never invent player actions
-(STORY_SCENE_PLAN §3.4 #1) is only as strong as its weakest path, and the
+ is only as strong as its weakest path, and the
 timeout path — the one nobody is watching — is exactly where a second
 implementation would drift.
 

@@ -215,13 +215,28 @@ const visibleConnections = computed(() => {
 // several rows are enabled (`_sync_search_tool` / `_sync_tts_backend` /
 // `_sync_embedding_backend` all pick `max(rows, key=updated_at)`). For
 // these tabs the "enabled" badge alone is misleading — two green rows,
-// only one actually serving. llm/image/video register every enabled row,
-// so they keep the plain enabled/disabled badge.
+// only one actually serving.
 const SINGLE_ACTIVE_CAPABILITIES: ReadonlySet<string> = new Set([
   'search',
   'embedding',
   'tts',
 ])
+
+// llm/image/video mount EVERY enabled row, each under its own runtime id
+// (`runtime_provider_id` — the preset id, or `preset__slug` when the row
+// carries a `connection_slug`). Two rows resolving to the same id cannot
+// coexist there, which is why the backend refuses that at save time; the
+// id itself is surfaced on the card so the operator can match a row
+// against the entry it produces in the model selector.
+const IDENTITY_SCOPED_CAPABILITIES: ReadonlySet<string> = new Set([
+  'llm',
+  'image',
+  'video',
+])
+
+function showsRuntimeId(row: ProviderConnection): boolean {
+  return row.capabilities.some(cap => IDENTITY_SCOPED_CAPABILITIES.has(cap))
+}
 
 const isSingleActiveTab = computed(() =>
   SINGLE_ACTIVE_CAPABILITIES.has(activeCapability.value),
@@ -1123,6 +1138,11 @@ onMounted(loadAll)
               <h3 class="provider-settings__connection-title">{{ connectionLabel(row.label) }}</h3>
               <p class="provider-settings__connection-meta">
                 {{ providerLabel(row.provider) }}
+                <code
+                  v-if="showsRuntimeId(row)"
+                  class="provider-settings__runtime-id"
+                  :title="t('admin.providerSettings.runtimeIdHint')"
+                >{{ row.runtime_provider_id }}</code>
               </p>
             </div>
             <UiBadge :variant="connectionBadge(row).variant">
@@ -1217,6 +1237,15 @@ onMounted(loadAll)
   font-size: var(--font-sm);
   color: var(--color-text-secondary);
   line-height: 1.6;
+}
+.provider-settings__runtime-id {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-xs);
+  word-break: break-all;
 }
 .provider-settings__hint--inline {
   margin: 0 0 var(--space-2);

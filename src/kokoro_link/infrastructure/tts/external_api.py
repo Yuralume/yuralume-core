@@ -41,7 +41,19 @@ class ExternalTTSAdapter:
         self._default_voice_id = default_voice_id
         self._timeout = timeout_seconds
 
-    async def list_voices(self) -> list[TTSVoice]:
+    async def list_voices(
+        self,
+        *,
+        character_id: str | None = None,
+        character_origin: str = "",
+    ) -> list[TTSVoice]:
+        """Both context arguments are accepted for ``TTSVoiceCatalogPort``
+        compatibility and unused: a self-host/BYOK custom TTS endpoint has
+        no concept of a cloud-exclusive voice to scope by character or by
+        card (EC5-C/EC5-D apply only to
+        :class:`CloudGatewayTTSAdapter`). Accepting them is what keeps a
+        caller that always passes context — the exclusive-card install —
+        from turning this adapter into a ``TypeError``."""
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(
@@ -200,7 +212,14 @@ class OpenAITTSAdapter(ExternalTTSAdapter):
         self._model = model or "gpt-4o-mini-tts"
         self._response_format = response_format or "wav"
 
-    async def list_voices(self) -> list[TTSVoice]:
+    async def list_voices(
+        self,
+        *,
+        character_id: str | None = None,
+        character_origin: str = "",
+    ) -> list[TTSVoice]:
+        """Context unused — OpenAI's product voices are static and carry no
+        cloud-exclusive concept (see base class docstring)."""
         return [
             TTSVoice(id=voice, label=voice, prompt_lang="", is_complete=True)
             for voice in self._VOICES
@@ -316,7 +335,14 @@ class OpenRouterTTSAdapter(OpenAITTSAdapter):
             timeout_seconds=timeout_seconds,
         )
 
-    async def list_voices(self) -> list[TTSVoice]:
+    async def list_voices(
+        self,
+        *,
+        character_id: str | None = None,
+        character_origin: str = "",
+    ) -> list[TTSVoice]:
+        """Context unused — OpenRouter's model-scoped voices carry no
+        cloud-exclusive concept (see base class docstring)."""
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(

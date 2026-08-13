@@ -1,6 +1,6 @@
 """Absolute-date context shared by every story-arc generation prompt.
 
-Why this module exists (COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN P3 /
+Why this module exists (
 CF1b): an arc premise, a beat title and a beat summary are written once
 and then re-injected into chat / proactive prompts every day until the
 beat is realized — sometimes for weeks. A beat summary that froze the

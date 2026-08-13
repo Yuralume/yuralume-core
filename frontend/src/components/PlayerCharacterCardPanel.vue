@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { notification } from 'ant-design-vue'
+import CharacterBackupRestorePanel from '@/components/CharacterBackupRestorePanel.vue'
 import CharacterCardGalleryModal from '@/components/CharacterCardGalleryModal.vue'
 import CharacterLimitAdvisory from '@/components/CharacterLimitAdvisory.vue'
 import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
@@ -17,6 +18,7 @@ import {
   type CharacterCardPreview,
   type CharacterCardPackSummary,
 } from '@/utils/api/characters'
+import { canInstallCard } from '@/utils/characterCardSource'
 import { UiButton } from '@/components/ui'
 
 const props = defineProps<{
@@ -275,6 +277,10 @@ async function ensureActiveBrowseCardEnriched() {
 
 async function installPack(card: CharacterCardPreview) {
   if (!card.pack_id) return
+  // A cloud-exclusive card this deployment cannot install. The card face
+  // already disables its button and says why; this closes the path a stale
+  // shelf or a keyboard confirm would still take (EC4).
+  if (!canInstallCard(card)) return
   pendingRelationshipAction.value = { kind: 'pack', card }
   relationshipWizardVisible.value = true
 }
@@ -389,6 +395,14 @@ function closePreview() {
   pendingImportFile.value = null
 }
 
+// CharacterBackupRestorePanel already shows its own success toast (and has
+// no relationship-wizard step — the restored history speaks for itself) —
+// this just bubbles the new character up the same "push into the roster
+// and select it" chain a card install uses.
+function handleBackupRestored(character: Character) {
+  emit('characterCreated', character)
+}
+
 function notifyCharacterCreated(character: Character, storyCount: number) {
   notification.success({
     message: t('playerSidebar.characterCards.createdSuccess', { name: character.name }),
@@ -410,8 +424,10 @@ defineExpose({
     <p class="character-cards__hint">{{ pt('playerSidebar.characterCards.importHint') }}</p>
 
     <div class="character-cards__actions">
+      <!-- EC2-B：託管角色不可匯出（人設是授權方財產），前端整段隱藏
+           匯出按鈕；EC3 會在伺服端也拒絕，這裡是先一步不給誤按的機會。 -->
       <UiButton
-        v-if="selectedCharacter"
+        v-if="selectedCharacter && !selectedCharacter.managed"
         variant="secondary"
         size="sm"
         :loading="exporting"
@@ -438,6 +454,8 @@ defineExpose({
 
     <!-- 帶入角色卡＝建立一位角色，吃的是同一組 hosted 上限；按鈕照樣可按。 -->
     <CharacterLimitAdvisory />
+
+    <CharacterBackupRestorePanel @imported="handleBackupRestored" />
 
     <input
       ref="importInputRef"

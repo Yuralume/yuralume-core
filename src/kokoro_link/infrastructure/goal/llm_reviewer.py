@@ -11,7 +11,7 @@ ignored, terminal statuses remain unchanged, and malformed output is
 silently dropped. Goal stability is intentional — drift is a greater
 failure mode than slow recognition.
 
-Convergence (CF2 / COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P2b) is a
+Convergence (CF2 / P2b) is a
 **prompt-level** discipline on purpose: near-duplicate merging, expiry of
 date-bound goals and the active soft cap are semantic judgements, so they
 are stated as rules in ``goal/reviewer`` and decided by the model. Nothing

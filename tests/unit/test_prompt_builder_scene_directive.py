@@ -1,6 +1,6 @@
 """Prompt builder — today's scene directive block rendering.
 
-Phase 1 of ``docs/SCENE_BEAT_PLAN.md`` introduces a separate
+Phase 1 of the scene-beat work introduces a separate
 "今日場景指引" segment that surfaces today's beat as a directive
 (location / NPCs / dramatic question) rather than just paragraph
 narrative. Tested in isolation here so a future tweak to the main

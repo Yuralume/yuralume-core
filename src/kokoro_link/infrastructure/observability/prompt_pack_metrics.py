@@ -1,6 +1,6 @@
 """Prometheus rendering for this process's prompt pack identity (PD3).
 
-``HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN`` §1-2 names the gap this closes: a
+The gap this closes: a
 rolling restart over a changed prompt pack leaves some replicas on the old pack
 and some on the new one, and while every ``TurnRecord`` carries its
 ``prompt_pack_hash`` as evidence, **nothing announces the split**. Mixed

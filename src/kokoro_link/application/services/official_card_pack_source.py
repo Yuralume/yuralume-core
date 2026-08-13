@@ -27,27 +27,36 @@ Three properties are worth stating because each one is a decision:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
-from typing import Any
 
-from kokoro_link.application.dto.character import (
-    CharacterPersonalityTypePayload,
-    InitialRelationshipPayload,
-)
-from kokoro_link.application.dto.character_card import (
-    CharacterCardPreview,
-    CharacterCardPreviewCompanion,
-)
+from kokoro_link.application.dto.character import InitialRelationshipPayload
+from kokoro_link.application.dto.character_card import CharacterCardPreview
 from kokoro_link.application.services.character_card_import_service import (
     CharacterCardImportService,
     ImportedCard,
 )
+from kokoro_link.application.services.exclusive_official_card_install import (
+    ExclusiveOfficialCardInstaller,
+)
+from kokoro_link.application.services.official_card_profile import (
+    preview_companions,
+    profile_personality_type,
+    profile_text,
+    profile_text_list,
+)
 from kokoro_link.contracts.official_card_catalog import (
+    DISTRIBUTION_CLOUD_EXCLUSIVE,
+    DISTRIBUTION_PUBLIC,
     OfficialCardCatalogPort,
     OfficialCardDetail,
+    OfficialCardNotFound,
     OfficialCardSummary,
     cloud_pack_ref,
+    is_installable_distribution,
     to_cloud_locale,
+)
+from kokoro_link.contracts.official_card_exclusive import (
+    OfficialCardExclusiveNotFound,
+    OfficialCardExclusiveUnavailable,
 )
 from kokoro_link.infrastructure.character_card.pretranslated_translator import (
     PreTranslatedCardTranslator,
@@ -73,9 +82,22 @@ class OfficialCardPackSource:
         *,
         catalog: OfficialCardCatalogPort,
         import_service: CharacterCardImportService,
+        exclusive_installer: ExclusiveOfficialCardInstaller | None = None,
     ) -> None:
         self._catalog = catalog
         self._import_service = import_service
+        # ``None`` on every self-hosted deployment and on any hosted one
+        # whose service credential does not carry the exclusive-read scope
+        # (EC4). It is the single fact behind both halves of the red line:
+        # cloud-exclusive rows report themselves un-installable to the
+        # gallery, and an install attempted anyway is refused here rather
+        # than failing somewhere upstream.
+        self._exclusive_installer = exclusive_installer
+
+    @property
+    def installs_cloud_exclusive(self) -> bool:
+        """Whether this deployment can complete a cloud-exclusive install."""
+        return self._exclusive_installer is not None
 
     async def list_summaries(
         self, *, primary_language: str,
@@ -91,7 +113,12 @@ class OfficialCardPackSource:
         )
         if cards is None:
             return None
-        return [_summary_preview(card) for card in cards]
+        return [
+            _summary_preview(
+                card, installs_exclusive=self.installs_cloud_exclusive,
+            )
+            for card in cards
+        ]
 
     async def preview(
         self, card_id: str, *, primary_language: str,
@@ -113,7 +140,9 @@ class OfficialCardPackSource:
         )
         if detail is None:
             raise OfficialCardUnavailableError(card_id)
-        return _detail_preview(detail)
+        return _detail_preview(
+            detail, installs_exclusive=self.installs_cloud_exclusive,
+        )
 
     async def install(
         self,
@@ -150,6 +179,13 @@ class OfficialCardPackSource:
         detail = await self._catalog.get_card(card_id, locale=locale, fresh=True)
         if detail is None:
             raise OfficialCardUnavailableError(card_id)
+        if detail.cloud_exclusive:
+            return await self._install_cloud_exclusive(
+                detail,
+                user_id=user_id,
+                locale=locale,
+                initial_relationship=initial_relationship,
+            )
         blob = await self._catalog.download_artifact(card_id)
         if blob is None:
             raise OfficialCardUnavailableError(card_id)
@@ -165,6 +201,50 @@ class OfficialCardPackSource:
             initial_relationship=initial_relationship,
             profile_translator=_profile_translator(detail),
         )
+
+    async def _install_cloud_exclusive(
+        self,
+        detail: OfficialCardDetail,
+        *,
+        user_id: str,
+        locale: str,
+        initial_relationship: InitialRelationshipPayload | None,
+    ) -> ImportedCard:
+        """Install an IP-partner card through the authenticated payload.
+
+        A deployment with no installer is answered as if the card were not
+        in the catalogue at all. That is the same answer Cloud's own
+        anonymous artifact route gives these cards, and for the same reason:
+        a distinct status here would tell a caller which of the published
+        cards are the licensed ones, which is a commercial fact about
+        somebody else's contract. The reason is in the log, where the
+        operator can see it and the visitor cannot.
+        """
+        if self._exclusive_installer is None:
+            _LOGGER.info(
+                "official card %s is cloud-exclusive and this deployment "
+                "holds no exclusive-read credential — install refused",
+                detail.id,
+            )
+            raise OfficialCardNotFound(detail.id)
+        try:
+            return await self._exclusive_installer.install(
+                detail,
+                user_id=user_id,
+                locale=locale,
+                initial_relationship=initial_relationship,
+            )
+        except OfficialCardExclusiveNotFound as exc:
+            # Cloud says this is not an installable exclusive card after
+            # all — most plausibly withdrawn between the catalog read and
+            # the install. Same answer a missing public card gets.
+            raise OfficialCardNotFound(detail.id) from exc
+        except OfficialCardExclusiveUnavailable as exc:
+            # Translated into the vocabulary the rest of the install path
+            # already speaks, so the exclusive endpoint's failures reach the
+            # player as the same "try again" a catalog outage does rather
+            # than as a new error class every caller has to learn.
+            raise OfficialCardUnavailableError(detail.id) from exc
 
     @staticmethod
     def _locale(primary_language: str) -> str:
@@ -209,7 +289,9 @@ def _profile_translator(
     return PreTranslatedCardTranslator(payload)
 
 
-def _summary_preview(card: OfficialCardSummary) -> CharacterCardPreview:
+def _summary_preview(
+    card: OfficialCardSummary, *, installs_exclusive: bool,
+) -> CharacterCardPreview:
     return CharacterCardPreview(
         pack_id=cloud_pack_ref(card.id),
         title=card.title,
@@ -226,10 +308,31 @@ def _summary_preview(card: OfficialCardSummary) -> CharacterCardPreview:
         stage_image_count=card.image_count,
         source=CLOUD_SOURCE,
         localized=card.localized,
+        distribution=card.distribution,
+        installable=_installable(
+            card.distribution, installs_exclusive=installs_exclusive,
+        ),
     )
 
 
-def _detail_preview(detail: OfficialCardDetail) -> CharacterCardPreview:
+def _installable(distribution: str, *, installs_exclusive: bool) -> bool:
+    """Whether *this* deployment can complete an install of such a card.
+
+    Two different questions folded into one answer on purpose. "What licence
+    is this card under" is a fact about the card (``distribution``, which
+    travels alongside); "can I install it here" is a fact about the
+    deployment, and it is the only one a button can act on. Leaving the
+    frontend to combine them would put a second copy of the rule in front of
+    every caller — and the frontend cannot see the credential at all.
+    """
+    return (
+        is_installable_distribution(distribution) or installs_exclusive
+    )
+
+
+def _detail_preview(
+    detail: OfficialCardDetail, *, installs_exclusive: bool,
+) -> CharacterCardPreview:
     """Project one catalog detail document into the shared preview DTO.
 
     Only prose crosses: the catalog publishes what a reader reads, not the
@@ -239,6 +342,11 @@ def _detail_preview(detail: OfficialCardDetail) -> CharacterCardPreview:
     itself is imported.
     """
     profile = detail.profile
+    distribution = (
+        DISTRIBUTION_CLOUD_EXCLUSIVE
+        if detail.cloud_exclusive
+        else DISTRIBUTION_PUBLIC
+    )
     return CharacterCardPreview(
         pack_id=cloud_pack_ref(detail.id),
         title=detail.title,
@@ -246,73 +354,39 @@ def _detail_preview(detail: OfficialCardDetail) -> CharacterCardPreview:
         description=detail.description,
         tags=list(detail.tags),
         note=detail.note,
-        name=_text(profile, "name") or detail.title,
-        summary=_text(profile, "summary"),
-        personality=_text_list(profile, "personality"),
-        interests=_text_list(profile, "interests"),
-        speaking_style=_text(profile, "speaking_style") or "natural",
-        boundaries=_text_list(profile, "boundaries"),
-        aspirations=_text_list(profile, "aspirations"),
-        appearance=_text(profile, "appearance"),
-        gender_identity=_text(profile, "gender_identity"),
-        third_person_pronoun=_text(profile, "third_person_pronoun"),
-        visual_gender_presentation=_text(profile, "visual_gender_presentation"),
-        world_topics=_text_list(profile, "world_topics"),
-        excluded_topics=_text_list(profile, "excluded_topics"),
-        personality_type=_personality_type(profile.get("personality_type")),
-        companions=_companions(profile.get("companions")),
+        name=profile_text(profile, "name") or detail.title,
+        summary=profile_text(profile, "summary"),
+        personality=profile_text_list(profile, "personality"),
+        interests=profile_text_list(profile, "interests"),
+        speaking_style=profile_text(profile, "speaking_style") or "natural",
+        boundaries=profile_text_list(profile, "boundaries"),
+        aspirations=profile_text_list(profile, "aspirations"),
+        appearance=profile_text(profile, "appearance"),
+        gender_identity=profile_text(profile, "gender_identity"),
+        third_person_pronoun=profile_text(profile, "third_person_pronoun"),
+        visual_gender_presentation=profile_text(
+            profile, "visual_gender_presentation",
+        ),
+        world_topics=profile_text_list(profile, "world_topics"),
+        excluded_topics=profile_text_list(profile, "excluded_topics"),
+        personality_type=profile_personality_type(
+            profile.get("personality_type"),
+        ),
+        companions=preview_companions(profile.get("companions")),
         image_urls=[image.url for image in detail.images],
         stage_image_count=len(detail.images),
         source=CLOUD_SOURCE,
         localized=detail.localized,
+        # A detail document has no ``distribution`` field of its own — the
+        # withheld artifact URL is how it says the same thing (see
+        # ``OfficialCardDetail.artifact_published``). Projecting it back to
+        # the vocabulary the catalog rows use keeps one word in front of the
+        # renderer instead of two shapes of the same fact.
+        distribution=distribution,
+        installable=_installable(
+            distribution, installs_exclusive=installs_exclusive,
+        ),
     )
-
-
-def _personality_type(raw: object) -> CharacterPersonalityTypePayload:
-    if not isinstance(raw, Mapping):
-        return CharacterPersonalityTypePayload()
-    try:
-        return CharacterPersonalityTypePayload(
-            code=_text(raw, "code"),
-            rationale=_text(raw, "rationale"),
-            consistency_notes=_text_list(raw, "consistency_notes"),
-        )
-    except ValueError:
-        # An unknown 16-type code fails the domain validator. One bad field
-        # must not blank a whole card in the gallery.
-        _LOGGER.warning(
-            "official card catalog: unusable personality_type — dropping",
-            exc_info=True,
-        )
-        return CharacterPersonalityTypePayload()
-
-
-def _companions(raw: object) -> list[CharacterCardPreviewCompanion]:
-    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
-        return []
-    companions: list[CharacterCardPreviewCompanion] = []
-    for entry in raw:
-        if not isinstance(entry, Mapping):
-            continue
-        name = _text(entry, "name")
-        if not name:
-            continue
-        companions.append(CharacterCardPreviewCompanion(
-            name=name, role=_text(entry, "role"),
-        ))
-    return companions
-
-
-def _text(payload: Mapping[str, Any], field: str) -> str:
-    value = payload.get(field)
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _text_list(payload: Mapping[str, Any], field: str) -> list[str]:
-    value = payload.get(field)
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return []
-    return [item.strip() for item in value if isinstance(item, str)]
 
 
 __all__ = [

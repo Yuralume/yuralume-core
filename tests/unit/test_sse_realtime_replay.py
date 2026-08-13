@@ -12,6 +12,7 @@ Times are self-referential data anchored to a fixed base, never the wall clock.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -49,10 +50,11 @@ class _DictReader:
         return self._rows.get(key)
 
 
-def _post_row(post_id="post-9"):
+def _post_row(post_id="post-9", *, video_url=None):
     return SimpleNamespace(
         id=post_id, character_id="char-1", kind=SimpleNamespace(value="daily"),
-        content_text="散步中", image_url=None, created_at=BASE,
+        content_text="散步中", image_url=None, video_url=video_url,
+        created_at=BASE,
     )
 
 
@@ -88,6 +90,65 @@ def test_feed_post_encoder_id_line_only_with_outbox_id() -> None:
     )
     assert "id:" not in events_route._encode_feed_post_event(no_id)
     assert events_route._encode_feed_post_event(with_id).startswith("id: 3\n")
+
+
+def test_feed_post_encoder_carries_video_url() -> None:
+    """CV0-2: the SSE gap — ``feed_post`` frames only ever carried
+    ``image_url``. A video post's frame must carry ``video_url`` too, so a
+    realtime subscriber can render the clip instead of falling back to a
+    (never-generated) poster still or missing it entirely until the next
+    poll-refresh."""
+    event = FeedPostEvent(
+        character_id="char-1", post_id="p", kind="daily",
+        content_text="x", image_url=None,
+        video_url="https://cdn.example/feed/p.mp4", created_at=BASE,
+    )
+    frame = events_route._encode_feed_post_event(event)
+    _, _, data_line = frame.partition("data: ")
+    payload = json.loads(data_line.strip())
+    assert payload["video_url"] == "https://cdn.example/feed/p.mp4"
+
+
+def test_feed_post_encoder_video_url_defaults_to_none() -> None:
+    """A text/image-only post (the overwhelming majority, self-host or
+    cloud) must still encode an explicit ``video_url: null`` rather than
+    omitting the key, so the frontend type never has to special-case a
+    missing field."""
+    event = FeedPostEvent(
+        character_id="char-1", post_id="p", kind="daily",
+        content_text="x", image_url="https://cdn.example/p.png",
+        created_at=BASE,
+    )
+    frame = events_route._encode_feed_post_event(event)
+    _, _, data_line = frame.partition("data: ")
+    payload = json.loads(data_line.strip())
+    assert payload["video_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_replay_frames_carry_the_posts_video_url() -> None:
+    """End-to-end: outbox replay reads the fresh domain row (not the minimal
+    outbox payload), so a video post replayed after reconnect must still
+    surface its ``video_url`` in the encoded frame."""
+    outbox = InMemoryRealtimeOutbox()
+    await _seed(outbox, "post-9", 0)
+    reh = RealtimeEventRehydrator(
+        _DictReader({}),
+        _DictReader({
+            "post-9": _post_row(video_url="https://cdn.example/feed/p.mp4"),
+        }),
+        _DictReader({}),
+    )
+    frames = [
+        f async for f in events_route.replay_frames(
+            outbox, reh, resume_from=0, is_owned=_always_owned,
+            replayed_ids=set(),
+        )
+    ]
+    assert len(frames) == 1
+    _, _, data_line = frames[0].partition("data: ")
+    payload = json.loads(data_line.strip())
+    assert payload["video_url"] == "https://cdn.example/feed/p.mp4"
 
 
 def test_parse_last_event_id_lenient() -> None:

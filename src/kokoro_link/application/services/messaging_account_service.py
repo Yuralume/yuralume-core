@@ -118,8 +118,12 @@ class MessagingAccountService:
         return updated
 
     async def delete(self, account_id: str) -> bool:
-        # Bindings follow via FK CASCADE at the DB layer; the in-memory
-        # repos don't enforce that so we clean them explicitly too.
+        # The binding rows are removed here, explicitly, in both modes.
+        # The FK's ``ON DELETE CASCADE`` only states that removing them is
+        # correct — it is not what removes them: in-memory repos have no
+        # FKs at all, and self-host SQLite runs without
+        # ``PRAGMA foreign_keys=ON`` (``persistence/engine.py`` never sets
+        # it), so leaning on the cascade would leave orphans there.
         await self._bindings.delete_for_account(account_id)
         return await self._accounts.delete(account_id)
 

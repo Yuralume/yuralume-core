@@ -12,7 +12,7 @@ import {
 } from '../utils/api/story'
 import type { StoryEvent, StorySeed } from '../types/story'
 import StoryArcPanel from './StoryArcPanel.vue'
-import { UiButton } from './ui'
+import { UiBadge, UiButton } from './ui'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
 const props = defineProps<{
@@ -23,6 +23,13 @@ const props = defineProps<{
    * the inner StoryArcPanel; ``null`` = LLM planning fallback.
    */
   arcTemplateId?: string | null
+  /**
+   * EC2-C: forwarded to the inner StoryArcPanel (arc_template_id binding
+   * gate) and used locally to lock this panel's own `world_frame` select
+   * — a second write path onto the same protected field WorldAdminEditor
+   * already gates. Both are not in MANAGED_WRITABLE_UPDATE_FIELDS.
+   */
+  managed?: boolean
 }>()
 const emit = defineEmits<{
   (e: 'update:worldFrame', v: string): void
@@ -190,6 +197,7 @@ watch(() => props.characterId, async () => {
       :character-id="characterId"
       :arc-template-id="arcTemplateId ?? null"
       :world-frame="worldFrame"
+      :managed="managed === true"
       @update:arc-template="(id) => emit('update:arc-template', id)"
       @active-arc-change="handleActiveArcChange"
     />
@@ -200,7 +208,18 @@ watch(() => props.characterId, async () => {
       {{ pt('story.panel.hint') }}
     </p>
 
-    <div class="frame-block">
+    <!-- EC2-C：world_frame 對託管角色可見但不可寫（不在 allowlist 內，
+         恆帶真值，PATCH 一定會被拒）——唯讀顯示，不給可編輯的 select。
+         跟 WorldAdminEditor 的 world_frame 卡是同一條規則。 -->
+    <div v-if="managed" class="frame-block">
+      <label class="field-label">{{ t('story.panel.worldFrameLabel') }}</label>
+      <div class="frame-readonly-value">{{ frameLabel(worldFrame) }}</div>
+      <div class="managed-frame-notice">
+        <UiBadge variant="primary">{{ t('characterEdit.managed.worldBadge') }}</UiBadge>
+        <p class="managed-frame-notice__text">{{ t('characterEdit.managed.worldFrameNotice') }}</p>
+      </div>
+    </div>
+    <div v-else class="frame-block">
       <label class="field-label">{{ t('story.panel.worldFrameLabel') }}</label>
       <select :value="worldFrame" class="field-select" @change="onFrameChange">
         <option v-for="f in frameChoices" :key="f" :value="f">{{ frameLabel(f) }}</option>
@@ -299,6 +318,27 @@ watch(() => props.characterId, async () => {
 /* .field-hint 在 global style.css；此面板 hint 字級較大 */
 .field-hint { font-size: 13px; }
 .frame-block { display: flex; flex-direction: column; gap: 4px; }
+.frame-readonly-value {
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--color-text);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+}
+.managed-frame-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 2px;
+}
+.managed-frame-notice__text {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+}
 /* 共用欄位樣式在 global style.css */
 .block-header {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

@@ -40,6 +40,7 @@ def _row_to_domain(row: DeferredIntentRow) -> DeferredIntent:
         created_at=_ensure_utc(row.created_at),
         expires_at=_ensure_utc(row.expires_at),
         consumed_at=_ensure_utc(row.consumed_at) if row.consumed_at else None,
+        revisit_at=_ensure_utc(row.revisit_at) if row.revisit_at else None,
     )
 
 
@@ -59,6 +60,7 @@ def _domain_to_row(intent: DeferredIntent) -> DeferredIntentRow:
         created_at=intent.created_at,
         expires_at=intent.expires_at,
         consumed_at=intent.consumed_at,
+        revisit_at=intent.revisit_at,
     )
 
 
@@ -93,6 +95,59 @@ class SADeferredIntentRepository(DeferredIntentRepositoryPort):
                 .limit(max(1, limit)),
             )
             return [_row_to_domain(r) for r in result.scalars().all()]
+
+    async def list_due_for(
+        self,
+        character_id: str,
+        operator_id: str,
+        *,
+        now: datetime,
+        limit: int = 5,
+    ) -> list[DeferredIntent]:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(DeferredIntentRow)
+                .where(
+                    DeferredIntentRow.character_id == character_id,
+                    DeferredIntentRow.operator_id == operator_id,
+                    DeferredIntentRow.status == STATUS_ACTIVE,
+                    DeferredIntentRow.expires_at > now,
+                    DeferredIntentRow.revisit_at.is_not(None),
+                    DeferredIntentRow.revisit_at <= now,
+                )
+                .order_by(DeferredIntentRow.created_at.desc())
+                .limit(max(1, limit)),
+            )
+            return [_row_to_domain(r) for r in result.scalars().all()]
+
+    async def clear_revisit(self, intent_id: str) -> bool:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(DeferredIntentRow)
+                .where(
+                    DeferredIntentRow.id == intent_id,
+                    DeferredIntentRow.revisit_at.is_not(None),
+                )
+                .values(revisit_at=None),
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def restore_revisit(
+        self, intent_id: str, *, revisit_at: datetime,
+    ) -> bool:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(DeferredIntentRow)
+                .where(
+                    DeferredIntentRow.id == intent_id,
+                    DeferredIntentRow.status == STATUS_ACTIVE,
+                    DeferredIntentRow.revisit_at.is_(None),
+                )
+                .values(revisit_at=revisit_at),
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     async def mark_consumed(
         self, intent_id: str, *, now: datetime,

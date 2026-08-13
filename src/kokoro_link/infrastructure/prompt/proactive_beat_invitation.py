@@ -8,7 +8,7 @@ stands in that scene (``operator_position``) and what their part is
 drift into telling the character opposite things about the same beat —
 the same reason ``proactive_streak`` exists.
 
-ARC_PLAYER_POSITION_PLAN §3.4 (OP3). A beat marked ``central`` is a
+OP3. A beat marked ``central`` is a
 scene *about* the player that cannot be played without them, so the
 autonomous scan walks past it (OP2-B) and it simply waits. Waiting is
 exactly the situation where a real person would reach out — "there's
@@ -25,7 +25,7 @@ acceptance criterion — no due central beat ⇒ behaviour identical to
 before — has to hold for judged arcs, not merely for legacy ones whose
 fields happen to read back empty.
 
-LLM-first stance (CLAUDE.md): everything here is a **fact layer plus an
+LLM-first stance: everything here is a **fact layer plus an
 open door**. Nothing decides that a waiting beat *must* produce a push:
 the judge still weighs it against timing and quota, the decider still
 defaults to silence, and the invitation wording is the character's own —
@@ -51,7 +51,7 @@ _MAX_NOTE_CHARS = 160
 # Prose for each member of the closed ``operator_position`` vocabulary.
 # Rendering a structural enum into natural language is the same move
 # ``_PACE_PHRASES`` / ``_FORMALITY_PHRASES`` already make in the judge —
-# it is not the keyword matching CLAUDE.md forbids, which is *deriving*
+# it is not the keyword matching the LLM-first rule forbids, which is *deriving*
 # semantics from free text. ``None`` (unjudged) has no entry on purpose:
 # there is nothing to state, and inventing a phrase for "nobody has
 # said" would put words in the model's mouth about every legacy beat.

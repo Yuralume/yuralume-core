@@ -95,7 +95,7 @@ def test_prompt_pins_action_narration_to_operator_primary_language() -> None:
     """
     prompt = _build_prompt(operator_primary_language="en-US")
 
-    assert "玩家可見自然語言輸出語言（BCP 47 標籤）：en-US" in prompt
+    assert "玩家可見自然語言輸出語言：English（BCP 47：en-US）" in prompt
     assert "星號 `*...*` 內的動作、表情與狀態描寫也屬於玩家可見自然語言" in prompt
     assert "不要因為下方格式範例是中文就把動作描寫寫成中文" in prompt
 

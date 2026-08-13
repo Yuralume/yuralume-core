@@ -11,7 +11,7 @@ Hosted (cloud mode) it is a compliance hole: Yuralume's own terms and
 AUP promise the hosted service does **not** produce sexually explicit
 content, so a tone that instructs the model to write it can't be
 reachable from a paid hosted seat.
-(``docs/plans/GROWTH_FUNNEL_PLAN.md`` §3.6 hole 1, red line #5.)
+(Growth-funnel hole 1, red line #5.)
 
 Two deliberately different strictnesses live here, because the two
 boundaries have opposite failure costs:

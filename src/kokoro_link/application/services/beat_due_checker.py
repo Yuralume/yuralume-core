@@ -24,7 +24,7 @@ Design choices:
 - **Beats about the player are left for the player**. When the scene
   service is wired the scan is *unattended* play, so a beat whose
   ``operator_position`` is ``central`` is passed over
-  (ARC_PLAYER_POSITION_PLAN §5.1 OP2-B). Passing over costs the beat
+Passing over costs the beat
   nothing — no attempt, no failure, no backoff, no retirement — because
   it did not fail; it is waiting. The player pulling the same beat
   through 起幕 or chat plays it normally.

@@ -1,4 +1,4 @@
-"""Shadow coordinator (HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §3.2 / §13 Phase 2 / Phase 5).
+"""Shadow coordinator.
 
 The coordinator is the *left half* of the Phase 2 shadow: it maintains the
 single-leader ``background-coordinator`` lease and, once per bucket, enqueues one

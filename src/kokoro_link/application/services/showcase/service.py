@@ -57,6 +57,7 @@ from kokoro_link.application.services.showcase.translate import ShowcaseTranslat
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.feed_source import SOURCE_SCHEDULE
+from kokoro_link.domain.value_objects.timezone import timezone_id_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -244,10 +245,8 @@ class ShowcaseService:
     ) -> tuple[TranslationResult, ...]:
         """Translate each item into every non-source locale.
 
-        A locale that fails comes back in ``missing`` rather than as a
-        silently untranslated string — the publisher's rule is that a post
-        missing a locale does not ship, and it can only apply that rule if
-        failure is visible.
+        A failed locale stays in ``missing`` so the next sync retries it. The
+        current snapshot falls back to source text instead of delaying the post.
         """
         character = await self._require_character(tenant_id, character_id)
         targets = tuple(
@@ -361,6 +360,7 @@ class ShowcaseService:
             days=_days_alive(character.created_at, moment, local_tz),
             memories=await self._count_memories(character.id),
             stories=await self._count_stories(character.id),
+            timezone=timezone_id_for(local_tz),
         )
         return SnapshotContext(card=card, now_entry=now_entry, schedule=strip)
 

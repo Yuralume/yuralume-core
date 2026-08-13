@@ -67,7 +67,7 @@ _VALID_BEAT_STATUSES = frozenset(
 # Two meanings live in ``last_play_attempt_result``: *what happened* to a
 # staging attempt, and — since ``with_status`` also writes the field — how
 # a beat reached a terminal status. Only the failure trio charges the
-# autonomous retry budget (BACKGROUND_COST_CONTROL_PLAN §10 #3); anything
+# autonomous retry budget; anything
 # else ("prompted", "notification_candidate", "scene_written:<strategy>",
 # "realized", "skipped") is bookkeeping the LLM reads.
 PLAY_RESULT_FAILED = "failed"
@@ -113,7 +113,7 @@ _VALID_SCENE_TYPES = frozenset(
     {SCENE_ENCOUNTER, SCENE_REVELATION, SCENE_CONFLICT, SCENE_RESOLUTION, SCENE_INTERLUDE},
 )
 
-# --- Operator position (OP0 of ARC_PLAYER_POSITION_PLAN) --------------
+# --- Operator position (OP0) -----------------------------------------
 # Where the *player* stands in this scene. Until this slot existed a
 # beat could only name third-party NPC labels in ``scene_characters``,
 # so every consumer had to re-invent the player's place in the story

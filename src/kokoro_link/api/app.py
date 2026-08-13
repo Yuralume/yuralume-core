@@ -31,10 +31,16 @@ from kokoro_link.api.routes.background_jobs_admin import (
 from kokoro_link.api.routes.execution_mode_admin import (
     router as execution_mode_admin_router,
 )
+from kokoro_link.api.routes.internal_video_trigger import (
+    router as internal_video_trigger_router,
+)
 from kokoro_link.api.routes.character_relationships import (
     router as character_relationships_router,
 )
 from kokoro_link.api.routes.characters import router as character_router
+from kokoro_link.api.routes.character_backups import (
+    router as character_backups_router,
+)
 from kokoro_link.api.routes.character_cards import router as character_cards_router
 from kokoro_link.api.routes.chat_assist import router as chat_assist_router
 from kokoro_link.api.routes.chat import router as chat_router
@@ -300,6 +306,49 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except Exception as exc:  # fail-soft
                 print(f"[lifespan] studio job recovery failed: {exc!r}")
 
+        # Character backup exports (CB2) execute exactly like studio jobs —
+        # asyncio tasks in *this* API process — so their recovery rides the
+        # same role gate: re-drive interrupted exports, prune old rows, and
+        # run the key-material TTL backstop. Fail-soft like everything else.
+        backup_export_service = getattr(
+            container, "character_backup_export_service", None,
+        )
+        if matrix.run_studio_recovery and backup_export_service is not None:
+            try:
+                report = await backup_export_service.recover()
+                if any(report.values()):
+                    print(
+                        "[lifespan] backup export recovery "
+                        f"resumed={report.get('resumed', 0)} "
+                        f"failed={report.get('failed', 0)} "
+                        f"pruned={report.get('pruned', 0)} "
+                        f"scrubbed={report.get('scrubbed', 0)} "
+                        f"lease_skipped={report.get('lease_skipped', 0)}"
+                    )
+            except Exception as exc:  # fail-soft
+                print(f"[lifespan] backup export recovery failed: {exc!r}")
+
+        # Backup restores (CB3) mirror the exports: clean up whatever the
+        # interrupted attempt half-landed, then rerun from scratch (or
+        # fail terminally when attempts / key material / the staged
+        # upload are gone). Runs AFTER the export recovery on purpose —
+        # that one owns the shared prune + payload TTL backstop.
+        backup_import_service = getattr(
+            container, "character_backup_import_service", None,
+        )
+        if matrix.run_studio_recovery and backup_import_service is not None:
+            try:
+                report = await backup_import_service.recover()
+                if any(report.values()):
+                    print(
+                        "[lifespan] backup restore recovery "
+                        f"resumed={report.get('resumed', 0)} "
+                        f"failed={report.get('failed', 0)} "
+                        f"lease_skipped={report.get('lease_skipped', 0)}"
+                    )
+            except Exception as exc:  # fail-soft
+                print(f"[lifespan] backup restore recovery failed: {exc!r}")
+
         # Role-gated startup: embedded schedulers and messaging connectors run
         # only where the matrix allows (HOSTED_CORE_SCALING §2.1). A dedicated
         # coordinator starts only the lease-gated world-event singleton below.
@@ -503,6 +552,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(version_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(character_router, prefix="/api/v1", dependencies=_auth_dep)
+    app.include_router(character_backups_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(character_cards_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(character_relationships_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(chat_router, prefix="/api/v1", dependencies=_auth_dep)
@@ -558,6 +608,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(admin_providers_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_app_settings_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_characters_router, prefix="/api/v1", dependencies=_auth_dep)
+    # CV6 — admin-only full-chain video test
+    # trigger. Not a player-facing surface and not on the public nginx
+    # allowlist (an infra-side concern); admin auth on the route is the
+    # whole gate. Registered unconditionally like the other admin-* routers
+    # above — the service layer itself reports "no async pipeline here"
+    # rather than requiring the route to know the deployment shape.
+    app.include_router(
+        internal_video_trigger_router, prefix="/api/v1", dependencies=_auth_dep,
+    )
     # Background-jobs admin diagnostics (P2-B). Registered ONLY when the shadow
     # queue is on (``YURALUME_BACKGROUND_SHADOW=postgres``) so shadow-off
     # deployments keep the exact pre-Phase-2 surface (these paths 404, not a new

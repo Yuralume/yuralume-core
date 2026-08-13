@@ -78,11 +78,10 @@ tts/
 | `.wav` (ref) | 這次合成的情緒 / 停頓 | 從遊戲 / 動畫剪一小段乾淨人聲 |
 | `.txt` (sidecar) | ref.wav 的逐字稿，模型對齊韻律用 | 自己聽完打字 |
 
-只缺 ckpt + pth 也能跑（zero-shot voice clone），但相似度差一截 — 詳見
-`docs/TODO.md` 的「換角色的三條路」段。
+只缺 ckpt + pth 也能跑（zero-shot voice clone），但相似度差一截。
 
 ## 不想用 docker
 
 完全可以。註解掉 `docker-compose.yml` 的 `yuralume-tts` service，本機自己跑
-Windows 整合包的 `api_v2.py`，把 `.env` 的 `KOKORO_TTS_INSTALL_DIR` 指到
-`C:\Users\User\Desktop\GPT-SoVITS` 即可。後端設定面板的下拉選單一樣會掃。
+Windows 整合包的 `api_v2.py`，把 `.env` 的 `KOKORO_TTS_INSTALL_DIR` 指到你自己
+解壓縮整合包的位置（例如 `D:\GPT-SoVITS`）即可。後端設定面板的下拉選單一樣會掃。

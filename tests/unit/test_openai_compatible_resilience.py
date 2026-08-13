@@ -1,7 +1,7 @@
 """Signal-driven resilience of OpenAICompatibleChatModel (2026-07-16).
 
 Covers the four adapter self-heals added after the provider
-compatibility audit (docs/PROVIDER_COMPAT_AUDIT.md):
+compatibility audit:
 
 * stream-verification fallback — OpenAI 400 "must be verified to
   stream" → non-stream request served as a single chunk, memoized;

@@ -12,7 +12,7 @@ posts, and above all the day's schedule text, which was planned hours
 earlier — can still be soaked in this morning's rain. Without being told
 which layer wins, the model keeps echoing the stale one.
 
-LLM-first stance (CLAUDE.md): this is a **precedence** directive, not a
+LLM-first stance: this is a **precedence** directive, not a
 behavioural one. It says which fact to trust; it never tells the
 character how to react to the weather. Reaction stays persona-driven.
 """

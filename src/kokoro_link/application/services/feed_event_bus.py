@@ -31,6 +31,12 @@ class FeedPostEvent:
     content_text: str
     image_url: str | None
     created_at: datetime
+    video_url: str | None = None
+    """CV0-2: the SSE gap — this carried only ``image_url`` even though a
+    ``feed_post`` can render as a video (``FeedPost.video_url``). Optional
+    with a ``None`` default so every existing positional/keyword
+    construction (self-host, in-memory backend) keeps working unchanged;
+    only cloud video posts ever populate it."""
     event_id: int | None = None
     """Durable outbox row id when rehydrated from the Phase 4 PostgreSQL outbox;
     ``None`` on the in-memory backend so the SSE frame carries no ``id:`` (wire

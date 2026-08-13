@@ -1,7 +1,7 @@
 """SillyTavern Character Card V2/V3 sniffing + parsing (stdlib only).
 
 This is the *format front layer* for the SillyTavern import feature (see
-``docs/SILLYTAVERN_CARD_IMPORT_PLAN.md``). It knows how to:
+``docs). It knows how to:
 
 1. Sniff the carrier of an uploaded blob by magic bytes
    (:func:`sniff_card_kind`) — never by file extension (D2). A ``PK``

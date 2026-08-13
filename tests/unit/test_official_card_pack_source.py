@@ -104,6 +104,8 @@ class _FakeCatalog(OfficialCardCatalogPort):
         self._detail = detail
         self._artifact = artifact
         self.missing = False
+        self.image_bytes: bytes | None = None
+        self.downloaded_images: list[str] = []
         self.requested_locales: list[str] = []
         # Whether each detail read asked to skip the cache. The install path
         # must; the browse paths must not.
@@ -126,6 +128,10 @@ class _FakeCatalog(OfficialCardCatalogPort):
         if self.missing:
             raise OfficialCardNotFound(card_id)
         return self._artifact
+
+    async def download_image(self, *, url: str) -> bytes | None:
+        self.downloaded_images.append(url)
+        return self.image_bytes
 
 
 def _summary(**overrides) -> OfficialCardSummary:

@@ -24,9 +24,11 @@ import {
   updateAccount,
   whatsappQrSvgUrl,
 } from '@/utils/api/messaging'
-import { UiButton } from '@/components/ui'
+import { UiBadge, UiButton } from '@/components/ui'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { useLocale } from '@/composables/useLocale'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
+import { formatRelativeTime } from '@/i18n/formatters'
 import ChannelSetupGuide from './ChannelSetupGuide.vue'
 import ChannelAccountNextStep from './ChannelAccountNextStep.vue'
 import ChannelProactiveAttemptLog from './ChannelProactiveAttemptLog.vue'
@@ -42,6 +44,7 @@ const props = withDefaults(defineProps<{
 
 const { t } = useI18n()
 const { pt, cloudMode } = usePlayerCopy()
+const { locale } = useLocale()
 const confirmDialog = useConfirmDialog()
 
 const PLATFORM_LABELS: Record<MessagingPlatform, string> = {
@@ -445,6 +448,11 @@ function bindingCount(accountId: string): number {
   return bindingsByAccount[accountId]?.length ?? 0
 }
 
+function formatConnectionTime(iso: string | null): string {
+  if (!iso) return ''
+  return formatRelativeTime(iso, locale.value)
+}
+
 async function handleRegisterWebhook(account: MessagingAccount) {
   if (!canRegisterWebhook.value) {
     webhookFeedback[account.id] = {
@@ -653,6 +661,24 @@ function readError(err: unknown, fallback: string): string {
                   {{ expandedAccountId === account.id ? '▾' : '▸' }}
                 </span>
               </div>
+            </div>
+
+            <div
+              v-if="account.polling_status.enabled
+                && (account.polling_status.last_error || account.polling_status.last_update_at)"
+              :class="['account-status-line', { 'is-error': account.polling_status.last_error }]"
+            >
+              <template v-if="account.polling_status.last_error">
+                <UiBadge variant="danger">
+                  {{ t('channelBindingsPanel.connectionStatus.errorBadge') }}
+                </UiBadge>
+                <span class="account-status-message">{{ account.polling_status.last_error }}</span>
+              </template>
+              <span v-else class="account-status-success">
+                {{ t('channelBindingsPanel.connectionStatus.lastSuccessAt', {
+                  time: formatConnectionTime(account.polling_status.last_update_at),
+                }) }}
+              </span>
             </div>
 
             <div v-if="expandedAccountId === account.id" class="account-detail">
@@ -1097,6 +1123,28 @@ function readError(err: unknown, fallback: string): string {
 .state-tag.disabled {
   background: rgba(128, 128, 128, 0.15);
   color: #999;
+}
+
+.account-status-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 10px;
+  font-size: 12px;
+}
+
+.account-status-line.is-error {
+  color: #ff4d4f;
+}
+
+.account-status-message {
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.account-status-success {
+  color: var(--text-secondary, #888);
 }
 
 .account-detail {

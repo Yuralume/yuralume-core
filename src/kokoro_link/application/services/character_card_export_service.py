@@ -1,6 +1,6 @@
 """Export a character + optional arc templates into a ``.lumecard`` blob.
 
-Pipeline (see ``docs/CHARACTER_CARD_PLAN.md`` §4):
+Pipeline:
 
 1. Load the owned character entity (cross-user access → not found).
 2. Project the A-layer settings into the manifest; B / C layers dropped.
@@ -49,6 +49,17 @@ class CharacterCardNotFoundError(CharacterCardError):
     caller (collapsed together to avoid enumeration)."""
 
 
+class CharacterCardManagedError(CharacterCardError):
+    """The character is owned by the caller and exists, but is a
+    *managed* (IP-partner) character (EC3) — its full persona lives only
+    on the server and is never packaged into a portable ``.lumecard``,
+    no matter who asks. Distinct from
+    :class:`CharacterCardNotFoundError`: the character is visible to the
+    caller (it's in their own roster), so collapsing this into a 404
+    would be a lie, not an anti-enumeration measure. Mirrors the
+    story-seed precedent for "exists, wrong kind, refuse" (403)."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExportedCard:
     """Result of an export: the zip bytes plus a human-friendly download
@@ -88,6 +99,8 @@ class CharacterCardExportService:
         )
         if character is None:
             raise CharacterCardNotFoundError(character_id)
+        if character.is_managed:
+            raise CharacterCardManagedError(character_id)
 
         series_bundles, series_ids, series_template_ids = await self._collect_arc_series(
             character_arc_series_id=character.arc_series_id,

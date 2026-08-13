@@ -109,6 +109,10 @@ class ProbeReportResponse(BaseModel):
 class ProviderConnectionResponse(BaseModel):
     id: str
     provider: str
+    # Registry id this row serves under — ``provider`` verbatim, or
+    # ``provider__slug`` when a connection slug distinguishes it from a
+    # sibling row of the same preset. Server-derived, never accepted on write.
+    runtime_provider_id: str
     label: str
     enabled: bool
     capabilities: list[str]
@@ -415,6 +419,7 @@ def _connection(
     return ProviderConnectionResponse(
         id=row.id,
         provider=row.provider,
+        runtime_provider_id=row.runtime_provider_id,
         label=row.label,
         enabled=row.enabled,
         capabilities=list(row.capabilities),

@@ -56,6 +56,23 @@ const completedFiles = [
   'src/components/CharacterImagesPanel.vue',
   'src/components/CharacterRelationshipMood.vue',
   'src/components/CharacterLorasPanel.vue',
+  // Backup / restore panel (plan CB, ticket CB4) — shared by the player
+  // settings tab and the admin characters page. CharacterBackupRestorePanel
+  // is the character-agnostic restore half, mounted next to the
+  // "add a character" surfaces instead (character-card panel, admin
+  // create-card card) so it stays reachable with zero characters.
+  'src/components/CharacterBackupPanel.vue',
+  'src/components/CharacterBackupRestorePanel.vue',
+  'src/components/CharacterBackupPasswordModal.vue',
+  'src/components/CharacterBackupImportPreviewCard.vue',
+  'src/components/CharacterSettingsSection.vue',
+  'src/components/PlayerSettingsPanel.vue',
+  'src/composables/useCharacterBackupExport.ts',
+  'src/composables/useCharacterBackupImport.ts',
+  'src/utils/api/characterBackups.ts',
+  'src/utils/characterBackupErrors.ts',
+  'src/utils/characterBackupPolling.ts',
+  'src/utils/passwordStrength.ts',
   'src/components/FeatureModelsPicker.vue',
   'src/components/ImageProfilesPicker.vue',
   'src/components/InterestSubscriptionPanel.vue',

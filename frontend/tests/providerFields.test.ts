@@ -44,6 +44,27 @@ function catalogEntry(
 }
 
 describe('providerFields', () => {
+  // connection_slug identifies the whole ROW (it becomes the runtime
+  // provider id every capability of that row mounts under), so it belongs
+  // in the shared block. Claiming it for a capability set would render it
+  // once per capability card and split one connection identity across
+  // several inputs.
+  it('keeps connection_slug in the shared block', () => {
+    const relay = catalogEntry('custom_openai_compatible', ['llm', 'embedding'], [
+      'base_url',
+      'default_model',
+      'embedding_model',
+      'connection_slug',
+    ])
+    expect(sharedFields(relay).map(f => f.key)).toContain('connection_slug')
+    for (const capability of ['llm', 'embedding']) {
+      expect(fieldsForCapability(relay, capability).map(f => f.key)).not.toContain(
+        'connection_slug',
+      )
+    }
+    expect(isSharedConfigField(fieldSpec('connection_slug'))).toBe(true)
+  })
+
   // Regression guard for the 2026-07-16 report: base_url disappeared from
   // the UI for every non-search capability, breaking local/custom provider
   // setup and "fetch models".

@@ -1,6 +1,6 @@
 """operator_profiles.primary_language NOT NULL
 
-Backs FRONTEND_I18N_PLAN.md's two-layer locale design: every operator
+Backs the two-layer locale design: every operator
 gets a fixed primary language at registration time that anchors all
 LLM content (chat, memory, persona, story, feed) for their lifetime.
 The frontend UI locale switcher is independent and may differ.

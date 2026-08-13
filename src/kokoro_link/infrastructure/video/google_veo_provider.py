@@ -62,7 +62,13 @@ class GoogleVeoVideoProvider(VideoProviderPort):
         length_frames: int = 81,
         recent_dialogue: str = "",
         use_runtime_state: bool = True,
+        first_frame_url: str | None = None,
     ) -> bytes:
+        # Accepted for port conformance only. Veo does support an image
+        # seed, but wiring it here would change what this adapter sends
+        # today; i2v for the native adapters is out of CV1's scope
+        # (existing adapters bit-identical).
+        del first_frame_url
         prompt = _build_prompt(
             character=character,
             positive=positive,

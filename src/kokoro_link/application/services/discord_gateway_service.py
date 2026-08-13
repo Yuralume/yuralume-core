@@ -1,4 +1,64 @@
-"""Discord Gateway worker for inbound messaging."""
+"""Discord Gateway worker for inbound messaging.
+
+Reconnect policy, in two independent halves.
+
+**Parking.** The loop retries forever on transient failures, but stops
+for a credential failure that says ``credentials_must_change`` — a
+rejected or absent bot token. Retrying those cannot succeed, so it would
+only produce an error report every ``reconnect_delay_seconds`` until
+someone edits the account. The "stop" is remembered in process memory as
+a *fingerprint of the credentials Discord refused*, and the one thing
+that lifts it is that fingerprint changing — i.e. someone edited the
+credentials. No schema, no extra persisted state, and nothing any worker
+writes can move it. A restart or a gateway-lock handover deliberately
+costs one more attempt per broken account: confirming the current state
+once after a restart is worth more than the single log line it prints.
+
+**Parking is per-process, and that is the whole design.** The memo lives
+in this instance's memory, so N connector instances each spend one
+attempt on a broken account and then all N go quiet — bounded by the
+fleet size, never by uptime. Hosted currently runs a single connector
+(the api / coordinator / worker roles are the ones at two instances), so
+today that is "one attempt, then silence" — but nothing here depends on
+that count, and it must stay that way: the ``connector`` role is defined
+as a per-account TTL lease precisely so it *can* be scaled out, and a
+rolling deploy briefly runs the old and new connector side by side.
+
+*Why the resume signal is only the fingerprint.* An earlier version also
+un-parked when the row's ``updated_at`` moved, reading that as "the
+operator re-saved the account, try again". It is not that:
+``updated_at`` is the row's last-write time, and
+``try_acquire_gateway_lock`` stamps it on every attempt by every
+instance (see ``SAMessagingAccountRepository.try_acquire_gateway_lock``,
+whose UPDATE sets ``updated_at=now``). With two instances the parks
+ping-ponged forever — A parks, B's next lock acquisition stamps the row,
+A reads a "repair" and un-parks, stamps it in turn, B un-parks, … — so a
+rejected token was back to a reconnect every ``reconnect_delay_seconds``,
+which is precisely the storm parking exists to remove. And it was
+invisible: the failure reporter de-duplicates identical reports, so the
+logs showed one WARNING and nothing else. **Do not add it back.**
+Re-saving an account without changing the token changes nothing, so the
+retry it would buy is certain to fail the same way; and the credential
+failures that really are repaired elsewhere (close 4014, *disallowed
+intents*) never park at all — they carry
+``credentials_must_change=False`` and keep retrying under the backoff
+below. This also puts Discord and WhatsApp on the same rule: see
+``WhatsAppGatewayService._known_bad_credentials``.
+
+**Backoff.** A credential failure repaired on Discord's side — close
+4014, *disallowed intents* — must keep retrying, because no local edit
+would ever un-park it. Reconnecting a doomed handshake every 5 seconds
+is not free: each attempt is a ``/gateway/bot`` request plus a WebSocket
+connect plus an IDENTIFY, and Discord budgets IDENTIFY per day (1000 for
+an unsharded bot), so a fixed 5s retry would spend ~17k of them in a day
+and risk the token being rate-limited on top of the original problem.
+Consecutive retryable credential failures therefore back off
+exponentially from ``reconnect_delay_seconds`` up to
+``credential_retry_max_delay_seconds``. The counter lives in memory next
+to the parking memo and resets the moment the account connects (or fails
+for any other reason), so enabling the intent is noticed within a minute
+without a restart.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +72,14 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from kokoro_link.application.async_cancellation import reraise_own_cancellation
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.messaging_dispatcher import MessagingDispatcher
+from kokoro_link.application.services.messaging_failure_reporter import (
+    MessagingErrorChannel,
+    MessagingFailureReport,
+    MessagingFailureReporter,
+)
 from kokoro_link.application.services.messaging_media_owner import (
     MessagingMediaOwnerUnavailable,
     resolve_messaging_media_owner,
@@ -27,6 +93,11 @@ from kokoro_link.contracts.object_storage import ObjectStoragePort
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.domain.entities.messaging_account import MessagingAccount
 from kokoro_link.domain.value_objects.delivery_mode import DeliveryMode
+from kokoro_link.domain.value_objects.messaging_failure import (
+    MessagingCredentialError,
+    MessagingFailureKind,
+    credentials_fingerprint,
+)
 from kokoro_link.domain.value_objects.platform import Platform
 
 DiscordMessageParser = Callable[..., ParsedInbound | None]
@@ -37,6 +108,10 @@ _DUPLICATE_BOT_TOKEN_ERROR = (
     "Duplicate Discord bot token is bound to multiple gateway accounts; "
     "delete duplicate Discord accounts before Gateway can run."
 )
+_MAX_BACKOFF_DOUBLINGS = 8
+"""Enough to reach any sane cap from any sane base (256x), and low
+enough that ``2 ** n`` stays a small int no matter how long a broken
+account sits there."""
 
 
 class DiscordGatewayClientPort(Protocol):
@@ -71,6 +146,7 @@ class DiscordGatewayService:
         owner_id: str | None = None,
         sync_interval_seconds: float = 5.0,
         reconnect_delay_seconds: float = 5.0,
+        credential_retry_max_delay_seconds: float = 60.0,
         lock_ttl_seconds: int = 90,
     ) -> None:
         self._accounts = account_repository
@@ -84,9 +160,28 @@ class DiscordGatewayService:
         self._owner_id = owner_id or f"discord-gateway-{uuid4()}"
         self._sync_interval_seconds = sync_interval_seconds
         self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._credential_retry_max_delay_seconds = credential_retry_max_delay_seconds
         self._lock_ttl = timedelta(seconds=lock_ttl_seconds)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._task: asyncio.Task[None] | None = None
+        self._failures = MessagingFailureReporter(
+            account_repository=account_repository,
+            owner_id=self._owner_id,
+            logger=_LOGGER,
+            channel=MessagingErrorChannel.GATEWAY,
+        )
+        # account id -> sha256 fingerprint (never the plaintext
+        # credentials — see credentials_fingerprint) of the credentials a
+        # CREDENTIAL failure with credentials_must_change=True was
+        # reported for. Present = parked. Lifted only when the
+        # fingerprint stops matching, i.e. someone edited the account's
+        # credentials — deliberately not updated_at, see module docstring.
+        # Bounded by _forget_absent_accounts in sync_once; cleared on
+        # restart by construction.
+        self._parked: dict[str, str] = {}
+        # account id -> consecutive credential failures that must keep
+        # retrying (Discord close 4014). Drives the backoff only.
+        self._credential_retries: dict[str, int] = {}
 
     @property
     def running(self) -> bool:
@@ -114,8 +209,14 @@ class DiscordGatewayService:
             account for account in await self._accounts.list_gateway_candidates()
             if _is_gateway_account(account)
         ]
+        self._forget_absent_accounts({account.id for account in accounts})
         pollable_accounts, duplicate_accounts = _split_duplicate_bot_tokens(accounts)
-        desired_ids = {account.id for account in pollable_accounts}
+        runnable_accounts = [
+            account
+            for account in pollable_accounts
+            if not self._is_parked(account)
+        ]
+        desired_ids = {account.id for account in runnable_accounts}
 
         for account_id, task in list(self._tasks.items()):
             if task.done():
@@ -128,7 +229,7 @@ class DiscordGatewayService:
         for account in duplicate_accounts:
             await self._mark_duplicate_bot_token_account(account)
 
-        for account in pollable_accounts:
+        for account in runnable_accounts:
             existing = self._tasks.get(account.id)
             if existing is None or existing.done():
                 self._tasks[account.id] = asyncio.create_task(
@@ -155,7 +256,9 @@ class DiscordGatewayService:
     async def _run_account_loop(self, account_id: str) -> None:
         while True:
             account = await self._accounts.get(account_id)
-            if not _is_gateway_account(account):
+            if account is None or not _is_gateway_account(account):
+                return
+            if self._is_parked(account):
                 return
             locked = await self._accounts.try_acquire_gateway_lock(
                 account_id,
@@ -171,15 +274,15 @@ class DiscordGatewayService:
                 self._refresh_lock_until_cancelled(locked.id, current_task),
                 name=f"discord-gateway-lock-{locked.id}",
             )
+            report: MessagingFailureReport | None = None
             try:
                 await self._connect_locked_account(locked)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                _LOGGER.exception(
-                    "discord gateway account failed account=%s", locked.id,
+                report = await self._failures.report(
+                    locked, exc, context="gateway connect",
                 )
-                await self._record_error(locked, str(exc) or exc.__class__.__name__)
             finally:
                 refresher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -188,13 +291,29 @@ class DiscordGatewayService:
                     locked.id,
                     owner_id=self._owner_id,
                 )
-            await asyncio.sleep(self._reconnect_delay_seconds)
+                # Only after the lock is back: the suppress above can eat
+                # this task's *own* cancellation, and dropping out here
+                # without releasing would strand the account until the TTL.
+                reraise_own_cancellation(current_task)
+            if report is not None and not report.should_retry:
+                # Credentials the platform rejected and only an edit can fix:
+                # leave the loop instead of reconnecting into the same refusal
+                # every few seconds. Parked on the credentials we just dialled,
+                # so an edit — and nothing else — resumes it.
+                self._park_account(locked)
+                return
+            await asyncio.sleep(self._retry_delay_for(locked.id, report))
 
     async def _connect_locked_account(self, account: MessagingAccount) -> None:
         token = account.credentials.get("bot_token", "")
         if not token:
-            await self._record_error(account, "Missing bot_token")
-            return
+            raise MessagingCredentialError(
+                "This Discord account has no bot token. Paste the bot token "
+                "from the Discord Developer Portal into the account settings.",
+                # Pasting the token is exactly a credentials edit, so the
+                # fingerprint change un-parks the account without a restart.
+                credentials_must_change=True,
+            )
         async def handle_ready() -> None:
             await self._accounts.mark_gateway_success(
                 account.id,
@@ -309,11 +428,104 @@ class DiscordGatewayService:
         if locked is None:
             return
         try:
-            await self._record_error(locked, _DUPLICATE_BOT_TOKEN_ERROR)
+            # Operator-fixable and re-evaluated on every 5s sync, so it goes
+            # through the reporter purely for its de-duplication. It is
+            # deliberately *not* parked: the fix is deleting the other
+            # account, which leaves this account's credentials — and
+            # therefore its fingerprint — untouched, so a memo keyed on them
+            # would never lift. (The default ``credentials_must_change=False``
+            # already says as much; parking here would contradict it.)
+            await self._failures.report(
+                locked,
+                MessagingCredentialError(_DUPLICATE_BOT_TOKEN_ERROR),
+                context="duplicate bot token",
+            )
         finally:
             await self._accounts.release_gateway_lock(
                 locked.id, owner_id=self._owner_id,
             )
+
+    def _is_parked(self, account: MessagingAccount) -> bool:
+        """Whether this account's *current* credentials are known-bad.
+
+        Clears the memo as a side effect when the credentials changed: an
+        edit is the only signal that makes another attempt worth
+        spending, and re-parking costs exactly one attempt if the edit
+        was wrong. It is also a signal no worker can forge — nothing on
+        the connect / report / lock path writes ``credentials``, so
+        another connector instance racing on this row cannot un-park it.
+        See the module docstring for why the account's ``updated_at`` is
+        deliberately *not* part of this test.
+        """
+        fingerprint = self._parked.get(account.id)
+        if fingerprint is None:
+            return False
+        if fingerprint == credentials_fingerprint(account.credentials):
+            return True
+        self._parked.pop(account.id, None)
+        return False
+
+    def _forget_absent_accounts(self, live_ids: set[str]) -> None:
+        """Keep the in-memory state bounded by the accounts that exist.
+
+        A deleted or disabled account must not pin an entry for the life
+        of the process. Re-enabling one costs a single extra attempt,
+        which is the same bound a restart already accepts.
+        """
+        for account_id in list(self._parked):
+            if account_id not in live_ids:
+                self._parked.pop(account_id, None)
+        for account_id in list(self._credential_retries):
+            if account_id not in live_ids:
+                self._credential_retries.pop(account_id, None)
+
+    def _park_account(self, account: MessagingAccount) -> None:
+        """Stop retrying ``account`` until its credentials change.
+
+        Fingerprints the entity the loop was already holding instead of
+        re-reading the row. The writes that just happened — the failure
+        report's ``polling_last_error``, the lock release — touch no
+        credential field, and ``credentials`` only ever moves through an
+        operator edit, so the held copy is current for the one field this
+        memo reads. (The earlier re-read existed solely to settle
+        ``updated_at``, which those writes really did move; that half of
+        the memo is gone.)
+
+        Re-reading would in fact be *wrong* under a concurrent edit: it
+        would fingerprint the freshly pasted token as the bad one and
+        park a credential that was never dialled. The held, pre-edit
+        fingerprint instead stops matching the row and un-parks on the
+        next sync — exactly what the edit asked for.
+        """
+        self._credential_retries.pop(account.id, None)
+        self._parked[account.id] = credentials_fingerprint(account.credentials)
+
+    def _retry_delay_for(
+        self,
+        account_id: str,
+        report: MessagingFailureReport | None,
+    ) -> float:
+        """How long to wait before dialling this account again.
+
+        A credential failure that must keep retrying (Discord close
+        4014) is a handshake that is certain to fail, and each attempt
+        spends an IDENTIFY out of a daily budget — so consecutive ones
+        back off exponentially. Everything else, success included, resets
+        the counter and uses the plain reconnect delay, which keeps the
+        recovery latency at one delay once the operator ticks the intent.
+        """
+        if report is None or report.kind is not MessagingFailureKind.CREDENTIAL:
+            self._credential_retries.pop(account_id, None)
+            return self._reconnect_delay_seconds
+        attempts = self._credential_retries.get(account_id, 0) + 1
+        self._credential_retries[account_id] = attempts
+        # Capped exponent as well as capped delay: the multiplication must
+        # not grow unbounded just because the cap would clamp it anyway.
+        growth = 2 ** min(attempts - 1, _MAX_BACKOFF_DOUBLINGS)
+        return min(
+            self._reconnect_delay_seconds * growth,
+            self._credential_retry_max_delay_seconds,
+        )
 
     async def _record_error(
         self,

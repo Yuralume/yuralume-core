@@ -6,7 +6,7 @@ chosen one as a brand-new character owned by the caller. Install reuses the
 import path, so a marketplace install and a manual ``.lumecard`` upload
 behave identically (A-layer only; runtime never travels with the card; the
 local install request may attach an importer-confirmed starting
-relationship). See ``docs/CHARACTER_CARD_PLAN.md`` §7–§8.
+relationship).
 
 The two sources answer through one shape. A local pack is read off disk; an
 official card is fetched from the public Yuralume catalog
@@ -48,6 +48,9 @@ from kokoro_link.application.services.character_card_import_service import (
 from kokoro_link.application.services.character_card_pack_service import (
     CharacterCardPackNotFoundError,
     CharacterCardPackSummary,
+)
+from kokoro_link.application.services.exclusive_official_card_install import (
+    ExclusiveCardEntitlementRequiredError,
 )
 from kokoro_link.application.services.character_service import (
     CharacterValidationError,
@@ -232,6 +235,15 @@ async def install_character_card(
                 install_request.initial_relationship if install_request else None
             ),
         )
+    except ExclusiveCardEntitlementRequiredError as exc:
+        # An IP card sold behind an entitlement this build has no port to
+        # check (plan D2 — v1 publishes none). 403 rather than 404: the card
+        # is real and the player can see it on the shelf, so "you may not
+        # install this one" is the truthful answer, and a 404 would send
+        # them looking for a card that is right in front of them.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc),
+        ) from exc
     except CharacterCardPackNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

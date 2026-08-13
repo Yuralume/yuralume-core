@@ -5,8 +5,7 @@ the parts of a character that are authored at creation time and mean
 the same thing on any deployment. Deployment-bound routing (B-layer:
 ``feature_models`` / image / video profiles, ``voice_profile``,
 ``loras``) and runtime accumulation (C-layer: ``state`` / memory /
-persona / schedule / feed / ...) are intentionally absent. See
-``docs/CHARACTER_CARD_PLAN.md`` §2.
+persona / schedule / feed / ...) are intentionally absent.
 
 The schema is versioned via :data:`CHARACTER_CARD_SCHEMA_VERSION` so a
 future exporter can bump the shape while older importers reject what
@@ -374,6 +373,29 @@ class CharacterCardPreview(BaseModel):
     exactly where it has always been for local cards, and lets it disappear
     for an official card that is already published in the player's
     language."""
+
+    distribution: str = "public"
+    """How an official card may be obtained: ``"public"`` or
+    ``"cloud_exclusive"`` (EC 系列 D1). Always ``"public"`` for a local pack
+    or an uploaded file — those *are* the artifact, so there is nothing
+    exclusive about them to describe.
+
+    Present so a renderer can say **why** an install is unavailable ("cloud
+    only") rather than showing a dead button. It is deliberately not what a
+    button reads: that is :attr:`installable`."""
+
+    installable: bool = True
+    """Whether **this deployment** can complete an install of this card.
+
+    ``False`` only for a cloud-exclusive card on a deployment holding no
+    exclusive-read credential — a self-hosted one, always. The card still
+    lists (the name, the summary and the portrait are the shop window); what
+    it must not offer is a button whose far end would refuse.
+
+    Two facts are folded together here on purpose. The licence belongs to
+    the card and travels as :attr:`distribution`; the credential belongs to
+    the deployment and is not something a browser can see at all. Only the
+    combination answers the question a UI has."""
 
     source_format: str = "lumecard"
     """Which upload format this preview came from — ``"lumecard"`` for the

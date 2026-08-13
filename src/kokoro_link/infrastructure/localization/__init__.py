@@ -3,7 +3,7 @@
 This package is **deliberately NOT an LLM path**. It holds the static
 fallback / channel-wrapper strings the backend emits without a model in
 the loop (LLM-failure apologies, channel attachment wrappers, inbound
-placeholders). Per CLAUDE.md the LLM-first rule governs *semantic*
+placeholders). The LLM-first rule governs *semantic*
 output; these are fixed system strings with no semantics to reason
 about, so a per-locale dict is the correct — and only — way to keep an
 en-US / ja-JP operator from receiving zh-TW system text.

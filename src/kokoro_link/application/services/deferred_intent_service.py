@@ -21,6 +21,7 @@ directly:
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from kokoro_link.bootstrap.settings import HumanizationSettings
@@ -61,9 +62,15 @@ class DeferredIntentService:
         operator_id: str,
         trigger: str,
         decision: ProactiveIntentionDecision,
+        revisit_at: datetime | None = None,
         now: datetime | None = None,
     ) -> DeferredIntent | None:
         """Persist a motive worth re-evaluating; drop otherwise.
+
+        ``revisit_at`` is the already-parsed, already-validated UTC form
+        of ``decision.revisit_at_iso`` — the caller owns timezone
+        resolution because only it knows the operator's zone, and it
+        passes ``None`` for anything unparseable or already past.
 
         Returns the stored row when written, ``None`` when feature off,
         motive empty, or storage failed.
@@ -84,6 +91,7 @@ class DeferredIntentService:
             risk=decision.risk,
             best_timing=decision.best_timing,
             reason=decision.reason,
+            revisit_at=revisit_at,
             ttl_minutes=self._ttl_minutes,
             now=now,
         )
@@ -121,6 +129,79 @@ class DeferredIntentService:
                 character_id, operator_id,
             )
             return []
+
+    async def list_due(
+        self,
+        character_id: str,
+        operator_id: str,
+        *,
+        now: datetime | None = None,
+        limit: int = 5,
+    ) -> list[DeferredIntent]:
+        """Motives whose ``revisit_at`` alarm has rung.
+
+        Runs on the cheap side of the proactive gate — once per tick,
+        before any LLM budget is spent — so unlike ``list_active`` it
+        does **not** trigger a GC sweep; the ``expires_at`` predicate in
+        the query already keeps stale rows out of the answer.
+        """
+        if not self.enabled:
+            return []
+        ref = now or datetime.now(timezone.utc)
+        try:
+            return await self._repository.list_due_for(
+                character_id, operator_id, now=ref, limit=limit,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "deferred_intent list_due_for failed (char=%s op=%s)",
+                character_id, operator_id,
+            )
+            return []
+
+    async def clear_revisit_many(self, intent_ids: list[str]) -> int:
+        """Spend the alarms: after one exemption they must not fire
+        again, or a single parked motive would keep the character out of
+        cooldown forever. Per-row failures are logged, never fatal."""
+        if not intent_ids:
+            return 0
+        cleared = 0
+        for intent_id in intent_ids:
+            try:
+                if await self._repository.clear_revisit(intent_id):
+                    cleared += 1
+            except Exception:
+                _LOGGER.exception(
+                    "deferred_intent clear_revisit failed (id=%s)", intent_id,
+                )
+        return cleared
+
+    async def restore_revisit_many(
+        self, intents: Sequence[DeferredIntent],
+    ) -> int:
+        """Give back the alarms spent on a tick that never produced a
+        judgement (upstream failure, unusable model output).
+
+        Takes the **pre-spend snapshots** rather than ids: each row's own
+        appointment is the only value worth restoring, and the caller
+        already holds it. Rows that carried no alarm are skipped instead
+        of having one invented. Per-row failures are logged, never fatal
+        — a lost restore degrades to the pre-fix behaviour."""
+        restorable = [i for i in intents if i.revisit_at is not None]
+        if not restorable:
+            return 0
+        restored = 0
+        for intent in restorable:
+            try:
+                if await self._repository.restore_revisit(
+                    intent.id, revisit_at=intent.revisit_at,
+                ):
+                    restored += 1
+            except Exception:
+                _LOGGER.exception(
+                    "deferred_intent restore_revisit failed (id=%s)", intent.id,
+                )
+        return restored
 
     async def mark_consumed_many(
         self,

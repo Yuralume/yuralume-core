@@ -14,9 +14,12 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 
 import {
+  canInstallCard,
   isCloudCard,
+  isCloudExclusiveCard,
   shouldHideTranslateToggle,
   shouldOfferInstallTranslateToggle,
+  shouldShowCloudOnlyNotice,
   shouldShowOfficialCardsUnavailableNotice,
 } from '@/utils/characterCardSource'
 import type { CharacterCardPreview } from '@/utils/api/characters'
@@ -146,5 +149,80 @@ describe('shouldShowOfficialCardsUnavailableNotice', () => {
     expect(shouldShowOfficialCardsUnavailableNotice({
       officialCardsUnavailable: false, loading: false, error: null,
     })).toBe(false)
+  })
+})
+
+describe('cloud-exclusive cards (EC4)', () => {
+  it('recognises the IP-partner distribution and nothing else', () => {
+    expect(isCloudExclusiveCard({ distribution: 'cloud_exclusive' })).toBe(true)
+    expect(isCloudExclusiveCard({ distribution: 'public' })).toBe(false)
+    // A local pack / upload preview never carries the field.
+    expect(isCloudExclusiveCard({ distribution: undefined })).toBe(false)
+    expect(isCloudExclusiveCard(null)).toBe(false)
+  })
+
+  it('offers install unless the backend explicitly refused', () => {
+    // `installable` is a refusal, so silence is not one: an older backend
+    // and an upload preview must both keep their button.
+    expect(canInstallCard({ installable: undefined })).toBe(true)
+    expect(canInstallCard(null)).toBe(true)
+    expect(canInstallCard({ installable: true })).toBe(true)
+    expect(canInstallCard({ installable: false })).toBe(false)
+  })
+
+  it('keeps the button on a cloud-exclusive card the deployment CAN install', () => {
+    // The same card is installable on hosted and not on self-host. A rule
+    // keyed on the licence alone would grey it out for exactly the players
+    // who are paying for it — the credential is what decides, and only the
+    // backend can see it.
+    const installableExclusive = {
+      distribution: 'cloud_exclusive' as const, installable: true,
+    }
+    expect(canInstallCard(installableExclusive)).toBe(true)
+    expect(shouldShowCloudOnlyNotice({
+      distribution: 'cloud_exclusive', installable: true,
+    })).toBe(false)
+  })
+
+  it('explains a refused install only when it can name the reason', () => {
+    expect(shouldShowCloudOnlyNotice({
+      distribution: 'cloud_exclusive', installable: false,
+    })).toBe(true)
+    // Refused for some other reason (a future gate): no "cloud only" claim.
+    expect(shouldShowCloudOnlyNotice({
+      distribution: 'public', installable: false,
+    })).toBe(false)
+  })
+})
+
+describe('CharacterCardFace wiring', () => {
+  const source = readFileSync(
+    new URL('../src/components/CharacterCardFace.vue', import.meta.url),
+    'utf8',
+  )
+
+  it('disables the action and shows the chip off the shared predicates', () => {
+    expect(source).toContain('canInstallCard')
+    expect(source).toContain('shouldShowCloudOnlyNotice')
+    expect(source).toContain(':disabled="actionDisabled || installBlocked"')
+    expect(source).toContain('playerSidebar.characterCards.cloudOnly.chip')
+    expect(source).toContain('playerSidebar.characterCards.cloudOnly.hint')
+    // One definition of "this deployment cannot install this". A literal
+    // comparison here is how the card face and the console start
+    // disagreeing about the same card.
+    expect(source).not.toContain("=== 'cloud_exclusive'")
+  })
+})
+
+describe('PlayerCharacterCardPanel wiring', () => {
+  const source = readFileSync(
+    new URL('../src/components/PlayerCharacterCardPanel.vue', import.meta.url),
+    'utf8',
+  )
+
+  it('refuses the install path itself, not only the button', () => {
+    // The disabled button is the explanation; this is the stale-shelf /
+    // keyboard path, and the backend refuses behind both.
+    expect(source).toContain('if (!canInstallCard(card)) return')
   })
 })

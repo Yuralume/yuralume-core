@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
 from urllib.parse import unquote, urlparse
 
 if TYPE_CHECKING:
@@ -109,6 +109,7 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_FEED_COMMENT_REPLY,
     FEATURE_IDLE_DRIFT,
     FEATURE_FEED_COMPOSE,
+    FEATURE_VIDEO_STORYBOARD,
     FEATURE_BRANCHING_DRAMA,
     FEATURE_BRANCHING_DRAMA_CRITIC,
     FEATURE_CHARACTER_DRAFT,
@@ -145,11 +146,23 @@ from kokoro_link.application.services.character_runtime_initializer import (
 from kokoro_link.application.services.character_card_export_service import (
     CharacterCardExportService,
 )
+from kokoro_link.application.services.character_backup_export_service import (
+    CharacterBackupExportService,
+)
+from kokoro_link.application.services.character_backup_import_service import (
+    CharacterBackupImportService,
+)
+from kokoro_link.contracts.character_backup_jobs import (
+    CharacterBackupJobRepositoryPort,
+)
 from kokoro_link.application.services.character_card_import_service import (
     CharacterCardImportService,
 )
 from kokoro_link.application.services.character_card_pack_service import (
     CharacterCardPackService,
+)
+from kokoro_link.application.services.exclusive_official_card_install import (
+    ExclusiveOfficialCardInstaller,
 )
 from kokoro_link.application.services.official_card_pack_source import (
     OfficialCardPackSource,
@@ -160,6 +173,9 @@ from kokoro_link.infrastructure.character_card.pack_catalog import (
 from kokoro_link.infrastructure.cloud.official_card_catalog_client import (
     CachedOfficialCardCatalog,
     OfficialCardCatalogClient,
+)
+from kokoro_link.infrastructure.cloud.official_card_exclusive_client import (
+    build_exclusive_payload_client,
 )
 from kokoro_link.infrastructure.character_card.llm_translator import (
     LLMCharacterCardTranslator,
@@ -210,6 +226,9 @@ from kokoro_link.application.services.messaging_account_service import (
     MessagingAccountService,
 )
 from kokoro_link.application.services.nsfw_mode import NsfwModeService
+from kokoro_link.application.services.output_language_policy import (
+    OperatorOutputLanguageResolver,
+)
 from kokoro_link.application.services.discord_gateway_service import (
     DiscordGatewayService,
 )
@@ -263,6 +282,7 @@ from kokoro_link.application.services.cloud_routing_profile_cache import (
     CachedCloudRoutingProfileResolver,
 )
 from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfilePort
+from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentityResolverPort
 from kokoro_link.infrastructure.cloud.tier_runtime_profile_client import (
     TierRuntimeProfileClient,
 )
@@ -283,6 +303,7 @@ from kokoro_link.infrastructure.cloud.action_charge_client import (
 )
 from kokoro_link.infrastructure.cloud.action_pricing_client import (
     ActionPricingClient,
+    TierActionPricingClient,
 )
 from kokoro_link.application.services.cloud_action_billing_service import (
     CloudActionBillingService,
@@ -290,6 +311,9 @@ from kokoro_link.application.services.cloud_action_billing_service import (
 )
 from kokoro_link.application.services.cloud_pricing_service import (
     CloudPricingService,
+)
+from kokoro_link.application.services.cloud_tier_pricing_service import (
+    CloudTierPricingService,
 )
 from kokoro_link.infrastructure.cloud.announcement_unread_client import (
     AnnouncementUnreadClient,
@@ -337,6 +361,13 @@ from kokoro_link.application.services.feed_comment_reply_service import (
 from kokoro_link.application.services.feed_composer_service import (
     FeedComposerService,
 )
+from kokoro_link.application.services.feed_video_job_service import (
+    FeedVideoJobService,
+)
+from kokoro_link.application.services.model_resolver import ModelResolver
+from kokoro_link.application.services.video_storyboard_service import (
+    VideoStoryboardService,
+)
 from kokoro_link.application.services.demo_account_reaper import DemoAccountReaper
 from kokoro_link.application.services.tts_pregeneration_service import (
     TTSPregenerationService,
@@ -381,6 +412,9 @@ from kokoro_link.application.services.rss_source_sync_service import (
 )
 from kokoro_link.application.services.world_event_scheduler import (
     WorldEventScheduler,
+)
+from kokoro_link.contracts.character_event_mention import (
+    CharacterEventMentionRepositoryPort,
 )
 from kokoro_link.contracts.character_event_inbox import (
     CharacterEventInboxRepositoryPort,
@@ -518,6 +552,12 @@ from kokoro_link.contracts.branching_drama import (
     BranchingDramaRepositoryPort,
 )
 from kokoro_link.contracts.fusion_story import FusionStoryRepositoryPort
+from kokoro_link.contracts.async_video_job import (
+    DEFAULT_VIDEO_JOB_TIMEOUT_SECONDS,
+)
+from kokoro_link.contracts.feed_video_jobs import (
+    PendingFeedVideoRepositoryPort,
+)
 from kokoro_link.contracts.studio_jobs import StudioJobRepositoryPort
 from kokoro_link.contracts.story_arc import (
     StoryArcPlannerPort,
@@ -899,6 +939,7 @@ from kokoro_link.infrastructure.tools.webfetch import (
     WebFetchTool,
 )
 from kokoro_link.infrastructure.tools.websearch import (
+    CloudGatewaySearchClient,
     TavilyClient,
     WebSearchTool,
 )
@@ -972,6 +1013,9 @@ class ServiceContainer:
     schedule_weather_drift_service: ScheduleWeatherDriftService | None = None
     active_llm_provider: ActiveLLMProviderPort | None = None
     cloud_routing_profile_resolver: CloudRoutingProfilePort | None = None
+    cloud_mode: bool = False
+    """Hosted deployment. Read by ``runtime_sync`` to keep DB-backed BYOK
+    provider rows out of registries the Gateway owns in hosted mode."""
     nsfw_mode_service: NsfwModeService | None = None
     visual_generation_style_service: VisualGenerationStyleService | None = None
     object_storage: ObjectStoragePort = field(
@@ -1068,8 +1112,7 @@ class ServiceContainer:
     # each tick, read by the internal metrics route. ``None`` on bare
     # ``ServiceContainer()`` test harnesses.
     scheduler_metrics: SchedulerMetrics | None = None
-    # GD1-A rolling-deploy drain switch (HOSTED_PROMPT_PACK_DISTRIBUTION_PLAN
-    # §7.3). One per container = one per process, which is the scope a drain
+    # GD1-A rolling-deploy drain switch. One per container = one per process, which is the scope a drain
     # request addresses. Always present — including on hand-built test
     # containers — so the internal drain route and the metrics exporter never
     # have to answer "what if nobody wired it". Defaults to *not* draining, and
@@ -1098,6 +1141,11 @@ class ServiceContainer:
     # Cloud→Core tenant-tier push, invoked by the internal route so a tier
     # change takes effect without waiting for the operator to re-login.
     cloud_tenant_tier_sync_service: "CloudTenantTierSyncService | None" = None
+    # Cloud→Core per-card exclusive-freeze (D7 / EC10-A/EC10-B), invoked by
+    # the internal route when an official card's IP-partner contract ends
+    # or resumes. Independent of ``subscription_freeze_service`` above —
+    # keyed by card, not tenant.
+    exclusive_card_freeze_service: "ExclusiveCardFreezeService | None" = None
     subscription_access_guard: "SubscriptionAccessGuard | None" = None
     cloud_subscription_repository: "CloudSubscriptionRepositoryPort | None" = None
     # Display-only hosted credit balance proxy (U3). Wired in cloud mode only;
@@ -1106,6 +1154,7 @@ class ServiceContainer:
     # Public hosted price list proxy (AP3). Cloud mode only; ``None`` leaves
     # ``GET /api/v1/cloud/pricing`` degraded rather than quoting stale numbers.
     cloud_pricing_service: "CloudPricingService | None" = None
+    cloud_tier_pricing_service: "CloudTierPricingService | None" = None
     # Notice-board unread flag (AN1) behind the in-game dot. None on self-host,
     # where there is no Cloud board to have unread notices on.
     cloud_announcement_service: "CloudAnnouncementService | None" = None
@@ -1151,6 +1200,11 @@ class ServiceContainer:
     feed_comment_repository: FeedCommentRepositoryPort | None = None
     feed_comment_service: "FeedCommentService | None" = None
     feed_composer_service: FeedComposerService | None = None
+    #: CV4 deferred video pipeline. Exposed so the CV6 internal trigger (and
+    #: any future admin surface) can drive the same object the two carriers do
+    #: rather than re-assembling one.
+    feed_video_job_service: "FeedVideoJobService | None" = None
+    pending_feed_video_repository: PendingFeedVideoRepositoryPort | None = None
     feed_comment_reply_service: FeedCommentReplyService | None = None
     feed_reaction_memorializer: FeedReactionMemorializer | None = None
     feed_event_bus: FeedEventBus | None = None
@@ -1175,6 +1229,21 @@ class ServiceContainer:
     branching_drama_service: "BranchingDramaService | None" = None
     studio_job_repository: StudioJobRepositoryPort | None = None
     studio_job_recovery_service: StudioJobRecoveryService | None = None
+    # CB2 — durable ``.lumebackup`` export jobs + orchestration. Both are
+    # ``None`` without a database: the export is a whole-history dump, so
+    # a DB-less dev rig has nothing meaningful to export and the route
+    # answers 503.
+    character_backup_job_repository: (
+        CharacterBackupJobRepositoryPort | None
+    ) = None
+    character_backup_export_service: (
+        CharacterBackupExportService | None
+    ) = None
+    # CB3 — the restore half; ``None`` without a database for the same
+    # reason as the export half.
+    character_backup_import_service: (
+        CharacterBackupImportService | None
+    ) = None
     world_event_repository: WorldEventRepositoryPort | None = None
     rss_source_repository: RssSourceRepositoryPort | None = None
     character_event_inbox_repository: CharacterEventInboxRepositoryPort | None = None
@@ -1205,7 +1274,7 @@ class ServiceContainer:
     # HUMANIZATION_ROADMAP P1 repositories (§3.1–§3.5 audit / read paths).
     disposition_drift_history_repository: "DispositionDriftHistoryRepositoryPort | None" = None
     self_reflection_repository: "SelfReflectionRepositoryPort | None" = None
-    # docs/MEMOIR_PLAN.md — player-side memoir aggregation.
+    # Player-side memoir aggregation.
     memory_repository: "MemoryRepositoryPort | None" = None
     memoir_pin_repository: "MemoirPinRepositoryPort | None" = None
     memoir_service: "MemoirService | None" = None
@@ -1219,7 +1288,7 @@ class ServiceContainer:
     # HUMANIZATION_ROADMAP §4.2 — observed register / address preference.
     address_preference_repository: "OperatorAddressPreferenceRepositoryPort | None" = None
     address_preference_service: "AddressPreferenceObserverService | None" = None
-    # ADDRESS_RESOLVER_PLAN §4–§8 — per-pair rename log + names edit.
+    # Per-pair rename log + names edit.
     address_change_log_repository: "AddressChangeLogRepositoryPort | None" = None
     relationship_names_service: "RelationshipNamesService | None" = None
     # HUMANIZATION_ROADMAP §4.6 — A/B framework.
@@ -1276,6 +1345,23 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed >= 0 else default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env override, falling back to ``default``.
+
+    Same fail-to-default contract as :func:`_env_int`: an unset or
+    unrecognised value keeps the default, so a deployment that never heard
+    of the knob behaves exactly as it did before the knob existed."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _build_in_memory_repositories() -> _RepoBundle:
@@ -1801,6 +1887,103 @@ def _build_object_storage(settings: AppSettings) -> ObjectStoragePort:
     return VariantAwareObjectStorage(_build_storage_adapter(settings))
 
 
+def _build_character_data_erasure(
+    *,
+    db_session_factory: "sessionmaker[AsyncSession] | None",
+    object_storage: ObjectStoragePort,
+    character_repository: CharacterRepositoryPort,
+    repositories: "Mapping[str, object]",
+) -> "CharacterDataErasureService":
+    """The one erasure engine behind ``delete_character`` (CD2).
+
+    With a database, the boundary is derived from the CB0 registry and
+    the ORM metadata — the only mode that can promise zero orphan rows.
+    Without one, the sweep can only reach the repositories this container
+    built; ``RepositoryCharacterDatabaseEraser``'s docstring records what
+    that mode does not cover.
+
+    ``repositories`` is keyed by
+    ``CHARACTER_ERASURE_REPOSITORY_SLOTS`` — the single declaration of
+    which roles the in-memory boundary contains and in which order they
+    run. An unregistered key fails loudly at construction.
+    """
+    from kokoro_link.application.services.character_data_erasure import (
+        CharacterDataErasureService,
+        RepositoryCharacterDatabaseEraser,
+    )
+
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_character_data_eraser import (
+            SACharacterDataEraser,
+        )
+        database_eraser = SACharacterDataEraser(db_session_factory)
+    else:
+        database_eraser = RepositoryCharacterDatabaseEraser(
+            character_repository=character_repository,
+            repositories=repositories,
+        )
+    return CharacterDataErasureService(
+        database_eraser=database_eraser,
+        object_storage=object_storage,
+    )
+
+
+def _build_character_data_reset(
+    *,
+    db_session_factory: "sessionmaker[AsyncSession] | None",
+    memory_repository: "MemoryRepositoryPort | None",
+    conversation_repository: "ConversationRepositoryPort | None",
+    state_history_repository: "StateHistoryRepositoryPort | None",
+    operator_persona_repository: "OperatorPersonaRepositoryPort | None",
+) -> "CharacterResetEraserPort":
+    """The one erasure engine behind ``reset_character_data`` (CD3).
+
+    With a database, each flag's table set is resolved from the RESET
+    consumer policy and swept in one transaction, same as the CD2 delete
+    engine. Without one, each flag is delegated to the one repository
+    this container already built for it.
+
+    Both modes are wrapped in the availability gate: a flag whose
+    subsystem this deployment never built (``KOKORO_PERSONA_ENABLED=false``
+    leaves ``operator_persona_repository`` unset) stays the no-op it was
+    before CD3, instead of the SQL eraser hard-deleting a table the
+    deployment does not otherwise use. The repository map is the one
+    place that knows which subsystems exist, so it feeds both the
+    fallback eraser and the gate.
+    """
+    from kokoro_link.application.dto.character_backup.consumer_policies import (
+        ResetFlag,
+    )
+    from kokoro_link.application.services.character_reset import (
+        FlagGatedCharacterResetEraser,
+        RepositoryCharacterResetEraser,
+    )
+
+    repositories = {
+        ResetFlag.MEMORIES: memory_repository,
+        ResetFlag.CONVERSATIONS: conversation_repository,
+        ResetFlag.STATE_HISTORY: state_history_repository,
+        ResetFlag.OPERATOR_PERSONA: operator_persona_repository,
+    }
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_character_reset_eraser import (
+            SACharacterResetEraser,
+        )
+        eraser: "CharacterResetEraserPort" = SACharacterResetEraser(
+            db_session_factory,
+        )
+    else:
+        eraser = RepositoryCharacterResetEraser(repositories)
+    return FlagGatedCharacterResetEraser(
+        eraser,
+        available_flags=frozenset(
+            flag
+            for flag, repository in repositories.items()
+            if repository is not None
+        ),
+    )
+
+
 def _build_storage_adapter(settings: AppSettings) -> ObjectStoragePort:
     provider = settings.storage.provider
     if provider == "http":
@@ -1923,6 +2106,9 @@ def _build_tool_registry(
     action_billing: (
         "CloudActionBillingService | NullActionBillingService | None"
     ) = None,
+    cloud_identity_resolver: CloudGatewayIdentityResolverPort | None = None,
+    cloud_routing_profile_resolver: CloudRoutingProfilePort | None = None,
+    provider_credentials_enabled: bool = True,
 ) -> ToolRegistryPort:
     """Build the tool registry with all adapters this deployment knows.
 
@@ -1962,6 +2148,30 @@ def _build_tool_registry(
             ),
         ),
     )
+    # Hosted mode: Core holds no provider keys (its provider-settings API is
+    # 403 in cloud mode), so ``web_search`` can only exist as a Gateway route.
+    # This is the *only* branch that mounts it there — ``runtime_sync`` cannot
+    # reach it either, because a hosted deployment has no ``search`` rows for it
+    # to sync from.
+    if settings.cloud.active:
+        # A role that holds no deployment token (the coordinator only enqueues
+        # durable work) must not construct a Gateway-backed adapter at all —
+        # same gate the cloud embedder uses. It never executes a tool call, so
+        # an absent ``web_search`` costs it nothing.
+        if cloud_identity_resolver is not None and provider_credentials_enabled:
+            tools.append(
+                WebSearchTool(
+                    client=CloudGatewaySearchClient(
+                        base_url=settings.cloud.gateway_url,
+                        deployment_token=settings.cloud.deployment_token,
+                        deployment_id=settings.cloud.deployment_id,
+                        audience=settings.cloud.deployment_audience,
+                        identity_resolver=cloud_identity_resolver,
+                        routing_profile_port=cloud_routing_profile_resolver,
+                    ),
+                ),
+            )
+        return InMemoryToolRegistry(tools)
     # Startup wiring for the deprecated ``TAVILY_*`` env path. This is a
     # compatibility bridge only: on first boot the same env is also seeded
     # into a DB ``search`` connection row (see ``_legacy_provider_drafts``),
@@ -2163,7 +2373,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # The four "real world" groups (weather / calendar / geoip / world_events)
     # additionally live behind a hot-swappable holder so a multi-process Hosted
     # fleet converges on an Admin change without a rolling restart
-    # (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §2 G0). The boot overlay above is its
+    # The boot overlay above is its
     # initial value; every later value comes from the site-settings refresher.
     site_settings_holder = SiteSettingsHolder(
         SiteSettingsSnapshot.from_app_settings(
@@ -2359,6 +2569,47 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         )
         studio_job_repository = InMemoryStudioJobRepository()
 
+    # CV4 pending LumeGram video posts — same shape as the studio job ledger:
+    # a durable row per in-flight generation, an in-memory twin for a DB-less
+    # rig. Note the twin is genuinely usable here (unlike the backup ledger):
+    # the whole record is written and read by the same process within
+    # minutes, so a restart-less dev box loses nothing by holding it in RAM.
+    pending_feed_video_repository: PendingFeedVideoRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_pending_feed_video_repository import (  # noqa: E501
+            SAPendingFeedVideoRepository,
+        )
+        pending_feed_video_repository = SAPendingFeedVideoRepository(
+            db_session_factory,
+        )
+    else:
+        from kokoro_link.infrastructure.repositories.in_memory_pending_feed_videos import (  # noqa: E501
+            InMemoryPendingFeedVideoRepository,
+        )
+        pending_feed_video_repository = InMemoryPendingFeedVideoRepository()
+
+    # CB2 durable backup job ledger + read-only export query layer. Both
+    # exist only with a real database (same isolated pattern as the
+    # studio job ledger above); the in-memory job twin serves unit tests
+    # directly, not this container — a DB-less rig has no character
+    # history worth exporting, so the whole feature stays unwired and
+    # the API answers 503.
+    character_backup_job_repository: CharacterBackupJobRepositoryPort | None = None
+    character_backup_export_reader = None
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_character_backup_job_repository import (
+            SACharacterBackupJobRepository,
+        )
+        from kokoro_link.infrastructure.persistence.sa_character_backup_export_reader import (
+            SACharacterBackupExportReader,
+        )
+        character_backup_job_repository = SACharacterBackupJobRepository(
+            db_session_factory,
+        )
+        character_backup_export_reader = SACharacterBackupExportReader(
+            db_session_factory,
+        )
+
     # Busy-defer follow-up repo. Same isolated-engine pattern as
     # fusion_story / branching_drama — additions never ripple through
     # the main ``_RepoBundle``.
@@ -2382,6 +2633,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     world_event_repository: WorldEventRepositoryPort
     rss_source_repository: RssSourceRepositoryPort
     character_event_inbox_repository: CharacterEventInboxRepositoryPort
+    character_event_mention_repository: CharacterEventMentionRepositoryPort
     if db_session_factory is not None:
         from kokoro_link.infrastructure.persistence.sa_world_event_repository import (
             SaWorldEventRepository,
@@ -2392,9 +2644,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.persistence.sa_character_event_inbox_repository import (
             SaCharacterEventInboxRepository,
         )
+        from kokoro_link.infrastructure.persistence.sa_character_event_mention_repository import (
+            SaCharacterEventMentionRepository,
+        )
         world_event_repository = SaWorldEventRepository(db_session_factory)
         rss_source_repository = SaRssSourceRepository(db_session_factory)
         character_event_inbox_repository = SaCharacterEventInboxRepository(
+            db_session_factory,
+        )
+        character_event_mention_repository = SaCharacterEventMentionRepository(
             db_session_factory,
         )
     else:
@@ -2407,9 +2665,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         from kokoro_link.infrastructure.repositories.in_memory_character_event_inbox import (
             InMemoryCharacterEventInboxRepository,
         )
+        from kokoro_link.infrastructure.repositories.in_memory_character_event_mentions import (
+            InMemoryCharacterEventMentionRepository,
+        )
         world_event_repository = InMemoryWorldEventRepository()
         rss_source_repository = InMemoryRssSourceRepository()
         character_event_inbox_repository = InMemoryCharacterEventInboxRepository()
+        character_event_mention_repository = (
+            InMemoryCharacterEventMentionRepository()
+        )
 
     character_relationship_repository: CharacterRelationshipRepositoryPort
     character_peer_profile_repository: CharacterPeerProfileRepositoryPort
@@ -2550,11 +2814,22 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # AP3 — public price list proxy. Same cloud-mode gate as the balance
     # proxy; self-host leaves it None so the route 404s by construction.
     cloud_pricing_service: CloudPricingService | None = None
+    cloud_tier_pricing_service: CloudTierPricingService | None = None
     if app_settings.cloud.active and app_settings.cloud.user_service_url:
         cloud_pricing_service = CloudPricingService(
             client=ActionPricingClient(
                 base_url=app_settings.cloud.user_service_url,
                 timeout_seconds=app_settings.cloud.introspect_timeout,
+            ),
+        )
+        cloud_tier_pricing_service = CloudTierPricingService(
+            client=TierActionPricingClient(
+                base_url=app_settings.cloud.user_service_url,
+                timeout_seconds=app_settings.cloud.introspect_timeout,
+                internal_token=app_settings.cloud.runtime_config_internal_token,
+                internal_credential=(
+                    app_settings.cloud.internal_service_credential
+                ),
             ),
         )
     # AN1 — notice-board unread proxy for the in-game dot. Same cloud-mode gate
@@ -2597,6 +2872,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             # The same cache the SPA's price list is served from, so a charge
             # is bound to the number this process actually quoted (C1).
             pricing=cloud_pricing_service,
+            # Quote-less server channels resolve the tenant's exact private
+            # tier; the public list may intentionally hide that tier.
+            tier_pricing=cloud_tier_pricing_service,
         )
     async def _notification_language_resolver(user_id: str) -> str:
         profile = await operator_profile_service.get_for_user(user_id)
@@ -2722,6 +3000,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 internal_credential=app_settings.cloud.internal_service_credential,
             ),
         )
+    # Carries the player's content language down to the adapter chain, which
+    # otherwise only ever sees a prompt string. Consumed by the
+    # Simplified→Traditional normalisation binding on both providers.
+    output_language_resolver = OperatorOutputLanguageResolver(
+        repository=operator_profile_repository,
+    )
     if app_settings.cloud.active:
         assert cloud_identity_resolver is not None
         active_llm_provider: ActiveLLMProviderPort = CloudActiveLLMProvider(
@@ -2740,6 +3024,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             model_presets=app_settings.cloud.llm_model_presets,
             account_runtime_profile_resolver=account_runtime_profile_resolver,
             routing_profile_port=cloud_routing_profile_resolver,
+            output_language_resolver=output_language_resolver,
         )
     else:
         active_llm_provider = PreferenceBackedActiveLLMProvider(
@@ -2747,6 +3032,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             preferences=preferences_repository,
             default_provider_id=app_settings.default_provider_id,
             nsfw_mode_service=nsfw_mode_service,
+            output_language_resolver=output_language_resolver,
         )
     active_llm_provider = MeteredActiveLLMProvider(
         inner=active_llm_provider,
@@ -3269,6 +3555,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 preset=preset,
                 feature_key=feature_key,
                 identity_resolver=cloud_identity_resolver,
+                # EC6: lets the adapter turn a managed character's locally
+                # stored reference art into real image input on the request.
+                object_storage=object_storage,
             ),
             identity_resolver=cloud_identity_resolver,
             routing_profile_port=cloud_routing_profile_resolver,
@@ -3283,6 +3572,13 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     video_profile_registry = _build_video_profile_registry(
         settings=app_settings,
     )
+    # CV4: the asynchronous job path is opt-in per deployment, because it
+    # needs a broker on the other side of the Gateway that the sync
+    # ``/v1/videos/generations`` route does not. Off → the adapter declares
+    # no async capability, the composer resolves to it and takes its
+    # synchronous branch, and no pending row is ever written. Enabling it is
+    # what turns LumeGram video into the deferred pipeline.
+    video_jobs_enabled = _env_flag("KOKORO_VIDEO_JOBS_ENABLED", False)
     if app_settings.cloud.active:
         assert cloud_identity_resolver is not None
         active_video_provider = CloudActiveVideoProvider(
@@ -3294,6 +3590,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 preset=preset,
                 feature_key=feature_key,
                 identity_resolver=cloud_identity_resolver,
+                jobs_enabled=video_jobs_enabled,
             ),
             identity_resolver=cloud_identity_resolver,
             routing_profile_port=cloud_routing_profile_resolver,
@@ -3358,6 +3655,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         album_service=album_service,
         visual_style_service=visual_generation_style_service,
         action_billing=action_billing_service,
+        cloud_identity_resolver=cloud_identity_resolver,
+        cloud_routing_profile_resolver=cloud_routing_profile_resolver,
+        provider_credentials_enabled=process_matrix.requires_cloud_provider_credentials,
     )
     tool_orchestrator = ToolOrchestrator(
         registry=tool_registry,
@@ -3459,7 +3759,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 conversation_repository=conversation_repository,
                 dialogue_summarizer=dialogue_summarizer,
                 # Dramatic-tier seeds are this layer's designated material
-                # source (STORY_SEED_ENRICHMENT_PLAN §1). An empty pool is
+                # source. An empty pool is
                 # the expected state until SE3 is imported, and degrades to
                 # relationship + memory rather than failing the scene.
                 gacha_service=story_gacha,
@@ -3759,7 +4059,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             self_reflection_service,
         )
 
-    # docs/MEMOIR_PLAN.md — player-side memoir view + pin store. Reuses
+    # Player-side memoir view + pin store. Reuses
     # the existing reader ports (memory / reflection / emotion) and adds
     # one new pin repository. The optional localizer only translates
     # existing player-visible prose; it does not generate new memoir
@@ -4163,6 +4463,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
         event_seed_dispenser=event_seed_dispenser,
+        event_mention_repository=character_event_mention_repository,
+        world_event_repository=world_event_repository,
         clock=clock,
     )
 
@@ -4325,6 +4627,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         world_event_repository=world_event_repository,
         feed_fetcher=rss_feed_fetcher,
         embedder=embedder,
+        event_mention_repository=character_event_mention_repository,
     )
     event_curator_service = EventCuratorService(
         world_event_repository=world_event_repository,
@@ -4348,7 +4651,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         seed_path=_Path(__file__).resolve().parents[1] / "data" / "rss_sources.yaml",
         # Bind region-scoped emergency feeds to the deployment region so
         # an overseas self-host doesn't auto-enable Taiwan-only civil
-        # alerts (SHIPPED_CONTENT_LOCALIZATION_PLAN #5 / D6-P3). Passed as the
+        # alerts. Passed as the
         # holder's accessor rather than the boot value: a process that came up
         # before the region was corrected would otherwise seed the wrong
         # defaults on any later sync (G0).
@@ -4500,6 +4803,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         local_tz=local_tz,
         dialogue_summarizer=dialogue_summarizer,
         event_seed_dispenser=event_seed_dispenser,
+        event_mention_repository=character_event_mention_repository,
         calendar_context_port=calendar_provider,
         weather_context_port=weather_provider,
         schedule_service=schedule_service,
@@ -4534,7 +4838,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         subscription_access_guard=subscription_access_guard,
         visible_slot_port=visible_slot_port,
         # SC1-E — a character inside a 起幕 scene does not also message the
-        # player from outside it (STORY_SCENE_PLAN §3.2). Pause only; the
+        # player from outside it. Pause only; the
         # tick after the scene closes evaluates exactly as it did before.
         story_scene_sessions=story_scene_session_repository,
     )
@@ -4562,9 +4866,31 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # ``video_prompt`` fields. Without this the model would pick
     # ``media_kind=video`` on a deploy that can't render it, costing tokens
     # for no reason. The composer itself short-circuits while fake is active.
+    #
+    # CV0-1: ``bool(video_profile_registry.profile_ids)`` alone is a
+    # self-host-only signal — that registry is materialised from
+    # ``KOKORO_VIDEO_*`` env, which hosted deployments never set (cloud mode
+    # routes video through the Gateway, wired as ``CloudActiveVideoProvider``
+    # just above), so hosted never offered the model a video option at all.
+    #
+    # In cloud mode the answer is ``video_jobs_possible``, not "a cloud
+    # provider exists": with the knob off, the same adapter still resolves,
+    # but only through the *synchronous* ``/v1/videos/generations`` route —
+    # a single await of up to 30 minutes that holds the ``image`` capability
+    # slot the whole time. Offering video there would not enable a feature,
+    # it would let one post wedge the deployment's background media lane.
+    # So video is offered exactly when a render can be queued, which is also
+    # exactly when a poll carrier exists to finish it.
+    #
+    # Self-host (cloud inactive) keeps reading the local registry, unchanged.
+    video_jobs_possible = video_jobs_enabled and app_settings.cloud.active
+    feed_video_enabled = (
+        video_jobs_possible if app_settings.cloud.active
+        else bool(video_profile_registry.profile_ids)
+    )
     feed_composer_port = LLMFeedComposer(
         provider=active_llm_provider, feature_key=FEATURE_FEED_COMPOSE,
-        video_enabled=bool(video_profile_registry.profile_ids),
+        video_enabled=feed_video_enabled,
     )
     feed_composer_service = FeedComposerService(
         repository=feed_post_repository,
@@ -4596,6 +4922,46 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         account_runtime_usage_repository=account_runtime_usage_repository,
         character_repository=character_repository,
         quota_overage=quota_overage_service,
+    )
+    # CV4 deferred video pipeline. Built unconditionally (it is inert without
+    # a provider that takes jobs) but its two *carriers* are not: the embedded
+    # sweep below and the distributed poll handler are wired only when the
+    # deployment can actually queue a render, so a self-host tick gains
+    # nothing — not even one query.
+    feed_video_job_service = FeedVideoJobService(
+        pending_repository=pending_feed_video_repository,
+        video_provider=active_video_provider,
+        lander=feed_composer_service,
+        storyboard_service=VideoStoryboardService(
+            ModelResolver(
+                provider=active_llm_provider,
+                feature_key=FEATURE_VIDEO_STORYBOARD,
+            ),
+            object_storage=object_storage,
+            public_base_url=app_settings.public_base_url,
+            uploads_dir=app_settings.uploads_dir,
+        ),
+        character_repository=character_repository,
+        timeout_seconds=_env_int(
+            "KOKORO_VIDEO_JOB_TIMEOUT_SECONDS",
+            DEFAULT_VIDEO_JOB_TIMEOUT_SECONDS,
+        ),
+        clock=clock,
+    )
+    # Set rather than injected: the composer submits jobs and the pipeline
+    # lands their posts through the composer, so exactly one of the two edges
+    # has to be closed after construction.
+    #
+    # ``video_jobs_possible`` (computed with ``feed_video_enabled`` above) is
+    # also what tells the composer whether a pending row can exist at all —
+    # the tick's in-flight dedup probe is skipped entirely when it cannot,
+    # so a self-host tick gains no query. The service's own capability probe
+    # remains the authority at call time (an adapter can be configured and
+    # still refuse); this flag only decides whether the sweep, the due-job
+    # handler and that probe exist at all.
+    feed_composer_service.set_video_job_service(
+        feed_video_job_service,
+        deferred_pipeline_possible=video_jobs_possible,
     )
     feed_reaction_service = FeedReactionService(
         post_repository=feed_post_repository,
@@ -4715,7 +5081,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # lines: the embedded tick executor calls it per character, and the
     # distributed ``story_scene_timeout`` chain calls the same step. The
     # window is the single configurable number in this feature
-    # (STORY_SCENE_PLAN §2 #5, 24h by default); everything downstream —
+    # (24h by default); everything downstream —
     # the step, the chain's explicit due time, the unowned sweep — reads it
     # from this one object rather than re-deriving it.
     story_scene_timeout_closer = StorySceneTimeoutCloser(
@@ -4739,6 +5105,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feed_comment_reply=feed_comment_reply_service,
         pending_follow_up_dispatcher=pending_follow_up_dispatcher,
         proactive_delivery_retry_worker=proactive_delivery_retry_worker,
+        # Embedded carrier for the deferred video pipeline, wired only where a
+        # render can actually be queued. On self-host this is ``None`` and the
+        # tick body is byte-identical to what it was before CV4.
+        feed_video_job_service=(
+            feed_video_job_service if video_jobs_possible else None
+        ),
         character_encounter_service=character_encounter_service,
         character_social_knowledge_service=character_social_knowledge_service,
         schedule_memorializer=schedule_memorializer,
@@ -4812,6 +5184,29 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             clock=clock,
         )
 
+        # CV4: the deferred video poll's event-driven carrier. The enqueuer is
+        # handed to the pipeline itself (which mints the next observation from
+        # inside submit / poll) and to the reconcile sweep, so both produce the
+        # same idempotent job. Only wired where a render can be queued.
+        _feed_video_reconciler = None
+        if video_jobs_possible:
+            from kokoro_link.application.services.feed_video_poll_jobs import (
+                FeedVideoPollEnqueuer,
+                FeedVideoPollReconciler,
+            )
+
+            _feed_video_enqueuer = FeedVideoPollEnqueuer(
+                queue=background_job_queue,
+                coordinator_lease=background_coordinator_lease,
+                clock=clock,
+            )
+            feed_video_job_service.set_poll_enqueuer(_feed_video_enqueuer)
+            _feed_video_reconciler = FeedVideoPollReconciler(
+                repository=pending_feed_video_repository,
+                enqueuer=_feed_video_enqueuer,
+                clock=clock,
+            )
+
         # §13 social split: relink missing social chains (per character dream/peer
         # + per pair encounter) on the same leader + cadence as the character
         # reconcile. Shares the ONE NextDueCalculator and the coordinator's epoch.
@@ -4843,6 +5238,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             reseed_jitter_seconds=_reseed_jitter,
             follow_up_reconciler=_follow_up_reconciler,
             social_reconciler=_social_reconciler,
+            feed_video_reconciler=_feed_video_reconciler,
         )
         background_shadow_coordinator.set_due_job_reconciler(
             _reconciler,
@@ -4958,6 +5354,18 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             runner=chat_service.run_post_turn_for_record,
             clock=clock,
         )
+        # CV4: the worker-side poll delegates to the SAME pipeline object the
+        # embedded sweep drives (抽共用而非複製) — one implementation of
+        # "observe, download, publish or degrade", two carriers.
+        _feed_video_poll_handler = None
+        if video_jobs_possible:
+            from kokoro_link.application.services.feed_video_poll_jobs import (
+                FeedVideoPollHandler,
+            )
+
+            _feed_video_poll_handler = FeedVideoPollHandler(
+                service=feed_video_job_service, clock=clock,
+            )
         execution_runner = ExecutionModeRunner(
             queue=background_job_queue,
             character_repository=character_repository,
@@ -4976,6 +5384,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             character_relationship_repository=character_relationship_repository,
             pending_follow_up_release_handler=_release_handler,
             post_turn_handler=_post_turn_handler,
+            feed_video_poll_handler=_feed_video_poll_handler,
         )
         background_shadow_worker.enable_execution(
             runtime_ownership=runtime_ownership,
@@ -4986,6 +5395,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             "llm": _env_int("YURALUME_BG_CAP_LLM", DEFAULT_CAPABILITY_CAPS["llm"]),
             "image": _env_int(
                 "YURALUME_BG_CAP_IMAGE", DEFAULT_CAPABILITY_CAPS["image"],
+            ),
+            # CV4: bounds concurrent pollers, not GPUs — deliberately far
+            # above the image cap, which a video poll must never share.
+            "video_poll": _env_int(
+                "YURALUME_BG_CAP_VIDEO_POLL",
+                DEFAULT_CAPABILITY_CAPS["video_poll"],
             ),
         })
 
@@ -5084,8 +5499,62 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_persona_repository=persona_repository,
     )
 
+    # CD2 — the character-delete boundary engine. Built here (not inside
+    # CharacterService) because only the container knows which of the two
+    # persistence modes is live and which repositories exist at all.
+    character_data_erasure = _build_character_data_erasure(
+        db_session_factory=db_session_factory,
+        object_storage=object_storage,
+        character_repository=character_repository,
+        # In-memory mode only — the DB mode ignores the whole mapping.
+        # This is the **authoritative** slot wiring: every repository this
+        # container built that the delete boundary reaches. Slot names and
+        # execution order live in ``CHARACTER_ERASURE_REPOSITORY_SLOTS``
+        # (which also records why ``story_seed`` is absent); this site
+        # only says which object fills each slot.
+        repositories={
+            "state_history": state_history_repository,
+            "goal": goal_repository,
+            "schedule": schedule_repository,
+            "memory": memory_repository,
+            "memoir_pin": memoir_pin_repository,
+            "proactive_attempt": proactive_attempt_repository,
+            "tool_invocation": tool_invocation_repository,
+            "event_mention": character_event_mention_repository,
+            "turn_journal": turn_journal_repository,
+            "album": album_repository,
+            "feed_post": feed_post_repository,
+            "story_event": story_event_repository,
+            "story_arc": story_arc_repository,
+            "operator_persona": persona_repository,
+            "relationship_seed": relationship_seed_repository,
+            "emotion_event": emotion_event_repository,
+            "behavioral_pattern": behavioral_pattern_repository,
+            "self_reflection": self_reflection_repository,
+            "disposition_drift_history": disposition_drift_history_repository,
+            "messaging_account": messaging_account_repository,
+            "character_relationship": character_relationship_repository,
+            "character_peer_profile": character_peer_profile_repository,
+            "character_encounter": character_encounter_repository,
+            "character_encounter_intent": character_encounter_intent_repository,
+            "pending_follow_up": pending_follow_up_repository,
+            "conversation": conversation_repository,
+        },
+    )
+    # CD3 — the character-reset boundary engine, same reasoning as CD2's
+    # erasure engine above: only the container knows which persistence
+    # mode is live.
+    character_data_reset = _build_character_data_reset(
+        db_session_factory=db_session_factory,
+        memory_repository=memory_repository,
+        conversation_repository=conversation_repository,
+        state_history_repository=state_history_repository,
+        operator_persona_repository=persona_repository,
+    )
     character_service = CharacterService(
         character_repository,
+        character_data_erasure=character_data_erasure,
+        character_data_reset=character_data_reset,
         conversation_repository=conversation_repository,
         memory_repository=memory_repository,
         goal_repository=goal_repository,
@@ -5155,6 +5624,19 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         character_repository=character_repository,
         operator_profile_repository=operator_profile_repository,
         subscription_repository=cloud_subscription_repository,
+        clock=clock,
+    )
+    # Cloud→Core per-card exclusive-freeze (invoked by the internal route on
+    # an official card's contract start/end). Wired unconditionally, same as
+    # ``subscription_freeze_service`` above — the internal route's own
+    # credential gate already 503s a self-host deployment that never
+    # configures ``KOKORO_CLOUD_INTERNAL_CREDENTIALS`` / ``_TOKENS``.
+    from kokoro_link.application.services.exclusive_card_freeze_service import (
+        ExclusiveCardFreezeService as _ExclusiveCardFreezeService,
+    )
+
+    exclusive_card_freeze_service = _ExclusiveCardFreezeService(
+        character_repository=character_repository,
         clock=clock,
     )
     # Cloud→Core tenant-tier push (invoked by the internal route). Only wired
@@ -5276,6 +5758,46 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         arc_series_repository=arc_series_repository,
     )
 
+    # Full character backup export (CB2) — DB-backed only (see the repo /
+    # reader wiring above). Reuses the arc repositories the `.lumecard`
+    # exporter uses so bundled templates behave identically, and the
+    # account-runtime-usage ledger for the hosted 24h throttle.
+    #
+    # Both backup services share ONE per-job execution lease (A1 — the
+    # studio-lease precedent this line originally skipped): scaled api
+    # replicas all run startup recovery, and without a claim a restarting
+    # replica's recover() tears down the rows a live replica is still
+    # landing (restore) or double-drives a dump (export). Same backend
+    # selection as the studio lease; a self-host single process gets the
+    # in-process backend, byte-identical to the historical behaviour.
+    character_backup_execution_lease = None
+    character_backup_export_service: CharacterBackupExportService | None = None
+    if (
+        character_backup_job_repository is not None
+        and character_backup_export_reader is not None
+    ):
+        from kokoro_link.application.services.studio_execution_lease import (
+            StudioExecutionLease,
+        )
+        from kokoro_link.infrastructure.build_info import get_build_info
+
+        character_backup_execution_lease = StudioExecutionLease(
+            _build_runtime_lease_backend(app_settings, db_session_factory),
+            owner_id=_runtime_lease_owner_id("backup"),
+            name_prefix="backup:",
+        )
+        character_backup_export_service = CharacterBackupExportService(
+            job_repository=character_backup_job_repository,
+            export_reader=character_backup_export_reader,
+            object_storage=object_storage,
+            arc_template_repository=arc_template_repository,
+            arc_series_repository=arc_series_repository,
+            account_runtime_usage_repository=account_runtime_usage_repository,
+            execution_lease=character_backup_execution_lease,
+            cloud_mode=app_settings.cloud.active,
+            app_version=get_build_info().version,
+        )
+
     # Character card import — the mirror of export: validates the zip,
     # lands bundled arc templates (collision-remapping ids), creates the
     # character from the A-layer profile, and re-uploads stage images via
@@ -5293,11 +5815,50 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         cloud_mode=app_settings.cloud.active,
     )
 
+    # Full character backup import (CB3) — DB-backed only, like the
+    # export half above. The restore rides existing seams end to end:
+    # the character-create gates through ``character_service``, the arc
+    # template / series landing through the ``.lumecard`` import
+    # service, the memory embedding recompute through the same
+    # repo + embedder pair ``chat_service`` uses, and the export reader
+    # for crash-recovery media reverse-lookup.
+    character_backup_import_service: CharacterBackupImportService | None = None
+    if (
+        character_backup_job_repository is not None
+        and character_backup_export_reader is not None
+        and db_session_factory is not None
+    ):
+        from kokoro_link.infrastructure.persistence.sa_character_backup_restore_writer import (
+            SACharacterBackupRestoreWriter,
+        )
+
+        character_backup_import_service = CharacterBackupImportService(
+            job_repository=character_backup_job_repository,
+            restore_writer=SACharacterBackupRestoreWriter(
+                db_session_factory,
+            ),
+            export_reader=character_backup_export_reader,
+            object_storage=object_storage,
+            character_service=character_service,
+            card_import_service=character_card_import_service,
+            arc_template_repository=arc_template_repository,
+            arc_series_repository=arc_series_repository,
+            memory_repository=memory_repository,
+            embedder=embedder,
+            # A6 hosted upload throttle + A4 job-keyed create-event dedup
+            # both read/write this ledger.
+            account_runtime_usage_repository=account_runtime_usage_repository,
+            # A1: shared with the export service — one lease table, one
+            # owner per process, per-job names.
+            execution_lease=character_backup_execution_lease,
+            cloud_mode=app_settings.cloud.active,
+        )
+
     # SillyTavern card front layer — converts a parsed ST V2/V3 card into
     # a ``CharacterCardManifest`` (LLM-normalising its free-text prose)
     # that the route packs into an in-memory ``.lumecard`` and feeds back
     # through the import service above, so the downstream pipeline is
-    # untouched. See ``docs/SILLYTAVERN_CARD_IMPORT_PLAN.md``.
+    # untouched.
     sillytavern_convert_service = SillyTavernConvertService(
         normalizer=LLMSillyTavernNormalizer(
             provider=active_llm_provider,
@@ -5313,13 +5874,35 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # unwired entirely (self-host opt-out, plan §3.5).
     official_card_source: OfficialCardPackSource | None = None
     if app_settings.official_cards.enabled:
-        official_card_source = OfficialCardPackSource(
-            catalog=CachedOfficialCardCatalog(
-                client=OfficialCardCatalogClient(
-                    base_url=app_settings.official_cards.catalog_url,
-                ),
+        official_card_catalog = CachedOfficialCardCatalog(
+            client=OfficialCardCatalogClient(
+                base_url=app_settings.official_cards.catalog_url,
             ),
+        )
+        # Cloud-exclusive (IP-partner) cards, EC4. The client is built only
+        # when this deployment holds a User-service credential carrying the
+        # exclusive-read scope — which a self-hosted one never does, and
+        # that absence *is* the red line: no client, no install button, no
+        # path to a partner's text. It is not an env switch anyone can flip.
+        exclusive_payload_client = build_exclusive_payload_client(
+            base_url=app_settings.cloud.user_service_url,
+            credential_descriptor=app_settings.cloud.internal_service_credential,
+        )
+        exclusive_installer = (
+            ExclusiveOfficialCardInstaller(
+                catalog=official_card_catalog,
+                exclusive_payloads=exclusive_payload_client,
+                character_service=character_service,
+                character_image_service=character_image_service,
+                voice_catalog=tts_voice_catalog,
+            )
+            if exclusive_payload_client is not None
+            else None
+        )
+        official_card_source = OfficialCardPackSource(
+            catalog=official_card_catalog,
             import_service=character_card_import_service,
+            exclusive_installer=exclusive_installer,
         )
     character_card_pack_service = CharacterCardPackService(
         catalog=CharacterCardPackCatalog(),
@@ -5402,6 +5985,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         schedule_weather_drift_service=schedule_weather_drift_service,
         active_llm_provider=active_llm_provider,
         cloud_routing_profile_resolver=cloud_routing_profile_resolver,
+        cloud_mode=app_settings.cloud.active,
         nsfw_mode_service=nsfw_mode_service,
         visual_generation_style_service=visual_generation_style_service,
         conversation_repository=conversation_repository,
@@ -5440,6 +6024,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         demo_account_reaper=demo_account_reaper,
         character_freeze_reaper=character_freeze_reaper,
         subscription_freeze_service=subscription_freeze_service,
+        exclusive_card_freeze_service=exclusive_card_freeze_service,
         cloud_tenant_tier_sync_service=cloud_tenant_tier_sync_service,
         subscription_access_guard=subscription_access_guard,
         cloud_subscription_repository=cloud_subscription_repository,
@@ -5447,6 +6032,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         cloud_pricing_service=cloud_pricing_service,
         cloud_announcement_service=cloud_announcement_service,
         action_billing_service=action_billing_service,
+        cloud_tier_pricing_service=cloud_tier_pricing_service,
         quota_overage_service=quota_overage_service,
         player_runtime_limits_service=player_runtime_limits_service,
         player_locale_service=player_locale_service,
@@ -5486,6 +6072,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feed_comment_repository=feed_comment_repository,
         feed_comment_service=feed_comment_service,
         feed_composer_service=feed_composer_service,
+        feed_video_job_service=feed_video_job_service,
+        pending_feed_video_repository=pending_feed_video_repository,
         feed_comment_reply_service=feed_comment_reply_service,
         feed_reaction_memorializer=feed_reaction_memorializer,
         feed_event_bus=feed_event_bus,
@@ -5502,6 +6090,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         branching_drama_service=branching_drama_service,
         studio_job_repository=studio_job_repository,
         studio_job_recovery_service=studio_job_recovery_service,
+        character_backup_job_repository=character_backup_job_repository,
+        character_backup_export_service=character_backup_export_service,
+        character_backup_import_service=character_backup_import_service,
         world_event_repository=world_event_repository,
         rss_source_repository=rss_source_repository,
         character_event_inbox_repository=character_event_inbox_repository,

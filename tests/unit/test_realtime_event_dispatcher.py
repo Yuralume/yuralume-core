@@ -92,10 +92,11 @@ def _conversation(text: str, *, created_at: datetime = BASE):
     ])
 
 
-def _post_row():
+def _post_row(*, video_url=None):
     return SimpleNamespace(
         id="post-9", character_id="char-1", kind=SimpleNamespace(value="daily"),
-        content_text="散步中", image_url="https://cdn/p.png", created_at=BASE,
+        content_text="散步中", image_url="https://cdn/p.png",
+        video_url=video_url, created_at=BASE,
     )
 
 
@@ -207,7 +208,26 @@ async def test_rehydrate_feed_post_reads_content() -> None:
     assert isinstance(event, FeedPostEvent)
     assert event.content_text == "散步中"
     assert event.image_url == "https://cdn/p.png"
+    assert event.video_url is None
     assert event.event_id == stored.id
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_feed_post_reads_video_url() -> None:
+    """CV0-2: the SSE gap — rehydration read ``image_url`` but never
+    ``video_url``, so a reconnecting client replaying a video post's outbox
+    row would get a frame indistinguishable from a text-only post."""
+    outbox = InMemoryRealtimeOutbox()
+    stored = await _append(
+        outbox, kind=EVENT_KIND_FEED_POST, offset=0,
+        character_id="char-1", post_id="post-9",
+    )
+    reh = _build(posts={
+        "post-9": _post_row(video_url="https://cdn/p.mp4"),
+    })
+    event = await reh.rehydrate(stored)
+    assert isinstance(event, FeedPostEvent)
+    assert event.video_url == "https://cdn/p.mp4"
 
 
 @pytest.mark.asyncio

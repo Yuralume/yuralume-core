@@ -40,13 +40,14 @@ class _ProfilePort:
         return self.profile
 
 
-def _identity() -> CloudGatewayIdentity:
+def _identity(*, character_origin: str | None = None) -> CloudGatewayIdentity:
     return CloudGatewayIdentity(
         operator_id="cloud:acct_1",
         account_id="acct_1",
         tenant_id="tenant_1",
         character_ref="",
         tenant_tier="standard",
+        character_origin=character_origin,
     )
 
 
@@ -92,12 +93,45 @@ async def test_cloud_embedder_posts_openai_shape_and_identity_headers(
     assert headers["x-yuralume-tenant"] == "tenant_1"
     assert headers["x-yuralume-account"] == "acct_1"
     assert headers["x-yuralume-feature"] == "embedding"
+    # EC7: no origin was bound on this identity, so the header must not
+    # appear at all.
+    assert "x-yuralume-character-origin" not in headers
     assert headers["x-yuralume-trigger"] == "v1;source=background"
     assert str(headers["x-request-id"]).startswith("embedding-")
     assert seen["payload"] == {
         "model": "embedding-default",
         "input": ["first", "second"],
     }
+
+
+@pytest.mark.asyncio
+async def test_cloud_embedder_sends_origin_header_for_managed_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "data": [{"index": 0, "embedding": [1.0]}],
+        })
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
+    )
+    embedder = CloudGatewayEmbedder(
+        base_url="https://gateway.example/",
+        deployment_token="ykl_deploy",
+        default_model="embedding-default",
+        dimension=1,
+        identity=_identity(character_origin="official-yumi"),
+    )
+
+    await embedder.embed_many(["first"])
+
+    assert seen["headers"]["x-yuralume-character-origin"] == "official-yumi"
 
 
 @pytest.mark.asyncio

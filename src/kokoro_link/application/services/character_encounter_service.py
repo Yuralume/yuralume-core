@@ -1400,7 +1400,7 @@ class CharacterEncounterRunner:
     ) -> dict[str, list[str]]:
         """Assemble per-speaker bucketed context once per encounter.
 
-        Buckets (ENCOUNTER_CHAT_PARITY_PLAN §Phase 1):
+        Buckets:
         1. 對方與關係 — social knowledge (peer profile, time-anchored
            memories, tier-gated operator gossip).
         2. 自己最近的生活 — CharacterLifeContextBuilder material, the
@@ -1415,8 +1415,7 @@ class CharacterEncounterRunner:
         for speaker in (char_a, char_b):
             # ``ambient_reference=char_a``: weather/holidays are a property
             # of the meeting *place*, not of each speaker, so both sides
-            # must read the same sky (owner decision 2026-07-26,
-            # HOSTED_PLAYER_GEO_ADAPTATION_PLAN §7-4: a cross-player
+            # must read the same sky (owner decision 2026-07-26: a cross-player
             # encounter happens in the initiating side's world).
             # Side A carries that role here: the encounter row persists no
             # initiator column — the a/b slots come from ``canonical_pair``

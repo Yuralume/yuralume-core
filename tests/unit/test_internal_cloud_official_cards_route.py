@@ -6,9 +6,10 @@ What is covered:
 
 * the gate's states (unconfigured → 503, a wrong secret → 401, a credential
   minted for the showcase scope → 401, no scope header at all → 401),
-* that the endpoint is **stateless**: no tenant id, no character id, no
+* that the endpoint is **stateless** for card data: no character id and no
   database — the request carries its own text and the response is that
-  text in another language,
+  text in another language; tenant/account are routing-only identity for
+  the Gateway and are never used to load the card,
 * the ``notes`` contract: a field the model dropped comes back as source
   text with an entry naming it, so the console can offer a retry for that
   field instead of failing the whole card.
@@ -21,6 +22,10 @@ from collections.abc import AsyncIterator
 from typing import Sequence
 
 from fastapi.testclient import TestClient
+
+from kokoro_link.application.services.cloud_identity_context import (
+    current_cloud_actor,
+)
 
 from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.application.services.official_card_translate import (
@@ -45,6 +50,7 @@ class _ScriptedModel(ChatModelPort):
     def __init__(self, response: str) -> None:
         self.response = response
         self.calls: list[str] = []
+        self.actors = []
 
     async def generate(
         self,
@@ -54,6 +60,7 @@ class _ScriptedModel(ChatModelPort):
         model: str | None = None,
     ) -> str:
         self.calls.append(prompt)
+        self.actors.append(current_cloud_actor())
         return self.response
 
     async def generate_stream(
@@ -96,6 +103,18 @@ def _headers(scope: str = _SCOPE) -> dict[str, str]:
     }
 
 
+def _body(payload: dict[str, object], target_language: str = "en-US") -> dict:
+    return {
+        "payload": payload,
+        "target_language": target_language,
+        "routing_identity": {
+            "tenant_id": "tenant-owner",
+            "account_id": "account-owner",
+            "tenant_tier": "internal_test",
+        },
+    }
+
+
 def _wire_model(monkeypatch, response: str) -> _ScriptedModel:
     """Put a scripted model behind the endpoint's translator.
 
@@ -116,7 +135,7 @@ def test_unconfigured_channel_is_503(monkeypatch) -> None:
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
+        json=_body({"name": "美緒"}),
         headers=_headers(),
     )
 
@@ -129,7 +148,7 @@ def test_wrong_secret_is_401(monkeypatch) -> None:
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
+        json=_body({"name": "美緒"}),
         headers=headers,
     )
 
@@ -152,7 +171,7 @@ def test_a_credential_that_names_no_scope_at_all_is_401(monkeypatch) -> None:
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
+        json=_body({"name": "美緒"}),
         headers=headers,
     )
 
@@ -167,7 +186,7 @@ def test_a_showcase_scoped_credential_cannot_spend_models_here(monkeypatch) -> N
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
+        json=_body({"name": "美緒"}),
         headers=_headers(scope="showcase:read"),
     )
 
@@ -191,16 +210,15 @@ def test_translates_the_payload_and_passes_the_rest_through(monkeypatch) -> None
 
     response = client.post(
         _URL,
-        json={
-            "payload": {
+        json=_body(
+            {
                 "name": "美緒",
                 "summary": "咖啡廳打工的女大生",
                 "title": "海邊的咖啡廳",
                 "tags": ["日常", "療癒"],
                 "author": "Yuralume",
             },
-            "target_language": "en-US",
-        },
+        ),
         headers=_headers(),
     )
 
@@ -215,6 +233,68 @@ def test_translates_the_payload_and_passes_the_rest_through(monkeypatch) -> None
     }
     assert body["notes"] == []
     assert "Target language: en-US" in model.calls[0]
+    actor = model.actors[0]
+    assert actor is not None
+    assert actor.gateway_identity is not None
+    assert actor.gateway_identity.tenant_id == "tenant-owner"
+    assert actor.gateway_identity.account_id == "account-owner"
+    assert actor.gateway_identity.tenant_tier == "internal_test"
+
+
+def test_nested_card_fields_cross_the_internal_route(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _wire_model(
+        monkeypatch,
+        json.dumps(
+            {
+                "companions": [
+                    {
+                        "name": "Rinka Tachibana",
+                        "role": "Childhood friend",
+                        "brief_profile": "A dependable teammate.",
+                        "relationship_snippet": "They grew up next door.",
+                        "personality_sketch": ["direct", "caring"],
+                    },
+                ],
+                "personality_type": {
+                    "rationale": "She is energized by helping friends.",
+                    "consistency_notes": ["Acts before overthinking."],
+                },
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    response = client.post(
+        _URL,
+        json=_body(
+            {
+                "companions": [
+                    {
+                        "name": "橘凜香",
+                        "role": "青梅竹馬",
+                        "brief_profile": "可靠的隊友。",
+                        "relationship_snippet": "兩人從小住在隔壁。",
+                        "personality_sketch": ["直率", "體貼"],
+                    },
+                ],
+                "personality_type": {
+                    "code": "ENFP",
+                    "rationale": "幫助朋友會讓她充滿活力。",
+                    "consistency_notes": ["總是先行動再思考。"],
+                },
+            },
+        ),
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["payload"]["companions"][0]["name"] == "Rinka Tachibana"
+    assert response.json()["payload"]["personality_type"] == {
+        "code": "ENFP",
+        "rationale": "She is energized by helping friends.",
+        "consistency_notes": ["Acts before overthinking."],
+    }
 
 
 def test_a_field_the_model_dropped_comes_back_as_source_text_with_a_note(
@@ -225,10 +305,7 @@ def test_a_field_the_model_dropped_comes_back_as_source_text_with_a_note(
 
     response = client.post(
         _URL,
-        json={
-            "payload": {"name": "美緒", "description": "適合日常閒聊。"},
-            "target_language": "en-US",
-        },
+        json=_body({"name": "美緒", "description": "適合日常閒聊。"}),
         headers=_headers(),
     )
 
@@ -249,7 +326,7 @@ def test_an_unrouted_deployment_answers_200_with_untranslated_fields(
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
+        json=_body({"name": "美緒"}),
         headers=_headers(),
     )
 
@@ -264,7 +341,7 @@ def test_missing_target_language_is_rejected(monkeypatch) -> None:
 
     response = client.post(
         _URL,
-        json={"payload": {"name": "美緒"}, "target_language": "  "},
+        json=_body({"name": "美緒"}, "  "),
         headers=_headers(),
     )
 
@@ -276,10 +353,20 @@ def test_an_oversized_payload_is_rejected_at_the_edge(monkeypatch) -> None:
 
     response = client.post(
         _URL,
-        json={
-            "payload": {"summary": "字" * 40_001},
-            "target_language": "en-US",
-        },
+        json=_body({"summary": "字" * 40_001}),
+        headers=_headers(),
+    )
+
+    assert response.status_code == 422
+
+
+def test_missing_routing_identity_is_rejected_at_the_edge(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _wire_model(monkeypatch, json.dumps({"name": "Mio"}))
+
+    response = client.post(
+        _URL,
+        json={"payload": {"name": "美緒"}, "target_language": "en-US"},
         headers=_headers(),
     )
 

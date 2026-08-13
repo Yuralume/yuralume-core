@@ -30,7 +30,7 @@ SEED_TIER_DRAMATIC = "dramatic"
 SEED_TIERS = (SEED_TIER_DAILY, SEED_TIER_DRAMATIC)
 """``daily`` feeds the everyday gacha; ``dramatic`` seeds are one-line
 scene openers consumed by the impromptu-episode layer and are excluded
-from the daily rotation (STORY_SEED_ENRICHMENT_PLAN §1)."""
+from the daily rotation."""
 
 SEED_REGION_GLOBAL = "global"
 KNOWN_SEED_REGIONS = (SEED_REGION_GLOBAL, "tw", "jp", "west")

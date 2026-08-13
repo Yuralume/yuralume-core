@@ -60,6 +60,7 @@ const GLOBAL_FEATURE_KEYS = [
   'arc_continuation_draft',
   'feed_compose',
   'feed_comment_reply',
+  'video_storyboard',
   'activity_aftermath',
   'schedule_weather_drift',
   'idle_drift',

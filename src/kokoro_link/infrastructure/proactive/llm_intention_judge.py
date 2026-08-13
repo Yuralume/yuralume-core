@@ -95,6 +95,12 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
                 reason=f"trigger={context.trigger.value} promise fulfilment",
             )
         if await self._resolver.is_fake(character=context.character):
+            # Deliberately *not* ``judge_unavailable``: that flag means
+            # "retrying may yet get a real judgement", and callers hold
+            # state open on it. No provider is a standing configuration,
+            # not a transient outage — flagging it would keep every
+            # pending alarm alive for its whole TTL, re-firing each tick
+            # for a character that can never evaluate anything.
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
                 reason="fake provider cannot judge proactive intention",
@@ -114,6 +120,7 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
                 reason="intention judge LLM call failed",
+                judge_unavailable=True,
             )
 
         payload = _extract_json_object(raw)
@@ -121,6 +128,7 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
                 reason="intention judge output contained no JSON object",
+                judge_unavailable=True,
             )
         try:
             parsed = json.loads(payload)
@@ -128,11 +136,13 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
                 reason=f"intention judge JSON unparseable: {exc.msg}",
+                judge_unavailable=True,
             )
         if not isinstance(parsed, dict):
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
                 reason="intention judge JSON was not an object",
+                judge_unavailable=True,
             )
 
         reason = _clamp(_coerce_str(parsed.get("reason")), _MAX_REASON_CHARS)
@@ -146,6 +156,10 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
             expected_reply=_clamp(_coerce_str(parsed.get("expected_reply")), 180),
             risk=_clamp(_coerce_str(parsed.get("risk")), 180),
             best_timing=_clamp(_coerce_str(parsed.get("best_timing")), 80),
+            # Carried verbatim: this layer does not know the operator's
+            # timezone, so parsing (and rejecting anything past or
+            # malformed) belongs to the dispatcher.
+            revisit_at_iso=_clamp(_coerce_str(parsed.get("revisit_at_iso")), 40),
         )
 
 
@@ -490,6 +504,13 @@ def _optional_deferred_intents_block(context: ProactiveContext) -> str:
             parts.append(f"  · 上次建議時機：{intent.best_timing[:80]}")
         if intent.reason:
             parts.append(f"  · 上次未發的原因：{intent.reason[:160]}")
+        if intent.revisit_at is not None:
+            local_revisit = to_timezone(intent.revisit_at, context.local_tz)
+            arrived = "已經到了" if intent.revisit_at <= now else "還沒到"
+            parts.append(
+                f"  · 當時記下的明確時點："
+                f"{local_revisit.strftime('%m/%d %H:%M')}（{arrived}）",
+            )
         parts.append(
             f"  · 已等候 {_format_elapsed_minutes(elapsed_minutes)}，"
             f"距離自然遺忘還有約 {_format_elapsed_minutes(remaining_minutes)}",

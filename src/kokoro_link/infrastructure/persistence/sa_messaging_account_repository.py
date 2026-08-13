@@ -6,6 +6,9 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
+from kokoro_link.application.services.messaging_failure_reporter import (
+    MAX_ERROR_LENGTH,
+)
 from kokoro_link.contracts.messaging import MessagingAccountRepositoryPort
 from kokoro_link.domain.entities.messaging_account import MessagingAccount
 from kokoro_link.domain.value_objects.delivery_mode import DeliveryMode
@@ -273,7 +276,7 @@ class SAMessagingAccountRepository(MessagingAccountRepositoryPort):
                 )
                 .values(
                     polling_last_update_at=at,
-                    polling_last_error=error[:1000],
+                    polling_last_error=error[:MAX_ERROR_LENGTH],
                     updated_at=at,
                 ),
             )

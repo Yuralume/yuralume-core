@@ -200,7 +200,9 @@ class _RefusingGuard:
 # ── fixture ──────────────────────────────────────────────────────────
 
 
-def _character(user_id: str = "u1") -> Character:
+def _character(
+    user_id: str = "u1", *, origin_official_card_id: str | None = None,
+) -> Character:
     return Character(
         id="c1",
         name="Mio",
@@ -216,6 +218,7 @@ def _character(user_id: str = "u1") -> Character:
         state=CharacterState(
             emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
         ),
+        origin_official_card_id=origin_official_card_id,
     )
 
 
@@ -319,6 +322,25 @@ async def test_an_opening_is_one_charge_and_settles() -> None:
     # ...and the writer ran inside the charge's scope, so the Gateway
     # waived it rather than billing the opening per call on top.
     assert fx.opener.scopes[0] is not None
+
+
+async def test_opening_charge_carries_origin_for_a_managed_character() -> None:
+    """EC7: the official card slug rides the ``story_scene_open`` charge."""
+    fx = await _fixture(opener=_CoveredOpener())
+
+    await fx.service.open_scene(
+        _character(origin_official_card_id="official-yumi"), now=NOW,
+    )
+
+    assert fx.client.charges[0]["character_origin"] == "official-yumi"
+
+
+async def test_opening_charge_omits_origin_for_an_ordinary_character() -> None:
+    fx = await _fixture(opener=_CoveredOpener())
+
+    await fx.service.open_scene(_character(), now=NOW)
+
+    assert fx.client.charges[0]["character_origin"] is None
 
 
 async def test_the_scene_is_charged_once_however_long_it_runs() -> None:

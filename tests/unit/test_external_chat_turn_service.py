@@ -11,11 +11,15 @@ source="line" self-heal, and the runtime-limit → 429 / generic → 503 mapping
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
+)
+from kokoro_link.domain.entities.character import (
+    FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
 )
 from kokoro_link.application.services.external_chat.canonical_hash import (
     compute_canonical_request_hash,
@@ -184,6 +188,25 @@ async def test_character_not_in_roster_is_opaque_404() -> None:
 async def test_subscription_denied_is_opaque_404() -> None:
     # A locked tenant empties the roster → the character is not chattable.
     harness = await build_harness(locked_tenants=("tenant-A",))
+    command = make_command()
+
+    result = await harness.turn_service.execute(command)
+
+    assert result.status_code == 404
+    assert json.loads(result.body_json)["error"]["code"] == "not_found"
+    assert harness.model.generate_calls == 0
+
+
+async def test_contract_end_freeze_is_opaque_404() -> None:
+    """D7 / EC10 — a card whose IP contract ended is "不可互動" on every
+    surface, LINE included. Same opaque shape as the other not-chattable
+    outcomes: the external caller learns nothing about *why*."""
+    harness = await build_harness()
+    await harness.character_repo.set_frozen(
+        CHARACTER_ID, frozen=True,
+        now=datetime(2026, 8, 12, tzinfo=timezone.utc),
+        reason=FREEZE_REASON_EXCLUSIVE_CONTRACT_END,
+    )
     command = make_command()
 
     result = await harness.turn_service.execute(command)

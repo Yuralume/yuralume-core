@@ -13,8 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import replace
 
 from kokoro_link.application.services.model_resolver import ModelResolver
+from kokoro_link.application.services.video_storyboard_shape import (
+    DEFAULT_CLIP_SECONDS,
+)
 from kokoro_link.infrastructure.llm.cloud_refusal import (
     log_auxiliary_llm_failure,
 )
@@ -58,6 +62,13 @@ _MAX_VIDEO_PROMPT_CHARS = 600
 list. Cap is generous enough for that without inviting wall-of-text."""
 
 _ALLOWED_MEDIA_KINDS = {"image", "video", "none"}
+_MEDIA_KIND_LABELS = {
+    "video": "影片",
+    "image": "圖片",
+    "none": "純文字",
+}
+
+_FIRST_FRAME_TEMPLATE_NAME = "feed/video_first_frame"
 
 
 class LLMFeedComposer(FeedComposerPort):
@@ -97,11 +108,56 @@ class LLMFeedComposer(FeedComposerPort):
                 payload.character.id,
             )
             return FeedComposerOutput(content_text="")
-        return _parse_output(
+        output = _parse_output(
             raw,
             image_required=payload.image_required,
             video_enabled=self._video_enabled,
         )
+        if _needs_first_frame_prompt(output, image_required=payload.image_required):
+            output = await self._add_first_frame_prompt(output, payload)
+        return output
+
+    async def _add_first_frame_prompt(
+        self, output: FeedComposerOutput, payload: FeedComposerInput,
+    ) -> FeedComposerOutput:
+        """Second pass: write the still the clip is supposed to start on.
+
+        A video post whose composer filled only ``video_prompt`` used to
+        have that prompt handed straight to the *image* model as the
+        clip's first frame. Its mandated shape is a three-beat
+        ``A → then B → finally C`` action, and an image model asked to
+        draw three beats at once answers with one picture holding three
+        stacked panels — which the storyboard step then reads off the
+        frame and pins as a composition anchor, so the finished clip is a
+        three-tier contact sheet that never moves as a single scene.
+
+        So the beats get collapsed back into one instant here, by the
+        model that wrote them, rather than papered over downstream. This
+        is advisory: a failure leaves ``image_prompt`` empty and the video
+        branch declines to render a frame it knows will be wrong.
+        """
+        character = payload.character
+        try:
+            instruction = _build_first_frame_prompt(payload, output)
+            raw = await self._resolver.generate(
+                instruction, character=character,
+            )
+        except Exception as exc:
+            log_auxiliary_llm_failure(
+                _LOGGER, exc,
+                "feed first-frame prompt call failed character=%s",
+                character.id,
+            )
+            return output
+        tags = _parse_first_frame_output(raw)
+        if not tags:
+            _LOGGER.warning(
+                "feed first-frame prompt returned nothing usable "
+                "character=%s — the video post will degrade to text",
+                character.id,
+            )
+            return output
+        return replace(output, image_prompt=tags)
 
 
 def _build_prompt(
@@ -142,8 +198,17 @@ def _build_prompt(
             "      影片時間只有 5 秒，挑選一個能在 5 秒內走完的小動作。",
             "    * \"image\"：靜態氛圍 / 構圖大於動作（例：站在窗邊看夕陽、桌上擺好的甜點）",
             "    * \"none\"：純內心獨白 / 沒有具體場景可拍",
-            "  影片比較貴，不要每篇都選 video；大約每 3-5 篇出現一次即可。",
+            "  先參考下方近期貼文媒體節奏；不要因成本直覺過度避開影片，",
+            "  但也不要為了湊比例硬選 video。",
             f"- {image_clause}",
+            "- image_prompt 是**必填**的，media_kind=\"video\" 時也一樣不能留空——"
+            "影片是從這張圖動起來的，這張圖就是影片的第一幀。",
+            "  media_kind=\"video\" 時，image_prompt 只畫 video_prompt 那三步動作裡"
+            "**A 開始前的那一個靜止瞬間**，而且必須是一張完整的單一畫面："
+            "不要把 A / B / C 三個時刻同時畫進同一張圖，"
+            "不要用 comic、4koma、multiple views、split screen、sequence、"
+            "panels、borders 這類會把畫面切成好幾格的 tag，也不要在 tag 串裡"
+            "寫動作的先後順序（then、after、finally）。",
             "- video_prompt：當 media_kind=\"video\" 時必填，否則留空字串。",
             "  寫法是 30-150 字的英文自然語言（不是 tag），格式：",
             "    [Anime style, cinematic short clip.] + [外觀描述句] + [場景與動作 verbs，"
@@ -165,6 +230,10 @@ def _build_prompt(
     fact_block_lines.extend(
         render_current_time_fact_lines(payload.now, payload.local_tz),
     )
+    if video_enabled and payload.image_required:
+        fact_block_lines.extend(
+            _render_recent_media_cadence(payload.recent_media_kinds),
+        )
     cal = (payload.calendar_context or "").strip()
     if cal:
         fact_block_lines.append("今日真實世界行事曆：")
@@ -217,6 +286,92 @@ def _build_prompt(
     if language_hint:
         body = f"{language_hint}\n\n{body}"
     return body
+
+
+def _render_recent_media_cadence(kinds: tuple[str, ...]) -> list[str]:
+    normalised = tuple(
+        kind for kind in kinds[:5] if kind in _MEDIA_KIND_LABELS
+    )
+    if not normalised:
+        return ["近期貼文媒體節奏：尚無貼文紀錄"]
+
+    lines = [
+        "近期貼文媒體節奏（由新到舊）："
+        + "、".join(_MEDIA_KIND_LABELS[kind] for kind in normalised)
+    ]
+    consecutive_non_video = 0
+    for kind in normalised:
+        if kind == "video":
+            break
+        consecutive_non_video += 1
+    if consecutive_non_video:
+        lines.append(f"最近連續 {consecutive_non_video} 篇沒有影片。")
+    else:
+        lines.append("最近一篇已經是影片。")
+    return lines
+
+
+def _needs_first_frame_prompt(
+    output: FeedComposerOutput, *, image_required: bool,
+) -> bool:
+    """Whether the video pick is missing the still it has to start on.
+
+    Only ``media_kind == "video"`` matters: an image post with no
+    ``image_prompt`` is the composer saying "no picture", which is a
+    legitimate text-only post, not a gap to fill."""
+    return (
+        image_required
+        and output.media_kind == "video"
+        and bool(output.video_prompt.strip())
+        and not output.image_prompt.strip()
+    )
+
+
+def _build_first_frame_prompt(
+    payload: FeedComposerInput, output: FeedComposerOutput,
+) -> str:
+    return get_default_loader().render(
+        _FIRST_FRAME_TEMPLATE_NAME,
+        clip_seconds=DEFAULT_CLIP_SECONDS,
+        video_prompt=output.video_prompt.strip(),
+        character_block="\n".join(
+            _visual_subject_block(payload.character),
+        ),
+    )
+
+
+def _visual_subject_block(character: Character) -> list[str]:
+    """Only what decides how the subject is drawn — the caption is
+    already written by the time this runs, so persona, mood and speaking
+    style would just be tokens the image tags must not absorb."""
+    lines = [f"- 名稱：{character.name}"]
+    lines.extend(
+        f"- {line}" for line in render_character_visual_subject_lines(character)
+    )
+    if character.appearance:
+        lines.append(f"- 外觀：{character.appearance[:300]}")
+    return lines
+
+
+def _parse_first_frame_output(raw: str) -> str:
+    """Tag string out of the second pass, however it came wrapped.
+
+    The template asks for a bare comma-separated tag string, but the same
+    model that wraps composer output in a fence or a JSON object will do
+    it here too — and a leaked ``{"image_prompt": ...}`` envelope would be
+    rendered as literal text into the frame."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"```$", "", text).strip()
+    if text.startswith("{"):
+        salvaged = _salvage_string_field(text, _IMAGE_PROMPT_FIELD_RE)
+        return (salvaged or "")[:_MAX_IMAGE_PROMPT_CHARS]
+    if _looks_like_schema_leak(text):
+        return ""
+    return text[:_MAX_IMAGE_PROMPT_CHARS]
 
 
 def _persona_block(character: Character) -> list[str]:

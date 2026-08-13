@@ -6,7 +6,7 @@ every consumer. That is correct for self-host (one process, restarted on every
 change) and wrong for Hosted: 2×api + coordinator + worker each captured
 whatever the table said at *its own* boot, so an Admin change to the site
 weather coordinates took effect on one replica and needed a rolling restart to
-reach the rest (HOSTED_PLAYER_GEO_ADAPTATION_PLAN §0.2 G-2).
+reach the rest (G-2).
 
 This module is the seam that makes that reloadable *without* rebuilding the
 whole settings system. It holds one immutable

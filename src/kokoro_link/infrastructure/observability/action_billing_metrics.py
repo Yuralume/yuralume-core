@@ -1,8 +1,8 @@
 """Prometheus rendering for the AP2/AP4 action-billing counters (AP5).
 
 ``CloudActionBillingService.counters`` and ``QuotaOverageService.counters``
-already record everything the reconciliation story in
-``CREDIT_ACTION_PRICING_PLAN`` §AP5 needs — they were simply trapped in the
+already record everything the AP5 reconciliation story needs — they were
+simply trapped in the
 process. This module lifts them onto the existing internal metrics scrape so a
 fixed-price deployment has a trend line instead of a log grep.
 

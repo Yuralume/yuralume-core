@@ -1,4 +1,4 @@
-"""Process-role settings group (HOSTED_CORE_SCALING_ARCHITECTURE_PLAN §2.1).
+"""Process-role settings group.
 
 A single Core image runs in one of several *process roles*. Self-host keeps
 the zero-config ``all`` role (embedded schedulers + connectors, no external

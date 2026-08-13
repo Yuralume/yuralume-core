@@ -2,7 +2,7 @@
  * Supported locale registry — single source of truth for locale ids,
  * display labels, and the type that all locale catalogs must satisfy.
  *
- * Per docs/FRONTEND_I18N_PLAN.md:
+ * Locale policy:
  *  - `zh-TW` is the source locale and fallback. Its catalog defines the
  *    canonical shape every other locale must mirror.
  *  - `en-US` is the first translation target.

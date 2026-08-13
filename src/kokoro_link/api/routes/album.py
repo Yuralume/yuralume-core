@@ -26,6 +26,7 @@ from kokoro_link.application.dto.character import CharacterResponse
 from kokoro_link.application.services.album_service import (
     AlbumCharacterMismatchError,
     AlbumItemNotFoundError,
+    AlbumManagedError,
     StageFullError,
     StageImageNotFoundError,
 )
@@ -88,6 +89,17 @@ async def transfer_from_stage(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    except AlbumManagedError as exc:
+        # EC2-C: the character exists and is the caller's own — a 404 here
+        # would be a lie, not an anti-enumeration measure. Mirrors
+        # CharacterCardManagedError's "exists, wrong kind, refuse" 403.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This character's stage art is managed by its licensor "
+                "and cannot be moved off the carousel"
+            ),
+        ) from exc
     return CharacterResponse.from_domain(updated)
 
 
@@ -119,6 +131,16 @@ async def promote_to_stage(
     except StageFullError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc),
+        ) from exc
+    except AlbumManagedError as exc:
+        # EC2-C: same 403 "exists, wrong kind, refuse" shape as
+        # CharacterCardManagedError / the transfer endpoint above.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This character's stage art is managed by its licensor "
+                "and cannot be changed from the album"
+            ),
         ) from exc
     return CharacterResponse.from_domain(updated)
 

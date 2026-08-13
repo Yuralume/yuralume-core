@@ -15,7 +15,7 @@ the single source of truth for the variant tier definitions
   to what IV1 would have produced at write time, or the route's ``stat()``
   lookup silently misses forever.
 
-See ``docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md`` §2 D1 for the
+for the
 product-level spec this module implements.
 
 Deliberate Pillow dependency (D4)

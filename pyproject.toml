@@ -18,8 +18,8 @@ dependencies = [
     "passlib[bcrypt]>=1.7,<2.0",
     "pgvector>=0.3.6,<1.0.0",
     # Deliberate exception to "no image codec dependency" — see the module
-    # docstring in kokoro_link/infrastructure/storage/image_variants.py (D4
-    # of docs/plans/IMAGE_DELIVERY_AND_PAGINATION_PLAN.md) for why this does
+    # docstring in kokoro_link/infrastructure/storage/image_variants.py
+    # for why this does
     # NOT contradict the header-only parsers in attachment_media.py /
     # image_probe.py.
     "pillow>=12.3.0,<13.0.0",
@@ -37,6 +37,8 @@ dependencies = [
     "uvicorn>=0.32.0,<1.0.0",
     "urllib3>=2.7.0,<3.0.0",
     "websockets>=13.0,<16.0",
+    "cryptography>=49.0.0,<50.0.0",
+    "opencc-python-reimplemented>=0.1.7,<0.2.0",
 ]
 
 [dependency-groups]

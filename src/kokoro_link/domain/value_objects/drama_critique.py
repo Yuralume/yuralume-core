@@ -10,7 +10,7 @@ shape that satisfies neither.
 Findings are intentionally schema-light: ``kind`` is a free-form
 string the LLM picks (重複前情 / 重複措辭 / 抽象 / 銜接 / 語感失調 / …)
 rather than an enum. Pinning the LLM to a closed taxonomy is exactly
-the keyword-style hard-coding CLAUDE.md forbids.
+the keyword-style hard-coding the LLM-first rule forbids.
 """
 
 from __future__ import annotations

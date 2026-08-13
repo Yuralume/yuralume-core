@@ -14,5 +14,5 @@ This package holds the pure-IO concerns:
 
 Deployment-bound settings (provider/profile routing, voice, LoRAs) and
 runtime accumulation (state, memory, persona, schedule, feed, ...) are
-deliberately *not* part of a card — see ``docs/CHARACTER_CARD_PLAN.md``.
+deliberately *not* part of a card —
 """

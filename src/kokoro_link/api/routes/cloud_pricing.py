@@ -5,9 +5,10 @@ reach the User service directly), same cloud-mode-only 404 so self-host's API
 inventory is unchanged, same fail-soft contract (``stale`` rather than a
 confident wrong answer, 503 rather than an empty list).
 
-The upstream endpoint is public; this proxy is not, only because it is mounted
-on the authenticated SPA surface. Nothing here is tenant-scoped — every player
-is quoted the same published list.
+The authenticated operator's projected tier selects one private control-plane
+snapshot, including an active unlisted tier. That keeps the quote identical to
+the charge path without exposing test/invite-only tiers through the public
+storefront price table.
 """
 
 from __future__ import annotations
@@ -15,8 +16,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from kokoro_link.api.dependencies import get_container, is_cloud_mode
+from kokoro_link.api.dependencies import (
+    get_container,
+    get_current_user,
+    is_cloud_mode,
+)
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.domain.entities.operator_profile import OperatorProfile
 
 router = APIRouter(prefix="/cloud", tags=["cloud"])
 
@@ -46,6 +52,7 @@ async def get_cloud_pricing(
         default=False,
         description="Bypass the 5-minute cache after a back-office price edit.",
     ),
+    user: OperatorProfile = Depends(get_current_user),
     container: ServiceContainer = Depends(get_container),
 ) -> CloudPricingResponse:
     if not is_cloud_mode(container):
@@ -53,9 +60,15 @@ async def get_cloud_pricing(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="pricing is only available in cloud mode",
         )
-    service = getattr(container, "cloud_pricing_service", None)
+    tier_name = (getattr(user, "cloud_tenant_tier", None) or "").strip()
+    if not tier_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="operator has no cloud tier",
+        )
+    service = getattr(container, "cloud_tier_pricing_service", None)
     snapshot = (
-        await service.get_pricing(refresh=refresh)
+        await service.get_pricing(tier_name, refresh=refresh)
         if service is not None
         else None
     )

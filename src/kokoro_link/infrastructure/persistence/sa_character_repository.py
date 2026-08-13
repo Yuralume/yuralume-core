@@ -63,6 +63,22 @@ class SACharacterRepository(CharacterRepositoryPort):
             rows = result.scalars().all()
             return [_row_to_domain(row) for row in rows]
 
+    async def list_by_origin_official_card_id(
+        self, card_id: str,
+    ) -> list[Character]:
+        """Cross-tenant lookup by card provenance (EC10-B).
+
+        Deliberately not scoped by ``user_id`` — a card's freeze applies to
+        every operator's installation of it, not one roster."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(CharacterRow).where(
+                    CharacterRow.origin_official_card_id == card_id,
+                )
+            )
+            rows = result.scalars().all()
+            return [_row_to_domain(row) for row in rows]
+
     async def list_active(self) -> list[Character]:
         """List only non-frozen characters (CHARACTER_FREEZE_PLAN).
 
@@ -554,6 +570,9 @@ def _row_to_domain(row: CharacterRow) -> Character:
         voice_profile=_voice_profile_from_json(row.voice_profile_json),
         arc_template_id=row.arc_template_id or None,
         arc_series_id=getattr(row, "arc_series_id", None) or None,
+        origin_official_card_id=(
+            getattr(row, "origin_official_card_id", None) or None
+        ),
         feature_models=_feature_models_from_json(row.feature_models_json),
         feature_image_profiles=_feature_image_profiles_from_json(
             row.feature_image_profiles_json,
@@ -659,6 +678,11 @@ def _domain_to_row(
     # aggregate save cannot undo an admin freeze or subscription projection.
     # ``created_at`` is server-managed and intentionally never written here.
     if include_control_fields:
+        # Provenance belongs here for the same reason: it is decided once,
+        # at install, and an aggregate save carrying a stale (or absent)
+        # origin must never be able to promote a player character into a
+        # managed one — or demote a managed one out of its protections.
+        row.origin_official_card_id = character.origin_official_card_id or None
         row.frozen = bool(character.frozen)
         row.frozen_at = character.frozen_at if character.frozen else None
         row.frozen_reason = character.frozen_reason if character.frozen else None

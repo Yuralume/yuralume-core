@@ -97,6 +97,54 @@ def _context(
     )
 
 
+class _RaisingModel(ChatModelPort):
+    async def generate(self, prompt: str) -> str:
+        raise RuntimeError("upstream 502")
+
+    async def generate_stream(
+        self, prompt: str,
+    ) -> AsyncIterator[str]:  # pragma: no cover
+        raise RuntimeError("upstream 502")
+        yield ""
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        _RaisingModel(),
+        _StubModel("模型今天只想聊天，沒有 JSON"),
+        _StubModel('{"should_consume_slot": false, '),
+        _StubModel("[1, 2, 3]"),
+    ],
+    ids=["llm-raised", "no-json", "unparseable", "not-an-object"],
+)
+@pytest.mark.asyncio
+async def test_fail_soft_skips_are_flagged_as_unavailable(model) -> None:
+    """F2-3 — every fail-soft path returns the same
+    ``should_consume_slot=False`` a real "not now" verdict does. The
+    dispatcher must be able to tell them apart *structurally* (it decides
+    whether a spent revisit alarm is given back), so the flag lives on the
+    decision rather than being inferred from the reason text."""
+    decision = await LLMProactiveIntentionJudge(model=model).judge(_context())
+
+    assert decision.should_consume_slot is False
+    assert decision.judge_unavailable is True
+
+
+@pytest.mark.asyncio
+async def test_a_real_verdict_is_never_flagged_unavailable() -> None:
+    model = _StubModel(
+        '{"should_consume_slot": false, '
+        '"inner_motive": "想關心面試", "risk": "太黏", '
+        '"reason": "剛聊完，等晚一點"}',
+    )
+
+    decision = await LLMProactiveIntentionJudge(model=model).judge(_context())
+
+    assert decision.should_consume_slot is False
+    assert decision.judge_unavailable is False
+
+
 @pytest.mark.asyncio
 async def test_parses_positive_intention_json() -> None:
     model = _StubModel(
@@ -267,6 +315,115 @@ async def test_prompt_surfaces_deferred_intents_block_when_present() -> None:
     # Elapsed marker is present so the LLM can sense the half-life
     # without inferring from raw timestamps.
     assert "已等候" in prompt
+
+
+@pytest.mark.asyncio
+async def test_parses_revisit_at_iso_and_prompt_asks_for_it() -> None:
+    """T2 — a skip whose real blocker is "the agreed time hasn't come
+    yet" carries that time back as structured output, so the dispatcher
+    can return at 19:30 instead of being fenced out by the cooldown."""
+    model = _StubModel(
+        '{"should_consume_slot": false, '
+        '"inner_motive": "要一起上線核對任務", '
+        '"conversation_purpose": "赴約", "expected_reply": "對方上線", '
+        '"risk": "太早講會打斷", "best_timing": "evening", '
+        '"revisit_at_iso": "2026-04-18T19:30", '
+        '"reason": "已經約好七點半，等到時間再自然聯絡"}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+
+    decision = await judge.judge(_context())
+
+    assert decision.should_consume_slot is False
+    assert decision.revisit_at_iso == "2026-04-18T19:30"
+    prompt = model.captured_prompt or ""
+    assert "revisit_at_iso" in prompt
+    # The instruction must stay a semantic judgement, not a trigger list:
+    # vague timing is explicitly told to leave the field blank.
+    assert "留空字串，不要硬湊一個時間" in prompt
+
+
+@pytest.mark.asyncio
+async def test_revisit_at_iso_defaults_empty_when_model_omits_it() -> None:
+    """Every response written before T2 — and every skip with only a
+    vague "later" — must keep working with no alarm attached."""
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "想聊天", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": "再等等"}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+
+    decision = await judge.judge(_context())
+
+    assert decision.revisit_at_iso == ""
+
+
+@pytest.mark.asyncio
+async def test_prompt_shows_whether_a_parked_alarm_has_arrived() -> None:
+    """The judge must be able to tell "the agreed 19:30 is now" from
+    "still waiting" — otherwise the re-tick has no way to know why it is
+    being asked again."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from kokoro_link.domain.entities.deferred_intent import DeferredIntent
+
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+
+    ctx = _context()
+    parked = DeferredIntent.new(
+        character_id=ctx.character.id,
+        operator_id="default",
+        trigger="tick",
+        inner_motive="說好七點半一起上線核對任務",
+        revisit_at=ctx.now - timedelta(minutes=2),
+        ttl_minutes=180,
+        now=ctx.now - timedelta(minutes=40),
+    )
+
+    await judge.judge(replace(ctx, deferred_intents=(parked,)))
+    prompt = model.captured_prompt or ""
+    assert "當時記下的明確時點" in prompt
+    assert "已經到了" in prompt
+
+    future = replace(parked, revisit_at=ctx.now + timedelta(minutes=30))
+    await judge.judge(replace(ctx, deferred_intents=(future,)))
+    prompt_future = model.captured_prompt or ""
+    assert "還沒到" in prompt_future
+
+
+@pytest.mark.asyncio
+async def test_prompt_omits_the_alarm_line_for_a_motive_without_one() -> None:
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from kokoro_link.domain.entities.deferred_intent import DeferredIntent
+
+    model = _StubModel(
+        '{"should_consume_slot": false, "inner_motive": "", '
+        '"conversation_purpose": "", "expected_reply": "", '
+        '"risk": "", "best_timing": "later", "reason": ""}',
+    )
+    judge = LLMProactiveIntentionJudge(model=model)
+    ctx = _context()
+    parked = DeferredIntent.new(
+        character_id=ctx.character.id,
+        operator_id="default",
+        trigger="tick",
+        inner_motive="想分享今天讀完的小說",
+        ttl_minutes=180,
+        now=ctx.now - timedelta(minutes=40),
+    )
+
+    await judge.judge(replace(ctx, deferred_intents=(parked,)))
+
+    assert "當時記下的明確時點" not in (model.captured_prompt or "")
 
 
 @pytest.mark.asyncio

@@ -183,6 +183,41 @@ async def test_no_quote_means_no_binding_field(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_managed_character_origin_rides_the_charge(monkeypatch) -> None:
+    """EC7: the origin card slug is forwarded as its own snake_case field."""
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"charge_id": "chg-1"})
+
+    _install(monkeypatch, handler)
+    await _client().charge(
+        tenant_id="t",
+        action_key="chat",
+        interaction_id="i",
+        character_origin="official-yumi",
+    )
+
+    assert seen["body"]["character_origin"] == "official-yumi"
+
+
+@pytest.mark.asyncio
+async def test_no_origin_means_no_character_origin_field(monkeypatch) -> None:
+    """A non-managed character must not put a key on the wire at all."""
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"charge_id": "chg-1"})
+
+    _install(monkeypatch, handler)
+    await _client().charge(tenant_id="t", action_key="chat", interaction_id="i")
+
+    assert "character_origin" not in seen["body"]
+
+
+@pytest.mark.asyncio
 async def test_409_becomes_a_price_change_carrying_the_new_number(
     monkeypatch,
 ) -> None:

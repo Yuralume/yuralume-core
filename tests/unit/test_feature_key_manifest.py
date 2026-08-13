@@ -16,6 +16,7 @@ import pytest
 from kokoro_link.application.services.feature_key_manifest import (
     CAPABILITY_IMAGE,
     CAPABILITY_LLM,
+    CAPABILITY_SEARCH,
     CAPABILITY_TTS,
     CAPABILITY_VIDEO,
     build_feature_key_manifest,
@@ -59,13 +60,18 @@ def test_manifest_covers_every_routable_registry_key() -> None:
     assert set(manifest.feature_keys_for(CAPABILITY_IMAGE)) == set(IMAGE_FEATURE_KEYS)
     assert set(manifest.feature_keys_for(CAPABILITY_VIDEO)) == set(VIDEO_FEATURE_KEYS)
     assert manifest.feature_keys_for(CAPABILITY_TTS) == ("tts_synthesis",)
+    assert manifest.feature_keys_for(CAPABILITY_SEARCH) == ("web_search",)
 
 
 def test_manifest_excludes_unknown_capabilities() -> None:
     manifest = build_feature_key_manifest()
-    # embedding / search are net-new routing surface and must not appear yet.
+    # ``embedding`` reaches the Gateway but has no ``feature_routes`` knob: its
+    # preset comes from the deployment default, so publishing a routable key for
+    # it would advertise a control-plane surface that does not exist. ``search``
+    # does have one (Gateway POST /v1/search + search_feature_presets), so it is
+    # a real capability here.
     assert "embedding" not in manifest.capabilities
-    assert "search" not in manifest.capabilities
+    assert manifest.capabilities["search"] == ("web_search",)
 
 
 def test_content_hash_is_stable_and_namespaced() -> None:
@@ -107,6 +113,7 @@ def test_artifact_is_valid_json_with_expected_shape() -> None:
         CAPABILITY_IMAGE,
         CAPABILITY_VIDEO,
         CAPABILITY_TTS,
+        CAPABILITY_SEARCH,
     }
     # Only the llm capability carries routing groups today.
     assert set(data["groups"]) == {CAPABILITY_LLM}
@@ -119,6 +126,7 @@ def test_groups_cover_declared_llm_group_keys_in_order() -> None:
     assert manifest.group_keys_for(CAPABILITY_IMAGE) == ()
     assert manifest.group_keys_for(CAPABILITY_VIDEO) == ()
     assert manifest.group_keys_for(CAPABILITY_TTS) == ()
+    assert manifest.group_keys_for(CAPABILITY_SEARCH) == ()
 
 
 def test_each_group_is_labelled_described_and_scoped_to_llm_keys() -> None:

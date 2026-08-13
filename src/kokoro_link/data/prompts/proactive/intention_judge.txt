@@ -8,6 +8,10 @@ ${language_hint}
 - 擋掉像廣告、日記廣播、刷存在感、無聊小事通知的推播。
 - 必須想清楚：為什麼現在要說？說了想讓對方怎麼回？對方不回時是否會顯得打擾？
 - 若現在理由普通但稍晚更自然，請保留額度並指出 best_timing。
+- 若你這次忍住的理由，是「已經存在一個明確、雙方都知道的未來時點，到那時才適合開口」——
+  例如你們已經談定了某個時間、對方說了某個時刻之後才有空——請在 revisit_at_iso 填上那個時點的當地時間。
+  這是你自己稍後要回來赴約的鬧鐘：填了就代表「到那個時間點，我一定要重新認真評估一次」。
+  只是模糊的「晚一點」「等他忙完」「之後再說」沒有可指認的時刻，就留空字串，不要硬湊一個時間。
 
 角色資料：
 ${persona_block}
@@ -30,4 +34,4 @@ ${schedule_block}${optional_recent_sent}${optional_unanswered_streak}${optional_
 
 輸出格式：只回傳一個 JSON 物件，不要 markdown。
 reason 欄位是操作者可見的判斷理由，必須使用上方指定的玩家可見輸出語言；其餘欄位（inner_motive 等）為內部推理，語言不限。
-{"should_consume_slot": <true|false>, "inner_motive": "角色真正想開口的內在理由；沒有就寫空字串", "conversation_purpose": "希望開啟/延續什麼對話；沒有就寫空字串", "expected_reply": "期待對方怎麼自然回應；沒有就寫空字串", "risk": "可能像推播/廣告/打擾/重複的風險", "best_timing": "now 或 morning/afternoon/evening/later 等", "reason": "一句話給操作者看的判斷理由（使用操作者可見輸出語言）"}
+{"should_consume_slot": <true|false>, "inner_motive": "角色真正想開口的內在理由；沒有就寫空字串", "conversation_purpose": "希望開啟/延續什麼對話；沒有就寫空字串", "expected_reply": "期待對方怎麼自然回應；沒有就寫空字串", "risk": "可能像推播/廣告/打擾/重複的風險", "best_timing": "now 或 morning/afternoon/evening/later 等", "revisit_at_iso": "只有在存在明確已知時點時才填，格式 YYYY-MM-DDTHH:MM（角色所在時區的當地時間）；否則空字串", "reason": "一句話給操作者看的判斷理由（使用操作者可見輸出語言）"}

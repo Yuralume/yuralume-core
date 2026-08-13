@@ -89,7 +89,7 @@ class CharacterRuntimeInitializer:
                 # Warm-up, not a performance: nothing produced here is
                 # shown to anyone, so a due beat that is *about the
                 # player* must not be recorded as surfaced to them
-                # (ARC_PLAYER_POSITION_PLAN §2 #5). One phantom attempt
+                # One phantom attempt
                 # is not harmless — the recheck threshold is small, so it
                 # buys the rechecker the right to declare the scene
                 # performed on the player's very first turn, instead of

@@ -2,7 +2,7 @@ import type { CharacterCardPreview } from '@/utils/api/characters'
 
 /**
  * Presentation decisions that hinge on *where* a character-card preview's
- * fields came from (OFFICIAL_CARD_CLOUD_CATALOG_PLAN §3.5).
+ * fields came from.
  *
  * A card whose `source` is `'cloud'` is a projection of the Yuralume Cloud
  * official-card catalog: the catalog publishes prose and images, never the
@@ -42,9 +42,61 @@ export function isCloudCard(
  * uploaded card.
  */
 export function shouldHideTranslateToggle(
-  card: Pick<CharacterCardPreview, 'source'> | null | undefined,
+  card: Pick<CharacterCardPreview, 'source' | 'localized'> | null | undefined,
 ): boolean {
   return isCloudCard(card)
+}
+
+/**
+ * Whether this card is an IP-partner character that only Yuralume Cloud
+ * serves in full (EC 系列 D1).
+ *
+ * A cloud-exclusive card is listed like any other — its name, one-line
+ * summary and portrait are the shop window, and hiding them would defeat the
+ * point of hosting an IP character at all. What changes is everything
+ * downstream of "add this one": the catalog publishes no prose for it, there
+ * is no card file to download, and a deployment without the credential has
+ * no path to either.
+ */
+export function isCloudExclusiveCard(
+  card: Pick<CharacterCardPreview, 'distribution'> | null | undefined,
+): boolean {
+  return card?.distribution === 'cloud_exclusive'
+}
+
+/**
+ * Whether the install action should be offered for this card at all.
+ *
+ * Reads the backend's `installable` verdict rather than recomputing it from
+ * `distribution`, and that is the whole point: "may this card be installed
+ * here" depends on a service credential the browser cannot see. On a hosted
+ * deployment the very same cloud-exclusive card is perfectly installable, so
+ * a frontend rule keyed on the licence alone would grey out the button for
+ * exactly the players who are paying for it.
+ *
+ * Absent (an older backend, or an upload preview that never had the field)
+ * means installable — the field is a refusal, and silence is not one.
+ */
+export function canInstallCard(
+  card: Pick<CharacterCardPreview, 'installable'> | null | undefined,
+): boolean {
+  return card?.installable !== false
+}
+
+/**
+ * Whether to explain an install that is not on offer, and not merely omit it.
+ *
+ * Only when both are true: the card cannot be installed here *and* the reason
+ * is one we can name. A button that is simply absent reads as a bug; "cloud
+ * only" reads as a fact about the character, which is what it is.
+ */
+export function shouldShowCloudOnlyNotice(
+  card:
+    | Pick<CharacterCardPreview, 'distribution' | 'installable'>
+    | null
+    | undefined,
+): boolean {
+  return isCloudExclusiveCard(card) && !canInstallCard(card)
 }
 
 /**

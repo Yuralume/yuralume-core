@@ -21,8 +21,7 @@ it must not invent memoir content or change structure.
 
 Privacy guard: HEARSAY memories and ``idle_drift`` emotion events are
 hard-excluded module-level constants to prevent regressions where a
-PR quietly loosens the rule (PRODUCT.md §脆弱資料保護 +
-HUMANIZATION_ROADMAP §3.2).
+PR quietly loosens the 脆弱資料保護 rule.
 """
 
 from __future__ import annotations
@@ -78,7 +77,7 @@ _EXCLUDED_EMOTION_CAUSES: Final[frozenset[str]] = frozenset({
 """``idle_drift`` emotion events read as "I felt lonely because you
 didn't message me". Even at high intensity, showing them to the player
 in a memoir frames the character as emotionally guilt-tripping the user
-— directly violates PRODUCT.md §脆弱資料保護 ("禁止情緒勒索"). Other
+— directly violates the 脆弱資料保護 rule ("禁止情緒勒索"). Other
 ``cause_ref_kind`` values stay in.
 """
 

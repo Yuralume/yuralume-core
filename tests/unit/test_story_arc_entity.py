@@ -1,7 +1,7 @@
 """Unit tests for ``StoryArcBeat`` scene-structure fields and for
 ``StoryArc.source_seed_ids`` provenance (AE2).
 
-Covers Phase 1 of ``docs/SCENE_BEAT_PLAN.md`` — the new beat fields
+Covers Phase 1 of the scene-beat work — the new beat fields
 (``scene_characters`` / ``location`` / ``dramatic_question`` /
 ``scene_type`` / ``required``) plus their normalisation in ``create``
 and ``with_fields``. Validation rules (empty scene_type, malformed

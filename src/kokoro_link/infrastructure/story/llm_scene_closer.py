@@ -11,8 +11,7 @@ only in framing and in who decides:
   decided, and framed from 「你離開之後，她自己…」 rather than from a
   scene the two of them ended together.
 
-**The red line lives here, not only in the prompt** (STORY_SCENE_PLAN
-§3.4 #1). The model is told never to describe a player action the
+**The red line lives here, not only in the prompt.** The model is told never to describe a player action the
 transcript does not show — and it is also required to *cite* the
 transcript line behind any player action it does describe. This module
 checks those citations against the lines the player really produced and

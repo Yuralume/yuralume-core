@@ -46,6 +46,10 @@ from kokoro_link.application.services.showcase.json_output import (
     coerce_json_object,
 )
 from kokoro_link.infrastructure.character_card.llm_translator import (
+    COMPANION_LIST_FIELDS,
+    COMPANION_SCALAR_FIELDS,
+    PERSONALITY_TYPE_LIST_FIELDS,
+    PERSONALITY_TYPE_SCALAR_FIELDS,
     PROFILE_LIST_FIELDS,
     PROFILE_SCALAR_FIELDS,
     valid_translated_text,
@@ -68,13 +72,14 @@ CARD_META_LIST_FIELDS = ("tags",)
 TRANSLATABLE_SCALAR_FIELDS = PROFILE_SCALAR_FIELDS + CARD_META_SCALAR_FIELDS
 TRANSLATABLE_LIST_FIELDS = PROFILE_LIST_FIELDS + CARD_META_LIST_FIELDS
 TRANSLATABLE_FIELDS = frozenset(
-    TRANSLATABLE_SCALAR_FIELDS + TRANSLATABLE_LIST_FIELDS,
+    TRANSLATABLE_SCALAR_FIELDS
+    + TRANSLATABLE_LIST_FIELDS
+    + ("companions", "personality_type"),
 )
-"""Everything this endpoint will rewrite. The payload is a flat map because
-profile prose and card meta share one namespace with no collisions
-(``name`` is the character's, ``title`` is the card's). Any other key the
-caller sends is passed through untouched — the caller decides what its
-payload carries, this service decides what is language."""
+"""Everything this endpoint will rewrite. Profile and catalog fields are
+flat; companions and personality-type prose keep the same bounded nesting
+as the card manifest. Any other key passes through untouched — the caller
+decides what its payload carries, this service decides what is language."""
 
 # --------------------------------------------------------------------------- #
 # failure vocabulary
@@ -135,8 +140,9 @@ language. The card is published in a public catalog where players browse
 in their own language, so the result is read by strangers, not by the
 card's author.
 
-The input is a flat JSON object: each key is one field, each value is a
-string or an array of strings.
+The input is a JSON object containing profile fields, companion objects and
+personality-type prose. Structural values that must not be translated have
+already been removed.
 
 Rules:
 - Translate every field present in the input.
@@ -146,6 +152,8 @@ Rules:
   same length class as the source, do not turn them into marketing prose,
   do not add information the source does not state.
 - Names should be natural in the target language: transliterate or localize
+- Keep the companion count and order unchanged, and keep every companion's
+  keys and list item counts unchanged.
   when appropriate, and leave them as-is when already suitable.
 - Pronouns should be natural pronouns in the target language, not literal
   word-by-word output.
@@ -179,11 +187,7 @@ class OfficialCardTranslator:
             raise ValueError("target_language is required")
 
         source = dict(payload or {})
-        translatable = {
-            name: value
-            for name, value in source.items()
-            if name in TRANSLATABLE_FIELDS and _has_content(value)
-        }
+        translatable = _translation_input(source)
         if not translatable:
             # Nothing to say to a model: an all-empty or all-pass-through
             # payload is a success with zero notes, not a failure.
@@ -257,6 +261,44 @@ def _has_content(value: object) -> bool:
     return False
 
 
+def _translation_input(source: Mapping[str, object]) -> dict[str, object]:
+    """Project the card payload into prose while preserving nested positions."""
+    translated: dict[str, object] = {
+        name: value
+        for name, value in source.items()
+        if name in TRANSLATABLE_SCALAR_FIELDS + TRANSLATABLE_LIST_FIELDS
+        and _has_content(value)
+    }
+
+    raw_companions = source.get("companions")
+    if isinstance(raw_companions, list):
+        companions: list[dict[str, object]] = []
+        has_companion_prose = False
+        for raw in raw_companions:
+            item: dict[str, object] = {}
+            if isinstance(raw, Mapping):
+                for field in COMPANION_SCALAR_FIELDS + COMPANION_LIST_FIELDS:
+                    value = raw.get(field)
+                    if _has_content(value):
+                        item[field] = value
+                        has_companion_prose = True
+            companions.append(item)
+        if has_companion_prose:
+            translated["companions"] = companions
+
+    raw_personality_type = source.get("personality_type")
+    if isinstance(raw_personality_type, Mapping):
+        personality_type: dict[str, object] = {}
+        for field in PERSONALITY_TYPE_SCALAR_FIELDS + PERSONALITY_TYPE_LIST_FIELDS:
+            value = raw_personality_type.get(field)
+            if _has_content(value):
+                personality_type[field] = value
+        if personality_type:
+            translated["personality_type"] = personality_type
+
+    return translated
+
+
 def _build_prompt(
     translatable: Mapping[str, object],
     *,
@@ -296,34 +338,112 @@ def _merge(
     translatable: Mapping[str, object],
     parsed: Mapping[str, object],
 ) -> OfficialCardTranslation:
-    """Accept the model's answer field by field, or keep the source text.
-
-    Which validator applies is decided by the **source value's** type, not
-    by which policy tuple the name is in: the caller's payload is what it
-    is, and a card whose ``tags`` arrived as one string should not fail
-    against a list validator it was never shaped for.
-    """
+    """Accept the model's answer field by field, including bounded nesting."""
     merged = dict(source)
     notes: list[TranslationNote] = []
     for name, original in translatable.items():
         answer = parsed.get(name, _ABSENT)
-        if isinstance(original, list):
-            value = (
-                None
-                if answer is _ABSENT
-                else valid_translated_text_list(
-                    answer, expected_length=len(original),
-                )
-            )
-            reason = _list_failure_reason(answer, len(original))
-        else:
-            value = None if answer is _ABSENT else valid_translated_text(answer)
-            reason = REASON_MISSING if answer is _ABSENT else REASON_INVALID
+        if name == "companions":
+            notes.extend(_merge_companions(merged, source, original, answer))
+            continue
+        if name == "personality_type":
+            notes.extend(_merge_personality_type(merged, source, original, answer))
+            continue
+        value, reason = _validated_value(original, answer)
         if value is None:
             notes.append(TranslationNote(field=name, reason=reason))
-            continue
-        merged[name] = value
+        else:
+            merged[name] = value
     return OfficialCardTranslation(payload=merged, notes=tuple(notes))
+
+
+def _merge_companions(
+    merged: dict[str, object],
+    source: Mapping[str, object],
+    original: object,
+    answer: object,
+) -> list[TranslationNote]:
+    if not isinstance(original, list):
+        return [TranslationNote("companions", REASON_INVALID)]
+    if not isinstance(answer, list):
+        reason = REASON_MISSING if answer is _ABSENT else REASON_INVALID
+        return [TranslationNote("companions", reason)]
+    if len(answer) != len(original):
+        return [TranslationNote("companions", REASON_LENGTH_MISMATCH)]
+    source_items = source.get("companions")
+    if not isinstance(source_items, list) or len(source_items) != len(original):
+        return [TranslationNote("companions", REASON_INVALID)]
+
+    result = list(source_items)
+    notes: list[TranslationNote] = []
+    for index, wanted in enumerate(original):
+        source_item = source_items[index]
+        translated_item = answer[index]
+        if not isinstance(wanted, Mapping) or not isinstance(source_item, Mapping):
+            continue
+        updated, item_notes = _merge_object(
+            source_item,
+            wanted,
+            translated_item,
+            prefix=f"companions.{index}",
+        )
+        result[index] = updated
+        notes.extend(item_notes)
+    merged["companions"] = result
+    return notes
+
+
+def _merge_personality_type(
+    merged: dict[str, object],
+    source: Mapping[str, object],
+    original: object,
+    answer: object,
+) -> list[TranslationNote]:
+    source_value = source.get("personality_type")
+    if not isinstance(original, Mapping) or not isinstance(source_value, Mapping):
+        return [TranslationNote("personality_type", REASON_INVALID)]
+    updated, notes = _merge_object(
+        source_value,
+        original,
+        answer,
+        prefix="personality_type",
+    )
+    merged["personality_type"] = updated
+    return notes
+
+
+def _merge_object(
+    source: Mapping[str, object],
+    translatable: Mapping[str, object],
+    answer: object,
+    *,
+    prefix: str,
+) -> tuple[dict[str, object], list[TranslationNote]]:
+    updated = dict(source)
+    if not isinstance(answer, Mapping):
+        reason = REASON_MISSING if answer is _ABSENT else REASON_INVALID
+        return updated, [TranslationNote(prefix, reason)]
+    notes: list[TranslationNote] = []
+    for name, original in translatable.items():
+        value, reason = _validated_value(original, answer.get(name, _ABSENT))
+        if value is None:
+            notes.append(TranslationNote(f"{prefix}.{name}", reason))
+        else:
+            updated[name] = value
+    return updated, notes
+
+
+def _validated_value(original: object, answer: object) -> tuple[object | None, str]:
+    if isinstance(original, list):
+        value = (
+            None
+            if answer is _ABSENT
+            else valid_translated_text_list(answer, expected_length=len(original))
+        )
+        return value, _list_failure_reason(answer, len(original))
+    value = None if answer is _ABSENT else valid_translated_text(answer)
+    reason = REASON_MISSING if answer is _ABSENT else REASON_INVALID
+    return value, reason
 
 
 def _list_failure_reason(answer: object, expected: int) -> str:

@@ -45,6 +45,9 @@ from kokoro_link.infrastructure.provider_settings.adapter_builders import (
     build_search_client as _build_search_client,  # noqa: F401 — legacy name kept for tests
 )
 from kokoro_link.infrastructure.provider_settings.catalog import catalog_by_id
+from kokoro_link.infrastructure.provider_settings.runtime_ids import (
+    runtime_provider_id,
+)
 from kokoro_link.infrastructure.security.provider_secret_cipher import (
     ProviderSecretCipherError,
 )
@@ -192,7 +195,11 @@ async def _sync_provider_connections_locked(container: ServiceContainer) -> None
     for row in all_rows:
         entry = catalog.get(row.provider)
         if entry is not None and "llm" in row.capabilities and "llm" in entry.capabilities:
-            configured_llm_provider_ids.add(row.provider)
+            # Must derive the id exactly as the builders do — a row with a
+            # connection slug occupies its slugged registry slot, and a
+            # teardown pass that looked at ``row.provider`` instead would
+            # unregister the wrong (slug-less) sibling.
+            configured_llm_provider_ids.add(runtime_provider_id(row))
     if unregister is not None:
         # Union with what the previous sync registered: a deleted row is absent
         # from ``configured_llm_provider_ids`` (``list_connections`` excludes
@@ -632,6 +639,14 @@ async def _sync_search_tool(container: ServiceContainer) -> None:
     replace = getattr(registry, "replace", None)
     unregister = getattr(registry, "unregister", None)
     if service is None or registry is None or replace is None or unregister is None:
+        return
+    if getattr(container, "cloud_mode", False):
+        # Hosted: ``web_search`` is the Cloud Gateway route the container mounted,
+        # and Core holds no provider keys by design (its provider-settings API is
+        # 403 in cloud mode). A stray DB ``search`` row — a legacy env seed, a row
+        # carried in from a converted self-host database — must not be able to
+        # replace the Gateway-routed tool with a direct, unbilled, unrouted
+        # provider call, nor to unregister it.
         return
     all_rows = await service.list_connections()
     if not any("search" in row.capabilities for row in all_rows) and not _is_db_owned(

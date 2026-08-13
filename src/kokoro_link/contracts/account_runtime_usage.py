@@ -11,6 +11,41 @@ ACCOUNT_RUNTIME_EVENT_CHARACTER_CREATE = "character_create"
 ACCOUNT_RUNTIME_EVENT_CHAT_IMAGE = "chat_image"
 ACCOUNT_RUNTIME_EVENT_FEED_POST = "feed_post"
 
+#: CV5 volume control — one row per feed video generation *attempt* (the
+#: decision to enter the async video pipeline / legacy synchronous video
+#: path), counted over a rolling 24h window per operator. Recorded at the
+#: same choke point the ``video_daily_limit`` check runs
+#: (``FeedComposerService._video_volume_allows``), before any storyboard
+#: call or first-frame render — mirrors ``daily_chat_image_limit``'s
+#: check-then-record shape (``chat_service._reserve_runtime_chat_image_quota``),
+#: not ``feed_post``'s atomic claim/discard: a downstream degrade (timeout,
+#: Gateway/broker 429) never rolls this back, because the *decision* to
+#: attempt a video already happened and self-host never records or counts
+#: these (the knob does not exist there).
+ACCOUNT_RUNTIME_EVENT_FEED_VIDEO = "feed_video"
+
+#: CB2 hosted export throttle — one row per started ``.lumebackup`` export,
+#: counted over a rolling 24h window per operator (mirrors the
+#: ``character_create`` ledger precedent in ``character_service``). Cloud-mode
+#: only; self-host never records or counts these.
+ACCOUNT_RUNTIME_EVENT_CHARACTER_BACKUP_EXPORT = "character_backup_export"
+
+#: CB3 hosted upload throttle (adversarial-review A6) — one row per staged
+#: ``.lumebackup`` upload, counted over a rolling 24h window per operator.
+#: Same shape and stance as the export throttle above: cloud-mode only,
+#: fail-closed when no ledger is wired; self-host never records or counts
+#: these. Without it, 2 GiB × unlimited uploads × 24h staging TTL fills the
+#: hosted disk overnight.
+ACCOUNT_RUNTIME_EVENT_CHARACTER_BACKUP_UPLOAD = "character_backup_upload"
+
+#: S4 hosted preview throttle — one row per ``.lumebackup`` preview, counted
+#: over a rolling 24h window per operator. Same shape and fail-closed stance
+#: as the upload throttle above. Preview is unthrottled otherwise, yet each
+#: call downloads the full staged archive (up to 2 GiB) and runs a scrypt
+#: KDF: a loop over one staged upload is a per-call CPU + memory + bandwidth
+#: amplifier. Cloud-mode only; self-host never records or counts these.
+ACCOUNT_RUNTIME_EVENT_CHARACTER_BACKUP_PREVIEW = "character_backup_preview"
+
 #: AP4 quota-overage purchases. Counted separately from the quota events
 #: above because they answer a different question: not "how much of the tier
 #: allowance is spent" but "how many extra slots has this player *bought*

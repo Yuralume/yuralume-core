@@ -7,11 +7,28 @@ from typing import TYPE_CHECKING
 from kokoro_link.application.services.account_runtime_profile import (
     PermissiveAccountRuntimeProfileResolver,
 )
+from kokoro_link.application.dto.character_backup.consumer_policies import (
+    ResetFlag,
+)
+from kokoro_link.application.services.character_data_erasure import (
+    CharacterDataErasureService,
+    RepositoryCharacterDatabaseEraser,
+)
+from kokoro_link.application.services.character_reset import (
+    CharacterResetEraserPort,
+    RepositoryCharacterResetEraser,
+)
 from kokoro_link.application.services.emotion_aggregator import (
     ExponentialDecayEmotionAggregator,
 )
 from kokoro_link.application.services.emotion_state_projection import (
     project_state_from_emotion_events,
+)
+from kokoro_link.application.services.managed_character_origin import (
+    ManagedCharacterOrigin,
+)
+from kokoro_link.application.services.managed_character_update_policy import (
+    review_managed_update,
 )
 from kokoro_link.application.dto.character import (
     CharacterResponse,
@@ -93,6 +110,27 @@ agree, or the hint quotes a different day than the one the wall enforces."""
 
 class CharacterValidationError(ValueError):
     """Character mutation payload is invalid for the current user."""
+
+
+def _reduce_managed_update(
+    payload: UpdateCharacterRequest,
+) -> UpdateCharacterRequest:
+    """Apply the managed-character write boundary to an update payload.
+
+    Raises when the request tries to change a field the IP partner owns,
+    and otherwise returns the payload reduced to the fields the player
+    may write — so a stale client echoing masked blanks updates what it
+    is allowed to and clears nothing. The field partition itself lives in
+    :mod:`...services.managed_character_update_policy`.
+    """
+    review = review_managed_update(payload)
+    if review.rejected_fields:
+        raise CharacterValidationError(
+            "managed character: these fields are maintained by the "
+            "character's licensor and cannot be edited: "
+            + ", ".join(review.rejected_fields),
+        )
+    return review.payload
 
 
 def _payload_feature_models(
@@ -292,18 +330,19 @@ class CharacterService:
             "BackgroundCoordinatorLeasePort | None"
         ) = None,
         warmup_enqueue_enabled: bool = False,
+        character_data_erasure: CharacterDataErasureService | None = None,
+        character_data_reset: CharacterResetEraserPort | None = None,
     ) -> None:
         self._repository = repository
         self._conversation_repository = conversation_repository
         self._memory_repository = memory_repository
-        self._goal_repository = goal_repository
-        self._schedule_repository = schedule_repository
         self._state_history_repository = state_history_repository
-        self._proactive_attempt_repository = proactive_attempt_repository
-        self._tool_invocation_repository = tool_invocation_repository
-        self._album_repository = album_repository
-        self._story_arc_repository = story_arc_repository
-        self._pending_follow_up_repository = pending_follow_up_repository
+        # ``goal`` / ``schedule`` / ``proactive_attempt`` /
+        # ``tool_invocation`` / ``album`` / ``story_arc`` /
+        # ``pending_follow_up`` are accepted but not held: since CD2 their
+        # only reader is the erasure fallback built below. Keeping unused
+        # attributes around would invite a second delete path to grow off
+        # them, which is exactly what CD2 removed.
         self._operator_persona_repository = operator_persona_repository
         self._relationship_seed_repository = relationship_seed_repository
         self._state_tracker = state_tracker
@@ -327,19 +366,77 @@ class CharacterService:
         self._background_job_queue = background_job_queue
         self._background_coordinator_lease = background_coordinator_lease
         self._warmup_enqueue_enabled = warmup_enqueue_enabled
+        # CD2 — deletion is one engine behind one call face, never a list
+        # of repository calls maintained here. The container injects the
+        # registry-driven SQL eraser; the fallback below is a convenience
+        # construction for rigs that build this service directly (tests,
+        # DB-less containers) so there is still exactly one code path
+        # through ``delete_character``.
+        #
+        # It wires only the slots this constructor happens to receive — a
+        # deliberate **subset** of the container's authoritative wiring,
+        # pinned as a subset in
+        # ``tests/unit/test_character_delete_boundary.py``. Slot names and
+        # execution order both come from
+        # ``CHARACTER_ERASURE_REPOSITORY_SLOTS``; nothing about the
+        # boundary is restated here.
+        self._data_erasure = character_data_erasure or (
+            CharacterDataErasureService(
+                database_eraser=RepositoryCharacterDatabaseEraser(
+                    character_repository=repository,
+                    repositories={
+                        "state_history": state_history_repository,
+                        "goal": goal_repository,
+                        "schedule": schedule_repository,
+                        "memory": memory_repository,
+                        "proactive_attempt": proactive_attempt_repository,
+                        "tool_invocation": tool_invocation_repository,
+                        "album": album_repository,
+                        "story_arc": story_arc_repository,
+                        "operator_persona": operator_persona_repository,
+                        "relationship_seed": relationship_seed_repository,
+                        "emotion_event": emotion_event_repository,
+                        "pending_follow_up": pending_follow_up_repository,
+                        "conversation": conversation_repository,
+                    },
+                ),
+            )
+        )
+        # CD3 — same shape, for ``reset_character_data``: the container
+        # injects the registry-driven SQL eraser; this fallback wires the
+        # pre-CD3 per-flag repository calls for rigs that build this
+        # service directly. Which table each flag reaches is declared once
+        # in ``consumer_policies.RESET_FLAG_EFFECTS`` — this map only
+        # says which already-injected repository owns that flag's table,
+        # it does not restate the table set.
+        self._data_reset = character_data_reset or RepositoryCharacterResetEraser({
+            ResetFlag.MEMORIES: memory_repository,
+            ResetFlag.CONVERSATIONS: conversation_repository,
+            ResetFlag.STATE_HISTORY: state_history_repository,
+            ResetFlag.OPERATOR_PERSONA: operator_persona_repository,
+        })
 
     async def create_character(
         self,
         payload: CreateCharacterRequest,
         *,
         user_id: str = DEFAULT_OPERATOR_ID,
+        managed_origin: ManagedCharacterOrigin | None = None,
     ) -> CharacterResponse:
-        if self._subscription_access_guard is not None:
-            await self._subscription_access_guard.ensure_operator_allowed(user_id)
+        """Create one character owned by ``user_id``.
+
+        ``managed_origin`` is the cloud-exclusive install's door (EC4) and
+        the **only** way a character is born managed. It is a keyword on the
+        service rather than a field on
+        :class:`CreateCharacterRequest` on purpose: the request DTO is what
+        a player's browser fills in, and a player must not be able to claim
+        their own character is an IP partner's. The binding is insert-only —
+        :meth:`update_character` has no path to it — so a character that
+        starts ordinary stays ordinary for good.
+        """
         now = self._now()
-        runtime_profile = await self._validate_runtime_profile_allows_character_create(
-            user_id,
-            now=now,
+        runtime_profile = await self.ensure_character_create_allowed(
+            user_id, now=now,
         )
         character = Character.create(
             name=payload.name,
@@ -384,7 +481,16 @@ class CharacterService:
             body_state=payload.body_state.to_domain(),
             operator_pace_preference=payload.operator_pace_preference,
             personality_type=payload.personality_type.to_domain(),
+            origin_official_card_id=(
+                managed_origin.official_card_id if managed_origin else None
+            ),
         )
+        if managed_origin is not None and managed_origin.voice_profile is not None:
+            # Written here rather than through a later PATCH because a
+            # managed character's ``voice_profile`` is protected the moment
+            # it exists: the licensed voice has to be part of the same birth
+            # as the licence itself, or it can never be set at all.
+            character = character.with_voice_profile(managed_origin.voice_profile)
         await self._validate_arc_template_binding(
             character.arc_template_id, character=character,
         )
@@ -464,6 +570,56 @@ class CharacterService:
                 "next tick)", character.id, exc_info=True,
             )
 
+    async def ensure_character_create_allowed(
+        self,
+        user_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> AccountRuntimeProfile | None:
+        """Shared "may this operator create a character right now?" seam.
+
+        One gate, two callers: :meth:`create_character` and the backup
+        restore job (CB3 — a restore *is* a create, so it walks into the
+        same subscription freeze / slot cap / daily-create wall instead
+        of copying the checks). Raises
+        :class:`~kokoro_link.application.services.subscription_access_guard.SubscriptionAccessLocked`
+        or :class:`CharacterValidationError`; returns the resolved
+        runtime profile for the paired
+        :meth:`record_character_create_event` call.
+        """
+        if self._subscription_access_guard is not None:
+            await self._subscription_access_guard.ensure_operator_allowed(user_id)
+        return await self._validate_runtime_profile_allows_character_create(
+            user_id,
+            now=now if now is not None else self._now(),
+        )
+
+    async def record_character_create_event(
+        self,
+        *,
+        character_id: str,
+        user_id: str,
+        profile: AccountRuntimeProfile | None,
+        now: datetime | None = None,
+        resource_id: str | None = None,
+    ) -> None:
+        """Ledger the create that a passed gate promised (CB3 seam).
+
+        The restore job calls this after its new character has fully
+        landed — same ledger semantics as :meth:`create_character` (only
+        counted when the profile actually carries a daily limit).
+        ``resource_id`` overrides the ledgered resource (default: the
+        character id) — the restore keys the event on its JOB id so a
+        crash-recovery rerun, which lands under a *fresh* character id,
+        can find and dedup the earlier write (CB A4)."""
+        await self._record_runtime_profile_character_create(
+            character_id=character_id,
+            user_id=user_id,
+            profile=profile,
+            now=now if now is not None else self._now(),
+            resource_id=resource_id,
+        )
+
     async def _validate_runtime_profile_allows_character_create(
         self,
         user_id: str,
@@ -506,6 +662,7 @@ class CharacterService:
         user_id: str,
         profile: AccountRuntimeProfile | None,
         now: datetime,
+        resource_id: str | None = None,
     ) -> None:
         if profile is None or profile.daily_character_create_limit is None:
             return
@@ -517,7 +674,7 @@ class CharacterService:
             operator_id=user_id,
             event_type=ACCOUNT_RUNTIME_EVENT_CHARACTER_CREATE,
             occurred_at=now,
-            resource_id=character_id,
+            resource_id=resource_id or character_id,
         )
 
     async def _save_initial_relationship_seed(
@@ -646,11 +803,19 @@ class CharacterService:
     async def delete_character(
         self, character_id: str, *, user_id: str | None = None,
     ) -> bool:
-        """Cascade-delete a character and all owned data.
+        """Hard-delete a character and every row and object it owns.
 
-        Order matters: child records first, so a partial failure never
-        leaves a character row whose memories or conversations are
-        orphaned. Returns ``True`` when the character existed.
+        The boundary being swept is the CD0 registry, resolved through
+        the ``DELETE`` consumer policy — not a list maintained here. See
+        :mod:`kokoro_link.application.services.character_data_erasure`
+        for the order discipline (harvest media keys → purge the database
+        → delete those keys → prefix backstop) and for the two standing
+        rulings this path must honour: billing evidence is ``RETAIN``ed
+        (D1) and co-authored works are left untouched (D2).
+
+        Returns ``True`` when the character existed. Object-storage
+        cleanup is fail-soft and never changes that answer: leftover
+        bytes are recoverable, a half-deleted database is not.
 
         When ``user_id`` is provided and the character belongs to a
         different user, returns ``False`` (treated as "not found" by
@@ -659,41 +824,8 @@ class CharacterService:
             character = await self._repository.get(character_id)
             if character is None or character.user_id != user_id:
                 return False
-        if self._state_history_repository is not None:
-            await self._state_history_repository.delete_for_character(character_id)
-        if self._goal_repository is not None:
-            await self._goal_repository.delete_for_character(character_id)
-        if self._schedule_repository is not None:
-            await self._schedule_repository.delete_for_character(character_id)
-        if self._memory_repository is not None:
-            await self._memory_repository.delete_for_character(character_id)
-        if self._proactive_attempt_repository is not None:
-            await self._proactive_attempt_repository.delete_for_character(character_id)
-        if self._tool_invocation_repository is not None:
-            await self._tool_invocation_repository.delete_for_character(character_id)
-        if self._album_repository is not None:
-            # SA path cascades via FK; explicit call here handles the
-            # in-memory repo path + keeps the ordering contract clean
-            # (children before parent).
-            await self._album_repository.delete_for_character(character_id)
-        if self._story_arc_repository is not None:
-            await self._story_arc_repository.delete_for_character(character_id)
-        if self._operator_persona_repository is not None:
-            await self._operator_persona_repository.delete_for_character(character_id)
-        if self._relationship_seed_repository is not None:
-            await self._relationship_seed_repository.delete_for_character(character_id)
-        if self._pending_follow_up_repository is not None:
-            # Run before the conversation cascade so the FK from
-            # ``pending_follow_ups.conversation_id`` doesn't cascade-
-            # delete the rows in an order the in-memory repo can't
-            # observe (SA path is fine either way; in-memory path needs
-            # this explicit call).
-            await self._pending_follow_up_repository.delete_for_character(
-                character_id,
-            )
-        if self._conversation_repository is not None:
-            await self._conversation_repository.delete_for_character(character_id)
-        return await self._repository.delete(character_id)
+        report = await self._data_erasure.erase(character_id)
+        return report.character_existed
 
     async def reset_character_data(
         self,
@@ -711,6 +843,11 @@ class CharacterService:
         state_history_deleted, operator_persona_deleted)``
         or ``None`` when the character doesn't exist. The character row
         itself is **never** removed — for that, use ``delete_character``.
+        Each count is the flag's primary-table row count (e.g.
+        ``conversations_deleted`` never includes the ``messages`` rows the
+        same reset deletes through the conversation parent chain) — see
+        :mod:`kokoro_link.application.services.character_reset`
+        for the full accounting.
 
         Intended for the identity-drift "clear memory" escape hatch: the
         operator is about to rewrite the character's personality, and
@@ -718,37 +855,32 @@ class CharacterService:
         persona back to the old one. Schedules + goals are left alone
         because they're easy to re-author manually and deleting them
         hides useful planning history.
+
+        The boundary being swept is the CD0 registry, resolved through the
+        ``RESET`` consumer policy for each requested flag — not a table
+        list maintained here.
         """
         existing = await self._repository.get(character_id)
         if existing is None:
             return None
         if user_id is not None and existing.user_id != user_id:
             return None
-        memories_deleted = 0
-        conversations_deleted = 0
-        state_history_deleted = 0
-        operator_persona_deleted = 0
-        if memories and self._memory_repository is not None:
-            memories_deleted = await self._memory_repository.delete_for_character(
-                character_id,
+        requested = frozenset(
+            flag
+            for flag, active in (
+                (ResetFlag.MEMORIES, memories),
+                (ResetFlag.CONVERSATIONS, conversations),
+                (ResetFlag.STATE_HISTORY, state_history),
+                (ResetFlag.OPERATOR_PERSONA, operator_persona),
             )
-        if conversations and self._conversation_repository is not None:
-            conversations_deleted = await self._conversation_repository.delete_for_character(
-                character_id,
-            )
-        if state_history and self._state_history_repository is not None:
-            state_history_deleted = await self._state_history_repository.delete_for_character(
-                character_id,
-            )
-        if operator_persona and self._operator_persona_repository is not None:
-            operator_persona_deleted = await self._operator_persona_repository.delete_for_character(
-                character_id,
-            )
+            if active
+        )
+        counts = await self._data_reset.erase(character_id, requested)
         return (
-            memories_deleted,
-            conversations_deleted,
-            state_history_deleted,
-            operator_persona_deleted,
+            counts.get(ResetFlag.MEMORIES, 0),
+            counts.get(ResetFlag.CONVERSATIONS, 0),
+            counts.get(ResetFlag.STATE_HISTORY, 0),
+            counts.get(ResetFlag.OPERATOR_PERSONA, 0),
         )
 
     async def mark_web_conversation_read(
@@ -818,6 +950,8 @@ class CharacterService:
             return None
         if user_id is not None and character.user_id != user_id:
             return None
+        if character.is_managed:
+            payload = _reduce_managed_update(payload)
 
         await self._validate_arc_template_update(payload, character=character)
         await self._validate_arc_series_update(payload, character=character)

@@ -11,7 +11,7 @@
  *      角色卡層級，避免使用者忘記某角色有主線）
  *   4. 舞台圖 —— CharacterImagesPanel（image_urls，A 層、會被打包進 .lumecard）
  *
- * 設計約束（呼應 docs/CHARACTER_CARD_PLAN.md §5 與 FRONTEND_REFACTOR_PLAN.md）：
+ * 設計約束：
  * 本元件由父層以 ``:key="character.id"`` 重掛 —— 切換角色時整片 fresh mount，
  * 內層 editor 不必各自再 key。各 inner editor 只 PATCH 自己的欄位（tri-state，
  * 省略 = 不動），所以同一個 character 上掛多個 editor **不會互相覆寫**；某段
@@ -24,6 +24,7 @@
 import { useI18n } from 'vue-i18n'
 import type { Character } from '@/types/character'
 import { updateCharacter } from '@/utils/api/characters'
+import { UiBadge } from '@/components/ui'
 import CollapsibleSection from '@/components/CollapsibleSection.vue'
 import CharacterEditPanel from '@/components/CharacterEditPanel.vue'
 import DispositionAdminEditor from '@/components/admin/DispositionAdminEditor.vue'
@@ -101,6 +102,7 @@ async function onArcTemplate(templateId: string | null) {
         :character-id="character.id"
         :arc-template-id="character.arc_template_id"
         :world-frame="character.world_frame"
+        :managed="character.managed === true"
         @update:arc-template="onArcTemplate"
       />
     </CollapsibleSection>
@@ -110,7 +112,13 @@ async function onArcTemplate(templateId: string | null) {
       :hint="t('admin.page.characters.card.stageHint')"
       :default-open="false"
     >
-      <CharacterImagesPanel :character="character" @updated="onUpdated" />
+      <!-- EC2-B：託管角色的立繪由授權方提供並鎖定，整段隱藏上傳／刪除／
+           重新生成，跟玩家側同一條規則。 -->
+      <div v-if="character.managed" class="managed-images-notice">
+        <UiBadge variant="primary">{{ t('characterEdit.managed.imagesBadge') }}</UiBadge>
+        <p class="managed-images-notice__text">{{ t('characterEdit.managed.imagesNotice') }}</p>
+      </div>
+      <CharacterImagesPanel v-else :character="character" @updated="onUpdated" />
     </CollapsibleSection>
   </div>
 </template>
@@ -120,5 +128,23 @@ async function onArcTemplate(templateId: string | null) {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+
+.managed-images-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  background: rgba(126, 182, 255, 0.08);
+  border: 1px solid rgba(126, 182, 255, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.managed-images-notice__text {
+  margin: 0;
+  font-size: var(--font-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.6;
 }
 </style>

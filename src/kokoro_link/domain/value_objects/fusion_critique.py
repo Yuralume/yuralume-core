@@ -23,7 +23,7 @@ Why a value object (vs free-form LLM text):
 Findings are intentionally schema-light: ``kind`` is a free-form
 string the LLM picks (重複 / 抽象 / 銜接 / 節奏 / …), not an enum.
 Forcing the LLM into a closed taxonomy is exactly the keyword-style
-hard-coding CLAUDE.md forbids.
+hard-coding the LLM-first rule forbids.
 """
 
 from __future__ import annotations

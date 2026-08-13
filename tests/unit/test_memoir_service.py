@@ -1,4 +1,4 @@
-"""Unit tests for ``MemoirService`` (docs/MEMOIR_PLAN.md).
+"""Unit tests for ``MemoirService``.
 
 Covers the three-source aggregation, privacy exclusion rules, pin
 ordering, per-(character, operator) isolation, and pin-limit enforcement.

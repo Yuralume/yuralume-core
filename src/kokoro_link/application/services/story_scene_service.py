@@ -324,6 +324,7 @@ class StorySceneService:
                 ACTION_STORY_SCENE_OPEN,
                 operator_id=getattr(character, "user_id", "") or "",
                 quoted_price_cr=client_quoted_price(ACTION_STORY_SCENE_OPEN),
+                character_origin=character.origin_official_card_id,
             ):
                 draft = await self._write_opening(
                     character,
@@ -464,7 +465,7 @@ class StorySceneService:
     # ── steps ────────────────────────────────────────────────────────
 
     async def _ensure_account_may_open(self, character: Character) -> None:
-        """Demo accounts do not get 起幕 (STORY_SCENE_PLAN §5).
+        """Demo accounts do not get 起幕.
 
         Checked against the account runtime profile rather than at the
         route, so every future caller (a chat slash-command, an external

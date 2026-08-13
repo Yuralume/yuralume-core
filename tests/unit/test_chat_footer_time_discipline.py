@@ -8,9 +8,8 @@ The footer therefore has to name the single date authority (the
 「接下來幾天的行程」 block, which renders real ISO dates) and forbid reciting
 a stale 「明天」 that doesn't match it.
 
-The tuned overlay (parent repo ``prompt-packs/tuned/chat/instructions_footer``)
-carries the same discipline in its own wording; this test pins the baseline
-that ships with Core.
+A tuned prompt overlay may carry the same discipline in its own wording;
+this test pins the baseline that ships with Core.
 """
 
 from __future__ import annotations

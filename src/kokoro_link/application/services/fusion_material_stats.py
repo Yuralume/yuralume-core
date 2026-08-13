@@ -5,7 +5,7 @@ the fusion brief pulls (:func:`select_brief_memories`), so the
 character-picker richness badge never drifts from the material a fusion
 story would actually have to work with.
 
-Per CREATOR_STUDIO_VALUE_LINE_PLAN §2.1-5 this is the calculated-
+This is the calculated-
 statistics carve-out the LLM-first rule allows: it only counts the
 memories the brief already selected and their total length — it never
 enumerates, keyword-matches, or judges content. Thresholds are

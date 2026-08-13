@@ -1,6 +1,6 @@
 /**
  * When an image that has scrolled away should stop holding a decoded bitmap
- * (plan IMAGE_DELIVERY_AND_PAGINATION_PLAN, D6 / ticket IV5-C).
+ * (D6 / ticket IV5-C).
  *
  * The measurement this exists for: a single chat thread held 39 loaded images
  * worth 228 MB of decoded bitmaps, and **30 of them (174 MB) were nowhere near

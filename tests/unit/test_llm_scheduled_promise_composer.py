@@ -162,6 +162,30 @@ def test_prompt_includes_disposition_and_personality_type_lines() -> None:
     assert "ISFJ" in prompt
 
 
+def test_prompt_covers_rendezvous_and_report_promise_shapes() -> None:
+    # The composer used to frame every promise as a reminder ("叫對方起床／
+    # 提醒對方吃飯"). A rendezvous intent ("一起上線") written in that frame
+    # reads as a bystander nudging the user instead of the character
+    # actually showing up, so the shapes are named explicitly.
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="到約定時間主動找使用者，開始一起核對夏祭任務",
+        promise_text="那我們七點半一起上線核對任務",
+        scheduled_for=datetime(2026, 8, 12, 11, 30, tzinfo=timezone.utc),
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=datetime(2026, 8, 12, 11, 30, tzinfo=timezone.utc),
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert "赴約型" in prompt
+    assert "回報型" in prompt
+    # A completion promise must never invent the result it was asked to fetch.
+    assert "不要憑空編造具體結果" in prompt
+
+
 def test_prompt_injects_operator_local_current_time() -> None:
     payload = ScheduledPromiseComposeInput(
         character=_character(),

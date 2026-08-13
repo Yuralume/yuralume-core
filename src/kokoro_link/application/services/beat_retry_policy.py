@@ -8,8 +8,7 @@ answers "how often did we try to play it and fail" — the only question
 "give up after N tries" is actually asking.
 
 Reading the wrong one meant a player's daily chat could burn the whole
-autonomous scene budget of a beat whose scene writer never failed once
-(BACKGROUND_COST_CONTROL_PLAN §10 #3).
+autonomous scene budget of a beat whose scene writer never failed once.
 
 ``allows`` and ``is_exhausted`` are deliberately separate: "blocked right
 now" (backoff still running) and "will never be allowed again" (budget

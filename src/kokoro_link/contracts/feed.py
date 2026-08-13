@@ -245,6 +245,10 @@ class FeedComposerInput:
     """Optional supporting bullets (recent chat lines, beat summary,
     memory text) the LLM should draw on. Caller pre-trims; adapter
     just renders into the prompt."""
+    recent_media_kinds: tuple[str, ...] = ()
+    """Actual media outcomes of recent posts, newest first. Values are
+    ``video``, ``image``, or ``none``; the composer uses this factual
+    history to keep media cadence natural instead of guessing blindly."""
     image_required: bool = True
     """Whether the composer should also produce a positive image prompt
     for ComfyUI. If ``False`` the service skips the image step entirely

@@ -12,6 +12,7 @@ from kokoro_link.contracts.cloud_gateway import (
     CloudGatewayIdentity,
     CloudGatewayRequestTooLargeError,
     CloudIdentityUnavailable,
+    character_origin_headers,
 )
 from kokoro_link.contracts.llm import ChatModelPort, ImageInputRejectedError
 from kokoro_link.contracts.generation_trigger import (
@@ -246,6 +247,8 @@ class CloudGatewayChatModel(ChatModelPort):
             "X-Yuralume-Account": identity.account_id,
             "X-Yuralume-Feature": self._feature_key,
             "X-Yuralume-Character": identity.character_ref,
+            # EC7: origin attribution, present only for a managed character.
+            **character_origin_headers(identity),
             TRIGGER_HEADER_NAME: generation_trigger_header_value(),
             # Read here, not at construction time: one cached adapter serves
             # every turn, and each turn is its own interaction. Empty outside

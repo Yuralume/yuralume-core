@@ -363,34 +363,70 @@ async function chatErrorFromResponse(
       statusCode: response.status,
     })
   }
+  // Cost-cap / quota throttling (backend: 429 with a structured
+  // ``{code: 'cost_cap_exceeded' | 'quota_exceeded', message}`` detail,
+  // shaped like the 402 insufficient-credits body above). Distinct from
+  // ``max_messages_per_session`` above — that one is the hosted demo's own
+  // session ceiling, this is the runtime hitting an operator-side cost cap
+  // or plan quota. Surfaced as a typed error so the panel shows localized,
+  // non-blaming copy instead of an opaque "Chat request failed: 429".
+  if (
+    response.status === 429
+    && (detailCodeIs(detail, 'cost_cap_exceeded') || detailCodeIs(detail, 'quota_exceeded'))
+  ) {
+    const code = (detail as { code: 'cost_cap_exceeded' | 'quota_exceeded' }).code
+    return new ChatRuntimeLimitError({
+      code,
+      message: detailMessage(detail, 'Runtime limit reached.'),
+      statusCode: response.status,
+    })
+  }
   // A lapsed-subscription hard lock (backend: 403 with a structured
   // ``{code: 'subscription_frozen', message}`` detail). Surface it as a typed
   // error so the chat boundary shows the localized "renew to continue" copy
   // instead of an opaque "Chat request failed: 403".
-  if (response.status === 403 && subscriptionFrozenCode(detail)) {
+  if (response.status === 403 && detailCodeIs(detail, 'subscription_frozen')) {
     return new ChatRuntimeLimitError({
       code: 'subscription_frozen',
       message: subscriptionFrozenMessage(detail),
       statusCode: response.status,
     })
   }
+  // D7 / EC10 — the licensor's contract for this character's source card
+  // ended. Its own code, deliberately not `subscription_frozen`: the
+  // player's plan is fine, and the renew-your-plan copy would send them
+  // to a payment page that cannot bring the character back.
+  if (
+    response.status === 403
+    && detailCodeIs(detail, 'character_contract_ended')
+  ) {
+    return new ChatRuntimeLimitError({
+      code: 'character_contract_ended',
+      message: detailMessage(detail, 'Character licensing agreement ended.'),
+      statusCode: response.status,
+    })
+  }
   return new Error(`${prefix}: ${response.status}`)
 }
 
-function subscriptionFrozenCode(detail: unknown): boolean {
+function detailCodeIs(detail: unknown, code: string): boolean {
   return (
     typeof detail === 'object'
     && detail !== null
-    && (detail as { code?: unknown }).code === 'subscription_frozen'
+    && (detail as { code?: unknown }).code === code
   )
 }
 
 function subscriptionFrozenMessage(detail: unknown): string {
+  return detailMessage(detail, 'Subscription lapsed.')
+}
+
+function detailMessage(detail: unknown, fallback: string): string {
   if (typeof detail === 'object' && detail !== null) {
     const message = (detail as { message?: unknown }).message
     if (typeof message === 'string' && message) return message
   }
-  return 'Subscription lapsed.'
+  return fallback
 }
 
 async function detailFromResponse(response: Response): Promise<unknown> {

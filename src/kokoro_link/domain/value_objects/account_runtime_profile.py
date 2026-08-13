@@ -60,12 +60,26 @@ class AccountRuntimeProfile:
     ``None`` (the default) means unlimited, and is the *only* spelling of
     unlimited: unlike ``daily_overage_limit``, this knob has no neutral
     nonzero default to fall back to, so the control-plane column is nullable
-    and a ``0`` is rejected there rather than reinterpreted (STORY_SCENE_PLAN
-    §3.3 / §4.1 SC3-B). Enforced by :class:`StorySceneQuotaGuard`
+    and a ``0`` is rejected there rather than reinterpreted (SC3-B). Enforced by :class:`StorySceneQuotaGuard`
     (``application/services/story_scene_quota.py``), not read directly by
     any billing path — hosted pacing only."""
     album_generation_enabled: bool = True
     video_generation_enabled: bool = True
+    video_daily_limit: int | None = None
+    """CV5 — per-tier daily ceiling on feed video generation (rolling 24h,
+    not an owner-local civil day — see ``FeedComposerService._video_volume_allows``
+    docstring for why this matches ``daily_feed_post_limit`` /
+    ``daily_chat_image_limit`` / ``story_scene_daily_limit`` rather than
+    inventing a fourth window shape).
+
+    ``None`` (the default) means unlimited, and is the *only* spelling of
+    unlimited — same non-nullable-zero shape as ``story_scene_daily_limit``
+    (V45): the control-plane column is nullable and a ``0`` is rejected there
+    rather than reinterpreted, because "no limit" and "no videos at all" must
+    not collapse onto the same value. (Blocking video entirely already has
+    its own knob, ``video_generation_enabled``.) self-host never sees a
+    non-``None`` value here — the field is only ever pushed down by the
+    cloud control-plane."""
     tts_enabled: bool = True
     billing_shape: str = BILLING_SHAPE_TOKEN_FLOATING
     overage_enabled: bool = False
@@ -195,6 +209,15 @@ class AccountRuntimeProfile:
             video_generation_enabled=_bool_knob(
                 data, "video_generation_enabled",
                 default=default.video_generation_enabled, name=name,
+            ),
+            # CV5: minimum=1, not 0 — mirrors story_scene_daily_limit's
+            # non-nullable-zero shape (see the field docstring). A stray 0
+            # here is exactly as invalid as a negative value, not a second
+            # spelling of "unlimited".
+            video_daily_limit=_int_knob(
+                data, "video_daily_limit", minimum=1,
+                default=default.video_daily_limit,
+                nullable=True, name=name,
             ),
             tts_enabled=_bool_knob(
                 data, "tts_enabled", default=default.tts_enabled, name=name,

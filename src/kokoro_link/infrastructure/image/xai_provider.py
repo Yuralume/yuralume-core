@@ -207,7 +207,7 @@ def _is_aspect_ratio_unsupported_error(
 
     NOTE: the exact ``aspect_ratio`` error wording is EXTRAPOLATED from
     that documented ``size``-rejection evidence and has not been verified
-    against a live xAI key (docs/PROVIDER_COMPAT_AUDIT.md, xAI section —
+    against a live xAI key (xAI section —
     confidence "PLAUSIBLE-high"). The match is deliberately loose
     ("aspect_ratio" + "not supported", case-insensitive) so wording
     drift within the same rejection class still triggers; a false

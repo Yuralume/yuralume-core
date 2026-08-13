@@ -1,6 +1,6 @@
 """LLMStoryEventExpander scene-prompt selection.
 
-Covers Phase 1 of ``docs/SCENE_BEAT_PLAN.md`` — when ``scene`` is set
+Covers Phase 1 of the scene-beat work — when ``scene`` is set
 and meaningful, the expander must switch to the "play this scene"
 prompt. Empty / ``None`` scene context falls back to the legacy
 "private journal" prompt so gacha-driven events are unchanged.

@@ -31,6 +31,8 @@ from kokoro_link.application.dto.chat import (
     SendChatMessageRequest,
 )
 from kokoro_link.application.services.chat_service import (
+    ChatCharacterContractEndedError,
+    ChatCharacterRestoringError,
     ChatRuntimeLimitExceeded,
     ChatSubscriptionFrozen,
 )
@@ -406,6 +408,23 @@ async def send_chat_message(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "subscription_frozen", "message": str(error)},
         ) from error
+    except ChatCharacterContractEndedError as error:
+        # D7 / EC10: the licensor's contract for this character's source
+        # card ended. Its own code, not `subscription_frozen` — the player's
+        # subscription is fine and renewing it would change nothing.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "character_contract_ended", "message": str(error),
+            },
+        ) from error
+    except ChatCharacterRestoringError as error:
+        # CB A3: the character row landed but its restore is still running
+        # — a temporary state conflict, not an authorization problem.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "character_restoring", "message": str(error)},
+        ) from error
     except ChatRuntimeLimitExceeded as error:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -449,6 +468,20 @@ async def send_chat_message_stream(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "subscription_frozen", "message": str(error)},
+        ) from error
+    except ChatCharacterContractEndedError as error:
+        # D7 / EC10 — same mapping, same reason as the sync route above.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "character_contract_ended", "message": str(error),
+            },
+        ) from error
+    except ChatCharacterRestoringError as error:
+        # CB A3 — same mapping, same reason as the sync route above.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "character_restoring", "message": str(error)},
         ) from error
     except ChatRuntimeLimitExceeded as error:
         raise HTTPException(

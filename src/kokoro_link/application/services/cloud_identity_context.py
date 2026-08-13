@@ -14,6 +14,7 @@ it once, here:
 
 * the authenticated HTTP request (``api.dependencies.get_current_user``)
 * the background persona-dream consolidation tick (per character / operator)
+* a credential-gated Cloud ops request carrying a Gateway-revalidated routing identity
 
 ``CloudActiveLLMProvider`` reads this as a **fallback** — only when a call
 site passes neither ``character`` nor ``operator_id`` explicitly. Explicit
@@ -30,6 +31,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
+    from kokoro_link.contracts.cloud_gateway import CloudGatewayIdentity
     from kokoro_link.domain.entities.character import Character
 
 
@@ -39,9 +41,14 @@ class AmbientCloudActor:
 
     operator_id: str | None = None
     character: "Character | None" = None
+    gateway_identity: "CloudGatewayIdentity | None" = None
 
     def is_empty(self) -> bool:
-        return self.character is None and not (self.operator_id or "").strip()
+        return (
+            self.character is None
+            and self.gateway_identity is None
+            and not (self.operator_id or "").strip()
+        )
 
 
 _AMBIENT_CLOUD_ACTOR: ContextVar[AmbientCloudActor | None] = ContextVar(
@@ -62,7 +69,10 @@ def current_cloud_actor() -> AmbientCloudActor | None:
 
 
 def bind_cloud_actor(
-    *, operator_id: str | None = None, character: "Character | None" = None,
+    *,
+    operator_id: str | None = None,
+    character: "Character | None" = None,
+    gateway_identity: "CloudGatewayIdentity | None" = None,
 ) -> Token:
     """Bind the ambient actor for the *current task*, without auto-reset.
 
@@ -73,13 +83,20 @@ def bind_cloud_actor(
     caller does want to reset it explicitly.
     """
     return _AMBIENT_CLOUD_ACTOR.set(
-        AmbientCloudActor(operator_id=operator_id, character=character),
+        AmbientCloudActor(
+            operator_id=operator_id,
+            character=character,
+            gateway_identity=gateway_identity,
+        ),
     )
 
 
 @contextmanager
 def cloud_actor_scope(
-    *, operator_id: str | None = None, character: "Character | None" = None,
+    *,
+    operator_id: str | None = None,
+    character: "Character | None" = None,
+    gateway_identity: "CloudGatewayIdentity | None" = None,
 ) -> Iterator[None]:
     """Bind the ambient actor for the duration of a ``with`` block.
 
@@ -87,7 +104,11 @@ def cloud_actor_scope(
     where there is no per-task lifecycle to lean on; the binding is reset on
     exit so sequential pairs processed in a loop never bleed into each other.
     """
-    token = bind_cloud_actor(operator_id=operator_id, character=character)
+    token = bind_cloud_actor(
+        operator_id=operator_id,
+        character=character,
+        gateway_identity=gateway_identity,
+    )
     try:
         yield
     finally:

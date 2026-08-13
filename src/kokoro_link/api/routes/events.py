@@ -82,6 +82,7 @@ def _encode_feed_post_event(event: FeedPostEvent) -> str:
         "kind": event.kind,
         "content_text": event.content_text,
         "image_url": event.image_url,
+        "video_url": event.video_url,
         "created_at": event.created_at.isoformat(),
     }
     return (

@@ -58,7 +58,7 @@ ACTION_FEED_POST_OVERAGE = "feed_post_overage"
 ACTION_FUSION_STORY = "fusion_story"
 ACTION_FUSION_STORY_ITERATE = "fusion_story_iterate"
 
-#: 起幕 (STORY_SCENE_PLAN §3.3). One press, one price, covering the scene's
+# 起幕. One press, one price, covering the scene's
 #: *opening* only — the narration, the character's first performed line and
 #: the scene frame. What happens inside the scene afterwards is ordinary
 #: chat, charged turn by turn under :data:`ACTION_CHAT`, so a long scene is
@@ -224,6 +224,7 @@ class ActionChargePort(Protocol):
         interaction_id: str,
         action_kind: str = ACTION_KIND_USER_ACTION,
         expected_price_cr: float | None = None,
+        character_origin: str | None = None,
     ) -> ActionCharge:
         """Reserve the configured fixed price for one player action.
 
@@ -233,6 +234,12 @@ class ActionChargePort(Protocol):
         shown. ``None`` means "Core has no quote to bind" (empty price cache)
         and deliberately keeps the old unbound behaviour rather than blocking
         play.
+
+        ``character_origin`` (EC7) is the official card slug the action's
+        character was installed from — ``None`` for every ordinary character,
+        every self-host install, and every action with no single character in
+        scope (character draft, Studio fusion). Omitted from the wire request
+        entirely when ``None``, same discipline as ``expected_price_cr``.
         """
 
     async def settle(self, charge_id: str) -> None:

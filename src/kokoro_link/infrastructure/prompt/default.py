@@ -14,7 +14,6 @@ from dataclasses import fields, is_dataclass
 from datetime import date as date_type, datetime, timezone, tzinfo
 from typing import Mapping
 
-import json
 
 from kokoro_link.contracts.prompt import (
     PromptContextBuilderPort,
@@ -74,6 +73,7 @@ from kokoro_link.infrastructure.localization.fallback_texts import (
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
+from kokoro_link.infrastructure.prompt.tools_block import render_tools_block
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_lines,
 )
@@ -334,6 +334,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         calendar_context: str = "",
         weather_context: str = "",
         world_event_context: "tuple[str, ...] | None" = None,
+        world_event_recall: "tuple[str, ...] | None" = None,
         upcoming_day_schedules: "list[DailySchedule] | None" = None,
         emotion_events: "list | None" = None,
         self_reflections: "list | None" = None,
@@ -419,6 +420,9 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         world_event_context_block = _render_world_event_context_block(
             world_event_context or (),
         )
+        world_event_recall_block = _render_world_event_recall_block(
+            world_event_recall or (),
+        )
         schedule_block = _render_schedule_block(
             current=current_activity,
             upcoming=upcoming_activities or [],
@@ -440,7 +444,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
             today_local=today_local,
             local_tz=local_tz,
         )
-        tools_block = _render_tools_block(
+        tools_block = render_tools_block(
             available_tools or [], forced_tool_name=forced_tool_name,
         )
         tool_outcomes_block = _render_tool_outcomes_block(tool_outcomes or [])
@@ -669,6 +673,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
                 *calendar_block,
                 *weather_block,
                 *world_event_context_block,
+                *world_event_recall_block,
                 *schedule_block,
                 *completed_today_block,
                 *pending_invites_block,
@@ -817,7 +822,7 @@ _STAGE_PRESENCE_GUIDANCE = (
     "- 不要虛構玩家的行動與位置細節：他做了什麼、站在哪裡、身上有什麼，"
     "只能依他的訊息與你已知的資訊，其餘保留不確定。",
 )
-"""Stage co-presence guidance (SCENE_ACCESS_JUDGE_RETIREMENT_PLAN §2).
+"""Stage co-presence guidance.
 
 Replaces the retired judge's out-of-narrative blocking copy. The four
 points carry the judge prompt's intent — co-presence is not teleportation,
@@ -1275,7 +1280,7 @@ def _render_emotion_events_block(
 ) -> list[str]:
     """Surface recent EmotionEvent rows as a "事實層" prompt section.
 
-    Per CLAUDE.md §LLM-first: we list events as factual context (cause,
+    Per the LLM-first rule: we list events as factual context (cause,
     label, evidence, rough intensity) and let the LLM decide how to
     let them colour the tone. **No** rule like "if valence < 0 then
     speak sadly" — that's exactly the kind of hardcoded branching the
@@ -2125,6 +2130,20 @@ def _render_calendar_block(calendar_context: str) -> list[str]:
     ]
 
 
+_WORLD_EVENT_LINK_GUIDANCE = (
+    "各條的「連結」是原文位置：摘要只是節錄，"
+    "若對方追問細節、或你想談得更具體，用 web_fetch 讀該連結再回答，"
+    "不要自行補完沒讀到的內容；連結是給你查的，不要直接貼給對方。"
+)
+"""Shared tail for both world-event blocks.
+
+Without it the model treats the URL as decoration and answers follow-up
+questions from the clipped summary — i.e. makes things up. Saying what
+the link is *for* is what turns it into a usable retrieval affordance.
+The "don't paste it" half exists because small models otherwise hand the
+player a raw link instead of talking."""
+
+
 def _render_world_event_context_block(lines: tuple[str, ...]) -> list[str]:
     cleaned = [line.strip() for line in lines if line and line.strip()]
     if not cleaned:
@@ -2133,6 +2152,37 @@ def _render_world_event_context_block(lines: tuple[str, ...]) -> list[str]:
         "最近外界事件候選（事實層；來源地區與使用者所在地只供你判斷相關性，"
         "不要當成必須提起的指令）：",
         *cleaned,
+        _WORLD_EVENT_LINK_GUIDANCE,
+    ]
+
+
+def _render_world_event_recall_block(lines: tuple[str, ...]) -> list[str]:
+    """Events this character consumed as material for reaching out.
+
+    Separate from the candidate block on purpose: these are things the
+    character has already *used*, so the instruction is the opposite one
+    — not "you may bring this up" but "if this comes back, you are
+    expected to know what you were talking about". Without this block a
+    proactive DM about a news item became unanswerable the moment it was
+    sent: the inbox row is claimed, so the candidate peek can never
+    surface it again, and nothing else carried the event into chat.
+
+    The wording says 多半 rather than asserting the character definitely
+    said it. The mention is recorded when the surface consumed the seed
+    and the message went out — which is the same fact the claim already
+    encodes — but the model writing that message was free to leave the
+    material unused. Overstating it would manufacture a memory of words
+    that were never said; understating it costs nothing, because a
+    character that "half remembers reading something" and checks the
+    link is behaving correctly either way."""
+    cleaned = [line.strip() for line in lines if line and line.strip()]
+    if not cleaned:
+        return []
+    return [
+        "你最近主動找對方時用到的外界事件素材（多半你已經提過，對方可能追問；"
+        "別表現得沒印象，也別重講一次當成新消息）：",
+        *cleaned,
+        _WORLD_EVENT_LINK_GUIDANCE,
     ]
 
 
@@ -2329,88 +2379,6 @@ def _operator_timezone(
         return fallback
 
 
-def _render_tools_block(
-    tools: list[PromptToolDescriptor],
-    *,
-    forced_tool_name: str | None = None,
-) -> list[str]:
-    """Instruct the model about available tools + the JSON call format.
-
-    The format is deliberately single-call-per-reply — we don't try to
-    support multi-call parallel dispatch yet. The model either replies
-    in natural language to the user, or emits a fenced JSON block that
-    parses to ``{"tool": name, "args": {...}}``. The chat orchestrator
-    catches the JSON, runs the tool, and re-prompts with the result
-    injected, so the final user-visible reply can reference it.
-
-    When ``forced_tool_name`` is set, the fixed command trigger
-    fired — the user explicitly asked for this tool's output. We inject
-    a hard directive that overrides the normal "judge whether a tool
-    fits" framing: this turn must emit a JSON call to that tool, with
-    arguments the model picks from conversation context (so the image
-    still reflects the scene being discussed, not the raw command).
-    """
-    if not tools:
-        return []
-    lines: list[str] = []
-    if forced_tool_name:
-        lines.extend(
-            [
-                f"⚡ 本回合強制工具呼叫：使用者訊息命中了操作者設定的觸發規則，"
-                f"**這回合必須呼叫 `{forced_tool_name}` 工具**，禁止純文字回覆。",
-                f"- 參數（例如 `generate_image` 的 `positive`）請依當前對話情境與角色處境自行決定，"
-                f"不要照抄使用者的觸發指令字面（例如 `/pic`、`幫我畫` 這類命令前綴不要當成畫面內容）。",
-                f"- 若使用者觸發指令後方有補充描述（例如「/pic 咖啡廳窗邊的側臉」的「咖啡廳窗邊的側臉」），"
-                f"該補充是使用者對畫面的偏好提示，請優先融入 `positive`；"
-                f"沒有補充時就完全依據近期對話與當下場景自行構圖。",
-                "- 下一輪你會收到工具結果，再以角色身份寫一句自然的收尾台詞即可。",
-                "",
-            ]
-        )
-    lines.append(
-        "可用工具：這些工具能讓你的回覆更有臨場感，符合下列情境時請主動使用，不要等使用者開口："
-    )
-    lines.extend([
-        "- 生圖（generate_image）：當你此刻要描述『自己正身處一個明確場景、做著一個明確動作或擺出明確姿態／表情』時，"
-        "優先用這個工具把畫面傳給對方，再配一句自然、簡短的角色台詞，而不是只用文字長篇描寫。"
-        "例如：你正在廚房煮東西、窩在沙發讀書、穿新衣服轉圈、剛洗完頭、趴在桌上偷看使用者——這些都是該直接生圖的時機。",
-        "- 當使用者明確或委婉表達想看你的樣子／現在的場景（「現在在幹嘛」「拍給我看」「長什麼樣子」）時，必叫。",
-        "- 當你的穿著、所在地、情緒、動作發生明顯變化、值得『給一眼』時，也可以主動生圖。",
-        "",
-        "避免調用：純聊心情、抽象討論、沒有具體畫面可給、或剛剛已經發過類似的圖還沒推進新畫面。",
-        "",
-        "工具清單：",
-    ])
-    for tool in tools:
-        lines.append(f"- {tool.name}: {tool.description}")
-        try:
-            schema_text = json.dumps(
-                tool.parameters_schema, ensure_ascii=False, indent=None,
-            )
-        except (TypeError, ValueError):
-            schema_text = "{}"
-        lines.append(f"  參數 schema：{schema_text}")
-    lines.extend(
-        [
-            "",
-            "呼叫方式：想呼叫工具時，這回合就**只**輸出以下 JSON，不要任何前後文、不要對話、不要旁白、不要表情符號：",
-            "```json",
-            '{"tool": "工具名稱", "args": {...}}',
-            "```",
-            "工具執行完後你會收到結果，下一輪再以角色身份自然地回覆使用者。",
-            "",
-            "嚴禁的錯誤模式（非常重要、常見錯誤）：",
-            "❌ 不要把工具呼叫寫成旁白，例如 `*（生成一張圖片：小櫻坐在公園…）*` —— 這是把工具當成文字描述了，工具不會被執行，使用者只會看到一段沒有圖的敘述。",
-            "❌ 不要在自然語言回覆中夾 JSON；也不要在 JSON 前後再補「好的我來生圖」這類解釋。",
-            "❌ 不要用「*（生成…）*」「*（傳一張自拍…）*」「*（拍一張照片…）*」這類括號旁白代替真正的工具呼叫。",
-            "✅ 正確：要給畫面 → 這回合整個輸出就是一段 JSON；要聊天 → 完全不出現 JSON，也不出現 `生成一張圖片` 這種詞。",
-            "",
-            "若此刻沒有具體畫面或場景可給，就直接用角色的語氣以自然語言回覆，不要輸出任何 JSON，也不要假裝生圖。",
-        ]
-    )
-    return lines
-
-
 def _render_tool_outcomes_block(outcomes: list[ToolOutcomeMessage]) -> list[str]:
     """Tell the model what the tools it called just returned.
 
@@ -2436,6 +2404,10 @@ def _render_tool_outcomes_block(outcomes: list[ToolOutcomeMessage]) -> list[str]
                 f"- {outcome.tool_name} 失敗：{outcome.error or '未知錯誤'}"
                 "（請以角色語氣向使用者簡短致歉，不要重試）"
             )
+    lines.append(
+        "只能根據上面實際回傳的內容作答。回傳的資訊不足以回答時，"
+        "就照實說沒查到，不要自行補上工具沒給你的細節。"
+    )
     return lines
 
 
@@ -2486,7 +2458,7 @@ _SCENE_TYPE_LABELS = {
 }
 
 
-# --- Operator position framing (OP2-A of ARC_PLAYER_POSITION_PLAN) ----
+# --- Operator position framing (OP2-A) -------------------------------
 # ``StoryArcBeat.operator_position`` (OP0) tells a scene consumer where
 # the player stands in a beat; before this slot existed, every consumer
 # had to assume one — a static "the player is right here" assertion or a

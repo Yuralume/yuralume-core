@@ -45,7 +45,7 @@ row, so the history of played scenes stays intact."""
 
 _VALID_STATUSES = frozenset({SCENE_OPEN, SCENE_CLOSED})
 
-# --- Material layer (STORY_SCENE_PLAN §3.1 waterfall) -----------------
+# --- Material layer (waterfall) --------------------------------------
 SCENE_LAYER_BEAT = "beat"
 """Layer 1 — the active arc had a pending beat and it was played now."""
 SCENE_LAYER_NEW_SEASON = "new_season"

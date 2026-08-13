@@ -38,6 +38,9 @@ from kokoro_link.infrastructure.embedder.lm_studio import LMStudioEmbedder
 from kokoro_link.infrastructure.llm.anthropic import AnthropicChatModel
 from kokoro_link.infrastructure.llm.openai_compatible import OpenAICompatibleChatModel
 from kokoro_link.infrastructure.persistence.models import MEMORY_EMBEDDING_DIM
+from kokoro_link.infrastructure.provider_settings.runtime_ids import (
+    runtime_provider_id,
+)
 from kokoro_link.infrastructure.tts.external_api import (
     ExternalTTSAdapter,
     OpenAITTSAdapter,
@@ -308,6 +311,7 @@ def build_chat_model(
         if not api_key:
             raise ValueError("Anthropic provider requires api_key")
         return AnthropicChatModel(
+            provider_id=runtime_provider_id(row),
             api_key=api_key,
             base_url=_config_str(row, "base_url", "https://api.anthropic.com"),
             model=_config_str(row, "default_model", "claude-sonnet-4-5"),
@@ -331,7 +335,10 @@ def build_chat_model(
         if not base_url or not model:
             raise ValueError("OpenAI-compatible provider requires base_url and default_model")
         return OpenAICompatibleChatModel(
-            provider_id=row.provider,
+            # Row-scoped, not preset-scoped: two rows of one preset must
+            # occupy two registry slots instead of overwriting each other
+            # (see runtime_ids). Slug-less rows keep the preset id.
+            provider_id=runtime_provider_id(row),
             base_url=base_url,
             api_key=_optional_secret(secret, "api_key"),
             model=model,
@@ -574,7 +581,7 @@ def build_image_profile(
     if not base_url or not model:
         raise ValueError("image provider requires base_url and image_model")
     return ImageProfile(
-        id=row.provider,
+        id=runtime_provider_id(row),
         label=row.label,
         kind="external_api",
         api=ExternalImageApiProfileConfig(
@@ -599,7 +606,7 @@ def build_comfyui_profile(row: ProviderConnection) -> ImageProfile:
     if not server:
         raise ValueError("ComfyUI provider requires server")
     return ImageProfile(
-        id=row.provider,
+        id=runtime_provider_id(row),
         label=row.label,
         kind="comfyui",
         comfyui=ComfyProfileConfig(
@@ -660,7 +667,7 @@ def build_video_profile(
     if not base_url or not model:
         raise ValueError("video provider requires base_url and default_model")
     return VideoProfile(
-        id=row.provider,
+        id=runtime_provider_id(row),
         label=row.label,
         kind="external_api",
         api=ExternalVideoApiProfileConfig(

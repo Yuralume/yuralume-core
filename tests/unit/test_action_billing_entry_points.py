@@ -146,7 +146,7 @@ class _BrokenObjectStorage:
         raise RuntimeError("bucket unreachable")
 
 
-def _character() -> Character:
+def _character(*, origin_official_card_id: str | None = None) -> Character:
     return Character.create(
         name="Yuki",
         summary="",
@@ -156,6 +156,7 @@ def _character() -> Character:
             emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
         ),
         allowed_tools=["generate_image"],
+        origin_official_card_id=origin_official_card_id,
     )
 
 
@@ -215,6 +216,39 @@ async def test_a_portrait_that_never_persists_is_refunded(tmp_path: Path) -> Non
 
     assert client.settled == []
     assert client.released == ["chg-1"]
+
+
+async def test_portrait_charge_carries_origin_for_a_managed_character(
+    tmp_path: Path,
+) -> None:
+    """EC7: the official card slug rides the ``image_portrait`` charge."""
+    repo = InMemoryCharacterRepository()
+    billing, client = _billing()
+    provider = _StubImageProvider()
+    service = CharacterImageService(
+        character_repository=repo,
+        uploads_dir=tmp_path,
+        image_provider=StaticActiveImageProvider(provider),  # type: ignore[arg-type]
+        object_storage=InMemoryObjectStorage(public_base_url="/uploads"),
+        action_billing=billing,
+    )
+    managed = _character(origin_official_card_id="official-yumi")
+    await repo.save(managed)
+
+    await service.generate_portrait(managed.id, positive="cafe")
+
+    assert client.charges[0]["character_origin"] == "official-yumi"
+
+
+async def test_portrait_charge_omits_origin_for_an_ordinary_character(
+    tmp_path: Path,
+) -> None:
+    service, chars, client, _ = await _portrait_service(tmp_path)
+    created = await chars.create_character(CreateCharacterRequest(name="Yui"))
+
+    await service.generate_portrait(created.id, positive="cafe")
+
+    assert client.charges[0]["character_origin"] is None
 
 
 async def test_portrait_binds_the_price_the_player_was_quoted(
@@ -541,6 +575,23 @@ async def test_image_tool_charges_its_own_action_and_settles(
     assert [c["action_key"] for c in client.charges] == ["image_chat_tool"]
     assert client.settled == ["chg-1"]
     assert provider.scopes[0] is not None
+
+
+async def test_image_tool_charge_carries_origin_for_a_managed_character(
+    tmp_path: Path,
+) -> None:
+    """EC7: ``image_chat_tool`` is raised deep inside the tool call, off the
+    turn's own character — the origin has to travel with ``ctx.character``."""
+    tool, client, _ = _tool(tmp_path)
+
+    await tool.invoke(
+        ToolContext(
+            character=_character(origin_official_card_id="official-yumi"),
+            arguments={"positive": "cafe"},
+        ),
+    )
+
+    assert client.charges[0]["character_origin"] == "official-yumi"
 
 
 async def test_image_tool_releases_when_generation_reports_failure(

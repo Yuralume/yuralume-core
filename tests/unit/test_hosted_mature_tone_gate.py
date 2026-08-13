@@ -1,6 +1,6 @@
 """Hosted (cloud-mode) gate on the ``mature`` arc tone — GF6.
 
-``docs/plans/GROWTH_FUNNEL_PLAN.md`` §3.6 hole 1: the ``mature`` tone
+The hole this closes: the ``mature`` tone
 tells the scene writers that "暴力、肉體、權力支配、酒精、性、創傷的
 細節都可以據實寫", and the template wizard happily offers it. Hosted
 that contradicts Yuralume's own terms/AUP, which promise no sexually

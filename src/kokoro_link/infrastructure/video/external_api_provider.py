@@ -75,7 +75,14 @@ class ExternalVideoApiProvider:
         length_frames: int = 81,
         recent_dialogue: str = "",
         use_runtime_state: bool = True,
+        first_frame_url: str | None = None,
     ) -> bytes:
+        # ``first_frame_url`` is accepted for port conformance only. The
+        # normalized ``/videos/generations`` shape this adapter speaks has
+        # no image-to-video field, and self-host behaviour must stay
+        # bit-identical, so it is deliberately
+        # never read.
+        del first_frame_url
         prompt = _build_prompt(
             character=character,
             positive=positive,

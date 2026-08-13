@@ -93,7 +93,7 @@ class ProactiveContext:
     beat_awaiting_player: StoryArcBeat | None = None
     """A due beat whose ``operator_position`` is ``central`` — a scene
     that is *about* the player and therefore cannot be played without
-    them (ARC_PLAYER_POSITION_PLAN §3.4, OP3).
+    them.
 
     Deliberately **not** a slice of ``upcoming_beats``: that tuple is a
     forward feed (``scheduled_date >= today``) and drops a beat the day
@@ -125,7 +125,7 @@ class ProactiveContext:
     push was already answered, or there is no proactive / conversation
     history. A pure fact for the LLM to weigh: concern, hurt, sulking,
     or deliberately giving space are all valid persona-driven reactions.
-    Per CLAUDE.md (LLM-first) behaviour must never branch on this number
+    Per the LLM-first rule, behaviour must never branch on this number
     in code — the prompt surfaces it and the model owns the reaction."""
     world_event_seed_title: str = ""
     """One-line headline of an external world event the character has
@@ -208,8 +208,8 @@ class ProactiveContext:
     nothing real resolves (a bare character-name fallback is suppressed
     so the cold-start prompt stays quiet about an unobserved salutation)."""
     operator_primary_language: str = "zh-TW"
-    """BCP 47 tag of the character owner's pinned content language
-    (FRONTEND_I18N_PLAN.md). Injected by the decider as a fact line so
+    """BCP 47 tag of the character owner's pinned content language.
+    Injected by the decider as a fact line so
     the proactive opener lands in the operator's chosen language without
     drift between chat and proactive surfaces. Defaults to ``zh-TW`` so
     legacy callers that haven't been ported keep their behaviour."""
@@ -234,7 +234,7 @@ class ProactiveDecision:
     The decider owns prompt assembly, so it is the only layer that can
     hand the real text back; the dispatcher persists it on the turn
     record when — and only when — the message actually goes out
-    (COMMITMENT_LIFECYCLE_AND_FRESHNESS_PLAN §2 P0). Skip / blocked
+Skip / blocked
     ticks drop it on the floor: at a ~5-minute cadence they would bury
     the table in prompts nobody will ever read.
 
@@ -257,7 +257,18 @@ class ProactiveGatePort(Protocol):
         idle_minutes: float | None,
         current_activity: ScheduleActivity | None,
         local_tz: tzinfo | None = None,
-    ) -> GateVerdict: ...
+        cooldown_exempt: bool = False,
+    ) -> GateVerdict:
+        """``cooldown_exempt`` waives **only** the per-attempt cooldown.
+
+        Set by the dispatcher when a deferred motive's own ``revisit_at``
+        alarm has come due: the character agreed to be somewhere at 19:30
+        and the 19:22 evaluation must not eat the 19:30 window. Every
+        other throttle — idle threshold, daily limit, quiet hours,
+        energy — still applies, because none of them is about "we just
+        looked at this a moment ago".
+        """
+        ...
 
 
 class ProactiveDeciderPort(Protocol):

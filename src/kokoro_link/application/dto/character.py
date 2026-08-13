@@ -1,8 +1,17 @@
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
+from kokoro_link.application.dto.character_managed_view import (
+    apply_managed_projection,
+)
 from kokoro_link.contracts.image_profile import FeatureImageProfileOverride  # noqa: F401  (used by TYPE_CHECKING / from_domain)
 from kokoro_link.contracts.video_profile import FeatureVideoProfileOverride  # noqa: F401
 from kokoro_link.domain.entities.character import (
@@ -692,10 +701,27 @@ class CharacterResponse(BaseModel):
     personality_type: CharacterPersonalityTypePayload = Field(
         default_factory=CharacterPersonalityTypePayload,
     )
+    managed: bool = False
+    """``true`` only for IP-partner characters, whose persona fields above
+    are masked (see :mod:`...dto.character_managed_view`).
+
+    Serialised **only when true**. An ordinary character's response must
+    stay byte-for-byte what it was before the EC series — self-host never
+    has a managed character, so it must never grow a key for them either.
+    Clients therefore read this as "absent = not managed"."""
+
+    @model_serializer(mode="wrap")
+    def _serialise_without_default_managed_flag(
+        self, handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if not self.managed:
+            data.pop("managed", None)
+        return data
 
     @classmethod
     def from_domain(cls, character: Character) -> "CharacterResponse":
-        return cls(
+        values: dict[str, Any] = dict(
             id=character.id,
             name=character.name,
             summary=character.summary,
@@ -766,6 +792,9 @@ class CharacterResponse(BaseModel):
                 character.personality_type,
             ),
         )
+        if character.is_managed:
+            apply_managed_projection(values)
+        return cls(**values)
 
 
 class GeneratePortraitRequest(BaseModel):
