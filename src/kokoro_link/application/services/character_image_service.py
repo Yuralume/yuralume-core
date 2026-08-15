@@ -411,7 +411,7 @@ class CharacterImageService:
         character-creation limits (``max_characters`` /
         ``daily_character_create_limit``), so it is exempt from the
         ``album_generation_enabled`` gate — that gate exists to close the
-        *repeatable* manual album path (which a demo could otherwise spam),
+        *repeatable* manual album path (which a capped tier could otherwise spam),
         not the bounded first portrait that is an important onboarding moment.
         """
         if self._image_provider is None:

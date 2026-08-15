@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from kokoro_link.application.exceptions import (
-    DemoSessionUnavailable,
     InvalidCredentials,
     PermissionDenied,
     SetupNotAllowed,
@@ -12,7 +11,6 @@ from kokoro_link.application.services.jwt_service import JWTService
 from kokoro_link.contracts.cloud_auth import (
     CloudAccountIdentity,
     CloudAuthRejected,
-    CloudDemoSessionRejected,
     CloudAuthUpstreamError,
     CloudProfileSeed,
     CloudUserServicePort,
@@ -78,42 +76,6 @@ class CloudFederatedAuthStrategy:
 
         return await self._login_with_identity(identity, profile_seed)
 
-    async def login_with_demo_session(
-        self,
-        *,
-        provider: str,
-        authorization_code: str,
-        redirect_uri: str | None = None,
-        code_verifier: str | None = None,
-        source_ip: str | None = None,
-        device_id: str | None = None,
-        profile_seed: CloudProfileSeed | None = None,
-    ) -> tuple[OperatorProfile, str]:
-        if not provider.strip() or not authorization_code.strip():
-            raise InvalidCredentials()
-        try:
-            identity = await self._user_service.create_demo_session(
-                provider=provider.strip().lower(),
-                authorization_code=authorization_code.strip(),
-                redirect_uri=_normalise_optional_text(redirect_uri),
-                code_verifier=_normalise_optional_text(code_verifier),
-                source_ip=_normalise_optional_text(source_ip),
-                device_id=_normalise_optional_text(device_id),
-            )
-        except CloudAuthRejected as exc:
-            raise InvalidCredentials() from exc
-        except CloudDemoSessionRejected as exc:
-            raise DemoSessionUnavailable(
-                status_code=exc.status_code,
-                code=exc.code,
-                message=exc.message,
-                retryable=exc.retryable,
-            ) from exc
-        except CloudAuthUpstreamError as exc:
-            raise SetupNotAllowed(str(exc) or "cloud user service unavailable") from exc
-
-        return await self._login_with_identity(identity, profile_seed)
-
     async def login_with_cloud_play_code(
         self,
         *,
@@ -147,17 +109,14 @@ class CloudFederatedAuthStrategy:
     def _authorize_tier(self, identity: CloudAccountIdentity) -> None:
         """Gate hosted compute on an active paid membership.
 
-        ``demo`` is ALWAYS allowed — it has its own restricted runtime
-        profile and TTL reaper flow. When ``require_paid_tier`` is off (the
-        default for self-host / existing cloud) every tier is allowed. When
-        on, a free ``standard`` tenant (or a blank/unknown-as-free tier) is
-        rejected; any other non-empty (paid) tier passes.
+        When ``require_paid_tier`` is off (the default for self-host /
+        existing cloud) every tier is allowed. When on, a free ``standard``
+        tenant (or a blank/unknown-as-free tier) is rejected; any other
+        non-empty tier passes.
         """
-        tier = (identity.tenant_tier or "").strip().lower()
-        if tier == "demo":
-            return
         if not self._require_paid_tier:
             return
+        tier = (identity.tenant_tier or "").strip().lower()
         if tier in {"standard", ""}:
             raise PermissionDenied("an active hosted membership is required")
 

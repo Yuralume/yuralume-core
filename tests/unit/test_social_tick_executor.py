@@ -1,6 +1,7 @@
 """SocialTickExecutor — the extracted global-social tick body (P3-A).
 
-Proves maintenance (demo reaper always, freeze sweep only when flagged),
+Proves maintenance (character TTL reaper always, freeze sweep only when
+flagged),
 follow-up release, and social advancement (encounters run-always / plan-flagged,
 peer knowledge flagged, persona dream) reproduce the scheduler's behaviour
 byte-for-byte, including the SocialTickOutcome the caller reads to advance its
@@ -38,22 +39,20 @@ class _AllowGate:
 
 
 @dataclass
-class _DemoResult:
+class _TtlResult:
     scanned_characters: int = 0
     expired_characters: int = 0
     deleted_characters: int = 0
-    released_accounts: int = 0
     delete_failures: int = 0
-    release_failures: int = 0
 
 
-class _DemoReaper:
+class _TtlReaper:
     def __init__(self) -> None:
         self.calls: list[datetime] = []
 
     async def run_once(self, *, now):  # noqa: ANN001
         self.calls.append(now)
-        return _DemoResult()
+        return _TtlResult()
 
 
 class _FreezeReaper:
@@ -109,36 +108,36 @@ def _step_timer_recorder(names: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_maintenance_runs_demo_always_and_freeze_only_when_flagged() -> None:
-    demo = _DemoReaper()
+async def test_maintenance_runs_ttl_reaper_always_and_freeze_only_when_flagged() -> None:
+    ttl = _TtlReaper()
     freeze = _FreezeReaper()
     executor = SocialTickExecutor(
-        demo_account_reaper=demo, character_freeze_reaper=freeze,
+        character_ttl_reaper=ttl, character_freeze_reaper=freeze,
     )
     names: list[str] = []
 
     await executor.run_maintenance(
         now=NOW, sweep_freeze=False, step_timer=_step_timer_recorder(names),
     )
-    assert demo.calls == [NOW]
+    assert ttl.calls == [NOW]
     assert freeze.calls == []  # not swept
     # Both steps are still timed (freeze step is a no-op, not skipped).
-    assert names == ["demo_reaper", "freeze_sweep"]
+    assert names == ["character_ttl_reaper", "freeze_sweep"]
 
     await executor.run_maintenance(now=NOW, sweep_freeze=True)
-    assert demo.calls == [NOW, NOW]
+    assert ttl.calls == [NOW, NOW]
     assert freeze.calls == [NOW]  # swept this time
 
 
 @pytest.mark.asyncio
-async def test_maintenance_demo_reaper_crash_is_isolated() -> None:
+async def test_maintenance_ttl_reaper_crash_is_isolated() -> None:
     class _Boom:
         async def run_once(self, *, now):  # noqa: ANN001
-            raise RuntimeError("demo boom")
+            raise RuntimeError("ttl boom")
 
     freeze = _FreezeReaper()
     executor = SocialTickExecutor(
-        demo_account_reaper=_Boom(), character_freeze_reaper=freeze,
+        character_ttl_reaper=_Boom(), character_freeze_reaper=freeze,
     )
     # Must not raise; freeze sweep still runs.
     await executor.run_maintenance(now=NOW, sweep_freeze=True)
@@ -148,12 +147,12 @@ async def test_maintenance_demo_reaper_crash_is_isolated() -> None:
 @pytest.mark.asyncio
 async def test_setters_update_live_reapers() -> None:
     executor = SocialTickExecutor()
-    demo = _DemoReaper()
+    ttl = _TtlReaper()
     freeze = _FreezeReaper()
-    executor.set_demo_account_reaper(demo)
+    executor.set_character_ttl_reaper(ttl)
     executor.set_character_freeze_reaper(freeze)
     await executor.run_maintenance(now=NOW, sweep_freeze=True)
-    assert demo.calls == [NOW]
+    assert ttl.calls == [NOW]
     assert freeze.calls == [NOW]
 
 

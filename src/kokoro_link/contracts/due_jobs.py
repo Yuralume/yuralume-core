@@ -80,6 +80,22 @@ class KnobGate(StrEnum):
 PENDING_FOLLOW_UP_RELEASE_KIND = "pending_follow_up_release"
 
 
+#: The **image half** of a promise fulfilment (PF3). A release job may fulfil its
+#: promise by calling a tool — and one of those tools drives a GPU ("晚點傳照片給
+#: 你"). Whether a given promise needs one is not knowable at enqueue time: it is
+#: the composer's own semantic decision, taken on the first compose pass. So the
+#: release does not *predict* it — it **discovers** it and hands the GPU half over
+#: to this kind, which is the one the §5 ``image`` ceiling counts.
+#:
+#: Why a second kind rather than declaring the release itself ``image``: the claim
+#: filter is per-kind, evaluated before the job runs, and the overwhelming majority
+#: of fulfilments are text. Putting them all under a 1-wide ceiling would park a
+#: player's owed message behind somebody else's picture. Splitting after pass 1
+#: keeps the kind honest on both sides — a text fulfilment never touches the image
+#: gate, and a picture never runs outside it.
+PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND = "pending_follow_up_image_release"
+
+
 #: The post-turn processor (memory / state / schedule / arc / promise extraction)
 #: that runs after a chat turn completes. In embedded mode it stays an in-process
 #: fire-and-forget task off the chat write point (§ red line); in distributed mode
@@ -323,6 +339,26 @@ EVENT_ONE_SHOT_KIND_REGISTRY: dict[str, KindSpec] = {
         character_scoped=False,
         chained=False,
         event_driven=True,
+    ),
+    PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND: KindSpec(
+        kind=PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
+        # Same priority-1 tier as the release it was split out of: this job IS a
+        # player-owed promise, not background decoration. Priority orders the claim;
+        # the capability cap below is what bounds the GPU.
+        priority=1,
+        capability=JobCapability.IMAGE,
+        base_interval_seconds=0.0,
+        handler="pending_follow_up_release",
+        knob_gate=KnobGate.NONE,
+        character_scoped=False,
+        chained=False,
+        event_driven=True,
+        # The ONE one-shot that opts into the ``image`` ceiling — and the reason
+        # this kind exists at all. Without it a promised photo would render on the
+        # GPU outside every cap the deployment has, three-wide or worse; with it a
+        # burst of promises coming due together queues for the image slot instead
+        # of racing for the card. Its text sibling stays exempt.
+        counts_toward_capability_cap=True,
     ),
     POST_TURN_KIND: KindSpec(
         kind=POST_TURN_KIND,

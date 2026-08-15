@@ -20,7 +20,7 @@ beforeEach(() => {
 })
 
 describe('chat API runtime limit errors', () => {
-  it('maps non-streaming demo max_messages 429 to a typed error', async () => {
+  it('maps a non-streaming per-session message cap 429 to a typed error', async () => {
     mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(429, {
       detail: 'account runtime profile session message limit reached (80/session)',
     }))
@@ -34,7 +34,7 @@ describe('chat API runtime limit errors', () => {
     })
   })
 
-  it('maps streaming demo max_messages 429 to a typed error', async () => {
+  it('maps a streaming per-session message cap 429 to a typed error', async () => {
     mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(429, {
       detail: 'account runtime profile session message limit reached (80/session)',
     }))

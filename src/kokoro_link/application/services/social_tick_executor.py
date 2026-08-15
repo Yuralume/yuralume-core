@@ -1,7 +1,7 @@
 """Global (non-per-character) social tick body — HOSTED_CORE_SCALING §13.
 
 Companion to :class:`CharacterTickExecutor`. Owns the steps that run once per
-tick for the whole working set rather than per character: the demo-account
+tick for the whole working set rather than per character: the character TTL
 reaper, the idle-character freeze sweep, busy-defer follow-up release, character
 encounters, peer-knowledge consolidation, and the operator-persona dream pass.
 
@@ -69,7 +69,7 @@ class SocialTickExecutor:
     def __init__(
         self,
         *,
-        demo_account_reaper=None,
+        character_ttl_reaper=None,
         character_freeze_reaper=None,
         pending_follow_up_dispatcher=None,
         character_encounter_service=None,
@@ -79,7 +79,7 @@ class SocialTickExecutor:
         character_repository=None,
         subscription_access_guard=None,
     ) -> None:
-        self._demo_account_reaper = demo_account_reaper
+        self._character_ttl_reaper = character_ttl_reaper
         self._character_freeze_reaper = character_freeze_reaper
         self._pending_follow_up_dispatcher = pending_follow_up_dispatcher
         self._character_encounter_service = character_encounter_service
@@ -91,14 +91,14 @@ class SocialTickExecutor:
 
     # The two reapers are wired AFTER construction via scheduler setters, so the
     # scheduler forwards updates here to keep the live reference current.
-    def set_demo_account_reaper(self, reaper) -> None:
-        self._demo_account_reaper = reaper
+    def set_character_ttl_reaper(self, reaper) -> None:
+        self._character_ttl_reaper = reaper
 
     def set_character_freeze_reaper(self, reaper) -> None:
         self._character_freeze_reaper = reaper
 
     # ------------------------------------------------------------------ #
-    # Pre-working-set maintenance (demo reaper always; freeze sweep gated)
+    # Pre-working-set maintenance (TTL reaper always; freeze sweep gated)
     # ------------------------------------------------------------------ #
     async def run_maintenance(
         self,
@@ -109,36 +109,29 @@ class SocialTickExecutor:
         abort_check: AbortCheck | None = None,
     ) -> bool:
         timer = step_timer or _run_untimed
-        await timer("demo_reaper", self._run_demo_reaper(now=now))
+        await timer("character_ttl_reaper", self._run_character_ttl_reaper(now=now))
         if _aborted(abort_check):
             return False
         freeze_ok = await timer("freeze_sweep", self._run_freeze_sweep(now=now, sweep=sweep_freeze))
         return bool(freeze_ok)
 
-    async def _run_demo_reaper(self, *, now: datetime) -> None:
-        if self._demo_account_reaper is None:
+    async def _run_character_ttl_reaper(self, *, now: datetime) -> None:
+        if self._character_ttl_reaper is None:
             return
         try:
-            result = await self._demo_account_reaper.run_once(now=now)
+            result = await self._character_ttl_reaper.run_once(now=now)
         except Exception:
-            _LOGGER.exception("proactive scheduler: demo account reaper crashed")
+            _LOGGER.exception("proactive scheduler: character ttl reaper crashed")
             return
-        if not (
-            result.deleted_characters
-            or result.released_accounts
-            or result.delete_failures
-            or result.release_failures
-        ):
+        if not (result.deleted_characters or result.delete_failures):
             return
         _LOGGER.info(
-            "proactive scheduler: demo reaper scanned=%d expired=%d "
-            "deleted=%d released=%d delete_failures=%d release_failures=%d",
+            "proactive scheduler: character ttl reaper scanned=%d expired=%d "
+            "deleted=%d delete_failures=%d",
             result.scanned_characters,
             result.expired_characters,
             result.deleted_characters,
-            result.released_accounts,
             result.delete_failures,
-            result.release_failures,
         )
 
     async def _run_freeze_sweep(self, *, now: datetime, sweep: bool) -> bool:

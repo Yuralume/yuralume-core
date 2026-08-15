@@ -3,13 +3,15 @@
 Renders a prompt that gives the model the character's persona, the
 candidate's hint + supporting context snippets, and an instruction to
 emit a JSON object with ``content_text`` and (when an image is wanted)
-``image_prompt``. Parse failures degrade to text-only — the JSON shape
-is robust enough that even a paragraph that drops the JSON wrapper
-can be salvaged via fallback parsing.
+``image_prompt``. The automatic publishing boundary is fail-closed:
+wrapper-less prose and invalid field types are rejected rather than
+being mistaken for a post. Structurally broken JSON can still be
+salvaged when a complete, quote-closed ``content_text`` field exists.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -71,6 +73,14 @@ _MEDIA_KIND_LABELS = {
 _FIRST_FRAME_TEMPLATE_NAME = "feed/video_first_frame"
 
 
+class _InvalidComposerOutput(ValueError):
+    """Typed, secret-safe reason for rejecting one model response."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class LLMFeedComposer(FeedComposerPort):
     def __init__(
         self,
@@ -108,11 +118,19 @@ class LLMFeedComposer(FeedComposerPort):
                 payload.character.id,
             )
             return FeedComposerOutput(content_text="")
-        output = _parse_output(
-            raw,
-            image_required=payload.image_required,
-            video_enabled=self._video_enabled,
-        )
+        try:
+            output = _parse_output(
+                raw,
+                image_required=payload.image_required,
+                video_enabled=self._video_enabled,
+            )
+        except _InvalidComposerOutput as exc:
+            _log_invalid_output(
+                raw,
+                payload=payload,
+                reason=exc.reason,
+            )
+            return FeedComposerOutput(content_text="")
         if _needs_first_frame_prompt(output, image_required=payload.image_required):
             output = await self._add_first_frame_prompt(output, payload)
         return output
@@ -452,12 +470,32 @@ def _looks_like_schema_leak(candidate: str) -> bool:
     )
 
 
+def _log_invalid_output(
+    raw: str | None,
+    *,
+    payload: FeedComposerInput,
+    reason: str,
+) -> None:
+    """Log correlation evidence without persisting model-authored text."""
+    text = raw or ""
+    fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    _LOGGER.error(
+        "feed composer rejected invalid LLM output character=%s source=%s "
+        "reason=%s response_chars=%d response_sha256=%s",
+        payload.character.id,
+        payload.source.kind,
+        reason,
+        len(text),
+        fingerprint,
+    )
+
+
 def _parse_output(
     raw: str, *, image_required: bool, video_enabled: bool = False,
 ) -> FeedComposerOutput:
     text = (raw or "").strip()
     if not text:
-        return FeedComposerOutput(content_text="")
+        raise _InvalidComposerOutput("empty_response")
     candidate = text
     if candidate.startswith("```"):
         candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
@@ -474,15 +512,12 @@ def _parse_output(
             except json.JSONDecodeError:
                 parsed = None
     if not isinstance(parsed, dict):
-        # A non-dict here is NOT only the documented "model dropped the
-        # JSON wrapper and wrote a plain paragraph" case. Structurally
-        # broken JSON — a stray un-keyed element, or a response truncated
-        # mid-object by a max_tokens ceiling — also lands here, and
-        # blindly publishing ``candidate[:N]`` leaks the raw
-        # ``{"content_text": "..."`` envelope onto the player-facing feed.
-        # Try a field-level salvage first (the caption is usually intact);
-        # if that fails but the text is still a schema leak, skip the post
-        # rather than ship JSON. Genuine prose falls through unchanged.
+        # Structurally broken JSON — a stray un-keyed element, or a
+        # response truncated mid-object by a max_tokens ceiling — lands
+        # here alongside wrapper-less prose and scalar sentinels. Rescue
+        # only a complete, quote-closed schema field. Everything else
+        # fails closed; automatic posts must cross the structured-output
+        # boundary before they can reach persistence.
         salvaged = _salvage_string_field(candidate, _CONTENT_TEXT_FIELD_RE)
         if salvaged is not None:
             image_prompt = ""
@@ -496,12 +531,19 @@ def _parse_output(
                 content_text=salvaged[:_MAX_BODY_CHARS],
                 image_prompt=image_prompt,
             )
-        if _looks_like_schema_leak(candidate):
-            return FeedComposerOutput(content_text="")
-        body = candidate.strip()[:_MAX_BODY_CHARS]
-        return FeedComposerOutput(content_text=body)
+        reason = (
+            "unrecoverable_schema_payload"
+            if _looks_like_schema_leak(candidate)
+            else "response_not_json_object"
+        )
+        raise _InvalidComposerOutput(reason)
 
-    body = str(parsed.get("content_text", "") or "").strip()[:_MAX_BODY_CHARS]
+    raw_body = parsed.get("content_text")
+    if not isinstance(raw_body, str):
+        raise _InvalidComposerOutput("content_text_not_string")
+    body = raw_body.strip()[:_MAX_BODY_CHARS]
+    if not body:
+        raise _InvalidComposerOutput("content_text_empty")
     image_prompt = (
         str(parsed.get("image_prompt", "") or "").strip()[:_MAX_IMAGE_PROMPT_CHARS]
         if image_required else ""

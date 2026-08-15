@@ -12,7 +12,6 @@ import {
 import {
   STORY_SCENE_DAILY_LIMIT_KEY,
   isStaleSceneState,
-  isStorySceneUnavailable,
   storySceneErrorKey,
 } from '@/utils/storySceneErrors'
 import { InsufficientCreditsError } from '@/utils/api/insufficientCredits'
@@ -149,7 +148,6 @@ describe('openStoryScene', () => {
 
   it('keeps the structured code of every documented refusal', async () => {
     const cases: Array<[number, string]> = [
-      [403, 'story_scene_unavailable'],
       [409, 'scene_in_progress'],
       [409, 'no_material'],
       [409, 'conversation_busy'],
@@ -270,7 +268,6 @@ describe('storySceneErrorKey', () => {
 
   it('maps every contract code to its own catalog key', () => {
     const expected: Array<[string, string]> = [
-      ['story_scene_unavailable', 'unavailable'],
       ['scene_in_progress', 'inProgress'],
       ['no_material', 'noMaterial'],
       ['conversation_busy', 'conversationBusy'],
@@ -308,7 +305,7 @@ describe('storySceneErrorKey', () => {
 
   it('resolves in all three languages, with no key left unwritten', () => {
     const keys = [
-      'unavailable', 'inProgress', 'noMaterial', 'conversationBusy',
+      'inProgress', 'noMaterial', 'conversationBusy',
       'openFailed', 'endNotAvailable', 'endAlreadyEnded', 'endSceneChanged',
       'dailyLimitReached', 'quotaUnavailable',
       'generic', 'endGeneric',
@@ -382,19 +379,6 @@ describe('storySceneErrorKey', () => {
     }
   })
 
-  it('singles out "not offered here" as the one refusal not worth retrying', () => {
-    const unavailable = new StorySceneError({
-      code: 'story_scene_unavailable',
-      statusCode: 403,
-    })
-
-    expect(isStorySceneUnavailable(unavailable)).toBe(true)
-    expect(isStorySceneUnavailable(
-      new StorySceneError({ code: 'scene_in_progress', statusCode: 409 }),
-    )).toBe(false)
-    expect(isStorySceneUnavailable(new Error('offline'))).toBe(false)
-  })
-
   it('groups the three refusals that mean "your view is out of date"', () => {
     // M7: each of these says the client asked about a scene the server does
     // not agree is running, and the only useful answer to all three is to go
@@ -408,11 +392,10 @@ describe('storySceneErrorKey', () => {
       ).toBe(true)
     }
 
-    // A refusal about the deployment, the material or the transport says
-    // nothing about which scene is running: re-reading would buy a request
-    // per failure and change nothing.
+    // A refusal about the material or the transport says nothing about which
+    // scene is running: re-reading would buy a request per failure and change
+    // nothing.
     for (const error of [
-      new StorySceneError({ code: 'story_scene_unavailable', statusCode: 403 }),
       new StorySceneError({ code: 'no_material', statusCode: 409 }),
       new StorySceneError({ code: 'scene_end_not_implemented', statusCode: 501 }),
       new Error('offline'),

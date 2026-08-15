@@ -2294,7 +2294,7 @@ class AccountRuntimeEventRow(Base):
     """Account-level runtime policy ledger.
 
     These rows are business-limit events, not provider metering. They
-    intentionally survive deletion of resources like demo characters so
+    intentionally survive deletion of resources like TTL-reaped characters so
     rolling-window quotas cannot be reset by deleting and recreating.
     """
 

@@ -116,6 +116,7 @@ async def test_enqueue_claim_execute_on_postgres(session_factory) -> None:
     assert set(job.payload.keys()) == {
         "turn_record_id", "conversation_id", "character_id",
         "assistant_index", "persona_enabled", "content_mode",
+        "has_user_message",
     }
 
     disposition = await runner.execute(

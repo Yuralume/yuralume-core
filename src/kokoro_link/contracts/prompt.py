@@ -93,8 +93,15 @@ class PromptContextBuilderPort(Protocol):
         upcoming_day_schedules: list[DailySchedule] | None = None,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         include_operator_status: bool = True,
+        stage_nudge: bool = False,
     ) -> str:
         """Build prompt context for model generation.
+
+        ``stage_nudge`` (SN1) says the player pulled this turn instead of
+        speaking: they asked the character to open, optionally after
+        declaring something about the scene. The builder renders one extra
+        conditional block; ``False`` (every other turn, every caller that
+        knows nothing about the flag) leaves the prompt byte-identical.
 
         ``now`` is the wall clock at the moment this reply is being
         generated; the builder renders it as local time so the model

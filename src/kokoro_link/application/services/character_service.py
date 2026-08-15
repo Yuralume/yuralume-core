@@ -664,7 +664,20 @@ class CharacterService:
         now: datetime,
         resource_id: str | None = None,
     ) -> None:
-        if profile is None or profile.daily_character_create_limit is None:
+        # Two knobs read this ledger row, and both must be able to write it:
+        # ``daily_character_create_limit`` counts rows inside a rolling window,
+        # and ``character_ttl`` uses the row's timestamp as the character's
+        # birth date (``CharacterTtlReaper`` has no other source for it).
+        # Gating the write on the create limit alone meant a tier that set only
+        # ``character_ttl_days`` got no rows and therefore a TTL that silently
+        # never fired — invisible while the sole TTL-bearing profile happened
+        # to set both knobs, reachable the moment either can be set on its own.
+        if profile is None:
+            return
+        if (
+            profile.daily_character_create_limit is None
+            and profile.character_ttl is None
+        ):
             return
         if self._account_runtime_usage_repository is None:
             raise CharacterValidationError(

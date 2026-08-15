@@ -164,7 +164,7 @@ class SAOperatorProfileRepository(OperatorProfileRepositoryPort):
         local operator that happens to share the tenant key is never touched.
         Returns the number of rows written (0 for a blank tenant / tier).
         Tier is normalised the same way the entity does on load so the
-        resolver's ``== 'demo'`` / control-plane lookups keep matching."""
+        resolver's control-plane lookups keep matching."""
         from sqlalchemy import update
 
         normalised_tenant = (cloud_tenant_id or "").strip()

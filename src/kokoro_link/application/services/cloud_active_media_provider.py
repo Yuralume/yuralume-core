@@ -27,8 +27,8 @@ class _ProfilePresetResolver:
     mode), ``feature_key -> preset`` is resolved from the cached routing profile
     keyed by the character's tenant/account/tier; otherwise (or on a non-strict
     miss) the deprecated ``YURALUME_CLOUD_*_PRESET`` env default is the fallback.
-    A strict (demo) account with no preset fails closed naming the feature key, so
-    a demo never silently falls through to a paid env preset (plan §3).
+    A strict account with no preset fails closed naming the feature key, so it
+    never silently falls through to a paid env preset (plan §3).
     """
 
     def __init__(

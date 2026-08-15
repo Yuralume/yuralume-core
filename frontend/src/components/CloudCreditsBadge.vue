@@ -1,23 +1,36 @@
 <script setup lang="ts">
 /**
- * Hosted credit ("螢火") balance badge — cloud mode only.
+ * Hosted account corner of the player sidebar — cloud mode only.
  *
- * Shows the *total* only (owner decision, plan §8-3); the split between the
- * monthly allowance and purchased credits appears in the expandable card,
- * matching how the Portal words it. Every per-charge detail stays in the
- * Portal ledger — this badge answers exactly one question ("how much is
- * left?") and links out for the rest.
+ * Shows the credit ("螢火") *total* only (owner decision, plan §8-3); the
+ * split between the monthly allowance and purchased credits appears in the
+ * expandable card, matching how the Portal words it. Every per-charge detail
+ * stays in the Portal ledger — this badge answers exactly one question ("how
+ * much is left?") and links out for the rest.
  *
- * Renders nothing at all when the deployment is self-host, or when the
- * balance is unknown: a fabricated `0` would read as "you are out of
- * credits" and is worse than no badge (plan §1-4).
+ * That expanded card is also where the account-centre entry lives
+ * (`PortalAccountLink`). It used to sit at the bottom of the settings tab,
+ * which meant a player had to already know it existed; balance, ledger and
+ * account are one subject, so one expansion now opens all three.
+ *
+ * The balance half renders nothing when the balance is unknown: a fabricated
+ * `0` would read as "you are out of credits" and is worse than no badge
+ * (plan §1-4). The account entry does *not* inherit that condition — losing
+ * the only way back to the Portal because a balance read degraded would be a
+ * worse failure than showing no number — so it stands alone in this slot in
+ * that case. On self-host the whole component stays silent.
  */
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { useAuth } from '@/composables/useAuth'
 import { useCloudCredits } from '@/composables/useCloudCredits'
-import { creditAmountText, portalCreditsUrl } from '@/utils/creditsFormat'
+import {
+  creditAmountText,
+  portalCreditsUrl,
+  portalHomeUrl,
+} from '@/utils/creditsFormat'
+import PortalAccountLink from './PortalAccountLink.vue'
 
 const { t } = useI18n()
 const { cloudMode, portalUrl } = useAuth()
@@ -25,7 +38,12 @@ const credits = useCloudCredits()
 
 const expanded = ref(false)
 
-const visible = computed(() => cloudMode.value && credits.hasBalance.value)
+/** Mirrors `PortalAccountLink`'s own guard, so the fallback branch never
+ *  renders an empty container on a cloud deployment without a Portal. */
+const hasPortal = computed(() => portalHomeUrl(portalUrl.value) !== null)
+const visible = computed(
+  () => cloudMode.value && (credits.hasBalance.value || hasPortal.value),
+)
 const topUpHref = computed(() => portalCreditsUrl(portalUrl.value))
 
 function amountText(value: number): string {
@@ -50,38 +68,51 @@ onMounted(() => {
 
 <template>
   <div v-if="visible" class="credits-badge">
-    <button
-      type="button"
-      class="credits-badge__trigger"
-      :class="{
-        'is-low': credits.lowBalance.value,
-        'is-stale': credits.stale.value,
-      }"
-      :title="tooltip"
-      :aria-label="t('credits.badge.ariaLabel')"
-      :aria-expanded="expanded"
-      @click="expanded = !expanded"
-    >
-      <span class="credits-badge__icon" aria-hidden="true">✦</span>
-      <span class="credits-badge__amount">{{ totalText }}</span>
-    </button>
+    <template v-if="credits.hasBalance.value">
+      <button
+        type="button"
+        class="credits-badge__trigger"
+        :class="{
+          'is-low': credits.lowBalance.value,
+          'is-stale': credits.stale.value,
+          'is-open': expanded,
+        }"
+        :title="tooltip"
+        :aria-label="t('credits.badge.ariaLabel')"
+        :aria-expanded="expanded"
+        @click="expanded = !expanded"
+      >
+        <span class="credits-badge__icon" aria-hidden="true">✦</span>
+        <span class="credits-badge__amount">{{ totalText }}</span>
+        <span class="credits-badge__caret" aria-hidden="true">▾</span>
+      </button>
 
-    <div v-if="expanded" class="credits-card">
-      <div class="credits-card__title">{{ t('credits.badge.cardTitle') }}</div>
-      <div class="credits-card__row">
-        <span class="credits-card__label">{{ t('credits.badge.gift') }}</span>
-        <span class="credits-card__value">{{ giftText }}</span>
+      <div v-if="expanded" class="credits-card">
+        <div class="credits-card__title">{{ t('credits.badge.cardTitle') }}</div>
+        <div class="credits-card__row">
+          <span class="credits-card__label">{{ t('credits.badge.gift') }}</span>
+          <span class="credits-card__value">{{ giftText }}</span>
+        </div>
+        <div class="credits-card__row">
+          <span class="credits-card__label">{{ t('credits.badge.purchased') }}</span>
+          <span class="credits-card__value">{{ purchasedText }}</span>
+        </div>
+
+        <!-- Both links come from the same `portal_url`, so one guard covers
+             the footer: without a Portal there is nothing to link to. -->
+        <div v-if="topUpHref" class="credits-card__actions">
+          <a
+            class="credits-card__link"
+            :href="topUpHref"
+          >{{ t('credits.badge.detailLink') }}</a>
+          <PortalAccountLink variant="inline" />
+        </div>
       </div>
-      <div class="credits-card__row">
-        <span class="credits-card__label">{{ t('credits.badge.purchased') }}</span>
-        <span class="credits-card__value">{{ purchasedText }}</span>
-      </div>
-      <a
-        v-if="topUpHref"
-        class="credits-card__link"
-        :href="topUpHref"
-      >{{ t('credits.badge.detailLink') }}</a>
-    </div>
+    </template>
+
+    <!-- Balance unknown (degraded read, or no ledger at all): no number, but
+         the way back to the account centre must not disappear with it. -->
+    <PortalAccountLink v-else />
   </div>
 </template>
 
@@ -111,6 +142,13 @@ onMounted(() => {
   background: rgba(255, 255, 255, 0.08);
 }
 
+/* Open state reads as "this is the panel you just opened", so the card below
+   looks attached to the pill rather than floating under it. */
+.credits-badge__trigger.is-open {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--color-primary-light);
+}
+
 /* Low balance: warn without alarming — the character's life is unaffected. */
 .credits-badge__trigger.is-low {
   border-color: #d9903f;
@@ -134,12 +172,28 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 
+/* Discoverability: the account centre now lives behind this expansion, so the
+   pill has to look expandable instead of like a read-only chip. */
+.credits-badge__caret {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--color-text-secondary);
+  transition: transform 0.2s;
+}
+
+.credits-badge__trigger.is-open .credits-badge__caret {
+  transform: rotate(180deg);
+}
+
 .credits-card {
   margin-top: 6px;
   padding: 8px 10px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--color-surface);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -164,8 +218,18 @@ onMounted(() => {
   white-space: nowrap;
 }
 
+/* Footer group: "where do I go to deal with my account?" — the ledger and the
+   account centre, one rule away from the numbers above them. */
+.credits-card__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border);
+}
+
 .credits-card__link {
-  margin-top: 2px;
   font-size: var(--font-xs);
   color: var(--color-primary);
   text-decoration: none;

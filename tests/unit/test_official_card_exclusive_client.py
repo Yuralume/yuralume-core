@@ -97,6 +97,54 @@ async def test_the_payload_is_read_with_the_service_credential() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_installing_tenant_is_named_when_there_is_one() -> None:
+    """TG3: the tier fence is checked on Cloud, against the tenant id.
+
+    What travels is the *id*, never the tier Core has cached on the
+    operator profile — that copy drifts, and the side that owns the answer
+    is the side that must resolve it (plan D4).
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=_BODY)
+
+    await _client(handler).fetch_payload(_CARD_ID, tenant_id="tenant-42")
+
+    assert seen["url"] == (
+        f"{_BASE}/internal/v1/official-cards/{_CARD_ID}"
+        f"/exclusive-payload?tenant_id=tenant-42"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_id", [None, "", "   "])
+async def test_without_a_tenant_the_request_is_byte_for_byte_the_old_one(
+    tenant_id: str | None,
+) -> None:
+    """The parameter is omitted, not sent blank.
+
+    A self-hosted deployment and a hosted account with no projected tenant
+    both make the pre-TG request, which is the one Cloud still answers
+    unchanged for every card with no tier fence on it. Sending
+    ``?tenant_id=`` instead would be a new request shape for the case that
+    is supposed to be untouched.
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=_BODY)
+
+    await _client(handler).fetch_payload(_CARD_ID, tenant_id=tenant_id)
+
+    assert seen["url"] == (
+        f"{_BASE}/internal/v1/official-cards/{_CARD_ID}/exclusive-payload"
+    )
+
+
+@pytest.mark.asyncio
 async def test_the_cards_own_manifest_is_read_through_as_the_map_it_is() -> None:
     # EC4-C: the structural half. Passed through untouched for the same
     # reason ``profile`` is — the manifest schema belongs to the card

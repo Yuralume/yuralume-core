@@ -23,7 +23,6 @@ import {
   getAuthConfig,
   login as apiLogin,
   loginWithCloudSession as apiLoginWithCloudSession,
-  loginWithDemoSession as apiLoginWithDemoSession,
   refreshSession as apiRefreshSession,
   setupInitialAdmin as apiSetup,
 } from '@/utils/api/auth'
@@ -64,7 +63,7 @@ function applyUserRuntimePreferences(user: AuthUser | null): void {
 
 /**
  * The single chokepoint for "the identity behind every request changed":
- * login, demo / cloud session exchange, first-admin setup, logout and the
+ * login, the cloud session exchange, first-admin setup, logout and the
  * 401 bounce all land here. Per-identity caches are told from this one
  * place so no new sign-in path can forget to drop the previous player's
  * data (see `@/utils/identityLifecycle` for why it is a broadcast and not
@@ -149,20 +148,6 @@ async function login(email: string, password: string): Promise<void> {
   persistToken(res.token)
   currentUser.value = res.user
   needsSetup.value = false
-  applyUserRuntimePreferences(res.user)
-}
-
-async function loginWithDemoSession(payload: {
-  provider: string
-  authorization_code: string
-  redirect_uri?: string | null
-  code_verifier?: string | null
-}): Promise<void> {
-  const res = await apiLoginWithDemoSession(payload)
-  persistToken(res.token)
-  currentUser.value = res.user
-  needsSetup.value = false
-  mode.value = 'cloud'
   applyUserRuntimePreferences(res.user)
 }
 
@@ -273,7 +258,6 @@ export function useAuth() {
     refreshMe,
     renewSession,
     login,
-    loginWithDemoSession,
     loginWithCloudSession,
     setup,
     logout,

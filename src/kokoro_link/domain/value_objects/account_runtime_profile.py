@@ -34,11 +34,10 @@ class AccountRuntimeProfile:
     """Runtime policy for an operator account.
 
     The default profile is intentionally permissive so self-host installs
-    keep existing behavior. Hosted demo accounts opt into the restrictive
-    profile through their cloud tenant tier projection. Paid hosted tiers
-    get their profile from the control-plane (see
-    ``from_control_plane_payload``) rather than any hardcoded tier->knob
-    mapping in Core.
+    keep existing behavior. Every hosted tier gets its profile from the
+    control-plane (see ``from_control_plane_payload``) rather than any
+    hardcoded tier->knob mapping in Core: there is no tier whose limits
+    live in this file.
     """
 
     name: str
@@ -121,10 +120,6 @@ class AccountRuntimeProfile:
                     self.name, activity, effective, clamped,
                 )
         return clamped
-
-    @property
-    def is_demo(self) -> bool:
-        return self.name == "demo"
 
     @classmethod
     def from_control_plane_payload(
@@ -250,22 +245,6 @@ class AccountRuntimeProfile:
 
 
 DEFAULT_ACCOUNT_RUNTIME_PROFILE = AccountRuntimeProfile(name="default")
-
-DEMO_ACCOUNT_RUNTIME_PROFILE = AccountRuntimeProfile(
-    name="demo",
-    proactive_tick_multiplier=6,
-    background_activity_multiplier=6,
-    character_ttl=timedelta(days=3),
-    max_characters=1,
-    daily_character_create_limit=1,
-    max_messages_per_session=80,
-    strict_no_fallback=True,
-    daily_chat_image_limit=1,
-    daily_feed_post_limit=1,
-    album_generation_enabled=False,
-    video_generation_enabled=False,
-    tts_enabled=False,
-)
 
 
 def _int_knob(

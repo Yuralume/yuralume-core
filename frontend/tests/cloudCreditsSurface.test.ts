@@ -3,6 +3,8 @@ import { createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createI18n } from 'vue-i18n'
 
+import badgeSource from '@/components/CloudCreditsBadge.vue?raw'
+import personalSettingsSource from '@/components/PersonalSettingsSection.vue?raw'
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
 
 // No DOM test infra exists in this repo (@vue/test-utils / jsdom are not
@@ -94,6 +96,29 @@ describe('CloudCreditsBadge', () => {
     expect(html).not.toContain('credits-badge__amount')
   })
 
+  it('keeps the account entry when the balance is unknown', async () => {
+    // The account centre now lives behind this badge, so a degraded balance
+    // read must not take the only way back to the Portal with it.
+    authState.portalUrl = 'https://app.yuralume.com'
+    mockedFetch.mockResolvedValueOnce({ kind: 'degraded' })
+    await useCloudCredits().refresh()
+
+    const html = await render(CloudCreditsBadge)
+
+    expect(html).not.toContain('credits-badge__amount')
+    expect(html).toContain(L.portalEntry.title)
+    expect(html).toContain('https://app.yuralume.com')
+  })
+
+  it('renders nothing at all without a balance and without a portal', async () => {
+    mockedFetch.mockResolvedValueOnce({ kind: 'degraded' })
+    await useCloudCredits().refresh()
+
+    const html = await render(CloudCreditsBadge)
+
+    expect(html).not.toContain('credits-badge')
+  })
+
   it('marks a low balance for the warning treatment', async () => {
     await seedBalance({ gift_cr: 0, purchased_cr: 120, total_cr: 120 })
 
@@ -164,5 +189,25 @@ describe('PortalAccountLink', () => {
     const html = await render(PortalAccountLink)
 
     expect(html).not.toContain(L.portalEntry.title)
+  })
+})
+
+/**
+ * Source-level (the SSR harness only renders the collapsed badge, so the
+ * card's contents never reach the string): the account centre used to sit at
+ * the bottom of the settings tab, where a player had to already know it
+ * existed. These pin the move — subscription, credits and account data open
+ * together from one place — so a later refactor cannot quietly bury it again.
+ */
+describe('account centre entry placement', () => {
+  it('rides in the credit badge card, beside the ledger link', () => {
+    expect(badgeSource).toContain('PortalAccountLink')
+    expect(badgeSource).toContain('variant="inline"')
+    expect(badgeSource).toContain('credits-card__actions')
+  })
+
+  it('is gone from the personal settings pane', () => {
+    expect(personalSettingsSource).not.toContain('<PortalAccountLink')
+    expect(personalSettingsSource).not.toContain("from './PortalAccountLink.vue'")
   })
 })

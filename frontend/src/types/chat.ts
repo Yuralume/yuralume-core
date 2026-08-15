@@ -80,11 +80,20 @@ export interface SendChatMessageRequest {
   quoted_price_cr?: number
   /** The same, for the picture this turn may spawn (`image_chat_tool`). */
   quoted_image_price_cr?: number
+  /**
+   * 示意——「讓角色先開口」（plan SN). The player pulled the turn rather than
+   * answering one; when true, `message` may be the empty string (a wordless
+   * nudge) and the backend prices and journals the turn exactly like any
+   * other chat turn (`ACTION_CHAT`) — no new action, no new feature key.
+   * Omitted (not `false`) on every ordinary send.
+   */
+  stage_nudge?: boolean
 }
 
 export interface ChatReplyResponse {
   conversation_id: string
-  user_message: ChatMessage
+  /** null 只出現在空示意輪（stage_nudge 且未補充）——該輪沒有玩家側訊息。 */
+  user_message: ChatMessage | null
   assistant_message?: ChatMessage | null
   state: CharacterState
   /**

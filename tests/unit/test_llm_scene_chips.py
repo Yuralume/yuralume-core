@@ -109,6 +109,28 @@ async def test_prompt_carries_the_scene_frame_and_the_last_exchange() -> None:
     assert "Aki：你到底想說什麼？" in prompt
 
 
+async def test_prompt_shows_whose_voice_a_chip_is_written_in() -> None:
+    """The failure players actually report: chips that read as the
+    character's next line. The JSON field names the voice it wants, and
+    the ✅/❌ pair is what makes "第一人稱" mean something concrete.
+
+    The contrast pair must sit *above* the JSON-only instruction: the
+    parser takes the first balanced ``{`` of the reply, so illustrative
+    text after that instruction is where a model learns to emit prose
+    around its object.
+    """
+    model = _ScriptedModel('{"actions": ["a", "b"]}')
+    writer = LLMStorySceneChipsWriter(model=model)
+
+    await writer.suggest_actions(_context())
+
+    prompt = model.prompts[0]
+    assert "玩家第一人稱" in prompt
+    assert "✅" in prompt
+    assert "❌" in prompt
+    assert prompt.index("❌") < prompt.index("只輸出 JSON")
+
+
 async def test_prompt_pins_the_operators_language() -> None:
     """Chips are player-visible text, so they follow the player's language."""
     model = _ScriptedModel('{"actions": ["a", "b"]}')

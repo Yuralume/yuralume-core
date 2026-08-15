@@ -132,14 +132,26 @@ class ExclusiveOfficialCardInstaller:
         user_id: str,
         locale: str,
         initial_relationship: InitialRelationshipPayload | None = None,
+        tenant_id: str = "",
     ) -> ImportedCard:
         """Create one managed character from ``detail``'s exclusive payload.
 
         ``detail`` is the freshly-read public document the caller already
         holds — it is where the stage image addresses come from, and reading
         it twice would risk describing two different versions of the card.
+
+        ``tenant_id`` is the installing player's Cloud tenant, forwarded so
+        Cloud can check a tier fence on the card (TG series D4). Blank on a
+        deployment or an account with no projected tenant, which is the
+        pre-TG request and installs every unfenced card exactly as before.
+        A fenced card the tenant may not have arrives as the ordinary
+        "no such card" 404 — the player is told what they would have been
+        told about a withdrawn card, and the word *tier* is never spoken on
+        this side of the wire.
         """
-        payload = await self._exclusive_payloads.fetch_payload(detail.id)
+        payload = await self._exclusive_payloads.fetch_payload(
+            detail.id, tenant_id=tenant_id or None,
+        )
         if payload is None:
             raise OfficialCardExclusiveUnavailable(detail.id)
         if payload.required_product:

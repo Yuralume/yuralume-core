@@ -124,12 +124,11 @@ class StorySceneQuotaGuard:
 
     Not wired into :class:`~kokoro_link.application.services.story_scene_service.StorySceneService`
     by this module — see the module docstring's "Wiring" note. The intended
-    call site is the top of ``StorySceneService.open_scene``, alongside
-    (after) ``_ensure_account_may_open``: both are pre-checks that must run
-    before any material is resolved or anything is written, and both raise
-    rather than returning a sentinel so the route can map each exception to
-    its own status code the way ``SceneAlreadyOpen`` /
-    ``SceneMaterialUnavailable`` already do.
+    call site is the top of ``StorySceneService.open_scene``, after the
+    already-open check: it is a pre-check that must run before any material
+    is resolved or anything is written, and it raises rather than returning
+    a sentinel so the route can map each exception to its own status code
+    the way ``SceneAlreadyOpen`` / ``SceneMaterialUnavailable`` already do.
     """
 
     def __init__(

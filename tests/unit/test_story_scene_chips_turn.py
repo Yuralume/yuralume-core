@@ -464,9 +464,12 @@ async def test_opening_offers_chips_for_a_player_with_no_opening_move() -> None:
     opening = await service.open_scene(character, now=NOW)
 
     assert opening.suggested_actions == ("問她在等誰", "什麼都不說，走過去")
-    # The chips see the curtain that just went up, not an empty scene.
+    # The chips see the curtain that just went up, not an empty scene —
+    # and every line names its speaker. An unlabelled narration reads as
+    # the character still talking, which is what makes the writer offer
+    # the character's next line instead of the player's.
     assert chips.contexts[0].recent_lines == (
-        "風把話吹散了。", "Aki：你怎麼還在這裡？",
+        "旁白：風把話吹散了。", "Aki：你怎麼還在這裡？",
     )
     assert chips.contexts[0].session.id == opening.session.id
 

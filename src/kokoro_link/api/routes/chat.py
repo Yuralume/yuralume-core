@@ -363,7 +363,7 @@ def _conversation_busy_http_error(
 
     A dedicated status + structured code so it stays distinguishable from the
     existing chat outcomes: 403 ``subscription_frozen`` (entitlement), 404
-    (unknown/foreign character or conversation), 429 (demo message cap). 409 is
+    (unknown/foreign character or conversation), 429 (session message cap). 409 is
     the accurate shape — the request is well-formed and authorized, it just
     conflicts with the conversation's current state, and retrying after the
     in-flight turn lands will succeed.

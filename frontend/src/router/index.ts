@@ -144,18 +144,6 @@ const router = createRouter({
       meta: { layout: 'auth', public: true },
     },
     {
-      path: '/demo/oauth/:provider/start',
-      name: 'demo-oauth-start',
-      component: () => import('@/pages/DemoOAuthStartPage.vue'),
-      meta: { layout: 'auth', public: true },
-    },
-    {
-      path: '/demo/oauth/:provider/callback',
-      name: 'demo-oauth-callback',
-      component: () => import('@/pages/DemoOAuthCallbackPage.vue'),
-      meta: { layout: 'auth', public: true },
-    },
-    {
       path: '/cloud/callback',
       name: 'cloud-callback',
       component: () => import('@/pages/CloudCallbackPage.vue'),

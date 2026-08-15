@@ -38,7 +38,7 @@ from kokoro_link.application.services.character_social_knowledge_service import 
 from kokoro_link.application.services.character_tick_executor import (
     CharacterTickExecutor,
 )
-from kokoro_link.application.services.demo_account_reaper import DemoAccountReaper
+from kokoro_link.application.services.character_ttl_reaper import CharacterTtlReaper
 from kokoro_link.application.services.feed_comment_reply_service import (
     FeedCommentReplyService,
 )
@@ -167,7 +167,7 @@ class ProactiveScheduler:
         account_runtime_profile_resolver: (
             AccountRuntimeProfileResolverPort | None
         ) = None,
-        demo_account_reaper: DemoAccountReaper | None = None,
+        character_ttl_reaper: CharacterTtlReaper | None = None,
         character_freeze_reaper: CharacterFreezeReaper | None = None,
         character_freeze_sweep_interval_seconds: float = (
             _DEFAULT_FREEZE_SWEEP_INTERVAL_SECONDS
@@ -286,7 +286,7 @@ class ProactiveScheduler:
             resolver=self._account_runtime_profile_resolver,
             character_repository=self._characters,
         )
-        self._demo_account_reaper = demo_account_reaper
+        self._character_ttl_reaper = character_ttl_reaper
         # Optional — idle-character auto-freeze sweep (CHARACTER_FREEZE_PLAN).
         # Runs on its own throttle (not every tick) because freezing only
         # culls characters already idle for N days. No-op when the reaper
@@ -351,7 +351,7 @@ class ProactiveScheduler:
             dispatcher=self._dispatcher,
         )
         self._social_executor = SocialTickExecutor(
-            demo_account_reaper=self._demo_account_reaper,
+            character_ttl_reaper=self._character_ttl_reaper,
             character_freeze_reaper=self._character_freeze_reaper,
             pending_follow_up_dispatcher=self._pending_follow_up_dispatcher,
             character_encounter_service=self._character_encounter_service,
@@ -494,14 +494,14 @@ class ProactiveScheduler:
                 character_id, trigger.value,
             )
 
-    def set_demo_account_reaper(
+    def set_character_ttl_reaper(
         self,
-        reaper: DemoAccountReaper | None,
+        reaper: CharacterTtlReaper | None,
     ) -> None:
         # Kept on the scheduler for the container-wiring test + forwarded to the
         # executor which actually runs it each tick.
-        self._demo_account_reaper = reaper
-        self._social_executor.set_demo_account_reaper(reaper)
+        self._character_ttl_reaper = reaper
+        self._social_executor.set_character_ttl_reaper(reaper)
 
     def set_character_freeze_reaper(
         self,

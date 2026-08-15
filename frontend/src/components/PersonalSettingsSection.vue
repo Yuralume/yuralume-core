@@ -17,7 +17,6 @@ import CollapsibleSection from './CollapsibleSection.vue'
 import NsfwModeSetting from './NsfwModeSetting.vue'
 import PlayerPasswordPanel from './PlayerPasswordPanel.vue'
 import PlayerPlaceLocaleSettings from './PlayerPlaceLocaleSettings.vue'
-import PortalAccountLink from './PortalAccountLink.vue'
 import QuotaOverageSettings from './QuotaOverageSettings.vue'
 import SimpleImageProfilePicker from './SimpleImageProfilePicker.vue'
 import TtsPregenSetting from './TtsPregenSetting.vue'
@@ -358,10 +357,9 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     <span class="admin-settings-entry__hint">{{ t('playerSidebar.admin.hint') }}</span>
   </RouterLink>
 
-  <!-- Hosted 玩家的回程動線：放在登出旁邊，因為兩者是同一個「離開這個
-       遊戲畫面」的意圖。self-host 下這個元件不輸出任何節點（連容器都沒有），
-       個人設定面在自架站的渲染結果與改動前逐字元相同。 -->
-  <PortalAccountLink class="portal-account-entry" />
+  <!-- Hosted 玩家的回程動線（帳號中心）已移到側欄螢火徽章的展開卡片裡：
+       訂閱、螢火、帳號資料是同一件事，藏在設定頁最底下等於要玩家先知道
+       它存在。見 CloudCreditsBadge.vue。 -->
 
   <section v-if="authEnabled" class="logout-section">
     <UiButton
@@ -542,10 +540,6 @@ defineExpose({ flashWebNotification, flashAdminEntry })
 .overage-section {
   padding-top: 10px;
   border-top: 1px solid var(--color-border);
-}
-
-.portal-account-entry {
-  margin-top: var(--space-2);
 }
 
 .logout-section {

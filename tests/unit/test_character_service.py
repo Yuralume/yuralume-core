@@ -7,8 +7,8 @@ from kokoro_link.application.services.character_service import (
     CharacterService,
     CharacterValidationError,
 )
-from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.entities.arc_series import ArcSeries
 from kokoro_link.domain.entities.arc_template import (
@@ -30,7 +30,7 @@ from kokoro_link.infrastructure.repositories.in_memory_account_runtime_usage imp
 
 class _StaticRuntimeProfileResolver:
     async def resolve_for_operator(self, operator_id: str):
-        return DEMO_ACCOUNT_RUNTIME_PROFILE
+        return RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE
 
 
 class _MutableClock:

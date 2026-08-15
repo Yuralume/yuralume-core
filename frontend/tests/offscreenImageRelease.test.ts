@@ -226,7 +226,7 @@ describe('chat panel message-item containment', () => {
 
   it('applies it to message items only, not to every child', () => {
     // The load-older button, the first-turn guide, the typing indicator and
-    // the credits / demo cards are single elements pinned to the ends of the
+    // the credits / session-cap cards are single elements pinned to the ends of the
     // thread; paint containment on them is risk with no saving.
     expect(panel).toContain('.messages-container > .bubble')
     expect(panel).toContain('.messages-container > .scene-frame')

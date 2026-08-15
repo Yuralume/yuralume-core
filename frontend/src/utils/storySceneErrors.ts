@@ -3,8 +3,8 @@ import { StorySceneError } from '@/utils/api/storyScene'
 /**
  * Classification only — the copy lives in the trilingual catalog under
  * `chat.storyScene.errors.*`, so every refusal is read in the player's own
- * language rather than in whatever the server logged (plan U1-D convention,
- * same shape as `demoSessionErrors`).
+ * language rather than in whatever the server logged (plan U1-D convention:
+ * this module maps codes to keys and owns no display string of its own).
  */
 
 /** Where an unrecognised failure lands, per entry point. */
@@ -14,8 +14,6 @@ export type StorySceneFallback = 'generic' | 'endGeneric'
 const KEY_PREFIX = 'chat.storyScene.errors.'
 
 const CODE_TO_KEY: Readonly<Record<string, string>> = {
-  // The deployment does not offer scenes at all (the public trial).
-  story_scene_unavailable: 'unavailable',
   // One scene at a time: this character is already in one.
   scene_in_progress: 'inProgress',
   // Nothing left to play — no pending beat, no season, no side story.
@@ -85,18 +83,4 @@ export function storySceneErrorKey(
     ? CODE_TO_KEY[error.code]
     : undefined
   return `${KEY_PREFIX}${suffix ?? fallback}`
-}
-
-/**
- * True when this deployment does not offer scenes to this player.
- *
- * Distinguished from every other refusal because it is the one that is not
- * worth retrying: the button is withdrawn instead of left there to fail
- * again.
- */
-export function isStorySceneUnavailable(error: unknown): boolean {
-  return (
-    error instanceof StorySceneError
-    && error.code === 'story_scene_unavailable'
-  )
 }

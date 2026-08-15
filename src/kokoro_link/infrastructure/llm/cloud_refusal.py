@@ -5,7 +5,7 @@ non-retryable policy decision (entitlement revoked, quota exhausted), that is
 the cloud doing its job — the deployment must treat it as an expected, quiet
 skip rather than an error worth a stack trace.
 
-Classifying it here keeps core free of any tenant / tier / demo-specific
+Classifying it here keeps core free of any tenant / tier-specific
 knowledge: it reacts only to the cloud's own ``retryable: false`` signal,
 leaving *who* is entitled (and why) entirely to the cloud control plane.
 """

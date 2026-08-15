@@ -20,6 +20,13 @@ Per-character flow:
    for the full reply, then call
    ``ProactiveDispatcher.deliver_pre_composed`` to fan out to web SSE +
    Telegram / LINE bindings.
+
+   That compose goes through :class:`ComposerToolLoop` when one is
+   wired (PF1), so a promise to *do* something — look a fact up, take a
+   picture — actually runs the tool before the message is written, and
+   ships whatever it produced as attachments on the same delivery. With
+   no loop injected the step is the single plain ``compose`` it always
+   was.
 5. On success → ``resolved``; on any failure → flip back to ``queued``
    with ``last_error`` set so the next tick retries.
 
@@ -30,8 +37,13 @@ break the loop. Other characters / other tick steps must keep working.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone, tzinfo
 
+from kokoro_link.application.services.composer_tool_loop import (
+    ComposedMessage,
+    ComposerToolLoop,
+)
 from kokoro_link.application.services.proactive_dispatcher import (
     ProactiveDispatcher,
 )
@@ -40,6 +52,7 @@ from kokoro_link.application.services.busy_defer_policy import (
 )
 from kokoro_link.application.services.schedule_service import ScheduleService
 from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
+from kokoro_link.contracts.messaging import OutboundAttachment
 from kokoro_link.contracts.pending_follow_up import (
     PendingFollowUpRepositoryPort,
 )
@@ -93,6 +106,7 @@ class PendingFollowUpDispatcher:
         schedule_service: ScheduleService | None = None,
         dialogue_summarizer: DialogueSummarizerPort | None = None,
         scheduled_promise_composer: ScheduledPromiseComposerPort | None = None,
+        tool_loop: ComposerToolLoop | None = None,
         operator_persona_service=None,  # noqa: ANN001 - optional app service
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         visible_slot_port=None,  # noqa: ANN001 - VisibleSlotPort | None (avoid import cycle)
@@ -107,6 +121,12 @@ class PendingFollowUpDispatcher:
         self._schedule_service = schedule_service
         self._dialogue_summarizer = dialogue_summarizer
         self._scheduled_promise_composer = scheduled_promise_composer
+        # PF1 — two-pass compose→tool→compose. ``None`` (no tool registry,
+        # fake provider, self-host without tools) means every compose stays
+        # a single plain call, byte-identical to the pre-PF1 dispatcher.
+        # Shared by BOTH kinds on purpose: PF2 only has to teach the
+        # busy-defer adapter to read available_tools / emit tool_calls.
+        self._tool_loop = tool_loop
         self._operator_persona_service = operator_persona_service
         # FRONTEND_I18N_PLAN — pin the deferred-reply language to the
         # same operator language chat / proactive use. Optional so the
@@ -118,8 +138,22 @@ class PendingFollowUpDispatcher:
         # ``None`` (no DB / embedded no-op wiring) fails open, so the single-process
         # embedded tick is byte-identical (its send always wins the claim first).
         self._visible_slot_port = visible_slot_port
+        # PF3 — where a fulfilment's capability-bound half (today: the GPU) gets
+        # handed to so it runs under the deployment's ceiling instead of wherever
+        # the composer happened to ask for it. Set by the container only when a
+        # distributed queue exists; ``None`` — and any embedded release, leader or
+        # not — runs the tool inline exactly as PF1 did.
+        self._capability_enqueuer = None
         self._local_tz = local_tz or timezone.utc
         self._tick_limit = max(1, tick_limit)
+
+    def set_capability_release_enqueuer(self, enqueuer) -> None:  # noqa: ANN001
+        """Wire the PF3 capability hand-off (:class:`PendingFollowUpReleaseEnqueuer`).
+
+        A setter, not a constructor argument, because the queue and the coordinator
+        lease are built long after the dispatcher in the container — and because a
+        deployment without them must keep working untouched."""
+        self._capability_enqueuer = enqueuer
 
     async def tick(self, *, now: datetime | None = None) -> int:
         """Process all due rows. Returns the number of rows resolved."""
@@ -151,17 +185,26 @@ class PendingFollowUpDispatcher:
 
     async def release_row(
         self, row: PendingFollowUp, *, now: datetime,
+        defer_capabilities: bool = False,
     ) -> bool:
         """Public entry for the distributed event-driven release path.
 
         The Phase 5 ``pending_follow_up_release`` worker handler hands one claimed
         row here; the busy-score / frozen re-gating, compose and fan-out are the
         SAME as the embedded tick (抽共用而非複製) — this only exposes the existing
-        per-row release as a callable so the handler need not re-implement it."""
-        return await self._maybe_release(row, now=now)
+        per-row release as a callable so the handler need not re-implement it.
+
+        ``defer_capabilities`` (PF3) is the caller telling us it did NOT claim a
+        provider slot: if the composer reaches for a capability-bound tool, queue
+        that half instead of running it here. It defaults to False so the embedded
+        tick — which has no queue to defer to — is untouched."""
+        return await self._maybe_release(
+            row, now=now, defer_capabilities=defer_capabilities,
+        )
 
     async def _maybe_release(
         self, row: PendingFollowUp, *, now: datetime,
+        defer_capabilities: bool = False,
     ) -> bool:
         character = await self._characters.get(row.character_id)
         if character is None:
@@ -190,6 +233,7 @@ class PendingFollowUpDispatcher:
                 current_activity=current_activity,
                 just_finished=just_finished,
                 now=now,
+                defer_capabilities=defer_capabilities,
             )
 
         force = row.is_at_cap
@@ -245,22 +289,35 @@ class PendingFollowUpDispatcher:
             operator_primary_language=operator_language,
         )
         try:
-            output = await self._composer.compose(compose_input)
+            composed = await self._compose(
+                character=character,
+                payload=compose_input,
+                compose=self._composer.compose,
+                conversation_id=resolving.conversation_id,
+                recent_dialogue=recent_summary or "",
+                row=resolving,
+                defer_capabilities=defer_capabilities,
+                now=now,
+            )
         except Exception:
             _LOGGER.exception(
                 "pending-follow-up composer crashed id=%s", row.id,
             )
-            await self._repository.save(
-                resolving.marked_failed(error="composer crashed", now=now),
+            await self._fail_back_to_queued(
+                resolving, error="composer crashed", now=now,
             )
             return False
-        body = (output.content_text or "").strip()
+        if composed.deferred_capability:
+            return await self._park_for_capability(
+                row=resolving, composed=composed, now=now,
+            )
+        body = composed.content_text
         if not body:
             # Composer fail-soft → leave queued for the next tick (no
             # cap on retries; if the model is fundamentally stuck the
             # operator will see a permanently-queued row and investigate).
-            await self._repository.save(
-                resolving.marked_failed(error="empty compose", now=now),
+            await self._fail_back_to_queued(
+                resolving, error="empty compose", now=now,
             )
             return False
 
@@ -272,6 +329,7 @@ class PendingFollowUpDispatcher:
                 f"follow-up release after {resolving.defer_reason or 'busy'}"
             ),
             character_id=character.id,
+            attachments=composed.attachments,
             now=now,
         )
 
@@ -283,6 +341,7 @@ class PendingFollowUpDispatcher:
         current_activity: ScheduleActivity | None,
         just_finished: ScheduleActivity | None,
         now: datetime,
+        defer_capabilities: bool = False,
     ) -> bool:
         """Release a ``kind=SCHEDULED_PROMISE`` row.
 
@@ -351,21 +410,32 @@ class PendingFollowUpDispatcher:
             promise_safe_summary=promise_safe_summary,
         )
         try:
-            output = await self._scheduled_promise_composer.compose(
-                compose_input,
+            composed = await self._compose(
+                character=character,
+                payload=compose_input,
+                compose=self._scheduled_promise_composer.compose,
+                conversation_id=resolving.conversation_id,
+                recent_dialogue=summary or "",
+                row=resolving,
+                defer_capabilities=defer_capabilities,
+                now=now,
             )
         except Exception:
             _LOGGER.exception(
                 "scheduled-promise composer crashed id=%s", row.id,
             )
-            await self._repository.save(
-                resolving.marked_failed(error="composer crashed", now=now),
+            await self._fail_back_to_queued(
+                resolving, error="composer crashed", now=now,
             )
             return False
-        body = (output.content_text or "").strip()
+        if composed.deferred_capability:
+            return await self._park_for_capability(
+                row=resolving, composed=composed, now=now,
+            )
+        body = composed.content_text
         if not body:
-            await self._repository.save(
-                resolving.marked_failed(error="empty compose", now=now),
+            await self._fail_back_to_queued(
+                resolving, error="empty compose", now=now,
             )
             return False
 
@@ -375,8 +445,209 @@ class PendingFollowUpDispatcher:
             trigger=ProactiveTrigger.SCHEDULED_PROMISE,
             reason=f"scheduled-promise release: {resolving.promise_intent[:60]}",
             character_id=character.id,
+            attachments=composed.attachments,
             now=now,
         )
+
+    async def _compose(
+        self,
+        *,
+        character: Character,
+        payload,  # noqa: ANN001 - one of the two composer input dataclasses
+        compose,  # noqa: ANN001 - the matching composer port's ``compose``
+        conversation_id: str | None,
+        recent_dialogue: str,
+        row: PendingFollowUp,
+        defer_capabilities: bool,
+        now: datetime,
+    ) -> ComposedMessage:
+        """Compose the outbound body, with tools when the loop is wired.
+
+        The single funnel both kinds go through, so promise fulfilment
+        and busy-defer follow-up can never drift into two different
+        tool protocols. Without a loop this is exactly the pre-PF1
+        single ``compose(payload)`` call."""
+        if self._tool_loop is None:
+            output = await compose(payload)
+            return ComposedMessage(
+                content_text=(getattr(output, "content_text", "") or "").strip(),
+            )
+        schedule = (
+            self._capability_scheduler(row=row, now=now)
+            if defer_capabilities
+            else None
+        )
+        return await self._tool_loop.run(
+            character=character,
+            payload=payload,
+            compose=compose,
+            conversation_id=conversation_id,
+            recent_dialogue=recent_dialogue,
+            schedule_capability=schedule,
+        )
+
+    def _capability_scheduler(self, *, row: PendingFollowUp, now: datetime):  # noqa: ANN202
+        """The hand-off closure the tool loop consults, or ``None``.
+
+        ``None`` when nothing can take the work — the loop then runs every tool
+        inline, which is the whole of the embedded behaviour."""
+        if self._capability_enqueuer is None:
+            return None
+
+        async def schedule(capability: str) -> bool:
+            return await self._defer_capability(
+                row=row, capability=capability, now=now,
+            )
+
+        return schedule
+
+    async def _defer_capability(
+        self, *, row: PendingFollowUp, capability: str, now: datetime,
+    ) -> bool:
+        """Ask the queue to take over this fulfilment's ``capability`` half."""
+        enqueuer = self._capability_enqueuer
+        if enqueuer is None:
+            return False
+        try:
+            return await enqueuer.defer_capability(
+                row, capability=capability, now=now,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: %s hand-off crashed id=%s — running inline",
+                capability, row.id,
+            )
+            return False
+
+    async def _park_for_capability(
+        self, *, row: PendingFollowUp, composed: ComposedMessage, now: datetime,
+    ) -> bool:
+        """The fulfilment is queued elsewhere: leave the row releasable.
+
+        ``marked_failed`` is the existing "back to queued, try again" transition —
+        the same one an empty compose takes — so the row keeps its place and the
+        job that owns the capability slot picks it up. Nothing was sent, so this
+        returns False; the promise is not broken, only rescheduled, and the error
+        text says so for anyone reading the row."""
+        parked = await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.marked_failed(
+                error=f"deferred to the {composed.deferred_capability} queue",
+                now=now,
+            ),
+            still_ours=_a_retry_write_is_still_ours,
+        )
+        if parked:
+            _LOGGER.info(
+                "pending-follow-up: parked id=%s until the %s slot is free",
+                row.id, composed.deferred_capability,
+            )
+        return False
+
+    async def _fail_back_to_queued(
+        self, row: PendingFollowUp, *, error: str, now: datetime,
+    ) -> bool:
+        """Flip this release's row back to ``queued`` for the next attempt."""
+        return await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.marked_failed(error=error, now=now),
+            still_ours=_a_retry_write_is_still_ours,
+        )
+
+    async def _mark_resolved(
+        self, row: PendingFollowUp, *, body: str, now: datetime,
+    ) -> bool:
+        """Record this release's message as delivered."""
+        return await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.marked_resolved(message_text=body, now=now),
+            still_ours=_a_delivery_write_is_still_ours,
+        )
+
+    async def _write_release_outcome(
+        self,
+        row: PendingFollowUp,
+        transition: Callable[[PendingFollowUp], PendingFollowUp],
+        *,
+        still_ours: Callable[[PendingFollowUpStatus], bool],
+    ) -> bool:
+        """Apply a post-compose transition onto a **re-read** row.
+
+        EVERY write this release makes after its compose goes through here,
+        because every one of them was computed from a snapshot taken before
+        it — and PF3 keeps two executors alive over the same row on purpose
+        (the reconciler re-mints the text half every sweep while the image
+        half waits for its slot), while the repository's ``save`` is a
+        version-less upsert. A stale snapshot written back can therefore put
+        a row the image half already resolved back on ``queued`` with its
+        ``resolved_at`` / ``resolved_message`` erased: the message the player
+        already has, recorded as never sent — and the next sweep composes and
+        renders it all over again.
+
+        ``still_ours`` is **per transition, and the asymmetry is deliberate**,
+        because the claim that puts a row on ``resolving`` is itself a
+        version-less upsert: two executors can both see ``resolving`` and
+        neither can tell whose it is. So each write abandons on what would
+        actually outrank the fact it carries:
+
+        * :meth:`_mark_resolved` after a confirmed send —
+          :func:`_a_delivery_write_is_still_ours`. Gives up only on a
+          **terminal** status (``resolved`` / ``cancelled``): somebody else
+          already filed a final answer for this promise and re-stamping it
+          with our body would record the wrong sentence as the one the player
+          received. ``queued`` does NOT stop it: that only means a concurrent
+          executor pushed the row back for a retry, and "the message went out"
+          is the stronger fact — leaving it queued is exactly the bug above,
+          just entered through the other door.
+        * :meth:`_fail_back_to_queued` and :meth:`_park_for_capability` —
+          :func:`_a_retry_write_is_still_ours`. Gives up on anything but
+          ``resolving``. All they carry is "this pass didn't finish", which
+          has no strength to overwrite anyone's result; and if the row is
+          already ``queued``, the retry they want is scheduled regardless.
+
+        Returns whether the write happened, so a caller can keep its logging
+        honest. It deliberately does NOT swallow ``save`` errors: a repository
+        failure is the caller's to handle exactly as it was before."""
+        fresh = await self._reread_writable(row, still_ours=still_ours)
+        if fresh is None:
+            return False
+        await self._repository.save(transition(fresh))
+        return True
+
+    async def _reread_writable(
+        self,
+        row: PendingFollowUp,
+        *,
+        still_ours: Callable[[PendingFollowUpStatus], bool],
+    ) -> PendingFollowUp | None:
+        """Re-load ``row``, or ``None`` when ``still_ours`` rejects its status.
+
+        Whatever the caller's rule is, it is applied to the status as it
+        stands NOW rather than to the pre-compose snapshot — another executor
+        may have reached a decision about this promise while we were
+        composing, and its decision is strictly newer than ours.
+
+        A read failure is treated as "not ours": we would be writing blind."""
+        try:
+            fresh = await self._repository.get(row.id)
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: re-read before write-back failed id=%s — "
+                "leaving the row untouched", row.id,
+            )
+            return None
+        if fresh is None:
+            _LOGGER.info(
+                "pending-follow-up: row gone before write-back id=%s", row.id,
+            )
+            return None
+        if not still_ours(fresh.status):
+            _LOGGER.info(
+                "pending-follow-up: row moved on to %s before write-back "
+                "id=%s — not overwriting it", fresh.status.value, row.id,
+            )
+            return None
+        return fresh
 
     async def _deliver_and_resolve(
         self,
@@ -386,16 +657,32 @@ class PendingFollowUpDispatcher:
         trigger: ProactiveTrigger,
         reason: str,
         character_id: str,
+        attachments: tuple[OutboundAttachment, ...] = (),
         now: datetime,
     ) -> bool:
         """Common tail for both kinds: fan out via deliver_pre_composed
         and flip status to resolved/failed.
 
+        ``attachments`` carries whatever a tool produced while the
+        promise was being fulfilled (a generated photo, typically) into
+        the pre-composed delivery path that has always accepted them —
+        the promise "晚點傳照片給你" is only kept if the photo ships
+        with the message.
+
         Guards the visible send with the at-most-once slot claim: claim BEFORE the
         send, so a reclaimed job whose predecessor already sent finds the slot taken
         and resolves WITHOUT re-sending; release the slot on a delivery failure so a
         genuine retry can re-claim (embedded stays byte-identical — its single
-        runner always wins the claim, and a failure frees it exactly as before)."""
+        runner always wins the claim, and a failure frees it exactly as before).
+
+        Every status write here is a post-compose write like the ones above, so it
+        goes through :meth:`_write_release_outcome`. The slot-taken branch shares
+        the *delivery* ownership rule rather than the retry one, because a refused
+        claim proves this row's visible send is already committed by somebody —
+        as good a reason to end the row as our own send, and the only thing left
+        uncertain is the wording. That is what the terminal check protects:
+        whoever DID send owns ``resolved_message``, so once they have filed it our
+        never-delivered ``body`` can no longer be stamped over it."""
         if not await self._claim_follow_up_slot(character_id, row.id):
             # Another executor already committed this row's send (crash-after-send
             # → reclaim). At-most-once: resolve without re-delivering.
@@ -403,9 +690,7 @@ class PendingFollowUpDispatcher:
                 "pending-follow-up: release slot already taken id=%s — "
                 "resolving without resend", row.id,
             )
-            await self._repository.save(
-                row.marked_resolved(message_text=body, now=now),
-            )
+            await self._mark_resolved(row, body=body, now=now)
             return True
         try:
             attempt = await self._proactive_dispatcher.deliver_pre_composed(
@@ -413,6 +698,7 @@ class PendingFollowUpDispatcher:
                 text=body,
                 trigger=trigger,
                 reason=reason,
+                attachments=attachments,
                 now=now,
             )
         except Exception:
@@ -421,8 +707,8 @@ class PendingFollowUpDispatcher:
                 row.id,
             )
             await self._release_follow_up_slot(character_id, row.id)
-            await self._repository.save(
-                row.marked_failed(error="delivery raised", now=now),
+            await self._fail_back_to_queued(
+                row, error="delivery raised", now=now,
             )
             return False
 
@@ -431,14 +717,10 @@ class PendingFollowUpDispatcher:
                 f"deliver={attempt.outcome.value if attempt else 'none'}"
             )
             await self._release_follow_up_slot(character_id, row.id)
-            await self._repository.save(
-                row.marked_failed(error=outcome_text, now=now),
-            )
+            await self._fail_back_to_queued(row, error=outcome_text, now=now)
             return False
 
-        await self._repository.save(
-            row.marked_resolved(message_text=body, now=now),
-        )
+        await self._mark_resolved(row, body=body, now=now)
         return True
 
     async def _claim_follow_up_slot(
@@ -594,6 +876,30 @@ class PendingFollowUpDispatcher:
                 character_id,
             )
             return []
+
+
+_TERMINAL_STATUSES = frozenset(
+    {PendingFollowUpStatus.RESOLVED, PendingFollowUpStatus.CANCELLED},
+)
+"""The statuses that record somebody's **final** answer for a promise.
+Everything else (``queued``, ``resolving``) says the promise is still in
+flight, which is why a delivery may write over them."""
+
+
+def _a_retry_write_is_still_ours(status: PendingFollowUpStatus) -> bool:
+    """Ownership test for the writes that say "this pass didn't finish".
+
+    Only ``resolving`` — see :meth:`PendingFollowUpDispatcher._write_release_outcome`
+    for why this is stricter than the delivery rule."""
+    return status == PendingFollowUpStatus.RESOLVING
+
+
+def _a_delivery_write_is_still_ours(status: PendingFollowUpStatus) -> bool:
+    """Ownership test for the write that records a **confirmed send**.
+
+    Anything non-terminal, ``queued`` included — see
+    :meth:`PendingFollowUpDispatcher._write_release_outcome`."""
+    return status not in _TERMINAL_STATUSES
 
 
 def _is_still_busy(current_activity: ScheduleActivity | None) -> bool:

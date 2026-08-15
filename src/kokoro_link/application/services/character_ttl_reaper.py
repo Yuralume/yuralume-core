@@ -1,4 +1,18 @@
-"""Hosted demo account TTL reaper."""
+"""Per-tier character TTL reaper.
+
+Deletes characters whose owning account is on a tier that sets a finite
+``character_ttl_days``. That knob is pushed down per tier by the cloud
+control-plane (it is one of the operator-editable Core runtime knobs), so
+this reaper is **not** tied to any particular tier — an account whose
+profile carries no ``character_ttl`` is simply never scanned, which is why
+self-host pays nothing for it.
+
+Historically this was the hosted demo reaper (``DemoAccountReaper``) and it
+additionally released the account's Cloud demo session once its last
+character was reaped. The demo site was retired on 2026-08-06 and that
+release hook went with it; the TTL sweep itself is a live tier capability
+and stays.
+"""
 
 from __future__ import annotations
 
@@ -16,47 +30,43 @@ from kokoro_link.contracts.account_runtime_usage import (
     AccountRuntimeUsageRepositoryPort,
 )
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
-from kokoro_link.contracts.cloud_auth import CloudDemoSessionReleasePort
-from kokoro_link.contracts.operator_profile import OperatorProfileRepositoryPort
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
-from kokoro_link.domain.entities.operator_profile import OperatorProfile
+from kokoro_link.domain.value_objects.account_runtime_profile import (
+    AccountRuntimeProfile,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class DemoAccountReaperResult:
+class CharacterTtlReaperResult:
     scanned_characters: int = 0
     expired_characters: int = 0
     deleted_characters: int = 0
-    released_accounts: int = 0
     delete_failures: int = 0
-    release_failures: int = 0
 
 
-class DemoAccountReaper:
-    """Delete expired hosted-demo characters and release their Cloud slot."""
+class CharacterTtlReaper:
+    """Delete characters past their tier's ``character_ttl``."""
 
     def __init__(
         self,
         *,
         character_repository: CharacterRepositoryPort,
         character_service: CharacterService,
-        operator_profile_repository: OperatorProfileRepositoryPort,
         account_runtime_profile_resolver: AccountRuntimeProfileResolverPort,
         account_runtime_usage_repository: AccountRuntimeUsageRepositoryPort,
-        release_hook: CloudDemoSessionReleasePort | None = None,
         clock: ClockPort | None = None,
     ) -> None:
         self._character_repository = character_repository
         self._character_service = character_service
-        self._operator_profile_repository = operator_profile_repository
         self._account_runtime_profile_resolver = account_runtime_profile_resolver
         self._account_runtime_usage_repository = account_runtime_usage_repository
-        self._release_hook = release_hook
         self._clock = clock
 
-    async def run_once(self, *, now: datetime | None = None) -> DemoAccountReaperResult:
+    async def run_once(
+        self, *, now: datetime | None = None,
+    ) -> CharacterTtlReaperResult:
         resolved_now = self._resolve_now(now)
         try:
             characters = await self._character_repository.list()
@@ -65,11 +75,10 @@ class DemoAccountReaper:
                 until=resolved_now,
             )
         except Exception:
-            _LOGGER.exception("demo account reaper: preflight failed")
-            return DemoAccountReaperResult()
+            _LOGGER.exception("character ttl reaper: preflight failed")
+            return CharacterTtlReaperResult()
 
         create_events_by_character = _index_create_events(create_events)
-        deleted_operators: set[str] = set()
         expired = 0
         deleted = 0
         delete_failures = 0
@@ -86,20 +95,17 @@ class DemoAccountReaper:
                 )
             except Exception:
                 _LOGGER.exception(
-                    "demo account reaper: runtime profile resolve failed user=%s",
+                    "character ttl reaper: runtime profile resolve failed user=%s",
                     character.user_id,
                 )
                 continue
-            if profile.character_ttl is None:
-                continue
-            if ensure_utc(create_event.occurred_at) + profile.character_ttl > resolved_now:
+            if not _is_expired(create_event, profile, resolved_now):
                 continue
             expired += 1
-            # H4: a paid tier push can land between the scan-time resolve above
-            # and this delete. Re-resolve the runtime profile immediately
-            # before deleting and skip if the operator is no longer demo (no
-            # character_ttl), so a just-upgraded customer's character is never
-            # reaped on an in-flight sweep.
+            # H4: a tier push can land between the scan-time resolve above and
+            # this delete. Re-resolve the runtime profile immediately before
+            # deleting, so a just-upgraded customer's character is never reaped
+            # on an in-flight sweep.
             try:
                 fresh_profile = await (
                     self._account_runtime_profile_resolver.resolve_for_operator(
@@ -108,12 +114,18 @@ class DemoAccountReaper:
                 )
             except Exception:
                 _LOGGER.exception(
-                    "demo account reaper: pre-delete profile re-resolve failed"
+                    "character ttl reaper: pre-delete profile re-resolve failed"
                     " user=%s",
                     character.user_id,
                 )
                 continue
-            if fresh_profile.character_ttl is None:
+            # Deliberately the *same* predicate as the scan above, not a weaker
+            # "does the tier still set a TTL at all" check: a push that only
+            # lengthens the TTL (3 days -> 30) leaves it non-``None`` while the
+            # character is no longer expired, and a weaker re-check would delete
+            # it anyway. Two different predicates on the two ends of the same
+            # race is what makes such a bug invisible, so there is only one.
+            if not _is_expired(create_event, fresh_profile, resolved_now):
                 continue
             try:
                 removed = await self._character_service.delete_character(
@@ -123,79 +135,20 @@ class DemoAccountReaper:
             except Exception:
                 delete_failures += 1
                 _LOGGER.exception(
-                    "demo account reaper: character delete failed character=%s",
+                    "character ttl reaper: character delete failed character=%s",
                     character.id,
                 )
                 continue
             if not removed:
                 continue
             deleted += 1
-            deleted_operators.add(character.user_id)
 
-        released = 0
-        release_failures = 0
-        for operator_id in sorted(deleted_operators):
-            if await self._operator_has_remaining_characters(operator_id):
-                continue
-            profile = await self._get_operator_profile(operator_id)
-            if profile is None:
-                continue
-            try:
-                did_release = await self._release_demo_account(profile)
-            except Exception:
-                release_failures += 1
-                _LOGGER.exception(
-                    "demo account reaper: demo release failed operator=%s",
-                    operator_id,
-                )
-                continue
-            if did_release:
-                released += 1
-
-        return DemoAccountReaperResult(
+        return CharacterTtlReaperResult(
             scanned_characters=len(characters),
             expired_characters=expired,
             deleted_characters=deleted,
-            released_accounts=released,
             delete_failures=delete_failures,
-            release_failures=release_failures,
         )
-
-    async def _operator_has_remaining_characters(self, operator_id: str) -> bool:
-        try:
-            return bool(await self._character_repository.list_for_user(operator_id))
-        except Exception:
-            _LOGGER.exception(
-                "demo account reaper: remaining character lookup failed user=%s",
-                operator_id,
-            )
-            return True
-
-    async def _get_operator_profile(
-        self,
-        operator_id: str,
-    ) -> OperatorProfile | None:
-        try:
-            return await self._operator_profile_repository.get(operator_id)
-        except Exception:
-            _LOGGER.exception(
-                "demo account reaper: operator profile lookup failed user=%s",
-                operator_id,
-            )
-            return None
-
-    async def _release_demo_account(self, profile: OperatorProfile) -> bool:
-        if self._release_hook is None:
-            return False
-        if profile.auth_provider != "cloud" or profile.cloud_tenant_tier != "demo":
-            return False
-        if not profile.cloud_tenant_id or not profile.cloud_account_id:
-            return False
-        await self._release_hook.release_demo_session(
-            tenant_id=profile.cloud_tenant_id,
-            account_id=profile.cloud_account_id,
-        )
-        return True
 
     def _resolve_now(self, now: datetime | None) -> datetime:
         if now is not None:
@@ -203,6 +156,21 @@ class DemoAccountReaper:
         if self._clock is not None:
             return ensure_utc(self._clock.now())
         return datetime.now(timezone.utc)
+
+
+def _is_expired(
+    create_event: AccountRuntimeUsageEvent,
+    profile: AccountRuntimeProfile,
+    now: datetime,
+) -> bool:
+    """Is this character past its tier's TTL as of ``now``?
+
+    A tier with no ``character_ttl`` never expires anything, which is why
+    self-host and every uncapped tier are invisible to the sweep.
+    """
+    if profile.character_ttl is None:
+        return False
+    return ensure_utc(create_event.occurred_at) + profile.character_ttl <= now
 
 
 def _index_create_events(

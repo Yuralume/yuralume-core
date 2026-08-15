@@ -119,6 +119,9 @@ from kokoro_link.application.services.location_context import (
 from kokoro_link.application.services.persona_curiosity_observability import (
     persona_curiosity_plan_summary,
 )
+from kokoro_link.application.services.tool_attachment_delivery import (
+    to_outbound_attachments,
+)
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.character_goal import CharacterGoal
 from kokoro_link.domain.entities.character_operator_relationship_seed import (
@@ -637,7 +640,7 @@ class ProactiveDispatcher:
         active_arc, upcoming_beats, beat_awaiting_player = (
             await self._ensure_active_arc(character, when, operator_tz)
         )
-        seed = await self._claim_event_seed(character)
+        seed = await self._claim_event_seed(character, when)
         seed_item_id = seed.item_id
 
         calendar_context = self._describe_calendar(
@@ -1532,28 +1535,13 @@ class ProactiveDispatcher:
                     "proactive tool %s failed: %s", call.name, result.error,
                 )
                 continue
-            for att in result.attachments:
-                url = att.url
-                if url.startswith("/"):
-                    if not public_base_url:
-                        _LOGGER.warning(
-                            "dropping proactive attachment %s for %s — "
-                            "messaging public base URL is not set, external "
-                            "platforms cannot fetch a server-relative URL. "
-                            "Set Admin Channel settings Public Base URL or "
-                            "APP_BASE_URL",
-                            url, att.kind,
-                        )
-                        continue
-                    url = f"{public_base_url}{url}"
-                collected.append(
-                    OutboundAttachment(
-                        kind=att.kind,
-                        url=url,
-                        mime_type=att.mime_type,
-                        caption=att.caption,
-                    ),
-                )
+            collected.extend(
+                to_outbound_attachments(
+                    result.attachments,
+                    public_base_url=public_base_url,
+                    surface="proactive",
+                ),
+            )
         return tuple(collected)
 
     async def _resolve_public_base_url(self) -> str:
@@ -1866,7 +1854,7 @@ class ProactiveDispatcher:
             return False
 
     async def _claim_event_seed(
-        self, character: Character,
+        self, character: Character, when: datetime,
     ) -> _ClaimedEventSeed:
         """Try to claim a curated world event for the proactive surface.
 
@@ -1884,6 +1872,7 @@ class ProactiveDispatcher:
         try:
             claimed = await self._event_seed_dispenser.claim(
                 character_id=character.id, surface="proactive_message",
+                now=when,
             )
         except Exception:
             _LOGGER.exception(

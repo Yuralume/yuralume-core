@@ -73,6 +73,9 @@ from kokoro_link.infrastructure.localization.fallback_texts import (
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
+from kokoro_link.infrastructure.prompt.tool_outcomes_block import (
+    render_tool_outcomes_block,
+)
 from kokoro_link.infrastructure.prompt.tools_block import render_tools_block
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_lines,
@@ -349,6 +352,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         resolved_character_address: "ResolvedAddress | None" = None,
         address_change_lines: "list[str] | None" = None,
         include_operator_status: bool = True,
+        stage_nudge: bool = False,
     ) -> str:
         # ``vision_markers`` carries the cross-turn image inventory:
         # which 1-based ``[圖 N]`` tags belong to which turn. The
@@ -447,7 +451,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         tools_block = render_tools_block(
             available_tools or [], forced_tool_name=forced_tool_name,
         )
-        tool_outcomes_block = _render_tool_outcomes_block(tool_outcomes or [])
+        tool_outcomes_block = render_tool_outcomes_block(tool_outcomes or [])
         story_events_block = _render_story_events_block(story_events or [])
         # Today's scripted beat — directive segment, distinct from the
         # narrative material in ``story_events_block``. Empty for
@@ -533,6 +537,18 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
             include_operator_status=include_operator_status,
             now=ref_now,
             local_tz=local_tz,
+        )
+        # SN1: rendered next to the latest-user-message line rather than up
+        # here with the presence frame — it is a statement about *this*
+        # turn ("nobody spoke to you"), and it has to land right where the
+        # model would otherwise be looking for the line that isn't there.
+        stage_nudge_block = _render_stage_nudge_block(
+            stage_nudge, presence_frame_model,
+        )
+        latest_user_message_block = _render_latest_user_message_line(
+            stage_nudge=stage_nudge,
+            prefix=latest_user_prefix,
+            message=latest_user_message,
         )
         instructions_footer = get_default_loader().render(
             "chat/instructions_footer",
@@ -703,7 +719,8 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
                 *memory_block,
                 *initial_relationship_block,
                 *relationship_anchor_block,
-                f"{LATEST_USER_MESSAGE_MARKER}{latest_user_prefix}{latest_user_message}",
+                *stage_nudge_block,
+                *latest_user_message_block,
                 *retry_directive_block,
                 instructions_footer,
             ]
@@ -831,6 +848,38 @@ hand the judgement to the main model *inside* the scene instead of
 refusing the turn before it starts.
 """
 
+_STAGE_NUDGE_GUIDANCE = (
+    "本輪情境（玩家請你先開口）：",
+    "- 本輪玩家沒有對你說話——他們（若有補充）宣告了場景中的事實或自己的動作，"
+    "或僅是示意你注意到他們在場。",
+    "- 請你主動開口：接住當下語境、你自己的行程與狀態，自然地說出這一刻的第一句話；"
+    "不要等他先講，也不要把這輪寫成在回覆一句他沒說出口的話。",
+    "- 玩家宣告過的行動可以承認、可以回應（那是他自己說的），"
+    "但不得替玩家虛構新的行動或台詞。",
+)
+"""Stage nudge (SN1) — the player pulled the turn instead of speaking.
+
+A conditional block in the same spirit as :data:`_STAGE_PRESENCE_GUIDANCE`:
+it hands the model the *situation* and one red line, and leaves the reading
+of the supplement (a declared fact? an action? nothing at all?) to the
+model, which is the only thing that can tell them apart.
+"""
+
+_STAGE_NUDGE_NEUTRAL_GUIDANCE = (
+    "本輪情境（玩家請你先開口）：",
+    "- 本輪玩家沒有對你說話，只是示意你先起頭；若有補充，那是他對此刻情況的說明。",
+    "- 請你主動開口，接住當下語境與你自己的行程與狀態。",
+    "- 玩家宣告過的行動可以承認、可以回應，但不得替玩家虛構新的行動或台詞。",
+)
+"""The same block for a turn that is not same-place acting.
+
+The nudge flag is not gated on the surface (no verdict gate, per the SA
+retirement): a DM or messaging frame that sends it still gets a turn, only
+framed neutrally — "they asked you to start" rather than "they are here
+with you", which would put the character in a room the frame says it is
+not in.
+"""
+
 _OPERATOR_STATUS_FRESHNESS_LINE = (
     "- 這是他自述的近況，不是硬性事實，也沒有固定有效期限："
     "請依內容語意與設定時間距今多久，自行判斷它現在還算不算數；"
@@ -839,6 +888,47 @@ _OPERATOR_STATUS_FRESHNESS_LINE = (
 
 _OPERATOR_STATUS_CLIP = 200
 """Prompt-budget guard for a free-text field with no length limit."""
+
+
+def _render_latest_user_message_line(
+    *,
+    stage_nudge: bool,
+    prefix: str,
+    message: str,
+) -> list[str]:
+    """The 「最新使用者訊息：」 line — omitted when there is no message.
+
+    Only a *silent* 示意 can omit it, and only because the nudge block
+    rendered immediately above already said 「本輪玩家沒有對你說話」. The
+    two together used to read as a contradiction: a labelled slot for the
+    player's line, empty, right under a sentence saying no line exists —
+    which invites the model to answer the silence (「你怎麼不說話」) on the
+    feature's most common press.
+
+    Every other turn keeps the line byte for byte, including an ordinary
+    turn whose text cleaned down to nothing (a bare ``/pic``) — that
+    player did send something, and the empty slot is the honest rendering
+    of it. The ``prefix`` guard is belt-and-braces: image markers without
+    text cannot reach a silent nudge (the request contract rejects that
+    combination), and if one ever did, dropping the line would hide the
+    ``[圖 N]`` tags the attached images are numbered by.
+    """
+    if stage_nudge and not prefix and not message.strip():
+        return []
+    return [f"{LATEST_USER_MESSAGE_MARKER}{prefix}{message}"]
+
+
+def _render_stage_nudge_block(
+    stage_nudge: bool,
+    presence_frame: "PresenceFrame | None",
+) -> list[str]:
+    """The conditional 示意 block, or nothing at all on an ordinary turn."""
+    if not stage_nudge:
+        return []
+    frame = presence_frame or PresenceFrame.web_stage()
+    if _presence_frame_uses_texting_style(frame):
+        return list(_STAGE_NUDGE_NEUTRAL_GUIDANCE)
+    return list(_STAGE_NUDGE_GUIDANCE)
 
 
 def _render_presence_frame_block(
@@ -2377,38 +2467,6 @@ def _operator_timezone(
         return timezone_for_id(getattr(operator, "timezone_id", None))
     except ValueError:
         return fallback
-
-
-def _render_tool_outcomes_block(outcomes: list[ToolOutcomeMessage]) -> list[str]:
-    """Tell the model what the tools it called just returned.
-
-    We keep the payload human-readable rather than echoing the full
-    JSON — the model is about to write a reply to the *user*, so it
-    needs enough context ("I just generated an image of …") without
-    getting distracted by URL structure.
-    """
-    if not outcomes:
-        return []
-    lines: list[str] = ["工具回傳結果（已執行，請在回覆中自然地交代結果）："]
-    for outcome in outcomes:
-        if outcome.ok:
-            lines.append(
-                f"- {outcome.tool_name} 成功：{outcome.output_text or '（無文字輸出）'}"
-            )
-            if outcome.attachment_urls:
-                lines.append(
-                    f"  產出檔案：{len(outcome.attachment_urls)} 個（已附在這則回覆一起送給使用者）"
-                )
-        else:
-            lines.append(
-                f"- {outcome.tool_name} 失敗：{outcome.error or '未知錯誤'}"
-                "（請以角色語氣向使用者簡短致歉，不要重試）"
-            )
-    lines.append(
-        "只能根據上面實際回傳的內容作答。回傳的資訊不足以回答時，"
-        "就照實說沒查到，不要自行補上工具沒給你的細節。"
-    )
-    return lines
 
 
 def _render_story_events_block(events: list[StoryEvent]) -> list[str]:

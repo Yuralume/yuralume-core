@@ -153,6 +153,61 @@ async def test_orphaned_row_is_pruned_and_skipped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_injected_now_anchors_the_age_window() -> None:
+    # A scheduler tick carries a logical clock; the age window must
+    # follow it, not the machine running the test. This is the seam
+    # that keeps pinned-date dispatcher fixtures from rotting as the
+    # calendar advances past their absolute dates.
+    events = InMemoryWorldEventRepository()
+    inbox = InMemoryCharacterEventInboxRepository()
+    tick = datetime(2026, 8, 10, 4, 0, tzinfo=timezone.utc)
+    event = WorldEvent(
+        id=str(uuid4()),
+        source="test",
+        title="Title",
+        summary="Summary body",
+        url=f"https://example.com/{uuid4()}",
+        published_at=tick - timedelta(days=4),
+        fetched_at=tick - timedelta(days=4),
+        category="news",
+        topic_tags=(),
+        embedding=None,
+    )
+    await events.upsert(event)
+    await inbox.add_many([
+        CharacterEventInboxItem.create(
+            character_id="char-1",
+            world_event_id=event.id,
+            similarity=0.7,
+            created_at=tick - timedelta(days=4),
+        ),
+    ])
+    dispenser = EventSeedDispenser(
+        inbox_repository=inbox,
+        world_event_repository=events,
+        max_age_days=5,
+    )
+
+    # Inside the window relative to the tick — fresh, regardless of
+    # today's wall clock (which is far past the pinned date).
+    peeked = await dispenser.peek(character_id="char-1", now=tick)
+    assert len(peeked) == 1
+    claimed = await dispenser.claim(
+        character_id="char-1", surface="proactive_message", now=tick,
+    )
+    assert claimed is not None
+    assert claimed.item.claimed_at == tick
+
+    # A tick two days later puts the same event past the window.
+    await inbox.release(claimed.item.id, surface="proactive_message")
+    late_tick = tick + timedelta(days=2)
+    assert await dispenser.peek(character_id="char-1", now=late_tick) == []
+    assert await dispenser.claim(
+        character_id="char-1", surface="proactive_message", now=late_tick,
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_peek_does_not_consume() -> None:
     events = InMemoryWorldEventRepository()
     inbox = InMemoryCharacterEventInboxRepository()

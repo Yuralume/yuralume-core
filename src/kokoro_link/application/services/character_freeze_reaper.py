@@ -1,7 +1,7 @@
 """Idle-character auto-freeze sweep (CHARACTER_FREEZE_PLAN).
 
 A cost-control reaper that freezes characters the user has stopped
-interacting with. Mirrors :class:`DemoAccountReaper`'s shape: it is
+interacting with. Mirrors :class:`CharacterTtlReaper`'s shape: it is
 driven from the proactive scheduler tick (throttled), scans the active
 (non-frozen) character set once, and freezes any whose last user
 interaction is older than the admin-configured idle threshold.

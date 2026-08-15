@@ -65,6 +65,16 @@ export function portalCreditsUrl(portalUrl: string | null): string | null {
   return portalPath(portalUrl, '/credits')
 }
 
+/**
+ * Absolute URL of the Portal itself (the account centre home), or `null` on
+ * the same terms as `portalCreditsUrl`. Shared so the components that render
+ * the entry and the ones that decide *whether* to render it agree on one
+ * normalization instead of each trimming the trailing slash themselves.
+ */
+export function portalHomeUrl(portalUrl: string | null): string | null {
+  return portalPath(portalUrl, '')
+}
+
 export function portalPath(
   portalUrl: string | null,
   path: string,

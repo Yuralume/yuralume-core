@@ -30,7 +30,6 @@ from kokoro_link.application.services.story_scene_service import (
     SceneMaterialUnavailable,
     SceneOpenFailed,
     StorySceneService,
-    StorySceneUnavailable,
 )
 from kokoro_link.contracts.story_arc import StoryArcPlannerPort
 from kokoro_link.contracts.story_scene import (
@@ -59,7 +58,9 @@ from kokoro_link.domain.entities.story_scene_session import (
 )
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+)
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.repositories.in_memory_background_jobs import (
@@ -213,7 +214,6 @@ class _Fixture:
         *,
         arc: StoryArc | None,
         opener: StorySceneOpenerPort,
-        profile=DEFAULT_ACCOUNT_RUNTIME_PROFILE,  # noqa: ANN001
         turn_lease: ChatTurnLease | None = None,
         retry_policy: BeatRetryPolicy | None = None,
         quota_guard=None,  # noqa: ANN001
@@ -239,7 +239,6 @@ class _Fixture:
             ),
             story_arc_service=self.arc_service,
             turn_lease=turn_lease,
-            account_runtime_profile_resolver=_StubProfileResolver(profile),
             quota_guard=quota_guard,
         )
 
@@ -528,23 +527,6 @@ async def test_arc_with_only_realized_beats_reports_no_material() -> None:
 
     with pytest.raises(SceneMaterialUnavailable):
         await fx.service.open_scene(_character(), now=NOW)
-
-
-@pytest.mark.asyncio
-async def test_demo_accounts_may_not_open_scenes() -> None:
-    fx = await _fixture(
-        arc=_arc(),
-        opener=_StubOpener(_DRAFT),
-        profile=DEMO_ACCOUNT_RUNTIME_PROFILE,
-    )
-
-    with pytest.raises(StorySceneUnavailable) as caught:
-        await fx.service.open_scene(_character(), now=NOW)
-
-    assert caught.value.code == "story_scene_unavailable"
-    assert await fx.sessions.get_open_for_character("c1") is None
-    # refused before the model was ever asked
-    assert fx.opener.contexts == []
 
 
 @pytest.mark.asyncio

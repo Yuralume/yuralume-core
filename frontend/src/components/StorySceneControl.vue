@@ -27,8 +27,6 @@ const props = defineProps<{
   ending?: boolean
   /** The composer cannot act right now (no character, a turn in flight). */
   disabled?: boolean
-  /** This deployment offers no scenes — the button is withdrawn entirely. */
-  unavailable?: boolean
   /** Already-localized refusal text, or null. */
   errorMessage?: string | null
   /**
@@ -58,15 +56,6 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
-/**
- * With no button and nothing to explain there is no strip at all — a trial
- * player is never shown a control they cannot use, nor a permanent apology
- * for its absence.
- */
-const visible = computed(
-  () => !props.unavailable || Boolean(props.errorMessage),
-)
-
 const openLabel = computed(() => (
   props.opening ? t('chat.storyScene.opening') : t('chat.storyScene.action')
 ))
@@ -77,8 +66,8 @@ const endLabel = computed(() => (
 </script>
 
 <template>
-  <div v-if="visible" class="story-scene-control">
-    <div v-if="!unavailable && sceneOpen" class="story-scene-control__status">
+  <div class="story-scene-control">
+    <div v-if="sceneOpen" class="story-scene-control__status">
       <span class="story-scene-control__pulse" aria-hidden="true" />
       <span class="story-scene-control__status-text">
         <span class="story-scene-control__status-label">
@@ -100,7 +89,7 @@ const endLabel = computed(() => (
       </UiButton>
     </div>
 
-    <div v-else-if="!unavailable" class="story-scene-control__idle">
+    <div v-else class="story-scene-control__idle">
       <UiButton
         variant="hero"
         size="sm"
@@ -127,7 +116,7 @@ const endLabel = computed(() => (
          above the other, and the error is the one that also promises
          nothing was charged. -->
     <p
-      v-if="!unavailable && !sceneOpen && quotaNote && !errorMessage"
+      v-if="!sceneOpen && quotaNote && !errorMessage"
       :class="[
         'story-scene-control__quota',
         { 'story-scene-control__quota--exhausted': quotaExhausted },

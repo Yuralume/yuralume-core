@@ -48,7 +48,6 @@ from kokoro_link.application.services.story_scene_service import (
     SceneMaterialUnavailable,
     SceneOpenFailed,
     StorySceneService,
-    StorySceneUnavailable,
 )
 from kokoro_link.contracts.cloud_action_billing import (
     ACTION_STORY_SCENE_OPEN,
@@ -77,8 +76,10 @@ from kokoro_link.domain.entities.story_scene_session import SCENE_CLOSE_MANUAL
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     BILLING_SHAPE_ACTION_FIXED,
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
+)
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.repositories.in_memory_background_jobs import (
@@ -253,7 +254,6 @@ class _Fixture:
         *,
         opener: StorySceneOpenerPort,
         arc: StoryArc | None = None,
-        profile=DEFAULT_ACCOUNT_RUNTIME_PROFILE,  # noqa: ANN001
         billing_profile=_ACTION_TIER,  # noqa: ANN001
         quota_guard=None,  # noqa: ANN001
         turn_lease: ChatTurnLease | None = None,
@@ -289,7 +289,6 @@ class _Fixture:
                 repository=self.arcs_repo, planner=_UnusedPlanner(),
             ),
             turn_lease=turn_lease,
-            account_runtime_profile_resolver=_StubProfiles(profile),
             quota_guard=quota_guard,
             action_billing=billing,
         )
@@ -424,17 +423,6 @@ async def test_an_opening_that_never_reaches_the_thread_is_refunded() -> None:
 
 
 # ── refusals this service already knows never move money ─────────────
-
-
-async def test_a_demo_account_is_refused_without_a_charge() -> None:
-    fx = await _fixture(
-        opener=_CoveredOpener(), profile=DEMO_ACCOUNT_RUNTIME_PROFILE,
-    )
-
-    with pytest.raises(StorySceneUnavailable):
-        await fx.service.open_scene(_character(), now=NOW)
-
-    assert fx.client.charges == []
 
 
 async def test_a_running_scene_is_refused_without_a_second_charge() -> None:

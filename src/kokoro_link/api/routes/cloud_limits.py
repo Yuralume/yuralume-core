@@ -75,8 +75,8 @@ async def get_cloud_runtime_limits(
             detail="runtime limits are only available in cloud mode",
         )
     # Deliberately not tenant-scoped, unlike ``/cloud/credits``: the ceilings
-    # come from the operator's own runtime profile, which the demo tier has
-    # too (and which is exactly the account most likely to hit one).
+    # come from the operator's own runtime profile, so the answer is the
+    # same one the guards themselves would reach for this operator.
     service = getattr(container, "player_runtime_limits_service", None)
     if service is None:
         raise HTTPException(

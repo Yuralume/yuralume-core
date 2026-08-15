@@ -13,7 +13,6 @@ from kokoro_link.domain.value_objects.account_runtime_profile import (
     BILLING_SHAPE_TOKEN_FLOATING,
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
     DEFAULT_DAILY_OVERAGE_LIMIT,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
 )
 from kokoro_link.infrastructure.repositories.in_memory_operator_profile import (
@@ -56,38 +55,13 @@ async def test_resolver_returns_default_without_cloud_projection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolver_maps_cloud_demo_tenant_to_demo_profile() -> None:
-    repo = InMemoryOperatorProfileRepository()
-    await repo.save(
-        OperatorProfile(
-            id="cloud:acct_1",
-            display_name="Demo Player",
-            cloud_account_id="acct_1",
-            cloud_tenant_id="tenant_demo",
-            cloud_tenant_tier="demo",
-            auth_provider="cloud",
-        )
-    )
-    resolver = AccountRuntimeProfileResolver(repo)
-
-    profile = await resolver.resolve_for_operator("cloud:acct_1")
-
-    assert profile == DEMO_ACCOUNT_RUNTIME_PROFILE
-    assert profile.max_characters == 1
-    assert profile.character_ttl.days == 3
-    assert profile.album_generation_enabled is False
-    assert profile.strict_no_fallback is True
-    assert profile.background_activity_multiplier == 6
-
-
-@pytest.mark.asyncio
-async def test_resolver_does_not_treat_local_profile_as_demo() -> None:
+async def test_resolver_does_not_apply_cloud_policy_to_local_profile() -> None:
     repo = InMemoryOperatorProfileRepository()
     await repo.save(
         OperatorProfile(
             id="default",
             display_name="Local Operator",
-            cloud_tenant_tier="demo",
+            cloud_tenant_tier="plus",
             auth_provider="local",
         )
     )
@@ -97,20 +71,6 @@ async def test_resolver_does_not_treat_local_profile_as_demo() -> None:
 
 
 # --- paid-tier control-plane resolution (plan H2 §9) ---------------------
-
-
-@pytest.mark.asyncio
-async def test_resolver_demo_tier_ignores_control_plane_port() -> None:
-    repo = InMemoryOperatorProfileRepository()
-    await _save_cloud_operator(repo, tier="demo")
-    port = _StubTierPort(AccountRuntimeProfile(name="plus"))
-    resolver = AccountRuntimeProfileResolver(repo, tier_profile_port=port)
-
-    profile = await resolver.resolve_for_operator("cloud:acct_1")
-
-    # Demo stays the hardcoded restrictive profile; the port is never consulted.
-    assert profile == DEMO_ACCOUNT_RUNTIME_PROFILE
-    assert port.calls == []
 
 
 @pytest.mark.asyncio
@@ -344,9 +304,9 @@ def test_invalid_overage_knobs_fall_back_to_the_safe_defaults() -> None:
     assert profile.daily_overage_limit == DEFAULT_DAILY_OVERAGE_LIMIT
 
 
-def test_demo_profile_is_not_action_priced() -> None:
-    assert DEMO_ACCOUNT_RUNTIME_PROFILE.uses_action_pricing is False
-    assert DEMO_ACCOUNT_RUNTIME_PROFILE.overage_enabled is False
+def test_default_profile_is_not_action_priced() -> None:
+    assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.uses_action_pricing is False
+    assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.overage_enabled is False
 
 
 # --- story_scene_daily_limit (SC3-B) ---------------------------------------

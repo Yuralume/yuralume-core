@@ -192,8 +192,8 @@ const storyScenesDaily = computed(() => usage(snap => snap.story_scenes_daily))
  * evidence of exhaustion. Both walls are reported when both are up
  * (`slots_and_daily`): deleting a character frees a slot but never refunds
  * the daily ledger, so "say goodbye to make room" alone would trade an
- * irreversible deletion for a creation the server still refuses today —
- * exactly the demo profile's everyday state (1 slot, 1 create/day).
+ * irreversible deletion for a creation the server still refuses today — the
+ * everyday state of any tight profile (e.g. 1 slot with 1 create/day).
  */
 const characterCreationBlocked = computed<CharacterCreationBlock | null>(() => {
   const slotsFull = reached(characterSlots.value)

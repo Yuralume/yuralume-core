@@ -7,6 +7,26 @@ asks the model to write the actual message that fulfils the promise.
 Output is plain prose. Same normalisation + length cap as
 :class:`LLMPendingFollowUpComposer` (they share the same fail-soft
 contract: empty output = retry next tick).
+
+**Tool passes (PF1).** When the caller offers ``available_tools``, the
+prompt gains the shared tools block and the model may answer with a
+JSON tool call instead of prose; we parse it and return it as
+``tool_calls`` for the application layer to execute — this adapter
+never runs a tool itself. On the second pass the caller supplies
+``tool_results`` (successes *and* failures) and no tools, so the model
+writes the message from what it actually got. Any JSON emitted when no
+tools are on offer is suppressed rather than shipped: a player must
+never receive a raw ``{"tool": …}`` blob as their promised message.
+
+**Machine output is never the message — on any pass.** The guard for
+that belongs to "this text is about to become player-visible", not to
+"this pass offered tools", so it runs on every compose. Only its
+*width* depends on the pass: with tools on offer the prompt demanded
+JSON alone, so anything carrying a call's shape is a failed call
+(:func:`looks_like_tool_call_shape`); without them we only refuse an
+answer that is *entirely* a structured literal
+(:func:`looks_like_object_literal`), because there the model was asked
+for prose and over-refusing would silently drop a kept promise.
 """
 
 from __future__ import annotations
@@ -16,6 +36,12 @@ import re
 from dataclasses import replace
 
 from kokoro_link.application.services.model_resolver import ModelResolver
+from kokoro_link.application.services.tool_call_parser import (
+    looks_like_object_literal,
+    looks_like_tool_call_attempt,
+    looks_like_tool_call_shape,
+    parse_tool_call,
+)
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.scheduled_promise_composer import (
@@ -41,6 +67,11 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
 )
+from kokoro_link.infrastructure.prompt.tool_outcomes_block import (
+    TOOL_PASS_CLOSING_HINT,
+    render_tool_outcomes_block,
+)
+from kokoro_link.infrastructure.prompt.tools_block import render_tools_block
 from kokoro_link.infrastructure.prompts import get_default_loader
 
 _LOGGER = logging.getLogger(__name__)
@@ -105,8 +136,58 @@ class LLMScheduledPromiseComposer(ScheduledPromiseComposerPort):
                 payload.character.id,
             )
             return ScheduledPromiseComposeOutput(content_text="")
-        body = _normalize(raw)
-        return ScheduledPromiseComposeOutput(content_text=body)
+        return _output_for(raw, payload)
+
+
+def _output_for(
+    raw: str, payload: ScheduledPromiseComposeInput,
+) -> ScheduledPromiseComposeOutput:
+    """Split the model's raw answer into "a tool call" or "the message".
+
+    Parsing runs against ``raw`` rather than the normalised text because
+    normalisation strips fences and truncates at 600 chars — either can
+    mangle a JSON call before we ever look at it.
+    """
+    allowed = {tool.name for tool in payload.available_tools}
+    if allowed:
+        call = parse_tool_call(raw)
+        if call is not None and call.name in allowed:
+            return ScheduledPromiseComposeOutput(
+                content_text="", tool_calls=(call,),
+            )
+        if call is not None:
+            _LOGGER.info(
+                "scheduled-promise composer asked for unavailable tool %r "
+                "character=%s — treating as no output",
+                call.name, payload.character.id,
+            )
+            return ScheduledPromiseComposeOutput(content_text="")
+    # Runs on *every* pass, at the width that pass has earned. The second
+    # pass offers no tools, so it lands here with the narrow judgement —
+    # which is the whole point: that is the pass whose output is handed
+    # straight to the player, and it used to have no guard at all.
+    if (
+        looks_like_tool_call_shape(raw)
+        if allowed
+        else looks_like_object_literal(raw)
+    ):
+        _LOGGER.warning(
+            "scheduled-promise composer returned machine output instead of a "
+            "message character=%s tools_offered=%d — suppressing",
+            payload.character.id, len(allowed),
+        )
+        return ScheduledPromiseComposeOutput(content_text="")
+    if looks_like_tool_call_attempt(raw):
+        # Either a malformed call, or a call on the pass where no tools
+        # were offered. Shipping the blob would put raw JSON in the
+        # player's chat; empty text means "retry next tick" instead.
+        _LOGGER.warning(
+            "scheduled-promise composer emitted an unusable tool call "
+            "character=%s tools_offered=%d — suppressing",
+            payload.character.id, len(allowed),
+        )
+        return ScheduledPromiseComposeOutput(content_text="")
+    return ScheduledPromiseComposeOutput(content_text=_normalize(raw))
 
 
 class NullScheduledPromiseComposer(ScheduledPromiseComposerPort):
@@ -137,6 +218,7 @@ def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
         f"\n\n對方當初的原話：「{original_text[:200]}」" if original_text else ""
     )
     scheduled_local = to_timezone(payload.scheduled_for, payload.local_tz)
+    tools_block = _tools_block(payload)
     body = get_default_loader().render(
         "busy/scheduled_promise_composer",
         promise_intent=payload.promise_intent.strip()[:300],
@@ -146,6 +228,11 @@ def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
         operator_persona_block=operator_block,
         schedule_block=schedule_block,
         summary_block=summary_block,
+        tool_results_block=_tool_results_block(payload),
+        tools_block=tools_block,
+        closing_tool_hint=(
+            f"{TOOL_PASS_CLOSING_HINT}\n" if tools_block else ""
+        ),
         max_reply_chars=_MAX_REPLY_CHARS,
     )
     language_hint = render_operator_language_hint(
@@ -154,6 +241,25 @@ def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
     if language_hint:
         body = f"{language_hint}\n\n{body}"
     return body
+
+
+def _tools_block(payload: ScheduledPromiseComposeInput) -> str:
+    """The shared chat/proactive tools section, first pass only.
+
+    Empty on every pre-PF1 call and on the second pass — the tool has
+    already run by then, and re-offering it invites a second call the
+    loop would not execute."""
+    if not payload.available_tools:
+        return ""
+    lines = render_tools_block(list(payload.available_tools))
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
+def _tool_results_block(payload: ScheduledPromiseComposeInput) -> str:
+    if not payload.tool_results:
+        return ""
+    lines = render_tool_outcomes_block(list(payload.tool_results))
+    return "\n\n" + "\n".join(lines) if lines else ""
 
 
 def _routing_tolerance_for_payload(

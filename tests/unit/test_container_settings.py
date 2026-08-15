@@ -12,6 +12,9 @@ from kokoro_link.bootstrap.settings import (
 from kokoro_link.application.services.cloud_active_llm_provider import (
     CloudActiveLLMProvider,
 )
+from kokoro_link.infrastructure.cloud.official_card_exclusive_client import (
+    EXCLUSIVE_READ_SCOPE,
+)
 from kokoro_link.application.services.messaging_public_url import (
     MESSAGING_PUBLIC_BASE_URL_KEY,
 )
@@ -350,11 +353,53 @@ def test_container_wires_background_encounter_and_schedule_memorializer() -> Non
         container.proactive_scheduler._schedule_memorializer  # noqa: SLF001
         is container.schedule_memorializer
     )
-    assert container.demo_account_reaper is not None
+    assert container.character_ttl_reaper is not None
     assert (
-        container.proactive_scheduler._demo_account_reaper  # noqa: SLF001
-        is container.demo_account_reaper
+        container.proactive_scheduler._character_ttl_reaper  # noqa: SLF001
+        is container.character_ttl_reaper
     )
+
+
+def test_cloud_container_wires_the_control_plane_tier_profile_port() -> None:
+    """Every hosted tier's limits now come from the control-plane.
+
+    Core carries no hardcoded tier->knob table since the demo profile was
+    removed, so an unwired ``tier_profile_port`` no longer degrades one tier —
+    it makes *every* hosted tier resolve to the permissive default, silently
+    and expensively. Nothing else fails when that wire is dropped, which is
+    exactly why both halves of the condition are pinned here.
+    """
+    container = build_container(
+        AppSettings(
+            cloud=CloudSettings(
+                enabled=True,
+                user_service_url="https://users.example",
+                gateway_url="https://gateway.example",
+                deployment_token="ykl_deploy",
+                runtime_config_enabled=True,
+            ),
+        ),
+    )
+
+    # Reached through a consumer because the resolver is not itself a
+    # container attribute; the reaper holds the very instance every other
+    # consumer got.
+    reaper = container.character_ttl_reaper
+    assert reaper is not None
+    resolver = reaper._account_runtime_profile_resolver  # noqa: SLF001
+    assert resolver._tier_profile_port is not None  # noqa: SLF001
+
+
+def test_cloud_container_leaves_the_tier_port_unwired_without_runtime_config() -> None:
+    """The other half of the contract: runtime-config off is a supported
+    deployment, and it resolves every tier to the permissive default rather
+    than failing. Pinned so the port's gate cannot quietly widen."""
+    container = build_container(_cloud_settings())
+
+    reaper = container.character_ttl_reaper
+    assert reaper is not None
+    resolver = reaper._account_runtime_profile_resolver  # noqa: SLF001
+    assert resolver._tier_profile_port is None  # noqa: SLF001
 
 
 def test_container_wires_schedule_weather_drift_into_the_tick() -> None:
@@ -697,3 +742,43 @@ def test_schedule_plan_claim_ttl_outlives_one_slow_planner_round() -> None:
     claim = container.schedule_service._plan_claim
     assert claim is not None
     assert claim.ttl_seconds >= 600
+
+
+def test_gated_catalog_client_absolutises_through_the_anonymous_catalog_client() -> None:
+    """TG3 wiring red line, pinned at the container rather than re-derived in
+    a hand-built unit test: the gated (tier-fenced) catalog client's asset
+    absolutiser must be the *same bound method* the anonymous
+    ``OfficialCardCatalogClient`` (wrapped by ``CachedOfficialCardCatalog``)
+    uses for the public shelf — never one re-derived from
+    ``cloud.user_service_url``.
+
+    That second client lives on an internal host; absolutising a gated
+    row's image path against it produces a URL the anonymous download
+    guard rejects, and the card installs with no stage images and no
+    error anywhere (see the wiring comment above
+    ``gated_catalog_client = build_gated_catalog_client(...)`` in
+    ``container.py``). A test that only reconstructs the two clients by
+    hand and checks they *can* share an absolutiser (as
+    ``test_official_card_gated_catalog_client.py`` does) would stay green
+    if a future edit swapped in a differently-sourced client here — this
+    test reads the actual production wiring instead.
+    """
+    settings = AppSettings(
+        database_url="",
+        cloud=CloudSettings(
+            user_service_url="https://users.example",
+            internal_service_credential=(
+                f"key-1|core|yuralume-user|{EXCLUSIVE_READ_SCOPE}|s3cr3t"
+            ),
+        ),
+    )
+
+    container = build_container(settings)
+
+    pack_source = container.character_card_pack_service._official_cards  # noqa: SLF001
+    assert pack_source is not None
+    gated_client = pack_source._gated_catalog  # noqa: SLF001
+    assert gated_client is not None
+
+    anonymous_client = pack_source._catalog._client  # noqa: SLF001
+    assert gated_client._absolutise_asset.__self__ is anonymous_client  # noqa: SLF001

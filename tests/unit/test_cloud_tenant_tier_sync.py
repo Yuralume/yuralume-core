@@ -18,7 +18,7 @@ from kokoro_link.application.services.cloud_tenant_tier_sync_service import (
 )
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+    AccountRuntimeProfile,
 )
 from kokoro_link.infrastructure.repositories.in_memory_operator_profile import (
     InMemoryOperatorProfileRepository,
@@ -37,16 +37,16 @@ def _cloud_operator(op_id: str, tenant: str, tier: str) -> OperatorProfile:
 
 
 async def _seed(repo) -> None:
-    await repo.save(_cloud_operator("a1", "tenant-A", "demo"))
-    await repo.save(_cloud_operator("a2", "tenant-A", "demo"))
-    await repo.save(_cloud_operator("b1", "tenant-B", "demo"))
+    await repo.save(_cloud_operator("a1", "tenant-A", "basic"))
+    await repo.save(_cloud_operator("a2", "tenant-A", "basic"))
+    await repo.save(_cloud_operator("b1", "tenant-B", "basic"))
     # A local operator that happens to share tenant-A's key must NOT be touched.
     await repo.save(
         OperatorProfile(
             id="local-1",
             display_name="Local",
             cloud_tenant_id="tenant-A",
-            cloud_tenant_tier="demo",
+            cloud_tenant_tier="basic",
             auth_provider="local",
         )
     )
@@ -62,37 +62,48 @@ async def test_bulk_update_only_touches_target_tenant_cloud_operators() -> None:
     assert updated == 2  # a1 + a2, not b1 and not the local operator
     assert (await repo.get("a1")).cloud_tenant_tier == "plus"
     assert (await repo.get("a2")).cloud_tenant_tier == "plus"
-    assert (await repo.get("b1")).cloud_tenant_tier == "demo"
-    assert (await repo.get("local-1")).cloud_tenant_tier == "demo"
+    assert (await repo.get("b1")).cloud_tenant_tier == "basic"
+    assert (await repo.get("local-1")).cloud_tenant_tier == "basic"
+
+
+class _EchoTierPort:
+    """Returns a profile named after whatever tier it was asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def fetch(self, tier: str) -> AccountRuntimeProfile:
+        self.calls.append(tier)
+        return AccountRuntimeProfile(name=tier)
 
 
 @pytest.mark.asyncio
 async def test_bulk_update_normalises_tier_and_resolver_sees_it() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_cloud_operator("a1", "tenant-A", "demo"))
-    resolver = AccountRuntimeProfileResolver(repo)  # no tier port -> DEFAULT
+    await repo.save(_cloud_operator("a1", "tenant-A", "basic"))
+    port = _EchoTierPort()
+    resolver = AccountRuntimeProfileResolver(repo, tier_profile_port=port)
 
-    # Before: demo tier resolves to the restrictive demo profile.
-    assert await resolver.resolve_for_operator("a1") == DEMO_ACCOUNT_RUNTIME_PROFILE
+    assert (await resolver.resolve_for_operator("a1")).name == "basic"
 
     updated = await repo.set_cloud_tenant_tier_for_cloud_tenant("tenant-A", " Plus ")
 
     assert updated == 1
     assert (await repo.get("a1")).cloud_tenant_tier == "plus"  # normalised
-    # After: paid tier with no port -> permissive default (no demo caps).
-    resolved = await resolver.resolve_for_operator("a1")
-    assert resolved.character_ttl is None
-    assert resolved.max_characters is None
+    # The resolver asks the control-plane for the *normalised* tier, so a
+    # trailing-space write can never miss its profile.
+    assert (await resolver.resolve_for_operator("a1")).name == "plus"
+    assert port.calls == ["basic", "plus"]
 
 
 @pytest.mark.asyncio
 async def test_bulk_update_blank_tenant_or_tier_is_noop() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_cloud_operator("a1", "tenant-A", "demo"))
+    await repo.save(_cloud_operator("a1", "tenant-A", "basic"))
 
     assert await repo.set_cloud_tenant_tier_for_cloud_tenant("   ", "plus") == 0
     assert await repo.set_cloud_tenant_tier_for_cloud_tenant("tenant-A", "  ") == 0
-    assert (await repo.get("a1")).cloud_tenant_tier == "demo"
+    assert (await repo.get("a1")).cloud_tenant_tier == "basic"
 
 
 @pytest.mark.asyncio

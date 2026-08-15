@@ -44,8 +44,10 @@ from kokoro_link.infrastructure.repositories.in_memory_story_scene_sessions impo
 )
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
+)
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 
@@ -280,7 +282,7 @@ async def test_empty_roster_reports_zero_scenes_without_querying() -> None:
 
 
 async def test_flags_and_session_limit_come_straight_from_the_profile() -> None:
-    service, _, _, _ = _service(DEMO_ACCOUNT_RUNTIME_PROFILE)
+    service, _, _, _ = _service(RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE)
 
     snapshot = await service.snapshot_for_operator(OPERATOR, now=NOW)
 

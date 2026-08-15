@@ -13,7 +13,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from kokoro_link.contracts.tool import ToolContext, ToolPort
+from kokoro_link.contracts.tool import (
+    TOOL_CAPABILITY_IMAGE,
+    ToolContext,
+    ToolPort,
+)
 from kokoro_link.domain.value_objects.tool_call import (
     ToolAttachment,
     ToolResult,
@@ -45,6 +49,10 @@ class FakeImageTool(ToolPort):
     """
 
     name: str = "fake_image"
+    #: Stands in for the real renderer everywhere, including in the
+    #: scheduling decisions taken around it — a fake that declared no
+    #: capability would let the tests pass while the gate stayed open.
+    capability: str = TOOL_CAPABILITY_IMAGE
     description: str = "產生一張角色圖片（測試用 stub）。"
     parameters_schema: Mapping[str, Any] = {
         "type": "object",

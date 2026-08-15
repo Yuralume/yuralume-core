@@ -69,7 +69,9 @@ class OfficialCardExclusiveClient(OfficialCardExclusivePayloadPort):
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
-    async def fetch_payload(self, card_id: str) -> ExclusiveCardPayload | None:
+    async def fetch_payload(
+        self, card_id: str, *, tenant_id: str | None = None,
+    ) -> ExclusiveCardPayload | None:
         if not self._base_url:
             raise OfficialCardExclusiveUnavailable(
                 "cloud user service url is not configured",
@@ -78,6 +80,12 @@ class OfficialCardExclusiveClient(OfficialCardExclusivePayloadPort):
             f"{self._base_url}/internal/v1/official-cards/"
             f"{quote(card_id, safe='')}/exclusive-payload"
         )
+        # Omitted entirely when there is no tenant to name, rather than sent
+        # blank: an absent parameter is the request every pre-TG deployment
+        # made, and it is the one Cloud still answers unchanged for a card
+        # with no tier fence on it.
+        tenant = (tenant_id or "").strip()
+        params = {"tenant_id": tenant} if tenant else {}
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout_seconds,
@@ -85,6 +93,7 @@ class OfficialCardExclusiveClient(OfficialCardExclusivePayloadPort):
             ) as client:
                 response = await client.get(
                     url,
+                    params=params,
                     headers={
                         **self._credential.headers(),
                         "Accept": "application/json",
@@ -98,9 +107,12 @@ class OfficialCardExclusiveClient(OfficialCardExclusivePayloadPort):
             raise OfficialCardExclusiveUnavailable(str(exc)) from exc
 
         if response.status_code == 404:
-            # Absent, unpublished, or not exclusive — Cloud answers all
-            # three the same way on purpose, so this side must not pretend
-            # to know which.
+            # Absent, unpublished, not exclusive, frozen, or fenced to a
+            # tier this tenant is not in — Cloud answers all of them the
+            # same way on purpose, so this side must not pretend to know
+            # which. The tier case in particular must never become
+            # distinguishable: that would make this endpoint an oracle for
+            # what is being tested and for who is in the test.
             raise OfficialCardExclusiveNotFound(card_id)
         if response.status_code in {401, 403}:
             # A credential problem is an operator problem, not a player one:

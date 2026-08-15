@@ -84,10 +84,15 @@ class _FakeCatalog:
 class _FakeExclusivePayloads(OfficialCardExclusivePayloadPort):
     def __init__(self, payload: ExclusiveCardPayload | None) -> None:
         self._payload = payload
-        self.requested: list[str] = []
+        # ``(card_id, tenant_id)``: the tenant is half of what Cloud checks
+        # a tier fence against (TG3), so a double that dropped it would let
+        # an install that names nobody pass here and 404 in production.
+        self.requested: list[tuple[str, str | None]] = []
 
-    async def fetch_payload(self, card_id: str) -> ExclusiveCardPayload | None:
-        self.requested.append(card_id)
+    async def fetch_payload(
+        self, card_id: str, *, tenant_id: str | None = None,
+    ) -> ExclusiveCardPayload | None:
+        self.requested.append((card_id, tenant_id))
         return self._payload
 
 
@@ -628,6 +633,43 @@ async def test_official_art_stops_at_the_per_character_image_cap() -> None:
     character = await repo.get(result.character.id)
     assert character is not None
     assert len(character.image_urls) == MAX_IMAGES_PER_CHARACTER
+
+
+# --------------------------------------------------------------------------- #
+# whose install this is (TG3)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_installing_tenant_is_forwarded_to_the_payload_read() -> None:
+    """The tier fence is checked on the Cloud side, against this id.
+
+    Nothing on this side compares tiers — Core caches one on the operator
+    profile and that copy drifts — so the only thing that has to be true
+    here is that the tenant actually travels. Dropped silently, every
+    tier-locked install would 404 and look like a withdrawn card.
+    """
+    installer, _repo, _storage, _catalog = _build(payload=_payload())
+
+    await installer.install(
+        _detail(), user_id=_PLAYER, locale="zh-Hant", tenant_id="tenant-42",
+    )
+
+    payloads = installer._exclusive_payloads  # noqa: SLF001 — pinning the seam
+    assert payloads.requested == [(_CARD_ID, "tenant-42")]
+
+
+@pytest.mark.asyncio
+async def test_an_install_with_no_tenant_asks_exactly_what_it_used_to() -> None:
+    # Self-host and any account with no projected tenant: the pre-TG
+    # request, unchanged, which is what keeps every unfenced card
+    # installing exactly as before.
+    installer, _repo, _storage, _catalog = _build(payload=_payload())
+
+    await installer.install(_detail(), user_id=_PLAYER, locale="zh-Hant")
+
+    payloads = installer._exclusive_payloads  # noqa: SLF001 — pinning the seam
+    assert payloads.requested == [(_CARD_ID, None)]
 
 
 # --------------------------------------------------------------------------- #

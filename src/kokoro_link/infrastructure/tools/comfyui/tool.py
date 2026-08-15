@@ -57,7 +57,11 @@ from kokoro_link.contracts.image_provider import (
     ImageTimeoutError,
 )
 from kokoro_link.contracts.object_storage import ObjectStoragePort
-from kokoro_link.contracts.tool import ToolContext, ToolPort
+from kokoro_link.contracts.tool import (
+    TOOL_CAPABILITY_IMAGE,
+    ToolContext,
+    ToolPort,
+)
 from kokoro_link.infrastructure.llm.cloud_refusal import (
     INSUFFICIENT_CREDITS_CODE,
     ExpectedCloudRefusal,
@@ -79,6 +83,10 @@ _USAGE_FEATURE_CHAT_IMAGE_TOOL = "chat_image_tool"
 
 class ComfyImageTool(ToolPort):
     name: str = "generate_image"
+    #: This tool IS the GPU. Background callers read it to schedule the
+    #: invocation against the deployment's image ceiling instead of firing
+    #: it inline (PF3).
+    capability: str = TOOL_CAPABILITY_IMAGE
     description: str = (
         "把『你此刻的樣子／正在做的動作／所在的場景』直接畫出來傳給使用者，"
         "取代純文字描述。只要當下有明確場景＋動作／姿態／表情就該主動呼叫，"

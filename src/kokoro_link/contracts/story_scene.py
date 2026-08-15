@@ -33,6 +33,37 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.story_scene_session import StorySceneSession
 
 
+SCENE_NARRATION_SPEAKER = "旁白"
+"""Label for a narration line in a rendered scene transcript.
+
+Narration is labelled rather than attributed to the character, because
+an unlabelled line reads as the character still talking — and a chips
+writer that believes the character spoke last writes *the character's*
+next line, which is the player-visible bug this label exists to stop.
+"""
+
+SCENE_PLAYER_SPEAKER = "玩家"
+"""Label for the player's own line."""
+
+
+def render_scene_line(speaker: str, text: str) -> str:
+    """One transcript line, in the format every scene writer reads.
+
+    A function rather than an f-string at each call site so the separator
+    travels with the labels above: the opening path has no player line
+    yet, so a drifted format there is invisible in tests that only look
+    at in-scene turns.
+
+    Internal newlines are flattened because every scene writer's prompt
+    promises one physical line per entry (「每行冒號前是說話的人」).
+    The opening narration is multi-paragraph prose; without this, its
+    second paragraph would enter the transcript as an unlabelled line
+    and be read as whoever spoke last — the exact mis-attribution the
+    speaker labels exist to stop.
+    """
+    return f"{speaker}：{' '.join(text.split())}"
+
+
 class SceneSessionConflict(Exception):
     """This character already owns an ``open`` scene session.
 

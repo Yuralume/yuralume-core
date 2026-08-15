@@ -80,6 +80,19 @@ _TEXTS: dict[str, dict[str, str]] = {
         ),
         "ja-JP": "（画像は送れたけど、そのあとに言おうとした言葉が詰まっちゃった。）",
     },
+    # --- promise fulfilment: the tool produced a file, but this deployment
+    #     cannot hand it to a messaging platform (no public base URL), so the
+    #     attachment was dropped before delivery. Deliberately NOT
+    #     ``chat.image_tool_final_reply_failed``: that line says the picture
+    #     was sent, and here it provably was not. ---
+    "promise.attachment_undeliverable": {
+        "zh-TW": "（東西我弄好了，可是這邊傳不出去給你，等修好再補給你。）",
+        "en-US": (
+            "(I got it ready, but it can't be sent to you from here. "
+            "I'll pass it along once that's fixed.)"
+        ),
+        "ja-JP": "（用意はできたんだけど、こっちから送れなかった。直ったら渡すね。）",
+    },
     # --- LINE outbound: attachment URL failed LINE's requirements ---
     "channel.line.attachment_url_invalid": {
         "zh-TW": "（附件 URL 不符 LINE 要求）{label}",

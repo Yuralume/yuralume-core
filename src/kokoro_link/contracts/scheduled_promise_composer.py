@@ -11,6 +11,16 @@ Unlike the busy-defer composer, there's no inline brief_reply to honour
 and no queued user-messages backlog to wrap up — the message is
 generated fresh from persona + promise_intent + current schedule
 context. Output is a single string; empty = retry next tick.
+
+**Two-pass tool use (PF1).** A promise is often a promise to *do*
+something ("晚點回家幫你查", "等等傳照片給你"), so the composer may
+answer a compose call with ``tool_calls`` instead of prose. The
+application layer — never the adapter — executes those calls through
+``ToolOrchestrator`` and composes a second time with ``tool_results``
+filled in; see
+:mod:`kokoro_link.application.services.composer_tool_loop`. Both extra
+fields default to empty, so a composer that ignores them (or a
+deployment with no tool registry) behaves exactly as it did before.
 """
 
 from __future__ import annotations
@@ -19,10 +29,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from typing import Protocol
 
+from kokoro_link.contracts.prompt import PromptToolDescriptor, ToolOutcomeMessage
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import MessageContentMode
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.content_flow import CONTENT_TOLERANCE_FRONTIER
+from kokoro_link.domain.value_objects.tool_call import ToolCall
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +79,18 @@ class ScheduledPromiseComposeInput:
     """Frontier-safe replacement for ``promise_text`` when available."""
     content_tolerance: str = CONTENT_TOLERANCE_FRONTIER
     """Prompt content-flow tolerance for this compose call."""
+    available_tools: tuple[PromptToolDescriptor, ...] = ()
+    """Tools this character may call while fulfilling the promise,
+    already filtered by ``character.allowed_tools``. Empty = pure prose
+    call (every pre-PF1 caller, and every deployment with no tool
+    registry wired) — the composer must then never emit ``tool_calls``.
+    """
+    tool_results: tuple[ToolOutcomeMessage, ...] = ()
+    """What the tools the composer asked for actually returned. Present
+    only on the second pass. **Failures are included on purpose**: a
+    character whose camera broke has to say so, and a composer that
+    only ever saw successes would write as if the promise had been kept.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +99,12 @@ class ScheduledPromiseComposeOutput:
     """The full outbound message. Empty string = no usable output —
     the dispatcher leaves the pending row in ``queued`` so the next
     tick retries (same fail-soft policy as the busy-defer composer)."""
+    tool_calls: tuple[ToolCall, ...] = ()
+    """Tools the composer wants run before it can write the message.
+    Non-empty only when ``available_tools`` was non-empty, and only on
+    the first pass; ``content_text`` is then empty and the application
+    layer composes again with ``tool_results``. Capped at one call by
+    the loop — the composer should not ask for more."""
 
 
 class ScheduledPromiseComposerPort(Protocol):

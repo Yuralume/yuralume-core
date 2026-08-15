@@ -56,6 +56,30 @@ class ToolContext:
     instead of relying on a guess from the chat text alone."""
 
 
+TOOL_CAPABILITY_NONE = ""
+"""A tool that consumes no scarce provider capacity (a lookup, a fetch)."""
+
+TOOL_CAPABILITY_IMAGE = "image"
+"""A tool that drives the image renderer — i.e. a GPU.
+
+Deliberately the same string as ``JobCapability.IMAGE`` (pinned by a test):
+a background job and a tool that both burn the same card must be countable
+against the same ``BG_CAP_IMAGE`` ceiling, and two vocabularies for one
+physical resource is how a ceiling ends up enforced on only half its
+consumers."""
+
+
+def tool_capability(tool: object) -> str:
+    """The capability a tool consumes, defaulting to none.
+
+    Read defensively (``getattr``) rather than as a required protocol
+    member: registries hand back fakes and third-party adapters that
+    predate the attribute, and a missing declaration must degrade to
+    "consumes nothing scarce", never to an attribute error."""
+    value = getattr(tool, "capability", TOOL_CAPABILITY_NONE)
+    return value if isinstance(value, str) else TOOL_CAPABILITY_NONE
+
+
 class ToolPort(Protocol):
     """One concrete tool (ComfyUI image, etc.).
 
@@ -65,6 +89,14 @@ class ToolPort(Protocol):
     """
 
     name: str
+    capability: str
+    """Which scarce provider capacity invoking this tool consumes — one of
+    the ``TOOL_CAPABILITY_*`` values, defaulting to none. Callers running
+    on a background worker use it to decide whether the invocation has to
+    be scheduled against a concurrency ceiling instead of run inline; see
+    ``ComposerToolLoop``. Declared by the adapter, never inferred from the
+    tool's name."""
+
     description: str
     """Short Chinese sentence the prompt builder embeds so the model
     knows when to pick this tool. Keep under ~40 chars — the full

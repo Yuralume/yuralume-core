@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from kokoro_link.application.exceptions import (
-    DemoSessionUnavailable,
     InvalidCredentials,
     PermissionDenied,
 )
@@ -14,7 +13,6 @@ from kokoro_link.application.services.jwt_service import JWTService
 from kokoro_link.contracts.cloud_auth import (
     CloudAccountIdentity,
     CloudAuthRejected,
-    CloudDemoSessionRejected,
     CloudProfileSeed,
 )
 from kokoro_link.infrastructure.repositories.in_memory_operator_profile import (
@@ -31,34 +29,10 @@ class _StubCloudUserService:
         self.identity = identity
         self.error = error
         self.calls: list[tuple[str, str]] = []
-        self.demo_calls: list[dict[str, str | None]] = []
         self.play_codes: list[str] = []
 
     async def login(self, *, email: str, password: str) -> CloudAccountIdentity:
         self.calls.append((email, password))
-        if self.error is not None:
-            raise self.error
-        assert self.identity is not None
-        return self.identity
-
-    async def create_demo_session(
-        self,
-        *,
-        provider: str,
-        authorization_code: str,
-        redirect_uri: str | None = None,
-        code_verifier: str | None = None,
-        source_ip: str | None = None,
-        device_id: str | None = None,
-    ) -> CloudAccountIdentity:
-        self.demo_calls.append({
-            "provider": provider,
-            "authorization_code": authorization_code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": code_verifier,
-            "source_ip": source_ip,
-            "device_id": device_id,
-        })
         if self.error is not None:
             raise self.error
         assert self.identity is not None
@@ -103,7 +77,7 @@ async def test_cloud_login_projects_operator_and_returns_core_jwt() -> None:
         tenant_id="tenant_abc",
         role="admin",
         status="active",
-        tenant_tier="demo",
+        tenant_tier="basic",
         email="PLAYER@EXAMPLE.COM",
         display_name=" Player One ",
         primary_language="en-us",
@@ -124,47 +98,11 @@ async def test_cloud_login_projects_operator_and_returns_core_jwt() -> None:
     assert operator.timezone_id == "America/Los_Angeles"
     assert operator.cloud_account_id == "acct_123"
     assert operator.cloud_tenant_id == "tenant_abc"
-    assert operator.cloud_tenant_tier == "demo"
+    assert operator.cloud_tenant_tier == "basic"
     assert operator.auth_provider == "cloud"
     assert operator.password_hash is None
     assert await repo.get_by_cloud_account_id("acct_123") == operator
     assert await strategy.verify_token(token) == operator
-
-
-@pytest.mark.asyncio
-async def test_cloud_demo_session_projects_operator_and_returns_core_jwt() -> None:
-    user_service = _StubCloudUserService(CloudAccountIdentity(
-        account_id="demo_acct",
-        tenant_id="demo_tenant",
-        role="member",
-        status="active",
-        tenant_tier="demo",
-        email="demo@example.com",
-        display_name="Demo Player",
-    ))
-    strategy, repo = _strategy(user_service)
-
-    operator, token = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="oauth-code",
-        redirect_uri="https://app.example/demo/oauth/discord/callback",
-        code_verifier="pkce",
-        source_ip="198.51.100.44",
-        device_id="device-1",
-    )
-
-    assert token
-    assert operator.id == "cloud:demo_acct"
-    assert operator.cloud_tenant_tier == "demo"
-    assert await repo.get_by_cloud_account_id("demo_acct") == operator
-    assert user_service.demo_calls == [{
-        "provider": "discord",
-        "authorization_code": "oauth-code",
-        "redirect_uri": "https://app.example/demo/oauth/discord/callback",
-        "code_verifier": "pkce",
-        "source_ip": "198.51.100.44",
-        "device_id": "device-1",
-    }]
 
 
 @pytest.mark.asyncio
@@ -232,29 +170,29 @@ async def test_cloud_play_code_inactive_identity_denied() -> None:
         await strategy.login_with_cloud_play_code(code="yhp_entry")
 
 
-def _demo_identity(**overrides: object) -> CloudAccountIdentity:
+def _seeded_identity(**overrides: object) -> CloudAccountIdentity:
     base: dict[str, object] = {
-        "account_id": "demo_acct",
-        "tenant_id": "demo_tenant",
+        "account_id": "seed_acct",
+        "tenant_id": "seed_tenant",
         "role": "member",
         "status": "active",
-        "tenant_tier": "demo",
-        "display_name": "Demo Player",
+        "tenant_tier": "plus",
+        "display_name": "Seeded Player",
     }
     base.update(overrides)
     return CloudAccountIdentity(**base)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_demo_session_pins_timezone_and_location_from_geo_seed() -> None:
-    # OAuth supplies the locale (language) but never a timezone; the GeoIP
-    # seed is what pins the operator's civil timezone + editable location.
-    user_service = _StubCloudUserService(_demo_identity(primary_language="zh-TW"))
+async def test_login_pins_timezone_and_location_from_geo_seed() -> None:
+    # The upstream identity supplies the locale (language) but never a
+    # timezone; the GeoIP seed is what pins the operator's civil timezone
+    # + editable location.
+    user_service = _StubCloudUserService(_seeded_identity(primary_language="zh-TW"))
     strategy, _ = _strategy(user_service)
 
-    operator, _ = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="oauth-code",
+    operator, _ = await strategy.login_with_cloud_play_code(
+        code="play-code",
         profile_seed=CloudProfileSeed(
             timezone_id="Asia/Tokyo",
             country_code="JP",
@@ -272,13 +210,12 @@ async def test_demo_session_pins_timezone_and_location_from_geo_seed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_demo_session_language_falls_back_to_geo_country() -> None:
-    # No OAuth locale at all -> conservative GeoIP country fallback applies.
-    strategy, _ = _strategy(_StubCloudUserService(_demo_identity()))
+async def test_login_language_falls_back_to_geo_country() -> None:
+    # No upstream locale at all -> conservative GeoIP country fallback.
+    strategy, _ = _strategy(_StubCloudUserService(_seeded_identity()))
 
-    operator, _ = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="oauth-code",
+    operator, _ = await strategy.login_with_cloud_play_code(
+        code="play-code",
         profile_seed=CloudProfileSeed(timezone_id="Asia/Taipei", country_code="JP"),
     )
 
@@ -287,14 +224,13 @@ async def test_demo_session_language_falls_back_to_geo_country() -> None:
 
 
 @pytest.mark.asyncio
-async def test_demo_session_defaults_when_no_locale_and_ambiguous_country() -> None:
+async def test_login_defaults_when_no_locale_and_ambiguous_country() -> None:
     # An ambiguous multi-language country (BE) is not mapped, so language
     # falls to the project default and timezone to the deployment default.
-    strategy, _ = _strategy(_StubCloudUserService(_demo_identity()))
+    strategy, _ = _strategy(_StubCloudUserService(_seeded_identity()))
 
-    operator, _ = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="oauth-code",
+    operator, _ = await strategy.login_with_cloud_play_code(
+        code="play-code",
         profile_seed=CloudProfileSeed(country_code="BE"),
     )
 
@@ -303,20 +239,18 @@ async def test_demo_session_defaults_when_no_locale_and_ambiguous_country() -> N
 
 
 @pytest.mark.asyncio
-async def test_demo_session_ignores_seed_for_already_provisioned_operator() -> None:
+async def test_login_ignores_seed_for_already_provisioned_operator() -> None:
     # timezone / language / location are pinned at creation; a later login
     # from a different geo must not rewrite them.
-    user_service = _StubCloudUserService(_demo_identity(primary_language="zh-TW"))
+    user_service = _StubCloudUserService(_seeded_identity(primary_language="zh-TW"))
     strategy, _ = _strategy(user_service)
-    first, _ = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="code",
+    first, _ = await strategy.login_with_cloud_play_code(
+        code="play-code",
         profile_seed=CloudProfileSeed(timezone_id="Asia/Taipei", country_code="TW"),
     )
 
-    second, _ = await strategy.login_with_demo_session(
-        provider="discord",
-        authorization_code="code",
+    second, _ = await strategy.login_with_cloud_play_code(
+        code="play-code",
         profile_seed=CloudProfileSeed(
             timezone_id="America/New_York", country_code="US",
         ),
@@ -326,26 +260,6 @@ async def test_demo_session_ignores_seed_for_already_provisioned_operator() -> N
     assert second.timezone_id == "Asia/Taipei"
     assert second.primary_language == "zh-TW"
     assert second.country_code == "TW"
-
-
-@pytest.mark.asyncio
-async def test_cloud_demo_session_preserves_structured_upstream_limit() -> None:
-    strategy, _ = _strategy(_StubCloudUserService(error=CloudDemoSessionRejected(
-        status_code=429,
-        code="demo_rate_limited",
-        message="demo session provisioning is rate limited for this source",
-        retryable=True,
-    )))
-
-    with pytest.raises(DemoSessionUnavailable) as raised:
-        await strategy.login_with_demo_session(
-            provider="discord",
-            authorization_code="oauth-code",
-        )
-
-    assert raised.value.status_code == 429
-    assert raised.value.code == "demo_rate_limited"
-    assert raised.value.retryable is True
 
 
 @pytest.mark.asyncio
@@ -366,7 +280,7 @@ async def test_cloud_login_updates_existing_projection() -> None:
         tenant_id="tenant_two",
         role="admin",
         status="active",
-        tenant_tier="demo",
+        tenant_tier="basic",
         email="player@example.com",
         display_name="Player Renamed",
     )
@@ -378,7 +292,7 @@ async def test_cloud_login_updates_existing_projection() -> None:
     # Tier is push-authoritative (H3): the ordinary login re-projection no
     # longer stamps ``identity.tenant_tier`` onto an already-existing
     # operator, so the first-login value survives even though the identity
-    # now reports "demo". Tier moves only via ``set_cloud_tenant_tier_for_
+    # now reports "basic". Tier moves only via ``set_cloud_tenant_tier_for_
     # cloud_tenant`` / the first projection.
     assert second.cloud_tenant_tier == "standard"
     assert second.is_admin is True
@@ -491,18 +405,6 @@ async def test_require_paid_tier_blocks_standard_password_login() -> None:
 
 
 @pytest.mark.asyncio
-async def test_require_paid_tier_blocks_standard_demo_session_login() -> None:
-    strategy, _ = _strategy(
-        _StubCloudUserService(_identity("standard")), require_paid_tier=True,
-    )
-
-    with pytest.raises(PermissionDenied):
-        await strategy.login_with_demo_session(
-            provider="discord", authorization_code="oauth-code",
-        )
-
-
-@pytest.mark.asyncio
 async def test_require_paid_tier_blocks_standard_play_code_login() -> None:
     strategy, _ = _strategy(
         _StubCloudUserService(_identity("standard")), require_paid_tier=True,
@@ -520,22 +422,6 @@ async def test_require_paid_tier_blocks_blank_tier() -> None:
 
     with pytest.raises(PermissionDenied):
         await strategy.login(email="player@example.com", password="secret")
-
-
-@pytest.mark.asyncio
-async def test_require_paid_tier_allows_demo_identity() -> None:
-    # Demo has its own restricted profile + reaper flow, so it is always
-    # allowed regardless of the paid-tier gate.
-    strategy, _ = _strategy(
-        _StubCloudUserService(_identity("demo")), require_paid_tier=True,
-    )
-
-    operator, token = await strategy.login(
-        email="player@example.com", password="secret",
-    )
-
-    assert token
-    assert operator.cloud_tenant_tier == "demo"
 
 
 @pytest.mark.asyncio

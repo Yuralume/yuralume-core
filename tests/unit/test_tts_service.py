@@ -29,8 +29,8 @@ from kokoro_link.infrastructure.repositories.in_memory_generation_usage import (
     InMemoryGenerationUsageRepository,
 )
 from kokoro_link.infrastructure.usage.recorder import BackgroundUsageEventRecorder
-from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.character_state import CharacterState
@@ -63,7 +63,7 @@ class _FailingPort(TTSPort):
 
 class _StaticDemoRuntimeProfileResolver:
     async def resolve_for_operator(self, operator_id: str):
-        return DEMO_ACCOUNT_RUNTIME_PROFILE
+        return RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE
 
 
 class _DenySubscriptionGuard:

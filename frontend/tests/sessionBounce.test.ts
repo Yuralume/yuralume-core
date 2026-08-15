@@ -55,7 +55,6 @@ describe('bounceToSignIn', () => {
     '/setup',
     '/session-expired',
     '/cloud/callback',
-    '/demo/oauth/discord/callback',
   ])('leaves %s alone so it can show its own error', (pathname) => {
     const router = fakeRouter()
     const clearToken = vi.fn()

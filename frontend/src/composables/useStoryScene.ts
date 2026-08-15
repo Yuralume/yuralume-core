@@ -14,7 +14,6 @@ import {
 } from '@/utils/api/storyScene'
 import {
   isStaleSceneState,
-  isStorySceneUnavailable,
   storySceneErrorKey,
 } from '@/utils/storySceneErrors'
 
@@ -35,8 +34,6 @@ export function useStoryScene() {
   const suggestedActions = ref<StorySceneSuggestedAction[]>([])
   const opening = ref(false)
   const ending = ref(false)
-  /** The button is withdrawn once we know this deployment has no scenes. */
-  const unavailable = ref(false)
   /** Catalog key of the last refusal, or null. Never a raw server string. */
   const errorKey = ref<string | null>(null)
 
@@ -55,7 +52,6 @@ export function useStoryScene() {
     suggestedActions.value = []
     opening.value = false
     ending.value = false
-    unavailable.value = false
     errorKey.value = null
   }
 
@@ -83,9 +79,8 @@ export function useStoryScene() {
       const current = await getStoryScene(characterId)
       if (seq !== requestSeq) return
       session.value = current && current.status === 'open' ? current : null
-    } catch (error) {
+    } catch {
       if (seq !== requestSeq) return
-      if (isStorySceneUnavailable(error)) unavailable.value = true
       session.value = null
     }
   }
@@ -192,7 +187,6 @@ export function useStoryScene() {
       if (seq !== requestSeq) return null
       if (billingRefusalKind(error) !== null) throw error
       errorKey.value = storySceneErrorKey(error, 'generic')
-      if (isStorySceneUnavailable(error)) unavailable.value = true
       // `scene_in_progress` is only reachable when this tab does not know
       // about the scene — the guard above would have refused the press
       // otherwise. So the scene is real and invisible here, and leaving it
@@ -249,7 +243,6 @@ export function useStoryScene() {
     suggestedActions,
     opening,
     ending,
-    unavailable,
     errorKey,
     isOpen,
     clear,

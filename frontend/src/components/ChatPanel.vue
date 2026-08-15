@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 import { BulbOutlined, CloseOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import type { Character } from '@/types/character'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, SendChatMessageRequest } from '@/types/chat'
 import type { ChatAssistSuggestion } from '@/types/chatAssist'
 import { webDmPresenceFrame, webStagePresenceFrame } from '@/types/chat'
 import type { ScheduleActivity } from '@/types/schedule'
@@ -36,6 +36,7 @@ import ChatFirstTurnGuide from '@/components/ChatFirstTurnGuide.vue'
 import SceneFrame from '@/components/SceneFrame.vue'
 import StorySceneChips from '@/components/StorySceneChips.vue'
 import StorySceneControl from '@/components/StorySceneControl.vue'
+import StageNudgeControl from '@/components/StageNudgeControl.vue'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
@@ -62,6 +63,7 @@ import { characterDisplayRef } from '@/utils/characterDisplay'
 import { splitAssistantBubbles } from '@/utils/chatSegments'
 import { isSceneNarration, sceneHeadingIndex } from '@/utils/sceneMessages'
 import { STORY_SCENE_DAILY_LIMIT_KEY } from '@/utils/storySceneErrors'
+import { buildStageNudgeTurn } from '@/utils/stageNudge'
 import { shouldSendChatInputOnKeydown } from '@/utils/chatInputKeys'
 import { resolveTTSAvailability } from '@/utils/ttsAvailability'
 import {
@@ -108,12 +110,13 @@ const chatImageExtraText = computed(() => {
   })
 })
 /**
- * Hosted trial chat hit its message cap. On self-host this state is
- * unreachable (there is no trial), so the existing error bubble is left
- * untouched there and this card is hosted-only — it replaces copy that used
- * to tell a paying player to "self-host or bring your own API key".
+ * This conversation hit the per-session message cap its plan sets
+ * (`max_messages_per_session`, a per-tier knob on the Cloud control plane —
+ * not a property of any one tier). The card is hosted-only: a self-host
+ * operator raises the number themselves, so there the plain error bubble
+ * still carries the message and this stays false.
  */
-const demoLimitReached = ref(false)
+const sessionMessageCapReached = ref(false)
 const {
   active: nsfwModeActive,
   loadNsfwMode,
@@ -213,7 +216,6 @@ const {
   suggestedActions: storySceneChips,
   opening: storySceneOpening,
   ending: storySceneEnding,
-  unavailable: storySceneUnavailable,
   errorKey: storySceneErrorKey,
   isOpen: storySceneActive,
   clear: clearStoryScene,
@@ -899,64 +901,44 @@ function currentBalanceView() {
   }
 }
 
-async function handleSend() {
-  if (!props.character || sending.value) return
-  const hasText = inputText.value.trim().length > 0
-  const hasImages = stagedAttachments.value.length > 0
-  if (!hasText && !hasImages) return
-
-  // AP2 pre-check: with a fixed, published price we can tell the player the
-  // turn will not go through *before* their sentence disappears into a send
-  // that ends in a 402. Runs before anything is cleared, so the text they
-  // wrote is still in the box when they come back from topping up.
+/**
+ * AP2 pre-check shared by every chat entry point (ordinary send, the
+ * stage-nudge popover): with a fixed, published price we can tell the
+ * player the turn will not go through *before* it disappears into a send
+ * that ends in a 402. Sets the money-refusal state and reports whether the
+ * caller must stop; deliberately timid — an unknown or stale balance never
+ * refuses (see `shortfallFor`).
+ */
+function refuseIfInsufficientCredits(): boolean {
   const shortfall = actionPricing.shortfallFor(ACTION_CHAT, currentBalanceView())
-  if (shortfall !== null) {
-    creditsRequiredCr.value = shortfall
-    creditsExhausted.value = true
-    await scrollToBottom()
-    return
+  if (shortfall === null) return false
+  creditsRequiredCr.value = shortfall
+  creditsExhausted.value = true
+  return true
+}
+
+/**
+ * Runs one chat turn to completion: streams the reply, settles it into
+ * `localMessages`, and folds in every side effect an ordinary turn carries
+ * (scene chips, scene closes, the activity badge, the credits badge, NSFW
+ * atmosphere). Shared by `handleSend` and `handleStageNudgeSubmit` — the two
+ * differ only in *how* a turn was composed (text vs. attachments, whether it
+ * carries `stage_nudge`, what — if anything — renders optimistically), which
+ * the caller decides before handing off here.
+ *
+ * `sendingLockId` is already-acquired by the caller (not begun in here):
+ * `handleSend`'s lock has to span its upload phase too, which happens
+ * before this function is ever called.
+ */
+async function runChatTurn(
+  request: SendChatMessageRequest,
+  optimisticMessage: ChatMessage | null,
+  sendingLockId: number,
+): Promise<void> {
+  if (optimisticMessage) {
+    // Immediate optimistic bubble so the user sees their turn land.
+    localMessages.value.push(optimisticMessage)
   }
-
-  const userText = inputText.value.trim() || t('chat.input.attachWithImage')
-  const toUpload = stagedAttachments.value.slice()
-  inputText.value = ''
-  uploadError.value = null
-  creditsExhausted.value = false
-  creditsRequiredCr.value = null
-  demoLimitReached.value = false
-  // The chips belonged to the previous turn; leaving them up through the send
-  // would invite a second press on an action the scene has already moved past.
-  setStorySceneChips([])
-  const sendingLockId = beginSendingLock()
-
-  // Upload first so the assistant turn has real URLs to reference.
-  let uploadedUrls: string[] = []
-  if (toUpload.length > 0) {
-    try {
-      uploadedUrls = await uploadChatAttachments(toUpload.map(s => s.file))
-    } catch (err) {
-      uploadError.value = err instanceof Error ? err.message : t('chat.errors.uploadFailed')
-      releaseSendingLock(sendingLockId)
-      return
-    }
-  }
-
-  // Clear the staged preview once the bytes are on the server; the
-  // chat bubble below uses the persisted URL from this point on.
-  for (const item of toUpload) URL.revokeObjectURL(item.preview)
-  stagedAttachments.value = []
-
-  // Immediate optimistic bubble so the user sees their turn land.
-  localMessages.value.push({
-    role: 'user',
-    content: userText,
-    attachments: uploadedUrls.map(url => ({
-      kind: 'image',
-      url,
-      mime_type: 'image/*',
-      caption: null,
-    })),
-  })
   streamingText.value = ''
   await scrollToBottom()
 
@@ -967,13 +949,7 @@ async function handleSend() {
   const isDmSend = interactionMode.value === 'dm'
   try {
     const reply = await sendChatMessageStream(
-      {
-        character_id: props.character.id,
-        conversation_id: props.conversationId,
-        message: userText,
-        attachment_urls: uploadedUrls,
-        presence_frame: currentPresenceFrame(uploadedUrls.length > 0),
-      },
+      request,
       (token: string) => {
         if (!isDmSend) {
           streamingText.value += token
@@ -1068,8 +1044,8 @@ async function handleSend() {
         role: 'assistant',
         content: t('chat.priceChanged'),
       })
-    } else if (cloudMode.value && isDemoMessageCapError(err)) {
-      demoLimitReached.value = true
+    } else if (cloudMode.value && isSessionMessageCapError(err)) {
+      sessionMessageCapReached.value = true
     } else {
       localMessages.value.push({
         role: 'assistant',
@@ -1089,8 +1065,112 @@ async function handleSend() {
   }
 }
 
-/** The hosted trial's own message ceiling, not a runtime/billing failure. */
-function isDemoMessageCapError(err: unknown): boolean {
+async function handleSend() {
+  if (!props.character || sending.value) return
+  const hasText = inputText.value.trim().length > 0
+  const hasImages = stagedAttachments.value.length > 0
+  if (!hasText && !hasImages) return
+
+  // Runs before anything is cleared, so the text the player wrote is still
+  // in the box when they come back from topping up.
+  if (refuseIfInsufficientCredits()) {
+    await scrollToBottom()
+    return
+  }
+
+  const userText = inputText.value.trim() || t('chat.input.attachWithImage')
+  const toUpload = stagedAttachments.value.slice()
+  inputText.value = ''
+  uploadError.value = null
+  creditsExhausted.value = false
+  creditsRequiredCr.value = null
+  sessionMessageCapReached.value = false
+  // The chips belonged to the previous turn; leaving them up through the send
+  // would invite a second press on an action the scene has already moved past.
+  setStorySceneChips([])
+  const sendingLockId = beginSendingLock()
+
+  // Upload first so the assistant turn has real URLs to reference.
+  let uploadedUrls: string[] = []
+  if (toUpload.length > 0) {
+    try {
+      uploadedUrls = await uploadChatAttachments(toUpload.map(s => s.file))
+    } catch (err) {
+      uploadError.value = err instanceof Error ? err.message : t('chat.errors.uploadFailed')
+      releaseSendingLock(sendingLockId)
+      return
+    }
+  }
+
+  // Clear the staged preview once the bytes are on the server; the
+  // chat bubble below uses the persisted URL from this point on.
+  for (const item of toUpload) URL.revokeObjectURL(item.preview)
+  stagedAttachments.value = []
+
+  await runChatTurn(
+    {
+      character_id: props.character.id,
+      conversation_id: props.conversationId,
+      message: userText,
+      attachment_urls: uploadedUrls,
+      presence_frame: currentPresenceFrame(uploadedUrls.length > 0),
+    },
+    {
+      role: 'user',
+      content: userText,
+      attachments: uploadedUrls.map(url => ({
+        kind: 'image',
+        url,
+        mime_type: 'image/*',
+        caption: null,
+      })),
+    },
+    sendingLockId,
+  )
+}
+
+/**
+ * The 示意 popover's confirm handler (plan SN §2–§5).
+ *
+ * Reuses the ordinary chat pipeline end to end — same lease, same
+ * `ACTION_CHAT` pricing, same streaming, same post-turn processing — with
+ * two differences an ordinary send can never have: `message` may be the
+ * empty string, and a wordless press renders no player-side bubble at all
+ * (`buildStageNudgeTurn` decides which of those this press is).
+ */
+async function handleStageNudgeSubmit(rawText: string) {
+  if (!props.character || sending.value) return
+
+  if (refuseIfInsufficientCredits()) {
+    await scrollToBottom()
+    return
+  }
+
+  const { message, optimisticMessage } = buildStageNudgeTurn(rawText)
+  creditsExhausted.value = false
+  creditsRequiredCr.value = null
+  sessionMessageCapReached.value = false
+  setStorySceneChips([])
+  const sendingLockId = beginSendingLock()
+
+  await runChatTurn(
+    {
+      character_id: props.character.id,
+      conversation_id: props.conversationId,
+      message,
+      attachment_urls: [],
+      // Only ever reachable in stage mode (the control only renders there),
+      // so this is always the same-space frame — never the DM one.
+      presence_frame: currentPresenceFrame(false),
+      stage_nudge: true,
+    },
+    optimisticMessage,
+    sendingLockId,
+  )
+}
+
+/** The plan's per-session message ceiling, not a runtime/billing failure. */
+function isSessionMessageCapError(err: unknown): boolean {
   return err instanceof ChatRuntimeLimitError
     && err.code === 'max_messages_per_session'
 }
@@ -1098,7 +1178,7 @@ function isDemoMessageCapError(err: unknown): boolean {
 function chatErrorContent(err: unknown): string {
   if (err instanceof ChatRuntimeLimitError
     && err.code === 'max_messages_per_session') {
-    return t('chat.errors.demoMaxMessages')
+    return t('chat.errors.sessionMessageCap')
   }
   if (err instanceof ChatRuntimeLimitError
     && err.code === 'subscription_frozen') {
@@ -1520,14 +1600,14 @@ onUnmounted(() => {
           :required-cr="creditsRequiredCr"
         />
 
-        <!-- 試玩上限：雲端專用卡片，把玩家帶回帳號中心註冊正式方案。 -->
-        <div v-if="demoLimitReached" class="chat-demo-limit" role="status">
-          <p class="chat-demo-limit__body">{{ pt('chat.errors.demoMaxMessages') }}</p>
+        <!-- 單場訊息上限：雲端專用卡片，把玩家帶回帳號中心調整方案。 -->
+        <div v-if="sessionMessageCapReached" class="chat-session-cap" role="status">
+          <p class="chat-session-cap__body">{{ pt('chat.errors.sessionMessageCap') }}</p>
           <a
             v-if="portalUrl"
-            class="chat-demo-limit__cta"
+            class="chat-session-cap__cta"
             :href="portalUrl"
-          >{{ t('chat.errors.demoMaxMessagesCta') }}</a>
+          >{{ t('chat.errors.sessionMessageCapCta') }}</a>
         </div>
       </div>
 
@@ -1553,7 +1633,6 @@ onUnmounted(() => {
           :opening="storySceneOpening"
           :ending="storySceneEnding"
           :disabled="storySceneControlDisabled"
-          :unavailable="storySceneUnavailable"
           :error-message="storySceneErrorMessage"
           :quota-note="storySceneQuotaNote"
           :quota-exhausted="storySceneQuotaExhausted"
@@ -1737,6 +1816,21 @@ onUnmounted(() => {
             @keydown="handleKeydown"
             @paste="onPaste"
           />
+          <!-- 示意——讓角色先開口：只在同場模式渲染（plan SN §2/§5）。 -->
+          <StageNudgeControl
+            v-if="interactionMode === 'stage'"
+            :character-name="characterDisplayName"
+            :disabled="storySceneControlDisabled"
+            @submit="handleStageNudgeSubmit"
+          >
+            <template #price>
+              <ActionPriceHint
+                :action-key="ACTION_CHAT"
+                tooltip-key="credits.price.chatTooltip"
+                variant="chip"
+              />
+            </template>
+          </StageNudgeControl>
           <button
             class="send-btn"
             :disabled="(!inputText.trim() && stagedAttachments.length === 0) || sending"
@@ -2114,7 +2208,7 @@ onUnmounted(() => {
 
 /* 離屏訊息不進 layout / paint（IV5-C, 計畫 D6-3）。
    只掛在兩種「訊息項」上，不是 `> *`：載入更早的按鈕、首輪引導、typing
-   indicator、螢火／試玩卡片都是單一、恆在兩端的元素，套上 paint containment
+   indicator、螢火／單場上限卡片都是單一、恆在兩端的元素，套上 paint containment
    只有風險沒有收益。
 
    `contain-intrinsic-size` 的兩件事：
@@ -2143,7 +2237,7 @@ onUnmounted(() => {
   max-width: 90%;
 }
 
-.chat-demo-limit {
+.chat-session-cap {
   align-self: flex-start;
   max-width: 90%;
   display: flex;
@@ -2155,14 +2249,14 @@ onUnmounted(() => {
   background: rgba(255, 255, 255, 0.04);
 }
 
-.chat-demo-limit__body {
+.chat-session-cap__body {
   margin: 0;
   font-size: var(--font-xs);
   line-height: 1.6;
   color: var(--color-text-secondary);
 }
 
-.chat-demo-limit__cta {
+.chat-session-cap__cta {
   align-self: flex-start;
   padding: 6px 12px;
   border: 1px solid var(--color-primary);
@@ -2172,7 +2266,7 @@ onUnmounted(() => {
   text-decoration: none;
 }
 
-.chat-demo-limit__cta:hover {
+.chat-session-cap__cta:hover {
   background: rgba(183, 93, 63, 0.18);
 }
 

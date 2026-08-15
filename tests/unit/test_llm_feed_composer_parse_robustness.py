@@ -9,13 +9,16 @@ hardening these fell through to a fallback that published
 envelope leaked straight onto the player-facing feed.
 
 These tests pin the recovery contract: salvage the caption when it's
-intact, drop the post when only unparseable JSON remains, and keep
-publishing genuine wrapper-less prose.
+intact and reject everything that did not cross the structured-output
+boundary. Rejections are logged with correlation metadata, never with
+the model-authored response body.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 
 import pytest
 
@@ -121,11 +124,27 @@ async def test_rogue_element_but_complete_image_prompt_keeps_both() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsalvageable_schema_leak_is_dropped() -> None:
+async def test_unsalvageable_schema_leak_is_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Truncated before ``content_text`` even closes: there's no clean
     caption to recover and the text is obviously a JSON envelope, so the
     post is skipped (empty body) rather than shipping raw braces."""
     payload = '{"content_text":"這句話還沒講完就被切'
+    composer = LLMFeedComposer(provider=_StaticActiveLLM(payload))
+
+    with caplog.at_level(logging.ERROR):
+        out = await composer.compose(_input())
+
+    assert out.content_text == ""
+    assert "reason=unrecoverable_schema_payload" in caplog.text
+    assert payload not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_plain_prose_without_wrapper_is_rejected() -> None:
+    """Automatic posts must satisfy the structured-output contract."""
+    payload = "今天心情很好，想跟大家分享一下傍晚的天空。"
     composer = LLMFeedComposer(provider=_StaticActiveLLM(payload))
 
     out = await composer.compose(_input())
@@ -134,16 +153,46 @@ async def test_unsalvageable_schema_leak_is_dropped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plain_prose_without_wrapper_still_published() -> None:
-    """Regression guard for the documented fallback: a model that drops
-    the JSON wrapper and writes a plain paragraph must still be published
-    verbatim — the leak guard only fires on JSON-envelope text."""
-    payload = "今天心情很好，想跟大家分享一下傍晚的天空。"
+async def test_bare_none_is_rejected_with_secret_safe_error_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = "None"
+    composer = LLMFeedComposer(provider=_StaticActiveLLM(payload))
+
+    with caplog.at_level(logging.ERROR):
+        out = await composer.compose(_input())
+
+    fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    assert out.content_text == ""
+    assert "feed composer rejected invalid LLM output" in caplog.text
+    assert "character=c1" in caplog.text
+    assert "source=manual" in caplog.text
+    assert "reason=response_not_json_object" in caplog.text
+    assert "response_chars=4" in caplog.text
+    assert f"response_sha256={fingerprint}" in caplog.text
+    assert payload not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "null",
+        '"looks like prose but is a JSON string"',
+        '{"content_text": null, "image_prompt": ""}',
+        '{"content_text": 1, "image_prompt": ""}',
+        '{"image_prompt": "1girl"}',
+        '{"content_text": "   ", "image_prompt": ""}',
+    ],
+)
+async def test_non_object_or_invalid_content_field_is_rejected(
+    payload: str,
+) -> None:
     composer = LLMFeedComposer(provider=_StaticActiveLLM(payload))
 
     out = await composer.compose(_input())
 
-    assert out.content_text == payload
+    assert out.content_text == ""
 
 
 @pytest.mark.asyncio

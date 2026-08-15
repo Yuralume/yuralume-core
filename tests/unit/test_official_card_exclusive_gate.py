@@ -81,7 +81,9 @@ class _Installer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def install(self, detail, *, user_id, locale, initial_relationship):
+    async def install(
+        self, detail, *, user_id, locale, initial_relationship, tenant_id="",
+    ):
         if self._raises is not None:
             raise self._raises
         self.calls.append((detail.id, locale))

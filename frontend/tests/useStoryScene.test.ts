@@ -119,18 +119,6 @@ describe('opening a scene', () => {
     expect(scene.errorKey.value).toBe('chat.storyScene.errors.noMaterial')
   })
 
-  it('withdraws the button where scenes are not offered', async () => {
-    mockedOpen.mockRejectedValueOnce(
-      new StorySceneError({ code: 'story_scene_unavailable', statusCode: 403 }),
-    )
-    const scene = useStoryScene()
-
-    await scene.open('char-1')
-
-    expect(scene.unavailable.value).toBe(true)
-    expect(scene.errorKey.value).toBe('chat.storyScene.errors.unavailable')
-  })
-
   it('refuses a second press while the first is still in flight', async () => {
     const inFlight: { reject?: (reason: unknown) => void } = {}
     mockedOpen.mockImplementationOnce(() => new Promise((_, reject) => {
@@ -163,7 +151,6 @@ describe('opening a scene', () => {
 
       expect(scene.isOpen.value).toBe(false)
       expect(scene.errorKey.value).toBeNull()
-      expect(scene.unavailable.value).toBe(false)
       // and the button is pressable again straight away
       expect(scene.opening.value).toBe(false)
     }
@@ -213,7 +200,6 @@ describe('restoring a scene', () => {
 
     expect(scene.errorKey.value).toBeNull()
     expect(scene.isOpen.value).toBe(false)
-    expect(scene.unavailable.value).toBe(false)
   })
 
   it('never installs a stale answer onto the character now on screen', async () => {
@@ -383,17 +369,19 @@ describe('a refusal that says the screen is out of date', () => {
     expect(scene.opening.value).toBe(false)
   })
 
-  it('does not resync when scenes are not offered at all', async () => {
+  it('does not resync for a refusal that is not about which scene is running', async () => {
+    // `no_material` says nothing about the server's idea of the session, so
+    // re-reading it would buy a request per failure and change nothing.
     mockedOpen.mockRejectedValueOnce(new StorySceneError({
-      code: 'story_scene_unavailable',
-      statusCode: 403,
+      code: 'no_material',
+      statusCode: 409,
     }))
     const scene = useStoryScene()
 
     await scene.open('char-1')
 
     expect(mockedGet).not.toHaveBeenCalled()
-    expect(scene.unavailable.value).toBe(true)
+    expect(scene.errorKey.value).toBe('chat.storyScene.errors.noMaterial')
   })
 
   it('never installs the resync onto a character the player has left', async () => {
@@ -452,7 +440,6 @@ describe('chips', () => {
 
     expect(scene.suggestedActions.value).toEqual([])
     expect(scene.session.value).toBeNull()
-    expect(scene.unavailable.value).toBe(false)
   })
 })
 

@@ -4,7 +4,7 @@ The operator's ``cloud_tenant_tier`` projection is otherwise refreshed only at
 login (``CloudFederatedAuthStrategy``). This service applies a tier change
 pushed by Yuralume Cloud immediately, so an upgrade / downgrade takes effect
 without waiting for the operator to re-login — closing the staleness window
-that (for example) lets the demo reaper delete a freshly-upgraded tenant's
+that (for example) lets the character TTL reaper delete a freshly-upgraded tenant's
 characters. The write is a single authoritative bulk projection; the caller
 retries on error through its own outbox.
 """

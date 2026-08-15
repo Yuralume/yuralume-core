@@ -2,11 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import axios from 'axios'
 
 import {
-  DemoSessionLoginError,
   getAuthConfig,
-  getDemoOAuthConfig,
   loginWithCloudSession,
-  loginWithDemoSession,
 } from '@/utils/api/auth'
 
 vi.mock('axios', () => {
@@ -71,92 +68,6 @@ describe('getAuthConfig', () => {
     const config = await getAuthConfig()
 
     expect(config.portal_url ?? null).toBeNull()
-  })
-})
-
-describe('getDemoOAuthConfig', () => {
-  it('fetches runtime client ids and keeps only non-empty ones', async () => {
-    mockedAxios.get.mockResolvedValueOnce({
-      data: {
-        providers: {
-          discord: { client_id: 'disc-123' },
-          google: { client_id: '' },
-        },
-      },
-    })
-
-    await expect(getDemoOAuthConfig()).resolves.toEqual({ discord: 'disc-123' })
-    expect(mockedAxios.get).toHaveBeenCalledWith('/api/v1/auth/demo/oauth/config')
-  })
-
-  it('returns an empty map when no providers are configured', async () => {
-    mockedAxios.get.mockResolvedValueOnce({ data: {} })
-
-    await expect(getDemoOAuthConfig()).resolves.toEqual({})
-  })
-})
-
-describe('loginWithDemoSession', () => {
-  it('posts OAuth callback material to the Core demo session endpoint', async () => {
-    const response = {
-      token: 'core-token',
-      user: {
-        id: 'cloud:demo',
-        display_name: 'Demo',
-        email: 'demo@example.com',
-        is_admin: false,
-        primary_language: 'en-US',
-        timezone_id: 'UTC',
-        country_code: null,
-        latitude: null,
-        longitude: null,
-        location_label: null,
-      },
-    }
-    mockedAxios.post.mockResolvedValueOnce({ data: response })
-
-    await expect(loginWithDemoSession({
-      provider: 'discord',
-      authorization_code: 'oauth-code',
-      redirect_uri: 'https://app.example/demo/oauth/discord/callback',
-      code_verifier: 'pkce',
-    })).resolves.toEqual(response)
-
-    expect(mockedAxios.post).toHaveBeenCalledWith('/api/v1/auth/demo/session', {
-      provider: 'discord',
-      authorization_code: 'oauth-code',
-      redirect_uri: 'https://app.example/demo/oauth/discord/callback',
-      code_verifier: 'pkce',
-    })
-  })
-
-  it('preserves structured demo limit errors from Core', async () => {
-    mockedAxios.post.mockRejectedValueOnce({
-      response: {
-        status: 429,
-        data: {
-          detail: {
-            error: {
-              code: 'demo_rate_limited',
-              message: 'demo session provisioning is rate limited',
-              retryable: true,
-            },
-          },
-        },
-      },
-    })
-
-    const rejected = loginWithDemoSession({
-      provider: 'discord',
-      authorization_code: 'oauth-code',
-    })
-
-    await expect(rejected).rejects.toBeInstanceOf(DemoSessionLoginError)
-    await expect(rejected).rejects.toMatchObject({
-      code: 'demo_rate_limited',
-      statusCode: 429,
-      retryable: true,
-    })
   })
 })
 

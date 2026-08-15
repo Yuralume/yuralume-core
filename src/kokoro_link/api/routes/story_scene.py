@@ -51,7 +51,6 @@ from kokoro_link.application.services.story_scene_service import (
     SceneOpenFailed,
     SceneSessionMismatch,
     StorySceneService,
-    StorySceneUnavailable,
 )
 from kokoro_link.bootstrap.container import ServiceContainer
 from kokoro_link.domain.entities.character import Character
@@ -93,8 +92,8 @@ async def open_story_scene(
     nothing opens a scene as before, and a hosted one posts the price it
     was quoting so the charge binds to the number on the player's screen.
     Binding happens through a scope rather than an argument because the
-    charge is raised inside the service, alongside the demo and quota
-    gates that must all refuse *before* any money moves.
+    charge is raised inside the service, alongside the quota gate that
+    must refuse *before* any money moves.
     """
     service = _require_service(container)
     try:
@@ -121,11 +120,6 @@ async def open_story_scene(
     except SceneMaterialUnavailable as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=_structured(error.code, str(error)),
-        ) from error
-    except StorySceneUnavailable as error:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
             detail=_structured(error.code, str(error)),
         ) from error
     except StorySceneDailyLimitReached as error:

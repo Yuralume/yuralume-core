@@ -1222,17 +1222,27 @@ function sceneTypeLabel(s: string): string {
 .modal-backdrop {
   position: fixed;
   inset: 0;
+  /* 用動態視窗高：排除手機瀏覽器網址列佔的高度，modal 才不會頂進被網址列遮住的區域。
+     不支援 dvh 的舊瀏覽器會忽略本行，回退到上面的 inset:0（layout viewport）。 */
+  height: 100dvh;
   z-index: 1400;
   background: rgba(0, 0, 0, 0.78);
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  /* 避讓瀏海 / 圓角 / home indicator，避免 footer 按鈕（存檔／關閉）被裁掉。 */
+  padding:
+    max(24px, var(--safe-area-top))
+    max(24px, var(--safe-area-right))
+    max(24px, var(--safe-area-bottom))
+    max(24px, var(--safe-area-left));
 }
 
 .wizard {
   width: min(820px, 100%);
-  max-height: 92vh;
+  /* 對 backdrop 的 content box 取尺寸（已扣掉上面的 padding／安全區），
+     不用 vh 避免手機網址列顯示時把 footer 頂出可視範圍。 */
+  max-height: 100%;
   display: flex;
   flex-direction: column;
   background:
@@ -1835,7 +1845,12 @@ function sceneTypeLabel(s: string): string {
 
 @media (max-width: 720px) {
   .rhythm-list { grid-template-columns: 1fr; }
-  .modal-backdrop { padding: 8px; }
-  .wizard { max-height: 96vh; }
+  .modal-backdrop {
+    padding:
+      max(8px, var(--safe-area-top))
+      max(8px, var(--safe-area-right))
+      max(8px, var(--safe-area-bottom))
+      max(8px, var(--safe-area-left));
+  }
 }
 </style>

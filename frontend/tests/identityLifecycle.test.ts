@@ -21,7 +21,6 @@ vi.mock('@/utils/api/auth', () => ({
   getAuthConfig: vi.fn(),
   login: vi.fn(),
   loginWithCloudSession: vi.fn(),
-  loginWithDemoSession: vi.fn(),
   setupInitialAdmin: vi.fn(),
 }))
 
@@ -117,19 +116,6 @@ describe('useAuth announces every identity change', () => {
     vi.mocked(authApi.login).mockResolvedValueOnce(session('t1'))
 
     await useAuth().login('alex@example.com', 'pw')
-
-    expect(listener).toHaveBeenCalledTimes(1)
-  })
-
-  it('announces on the demo session exchange', async () => {
-    const listener = vi.fn()
-    onIdentityChanged(listener)
-    vi.mocked(authApi.loginWithDemoSession).mockResolvedValueOnce(session('t2'))
-
-    await useAuth().loginWithDemoSession({
-      provider: 'google',
-      authorization_code: 'code',
-    })
 
     expect(listener).toHaveBeenCalledTimes(1)
   })

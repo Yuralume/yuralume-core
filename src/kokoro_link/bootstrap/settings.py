@@ -903,7 +903,7 @@ class CloudSettings:
     deployment_id: str = "hosted-primary"
     deployment_audience: str = "yuralume-gateway"
     # Shared secret for the User service internal hosted-play code exchange
-    # (X-Internal-Token). Blank in demo-only deployments; the SSO entry flow
+    # (X-Internal-Token). Blank where hosted-play SSO is not used; the entry flow
     # (plan H0) requires it to be set on both Core and the User service.
     hosted_play_internal_token: str = ""
     # Versioned caller/audience/scope credential for User internal APIs.
@@ -941,7 +941,7 @@ class CloudSettings:
     runtime_config_internal_token: str = ""
     # Hosted deployments set this True to reject free ``standard`` tenants at
     # Core login (H1). Default False keeps self-host / existing cloud behavior
-    # where any active account may log in. ``demo`` is always allowed.
+    # where any active account may log in.
     require_paid_tier: bool = False
     # Customer-facing Cloud Portal origin served to the SPA at runtime
     # so a hosted player always has a way back
@@ -955,39 +955,6 @@ class CloudSettings:
     @property
     def active(self) -> bool:
         return self.enabled
-
-
-@dataclass(frozen=True, slots=True)
-class DemoOAuthSettings:
-    """Public demo OAuth client ids served to the SPA at runtime (plan Phase 5.1).
-
-    These are PUBLIC client ids, not secrets. Serving them at runtime removes the
-    Vite build-time bake (``VITE_YURALUME_DEMO_*_CLIENT_ID``) so changing a client
-    id no longer requires rebuilding the SPA/GHCR image. Provider *secrets* stay
-    server-side in the Cloud User service.
-    """
-
-    discord_client_id: str = ""
-    google_client_id: str = ""
-
-    @classmethod
-    def from_env(cls) -> "DemoOAuthSettings":
-        return cls(
-            discord_client_id=os.getenv(
-                "YURALUME_DEMO_DISCORD_CLIENT_ID", "",
-            ).strip(),
-            google_client_id=os.getenv(
-                "YURALUME_DEMO_GOOGLE_CLIENT_ID", "",
-            ).strip(),
-        )
-
-    def client_id_for(self, provider: str) -> str:
-        normalized = (provider or "").strip().lower()
-        if normalized == "discord":
-            return self.discord_client_id
-        if normalized == "google":
-            return self.google_client_id
-        return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1075,7 +1042,6 @@ class AppSettings:
     # Process role + Phase 1 realtime-relay wiring. Default = all + embedded
     # (self-host zero-config red line); Hosted splits api/background via env.
     process: ProcessSettings = field(default_factory=ProcessSettings)
-    demo_oauth: DemoOAuthSettings = field(default_factory=DemoOAuthSettings)
     web_push: WebPushSettings = field(default_factory=WebPushSettings)
     official_cards: OfficialCardCatalogSettings = field(
         default_factory=OfficialCardCatalogSettings,
@@ -1689,7 +1655,6 @@ class AppSettings:
             auth=auth,
             cloud=cloud,
             process=process,
-            demo_oauth=DemoOAuthSettings.from_env(),
             web_push=web_push,
             official_cards=OfficialCardCatalogSettings.from_env(),
             config_encryption_key=(

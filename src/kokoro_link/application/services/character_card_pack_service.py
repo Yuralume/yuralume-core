@@ -119,7 +119,7 @@ class CharacterCardPackService:
         self._official_cards = official_cards
 
     async def list_available(
-        self, *, primary_language: str = "",
+        self, *, primary_language: str = "", cloud_tenant_id: str = "",
     ) -> CharacterCardCatalogue:
         """Project the Cloud catalog and every readable local pack.
 
@@ -127,12 +127,19 @@ class CharacterCardPackService:
         local pack whose blob is unreadable or whose manifest fails schema
         validation is skipped (fail-soft) so one bad file doesn't blank the
         whole gallery.
+
+        ``cloud_tenant_id`` is the caller's Cloud tenant, and it is the one
+        argument here that makes the shelf differ between two players of the
+        same deployment: official cards fenced to a tenant tier (TG series)
+        are visible only to the tenants in it. Blank — self-host, or an
+        account with no projected tenant — is the shelf as it always was.
         """
         cards: list[CharacterCardPackSummary] = []
         unavailable = False
         if self._official_cards is not None:
             official = await self._official_cards.list_summaries(
                 primary_language=primary_language,
+                cloud_tenant_id=cloud_tenant_id,
             )
             if official is None:
                 unavailable = True
@@ -178,6 +185,7 @@ class CharacterCardPackService:
         translate: bool = False,
         target_language: str | None = None,
         primary_language: str = "",
+        cloud_tenant_id: str = "",
     ) -> CharacterCardPreview:
         """Preview one pack, optionally translating only this card.
 
@@ -191,7 +199,9 @@ class CharacterCardPackService:
         card_id = parse_cloud_pack_ref(pack_id)
         if card_id is not None:
             return await self._official_preview(
-                card_id, primary_language=primary_language,
+                card_id,
+                primary_language=primary_language,
+                cloud_tenant_id=cloud_tenant_id,
             )
         blob = self._catalog.read_blob(pack_id)
         if blob is None:
@@ -215,6 +225,7 @@ class CharacterCardPackService:
         target_language: str | None = None,
         primary_language: str = "",
         initial_relationship: InitialRelationshipPayload | None = None,
+        cloud_tenant_id: str = "",
     ) -> ImportedCard:
         """Install a pack as a brand-new character owned by ``user_id`` —
         same import path as a manual ``.lumecard`` upload, whether the card
@@ -241,6 +252,7 @@ class CharacterCardPackService:
                 user_id=user_id,
                 primary_language=primary_language,
                 initial_relationship=initial_relationship,
+                cloud_tenant_id=cloud_tenant_id,
             )
         blob = self._catalog.read_blob(pack_id)
         if blob is None:
@@ -278,13 +290,15 @@ class CharacterCardPackService:
         return previews
 
     async def _official_preview(
-        self, card_id: str, *, primary_language: str,
+        self, card_id: str, *, primary_language: str, cloud_tenant_id: str,
     ) -> CharacterCardPreview:
         if self._official_cards is None:
             raise CharacterCardPackNotFoundError(card_id)
         try:
             return await self._official_cards.preview(
-                card_id, primary_language=primary_language,
+                card_id,
+                primary_language=primary_language,
+                cloud_tenant_id=cloud_tenant_id,
             )
         except OfficialCardNotFound as exc:
             raise CharacterCardPackNotFoundError(card_id) from exc
@@ -296,6 +310,7 @@ class CharacterCardPackService:
         user_id: str,
         primary_language: str,
         initial_relationship: InitialRelationshipPayload | None,
+        cloud_tenant_id: str,
     ) -> ImportedCard:
         if self._official_cards is None:
             raise CharacterCardPackNotFoundError(card_id)
@@ -305,6 +320,7 @@ class CharacterCardPackService:
                 user_id=user_id,
                 primary_language=primary_language,
                 initial_relationship=initial_relationship,
+                cloud_tenant_id=cloud_tenant_id,
             )
         except OfficialCardNotFound as exc:
             raise CharacterCardPackNotFoundError(card_id) from exc

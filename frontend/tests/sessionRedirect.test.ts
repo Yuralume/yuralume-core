@@ -25,8 +25,6 @@ describe('isSignInFlowPath', () => {
     expect(isSignInFlowPath('/setup')).toBe(true)
     expect(isSignInFlowPath('/session-expired')).toBe(true)
     expect(isSignInFlowPath('/cloud/callback')).toBe(true)
-    expect(isSignInFlowPath('/demo/oauth/discord/start')).toBe(true)
-    expect(isSignInFlowPath('/demo/oauth/google/callback')).toBe(true)
   })
 
   it('treats ordinary player screens as bounceable', () => {
@@ -60,8 +58,8 @@ describe('signInRouteFor', () => {
   })
 
   it('falls back to the password form when a hosted deployment has no Portal', () => {
-    // Demo deployments run in cloud mode without a Portal; the /login fallback
-    // is the only exit they have.
+    // A deployment can run in cloud mode without advertising a Portal; the
+    // /login fallback is the only exit it has.
     expect(signInRouteFor({ portalUrl: '   ' }, '/studio').path).toBe(SIGN_IN_PATH)
   })
 

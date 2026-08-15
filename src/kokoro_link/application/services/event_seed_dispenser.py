@@ -56,6 +56,7 @@ class EventSeedDispenser:
 
     async def claim(
         self, *, character_id: str, surface: str,
+        now: datetime | None = None,
     ) -> ClaimedSeed | None:
         """Atomically claim the oldest unclaimed inbox row.
 
@@ -63,13 +64,17 @@ class EventSeedDispenser:
         beyond the age window, or the chosen row is already claimed
         (race lost). Caller treats ``None`` as "no seed this round" and
         falls through to whatever it was doing before.
+
+        ``now`` is the caller's logical clock (a scheduler tick carries
+        one); the age window and the claim timestamp both derive from
+        it so a tick evaluated at time T behaves the same whenever it
+        actually runs. Omitted means wall clock.
         """
         if not (surface or "").strip():
             raise ValueError("surface must be non-empty")
 
-        cutoff_published = (
-            datetime.now(timezone.utc) - timedelta(days=self._max_age_days)
-        )
+        now = now if now is not None else datetime.now(timezone.utc)
+        cutoff_published = now - timedelta(days=self._max_age_days)
         unclaimed = await self._inbox.list_for_character(
             character_id, unclaimed_only=True, limit=20,
         )
@@ -85,7 +90,7 @@ class EventSeedDispenser:
                 # GC will sweep it.
                 continue
             claimed = await self._inbox.claim(
-                item.id, surface=surface, at=datetime.now(timezone.utc),
+                item.id, surface=surface, at=now,
             )
             if claimed is None:
                 # Lost the race; try the next candidate.
@@ -95,6 +100,7 @@ class EventSeedDispenser:
 
     async def commit(
         self, *, item_id: str, surface: str,
+        now: datetime | None = None,
     ) -> ClaimedSeed | None:
         """Atomically claim a specific peeked row, by id.
 
@@ -107,7 +113,8 @@ class EventSeedDispenser:
         if not (surface or "").strip():
             raise ValueError("surface must be non-empty")
         claimed = await self._inbox.claim(
-            item_id, surface=surface, at=datetime.now(timezone.utc),
+            item_id, surface=surface,
+            at=now if now is not None else datetime.now(timezone.utc),
         )
         if claimed is None:
             return None
@@ -136,6 +143,7 @@ class EventSeedDispenser:
 
     async def peek(
         self, *, character_id: str, limit: int = 3,
+        now: datetime | None = None,
     ) -> list[ClaimedSeed]:
         """Read-only view of the most recent unclaimed seeds.
 
@@ -148,7 +156,8 @@ class EventSeedDispenser:
             character_id, unclaimed_only=True, limit=limit * 2,
         )
         cutoff_published = (
-            datetime.now(timezone.utc) - timedelta(days=self._max_age_days)
+            (now if now is not None else datetime.now(timezone.utc))
+            - timedelta(days=self._max_age_days)
         )
         for item in unclaimed:
             event = await self._events.get(item.world_event_id)

@@ -177,6 +177,9 @@ from kokoro_link.infrastructure.cloud.official_card_catalog_client import (
 from kokoro_link.infrastructure.cloud.official_card_exclusive_client import (
     build_exclusive_payload_client,
 )
+from kokoro_link.infrastructure.cloud.official_card_gated_catalog_client import (
+    build_gated_catalog_client,
+)
 from kokoro_link.infrastructure.character_card.llm_translator import (
     LLMCharacterCardTranslator,
 )
@@ -368,7 +371,7 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.application.services.video_storyboard_service import (
     VideoStoryboardService,
 )
-from kokoro_link.application.services.demo_account_reaper import DemoAccountReaper
+from kokoro_link.application.services.character_ttl_reaper import CharacterTtlReaper
 from kokoro_link.application.services.tts_pregeneration_service import (
     TTSPregenerationService,
 )
@@ -504,6 +507,7 @@ from kokoro_link.application.services.schedule_weather_drift_service import (
     ScheduleWeatherDriftService,
 )
 from kokoro_link.application.services.state_tracker import StateChangeTracker
+from kokoro_link.application.services.composer_tool_loop import ComposerToolLoop
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
 from kokoro_link.application.services.notification_service import NotificationService
 from kokoro_link.bootstrap.settings import (
@@ -1133,7 +1137,7 @@ class ServiceContainer:
     # metrics + execution-mode admin routes read through this.
     runtime_ownership: "RuntimeOwnershipPort | None" = None
     execution_mode_transition: "ExecutionModeTransitionService | None" = None
-    demo_account_reaper: DemoAccountReaper | None = None
+    character_ttl_reaper: CharacterTtlReaper | None = None
     character_freeze_reaper: "CharacterFreezeReaper | None" = None
     # Cloud→Core subscription-lapse batch freeze/thaw, invoked by the
     # internal service-to-service route on tenant tier changes.
@@ -1345,6 +1349,28 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed >= 0 else default
+
+
+def _capability_caps() -> dict[str, int]:
+    """The deployment's §5 per-capability background ceilings.
+
+    One reader for two consumers: the worker's claim filter (what the cap
+    actually enforces) and the promise tool loop (which must not offer a
+    tool whose queue the operator closed with a cap of 0 — the job would be
+    minted and never claimable). Two copies of this env read would be two
+    places for those answers to disagree."""
+    return {
+        "llm": _env_int("YURALUME_BG_CAP_LLM", DEFAULT_CAPABILITY_CAPS["llm"]),
+        "image": _env_int(
+            "YURALUME_BG_CAP_IMAGE", DEFAULT_CAPABILITY_CAPS["image"],
+        ),
+        # CV4: bounds concurrent pollers, not GPUs — deliberately far
+        # above the image cap, which a video poll must never share.
+        "video_poll": _env_int(
+            "YURALUME_BG_CAP_VIDEO_POLL",
+            DEFAULT_CAPABILITY_CAPS["video_poll"],
+        ),
+    }
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -3771,7 +3797,6 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # two messages into the same thread a chat turn writes into, and
         # the two must not interleave.
         turn_lease=ChatTurnLease.from_studio_lease(studio_execution_lease),
-        account_runtime_profile_resolver=account_runtime_profile_resolver,
         operator_profile_service=operator_profile_service,
         # SC3-B: per-tier daily ceiling on openings. The knob defaults to
         # unlimited (None) so self-host never sees the guard fire.
@@ -4990,10 +5015,29 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         notification_service=notification_service,
         visible_slot_port=visible_slot_port,
     )
+    # PF1 — the two-pass compose→tool→compose loop shared by every kind of
+    # pending follow-up. Same registry / orchestrator / public-URL resolver the
+    # proactive path uses, so a promised photo is delivered through exactly the
+    # same absolutisation rules as a spontaneous one.
+    promise_tool_loop = ComposerToolLoop(
+        tool_registry=tool_registry,
+        tool_orchestrator=tool_orchestrator,
+        public_base_url=app_settings.public_base_url,
+        public_base_url_provider=messaging_public_url_resolver.resolve,
+        surface="promise",
+        # The same ceilings the worker claims under. A capability capped at 0
+        # is a closed queue, so a fulfilment that would have to hand that
+        # capability off is not offered the tool at all — it says so in words
+        # instead of waiting forever for a job nobody can claim. Only the
+        # deferring (distributed) caller is filtered; the embedded release
+        # runs its tools inline and is unaffected whatever the env says.
+        capability_caps=_capability_caps(),
+    )
     pending_follow_up_dispatcher = PendingFollowUpDispatcher(
         repository=pending_follow_up_repository,
         composer=pending_follow_up_composer,
         proactive_dispatcher=proactive_dispatcher,
+        tool_loop=promise_tool_loop,
         character_repository=character_repository,
         conversation_repository=conversation_repository,
         schedule_service=schedule_service,
@@ -5168,6 +5212,13 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             clock=clock,
         )
         chat_service.set_pending_follow_up_release_enqueuer(_release_enqueuer)
+        # PF3 — the SAME enqueuer is how a fulfilment hands its GPU half to the
+        # image-capped kind. Only wired here, i.e. only where a distributed queue
+        # exists: with no queue there is nowhere to defer to and the tool runs
+        # inline, which is exactly what self-host wants.
+        pending_follow_up_dispatcher.set_capability_release_enqueuer(
+            _release_enqueuer,
+        )
 
         # Event-driven post-turn processing (§5 priority 3). The chat write point
         # enqueues ONE immediate one-shot job so the post-turn LLM extraction runs on
@@ -5391,18 +5442,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             execution_runner=execution_runner,
         )
         # §5 caps bind at claim time (execution mode only).
-        background_shadow_worker.set_capability_caps({
-            "llm": _env_int("YURALUME_BG_CAP_LLM", DEFAULT_CAPABILITY_CAPS["llm"]),
-            "image": _env_int(
-                "YURALUME_BG_CAP_IMAGE", DEFAULT_CAPABILITY_CAPS["image"],
-            ),
-            # CV4: bounds concurrent pollers, not GPUs — deliberately far
-            # above the image cap, which a video poll must never share.
-            "video_poll": _env_int(
-                "YURALUME_BG_CAP_VIDEO_POLL",
-                DEFAULT_CAPABILITY_CAPS["video_poll"],
-            ),
-        })
+        background_shadow_worker.set_capability_caps(_capability_caps())
 
     tts_voice_catalog: TTSVoiceCatalogPort | None = None
     tts_settings = app_settings.tts
@@ -5586,16 +5626,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             app_settings.process.background_backend == "postgres"
         ),
     )
-    demo_account_reaper = DemoAccountReaper(
+    character_ttl_reaper = CharacterTtlReaper(
         character_repository=character_repository,
         character_service=character_service,
-        operator_profile_repository=operator_profile_repository,
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
-        release_hook=cloud_user_service_client,
         clock=clock,
     )
-    proactive_scheduler.set_demo_account_reaper(demo_account_reaper)
+    proactive_scheduler.set_character_ttl_reaper(character_ttl_reaper)
     # Idle-character auto-freeze sweep (CHARACTER_FREEZE_PLAN). Reads the
     # ``character_freeze`` site-settings group each sweep and freezes
     # characters idle past the configured threshold. No-op until an
@@ -5874,10 +5912,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     # unwired entirely (self-host opt-out, plan §3.5).
     official_card_source: OfficialCardPackSource | None = None
     if app_settings.official_cards.enabled:
+        official_card_catalog_client = OfficialCardCatalogClient(
+            base_url=app_settings.official_cards.catalog_url,
+        )
         official_card_catalog = CachedOfficialCardCatalog(
-            client=OfficialCardCatalogClient(
-                base_url=app_settings.official_cards.catalog_url,
-            ),
+            client=official_card_catalog_client,
         )
         # Cloud-exclusive (IP-partner) cards, EC4. The client is built only
         # when this deployment holds a User-service credential carrying the
@@ -5899,10 +5938,37 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             if exclusive_payload_client is not None
             else None
         )
+        # Tier-fenced official cards (TG3). Built from the same credential
+        # and the same scope as the installer above, which is why the two
+        # can never disagree: a deployment able to *see* a card being
+        # internally tested is exactly one able to install it. No
+        # credential — every self-hosted build — means no client, and those
+        # cards then do not exist here at all rather than existing as rows
+        # nobody may take.
+        #
+        # Two URLs on purpose: the *document* is read from the internal User
+        # service, while the *art* those rows point at is served by the
+        # public catalog and downloaded anonymously — so the image paths are
+        # absolutised by the anonymous client's own absolutiser, which is
+        # also the origin its download guard checks against. Absolutising
+        # them against the User service URL instead lands a card with no
+        # stage images and no error anywhere.
+        gated_catalog_client = (
+            build_gated_catalog_client(
+                base_url=app_settings.cloud.user_service_url,
+                credential_descriptor=(
+                    app_settings.cloud.internal_service_credential
+                ),
+                absolutise_asset=official_card_catalog_client.absolutise,
+            )
+            if exclusive_payload_client is not None
+            else None
+        )
         official_card_source = OfficialCardPackSource(
             catalog=official_card_catalog,
             import_service=character_card_import_service,
             exclusive_installer=exclusive_installer,
+            gated_catalog=gated_catalog_client,
         )
     character_card_pack_service = CharacterCardPackService(
         catalog=CharacterCardPackCatalog(),
@@ -6021,7 +6087,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         background_coordinator_lease=background_coordinator_lease,
         runtime_ownership=runtime_ownership,
         execution_mode_transition=execution_mode_transition,
-        demo_account_reaper=demo_account_reaper,
+        character_ttl_reaper=character_ttl_reaper,
         character_freeze_reaper=character_freeze_reaper,
         subscription_freeze_service=subscription_freeze_service,
         exclusive_card_freeze_service=exclusive_card_freeze_service,

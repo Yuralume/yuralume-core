@@ -26,6 +26,9 @@ from kokoro_link.contracts.cloud_routing_profile import CloudRoutingProfile
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
+from kokoro_link.domain.value_objects.account_runtime_profile import (
+    AccountRuntimeProfile,
+)
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.llm.cloud_gateway_model import CloudGatewayChatModel
 from kokoro_link.infrastructure.repositories.in_memory_operator_profile import (
@@ -76,13 +79,30 @@ def _operator() -> OperatorProfile:
     )
 
 
-def _demo_operator() -> OperatorProfile:
+STRICT_TIER = "strict-tier"
+"""A tier whose control-plane profile pins ``strict_no_fallback``."""
+
+
+class _StrictTierPort:
+    """Control-plane stand-in: ``STRICT_TIER`` fails closed on a missing preset."""
+
+    async def fetch(self, tier: str) -> AccountRuntimeProfile | None:
+        if tier == STRICT_TIER:
+            return AccountRuntimeProfile(name=STRICT_TIER, strict_no_fallback=True)
+        return None
+
+
+def _strict_tier_resolver(repo) -> AccountRuntimeProfileResolver:  # noqa: ANN001
+    return AccountRuntimeProfileResolver(repo, tier_profile_port=_StrictTierPort())
+
+
+def _hosted_operator() -> OperatorProfile:
     return OperatorProfile(
         id="cloud:acct_1",
-        display_name="Demo Player",
+        display_name="Hosted Player",
         cloud_account_id="acct_1",
         cloud_tenant_id="tenant_1",
-        cloud_tenant_tier="demo",
+        cloud_tenant_tier=STRICT_TIER,
         auth_provider="cloud",
     )
 
@@ -115,9 +135,9 @@ async def test_cloud_active_llm_provider_resolves_gateway_model_by_feature() -> 
 
 
 @pytest.mark.asyncio
-async def test_cloud_active_llm_provider_requires_demo_feature_preset() -> None:
+async def test_cloud_active_llm_provider_requires_strict_tier_feature_preset() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     factory_calls: list[tuple[str, CloudGatewayIdentity | None, str]] = []
 
     def factory(
@@ -132,7 +152,7 @@ async def test_cloud_active_llm_provider_requires_demo_feature_preset() -> None:
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
         model_factory=factory,
         model_presets={"default": "preset-default"},
-        account_runtime_profile_resolver=AccountRuntimeProfileResolver(repo),
+        account_runtime_profile_resolver=_strict_tier_resolver(repo),
     )
 
     with pytest.raises(RuntimeError, match="strict no-fallback"):
@@ -142,28 +162,31 @@ async def test_cloud_active_llm_provider_requires_demo_feature_preset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cloud_active_llm_provider_allows_demo_explicit_feature_preset() -> None:
+async def test_cloud_active_llm_provider_allows_strict_explicit_feature_preset() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     provider = CloudActiveLLMProvider(
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
         model_factory=_model_factory,
         model_presets={
-            FEATURE_CHAT: "preset-demo-chat",
+            FEATURE_CHAT: "preset-strict-chat",
             "default": "preset-default",
         },
-        account_runtime_profile_resolver=AccountRuntimeProfileResolver(repo),
+        # The strict-tier resolver, not a bare one: this is the *positive*
+        # half of the fail-closed pair above, and with a permissive profile it
+        # would pass no matter what the strict path did.
+        account_runtime_profile_resolver=_strict_tier_resolver(repo),
     )
 
     model = await provider.resolve(FEATURE_CHAT, character=_character())
 
-    assert await model.list_models() == ["preset-demo-chat"]
+    assert await model.list_models() == ["preset-strict-chat"]
 
 
 @pytest.mark.asyncio
-async def test_cloud_active_llm_provider_resolves_operator_scoped_demo_call() -> None:
+async def test_cloud_active_llm_provider_resolves_operator_scoped_hosted_call() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     factory_calls: list[tuple[str, CloudGatewayIdentity | None, str]] = []
 
     def factory(
@@ -178,7 +201,7 @@ async def test_cloud_active_llm_provider_resolves_operator_scoped_demo_call() ->
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
         model_factory=factory,
         model_presets={
-            FEATURE_CHARACTER_DRAFT: "preset-demo-draft",
+            FEATURE_CHARACTER_DRAFT: "preset-strict-draft",
             "default": "preset-default",
         },
         account_runtime_profile_resolver=AccountRuntimeProfileResolver(repo),
@@ -189,10 +212,10 @@ async def test_cloud_active_llm_provider_resolves_operator_scoped_demo_call() ->
         operator_id="cloud:acct_1",
     )
 
-    assert await model.list_models() == ["preset-demo-draft"]
+    assert await model.list_models() == ["preset-strict-draft"]
     feature_key, identity, default_model = factory_calls[0]
     assert feature_key == FEATURE_CHARACTER_DRAFT
-    assert default_model == "preset-demo-draft"
+    assert default_model == "preset-strict-draft"
     assert identity is not None
     assert identity.account_id == "acct_1"
     assert identity.tenant_id == "tenant_1"
@@ -200,14 +223,14 @@ async def test_cloud_active_llm_provider_resolves_operator_scoped_demo_call() ->
 
 
 @pytest.mark.asyncio
-async def test_cloud_active_llm_provider_enforces_demo_preset_for_operator_call() -> None:
+async def test_cloud_active_llm_provider_enforces_strict_preset_for_operator_call() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     provider = CloudActiveLLMProvider(
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
         model_factory=_model_factory,
         model_presets={"default": "preset-default"},
-        account_runtime_profile_resolver=AccountRuntimeProfileResolver(repo),
+        account_runtime_profile_resolver=_strict_tier_resolver(repo),
     )
 
     with pytest.raises(RuntimeError, match="strict no-fallback"):
@@ -263,9 +286,9 @@ class _RecordingProfilePort:
 @pytest.mark.asyncio
 async def test_profile_mode_resolves_preset_with_no_env_presets() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
-        _routing_profile(llm_presets={FEATURE_CHAT: "demo-gb10-chat"}, strict=True)
+        _routing_profile(llm_presets={FEATURE_CHAT: "gb10-chat"}, strict=True)
     )
     provider = CloudActiveLLMProvider(
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
@@ -276,10 +299,10 @@ async def test_profile_mode_resolves_preset_with_no_env_presets() -> None:
 
     model = await provider.resolve(FEATURE_CHAT, character=_character())
 
-    assert await model.list_models() == ["demo-gb10-chat"]
-    # The profile is fetched for the demo-tier scope of the forwarded identity, with
+    assert await model.list_models() == ["gb10-chat"]
+    # The profile is fetched for the tier scope of the forwarded identity, with
     # user_id = the player's cloud account id so user-scope preferences resolve (§6).
-    assert port.scopes == [("tenant_1", "acct_1", "acct_1", "demo")]
+    assert port.scopes == [("tenant_1", "acct_1", "acct_1", STRICT_TIER)]
 
 
 @pytest.mark.asyncio
@@ -326,9 +349,9 @@ async def test_profile_mode_uses_request_scoped_gateway_identity_without_operato
 @pytest.mark.asyncio
 async def test_profile_mode_disabled_feature_fails_closed() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     profile = CloudRoutingProfile(
-        llm_feature_presets={FEATURE_CHAT: "demo-gb10-chat"},
+        llm_feature_presets={FEATURE_CHAT: "gb10-chat"},
         image_feature_presets={},
         video_feature_presets={},
         tts_voice_defaults={},
@@ -351,7 +374,7 @@ async def test_profile_mode_disabled_feature_fails_closed() -> None:
 @pytest.mark.asyncio
 async def test_profile_mode_strict_missing_names_feature_key_and_source() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(_routing_profile(llm_presets={}, strict=True))
     provider = CloudActiveLLMProvider(
         identity_resolver=CloudOperatorIdentityResolver(repository=repo),
@@ -371,9 +394,9 @@ async def test_profile_mode_strict_missing_names_feature_key_and_source() -> Non
 @pytest.mark.asyncio
 async def test_profile_mode_hot_path_makes_no_sync_call_per_turn() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     client = _RecordingProfilePort(
-        _routing_profile(llm_presets={FEATURE_CHAT: "demo-gb10-chat"}, strict=True)
+        _routing_profile(llm_presets={FEATURE_CHAT: "gb10-chat"}, strict=True)
     )
     cache = CachedCloudRoutingProfileResolver(client=client, refresh_interval_seconds=1000)
     provider = CloudActiveLLMProvider(
@@ -403,7 +426,7 @@ async def test_profile_mode_hot_path_makes_no_sync_call_per_turn() -> None:
 @pytest.mark.asyncio
 async def test_profile_pinned_text_only_preset_binds_supports_vision_false() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-text-mini"},
@@ -427,7 +450,7 @@ async def test_profile_pinned_text_only_preset_binds_supports_vision_false() -> 
 @pytest.mark.asyncio
 async def test_profile_pinned_vision_preset_binds_supports_vision_true() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-vision"},
@@ -453,7 +476,7 @@ async def test_unpinned_preset_keeps_the_adapter_default() -> None:
     exactly as it did before VP1 (vision-capable), so shipping this change
     with an unannotated catalog changes nothing."""
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-unannotated"},
@@ -521,7 +544,7 @@ async def test_resolve_reads_the_profile_once_per_call() -> None:
     fetch could observe a refreshed profile naming a different preset than
     the adapter was just built for."""
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-text-mini"},
@@ -544,7 +567,7 @@ async def test_resolve_reads_the_profile_once_per_call() -> None:
 @pytest.mark.asyncio
 async def test_resolve_model_id_is_unaffected_by_the_vision_map() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-text-mini"},
@@ -580,7 +603,7 @@ async def test_adapter_without_a_vision_binder_passes_through() -> None:
             return ["hosted-text-mini"]
 
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
         _routing_profile(
             llm_presets={FEATURE_CHAT: "hosted-text-mini"},

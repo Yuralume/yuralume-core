@@ -55,7 +55,9 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.feed_post import FeedPost
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     AccountRuntimeProfile,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+)
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
@@ -84,7 +86,7 @@ from kokoro_link.infrastructure.usage.recorder import BackgroundUsageEventRecord
 
 class _StaticDemoRuntimeProfileResolver:
     async def resolve_for_operator(self, operator_id: str):
-        return DEMO_ACCOUNT_RUNTIME_PROFILE
+        return RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE
 
 
 def _make_character(*, feed_daily_limit: int = 3) -> Character:

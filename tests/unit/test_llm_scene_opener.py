@@ -107,6 +107,35 @@ def _opener(model) -> LLMStorySceneOpener:  # noqa: ANN001
     return LLMStorySceneOpener(model=model)
 
 
+async def test_narration_keeps_paragraph_breaks() -> None:
+    """The opening is interactive fiction, not a stage direction: the
+    narration arrives in paragraphs and must reach the frontend with its
+    blank-line separators intact (SceneFrame splits on them). Whitespace
+    *inside* a paragraph still collapses."""
+    reply = (
+        '{"narration": "第一段開場。\\n\\n第二段有\\t多餘  空白。\\n\\n\\n\\n第三段。",'
+        ' "character_line": "……你來了。"}'
+    )
+
+    draft = await _opener(_ScriptedModel(reply)).write_opening(_context())
+
+    assert draft is not None
+    assert draft.narration == "第一段開場。\n\n第二段有 多餘 空白。\n\n第三段。"
+
+
+async def test_literal_newlines_inside_the_json_string_still_parse() -> None:
+    """Models asked for multi-paragraph prose often emit *literal*
+    newlines inside the JSON string instead of \\n escapes. Strict JSON
+    rejects those control characters, and a failed parse here fails the
+    whole paid action — so the parser must tolerate them."""
+    reply = '{"narration": "第一段。\n\n第二段。", "character_line": "好。"}'
+
+    draft = await _opener(_ScriptedModel(reply)).write_opening(_context())
+
+    assert draft is not None
+    assert draft.narration == "第一段。\n\n第二段。"
+
+
 async def test_parses_a_well_formed_opening() -> None:
     opener = _opener(_ScriptedModel(_GOOD_JSON))
 

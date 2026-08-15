@@ -175,8 +175,18 @@ class OfficialCardExclusivePayloadPort(ABC):
     """Read-only access to one cloud-exclusive card's full text."""
 
     @abstractmethod
-    async def fetch_payload(self, card_id: str) -> ExclusiveCardPayload | None:
+    async def fetch_payload(
+        self, card_id: str, *, tenant_id: str | None = None,
+    ) -> ExclusiveCardPayload | None:
         """The card's authored text.
+
+        ``tenant_id`` names the Cloud tenant the install is being made for,
+        and it is optional because for almost every card it changes nothing:
+        Cloud only consults it when the card is fenced to a tier (TG series
+        D4), and a request that omits it is byte-for-byte the pre-TG one. It
+        is the *tenant id*, never the tier — Core caches a tenant's tier on
+        the operator profile and that cache drifts, so the side that owns
+        the answer resolves it on every call.
 
         Three outcomes, and the caller has to tell them apart because they
         are three different things to say to a player:
@@ -189,6 +199,11 @@ class OfficialCardExclusivePayloadPort(ABC):
           implementation that prefers to stay quiet — nothing was learned,
           so the honest answer downstream is "try again", never a partial
           install.
+
+        A tenant whose tier may not see a fenced card is answered with the
+        *same* 404 as a card that does not exist, so nothing here has to
+        know that tiers are the reason — and nothing downstream can turn
+        this endpoint into an oracle for which cards are being tested.
         """
 
 

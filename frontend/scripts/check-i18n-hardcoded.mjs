@@ -138,12 +138,6 @@ const completedFiles = [
   'src/utils/sceneMessages.ts',
   'src/utils/storySceneErrors.ts',
   'src/utils/api/worldEvents.ts',
-  // Demo conversion copy moved into the trilingual catalog (plan U1-D);
-  // these modules now own links/classification only, never display strings.
-  'src/utils/demoConversionLinks.ts',
-  'src/utils/demoSessionErrors.ts',
-  'src/pages/DemoOAuthStartPage.vue',
-  'src/pages/DemoOAuthCallbackPage.vue',
   'src/composables/usePlayerCopy.ts',
   'src/utils/studioFailure.ts',
   // Plan #1/#13 root cause lived here, outside the old allowlist. The

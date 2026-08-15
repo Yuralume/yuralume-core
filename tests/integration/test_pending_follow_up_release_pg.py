@@ -70,7 +70,7 @@ class _SpyDispatcher:
     result: bool = True
     calls: list[str] = field(default_factory=list)
 
-    async def release_row(self, row, *, now):  # noqa: ANN001
+    async def release_row(self, row, *, now, defer_capabilities=False):  # noqa: ANN001
         self.calls.append(row.id)
         return self.result
 
@@ -182,7 +182,9 @@ class _CountingProactiveDispatcher:
     def __init__(self) -> None:
         self.sends: list[str] = []
 
-    async def deliver_pre_composed(self, *, character_id, text, trigger, reason, now):  # noqa: ANN001
+    async def deliver_pre_composed(  # noqa: ANN001
+        self, *, character_id, text, trigger, reason, attachments=(), now,
+    ):
         self.sends.append(text)
         return _SentAttempt()
 
@@ -275,7 +277,9 @@ async def test_failed_delivery_releases_slot_for_retry_on_postgres(
         def __init__(self) -> None:
             self.calls = 0
 
-        async def deliver_pre_composed(self, *, character_id, text, trigger, reason, now):  # noqa: ANN001
+        async def deliver_pre_composed(  # noqa: ANN001
+            self, *, character_id, text, trigger, reason, attachments=(), now,
+        ):
             self.calls += 1
             if self.calls == 1:
                 return None  # first delivery fails (binding offline)

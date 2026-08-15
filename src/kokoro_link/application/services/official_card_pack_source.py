@@ -22,6 +22,20 @@ Three properties are worth stating because each one is a decision:
   answers ``None`` for "we do not know", which the caller renders as an
   empty official shelf plus a flag — local packs and installed characters
   carry on untouched.
+
+Since the TG series the shelf has a *second* source, and the split is by
+who may see a card rather than by where it lives: cards fenced to a tenant
+tier are absent from the anonymous catalog entirely (they 404 there, like a
+card that does not exist) and arrive instead through
+:class:`~kokoro_link.contracts.official_card_gated_catalog.OfficialCardGatedCatalogPort`,
+which names the player's Cloud tenant. The two shelves are disjoint *on the
+Cloud side, at any one instant* — but Core reads them through two layers
+with different clocks (the anonymous one behind a TTL cache, the gated one
+per request), so a card locked down after publication is on both shelves
+until the cache turns over. :meth:`OfficialCardPackSource.list_summaries`
+therefore merges by id rather than concatenating. A deployment with no gated
+client, which is every self-hosted one, takes every path below exactly as it
+did before.
 """
 
 from __future__ import annotations
@@ -58,6 +72,9 @@ from kokoro_link.contracts.official_card_exclusive import (
     OfficialCardExclusiveNotFound,
     OfficialCardExclusiveUnavailable,
 )
+from kokoro_link.contracts.official_card_gated_catalog import (
+    OfficialCardGatedCatalogPort,
+)
 from kokoro_link.infrastructure.character_card.pretranslated_translator import (
     PreTranslatedCardTranslator,
 )
@@ -83,6 +100,7 @@ class OfficialCardPackSource:
         catalog: OfficialCardCatalogPort,
         import_service: CharacterCardImportService,
         exclusive_installer: ExclusiveOfficialCardInstaller | None = None,
+        gated_catalog: OfficialCardGatedCatalogPort | None = None,
     ) -> None:
         self._catalog = catalog
         self._import_service = import_service
@@ -93,6 +111,13 @@ class OfficialCardPackSource:
         # gallery, and an install attempted anyway is refused here rather
         # than failing somewhere upstream.
         self._exclusive_installer = exclusive_installer
+        # ``None`` under exactly the same conditions and for the same
+        # reason (TG3): the gated shelf is read with the very credential
+        # that installs from it, so a deployment that could list a
+        # tier-locked card could always also install it. Absent here means
+        # the tier-locked cards do not exist as far as this build is
+        # concerned — no row, no card face, no install.
+        self._gated_catalog = gated_catalog
 
     @property
     def installs_cloud_exclusive(self) -> bool:
@@ -100,28 +125,65 @@ class OfficialCardPackSource:
         return self._exclusive_installer is not None
 
     async def list_summaries(
-        self, *, primary_language: str,
+        self, *, primary_language: str, cloud_tenant_id: str = "",
     ) -> list[CharacterCardPreview] | None:
         """The published catalog as browse rows, or ``None`` when unreachable.
 
         The rows are thin by nature — the catalog document carries a title, a
         summary, tags and one image, and that is what a grid needs. The prose
         a card face renders arrives with :meth:`preview`.
+
+        ``cloud_tenant_id`` is what lets a hosted player also see the cards
+        fenced to their tenant's tier. They are appended to the anonymous
+        shelf rather than mixed into it, so the order every other player
+        sees is untouched, and they render as ordinary cloud-exclusive rows
+        — a tester is not shown a new kind of card, they are shown a card.
+        An id that arrives on both shelves at once is one card, not two:
+        see the merge below.
         """
-        cards = await self._catalog.list_cards(
-            locale=self._locale(primary_language),
-        )
+        locale = self._locale(primary_language)
+        cards = await self._catalog.list_cards(locale=locale)
         if cards is None:
+            # The public shelf is what "the official cards" means to the
+            # caller, so not knowing it is not knowing the shelf. The gated
+            # rows are deliberately not asked for either: half a shelf
+            # flagged as unavailable would be a stranger answer than none.
             return None
-        return [
+        rows = [
             _summary_preview(
                 card, installs_exclusive=self.installs_cloud_exclusive,
             )
             for card in cards
         ]
+        # ``None`` here is the fail-soft case and reads as "no tier-locked
+        # rows this time" (already logged one level down): a shelf minus the
+        # WIP cards, not a shelf nobody can load.
+        gated = await self._gated_rows(
+            locale=locale, cloud_tenant_id=cloud_tenant_id,
+        )
+        locked = [
+            _detail_preview(
+                row, installs_exclusive=self.installs_cloud_exclusive,
+            )
+            for row in gated or ()
+        ]
+        if locked:
+            # The two shelves are disjoint by construction — but only in the
+            # sense that Cloud never *serves* one card on both at the same
+            # instant. These two lists were not read at the same instant: the
+            # anonymous one comes out of a TTL cache measured in minutes and
+            # the gated one is live, so a card locked down after it was
+            # published sits on both until that cache turns over, and a
+            # concatenation would give the gallery two tiles and two
+            # identical keys. The gated row wins because it is the newer
+            # fact: this card is fenced now.
+            locked_ids = {row.pack_id for row in locked}
+            rows = [row for row in rows if row.pack_id not in locked_ids]
+            rows.extend(locked)
+        return rows
 
     async def preview(
-        self, card_id: str, *, primary_language: str,
+        self, card_id: str, *, primary_language: str, cloud_tenant_id: str = "",
     ) -> CharacterCardPreview:
         """One official card in the best language the catalog can answer with.
 
@@ -134,9 +196,16 @@ class OfficialCardPackSource:
         were approved by a human; hiding them would empty the card face for
         no gain. The install path is where staleness starts to matter,
         because that is where the two versions would be merged together.
+
+        A tier-fenced card has no anonymous document at all, so
+        ``cloud_tenant_id`` is what decides whether this can answer for one
+        — and a player outside the circle gets the answer a card that does
+        not exist gets, which is the whole point of the fence.
         """
-        detail = await self._catalog.get_card(
-            card_id, locale=self._locale(primary_language),
+        detail = await self._resolve_detail(
+            card_id,
+            locale=self._locale(primary_language),
+            cloud_tenant_id=cloud_tenant_id,
         )
         if detail is None:
             raise OfficialCardUnavailableError(card_id)
@@ -151,6 +220,7 @@ class OfficialCardPackSource:
         user_id: str,
         primary_language: str,
         initial_relationship: InitialRelationshipPayload | None = None,
+        cloud_tenant_id: str = "",
     ) -> ImportedCard:
         """Download the card and import it as a brand-new local character.
 
@@ -174,9 +244,20 @@ class OfficialCardPackSource:
         :func:`_profile_translator` merges the old prose into the new
         character on that word. The browse paths keep their cache; this is
         the one caller that would be wrong to.
+
+        ``cloud_tenant_id`` travels the whole way down to the authenticated
+        payload read, where Cloud re-checks the tier fence: the row this
+        install started from was read a moment ago, and a card's fence — or
+        a tenant's tier — can change in between. Losing that race is the
+        ordinary "no such card" answer, never a message about tiers.
         """
         locale = self._locale(primary_language)
-        detail = await self._catalog.get_card(card_id, locale=locale, fresh=True)
+        detail = await self._resolve_detail(
+            card_id,
+            locale=locale,
+            cloud_tenant_id=cloud_tenant_id,
+            fresh=True,
+        )
         if detail is None:
             raise OfficialCardUnavailableError(card_id)
         if detail.cloud_exclusive:
@@ -185,6 +266,7 @@ class OfficialCardPackSource:
                 user_id=user_id,
                 locale=locale,
                 initial_relationship=initial_relationship,
+                cloud_tenant_id=cloud_tenant_id,
             )
         blob = await self._catalog.download_artifact(card_id)
         if blob is None:
@@ -209,6 +291,7 @@ class OfficialCardPackSource:
         user_id: str,
         locale: str,
         initial_relationship: InitialRelationshipPayload | None,
+        cloud_tenant_id: str = "",
     ) -> ImportedCard:
         """Install an IP-partner card through the authenticated payload.
 
@@ -233,11 +316,15 @@ class OfficialCardPackSource:
                 user_id=user_id,
                 locale=locale,
                 initial_relationship=initial_relationship,
+                tenant_id=(cloud_tenant_id or "").strip(),
             )
         except OfficialCardExclusiveNotFound as exc:
             # Cloud says this is not an installable exclusive card after
             # all — most plausibly withdrawn between the catalog read and
-            # the install. Same answer a missing public card gets.
+            # the install, or fenced to a tier this tenant left in between.
+            # Same answer a missing public card gets, and deliberately the
+            # same for both: the player is never told that a card they can
+            # see is one they are not in the circle for.
             raise OfficialCardNotFound(detail.id) from exc
         except OfficialCardExclusiveUnavailable as exc:
             # Translated into the vocabulary the rest of the install path
@@ -245,6 +332,117 @@ class OfficialCardPackSource:
             # player as the same "try again" a catalog outage does rather
             # than as a new error class every caller has to learn.
             raise OfficialCardUnavailableError(detail.id) from exc
+
+    async def _resolve_detail(
+        self,
+        card_id: str,
+        *,
+        locale: str,
+        cloud_tenant_id: str,
+        fresh: bool = False,
+    ) -> OfficialCardDetail | None:
+        """One card's document, from whichever shelf actually holds it.
+
+        The anonymous catalog is asked first and answers for every card that
+        is not tier-fenced, which is all of them on a self-hosted deployment
+        and nearly all of them on a hosted one. A tier-fenced card is a 404
+        there — indistinguishable from a card that does not exist, which is
+        the whole point — and *that* is the only branch which reaches for
+        the gated shelf. The cost of the second call is therefore paid on
+        the miss, never on the ordinary read.
+
+        An unreachable catalog (``None``) is left alone rather than
+        retried against the gated route: "we could not find out" is already
+        an honest answer with a caller-side meaning, and turning an outage
+        into a second lookup would let a browse succeed with half a shelf
+        while an install thinks it confirmed something it did not.
+
+        The gated shelf failing is the mirror image of that and behaves the
+        same way: :meth:`_gated_detail` raises
+        :class:`OfficialCardUnavailableError` (a 503, "try again") rather
+        than letting the anonymous 404 stand, because the anonymous 404 is
+        not evidence about a card only the other shelf can answer for. A
+        gated shelf that *did* answer and does not list the card keeps the
+        404 — that is a tenant outside the circle, and it must look exactly
+        like a card that never existed.
+
+        ``fresh`` reaches the anonymous read only. A gated row is fetched
+        per request with no cache anywhere behind it (plan D6), so it is
+        unconditionally what ``fresh`` exists to guarantee.
+        """
+        try:
+            detail = await self._catalog.get_card(
+                card_id, locale=locale, fresh=fresh,
+            )
+        except OfficialCardNotFound:
+            gated = await self._gated_detail(
+                card_id, locale=locale, cloud_tenant_id=cloud_tenant_id,
+            )
+            if gated is None:
+                raise
+            return gated
+        return detail
+
+    async def _gated_detail(
+        self, card_id: str, *, locale: str, cloud_tenant_id: str,
+    ) -> OfficialCardDetail | None:
+        """The tier-locked card by that id, if this tenant may see it.
+
+        Read out of the same list the shelf is built from rather than
+        through a per-card route, because there is no per-card route: the
+        gated endpoint answers "everything your tier may see", and one card
+        is a row of that. At internal-test volumes — a handful of cards —
+        that is the cheaper shape as well as the only one.
+
+        ``None`` means the shelf was read and this card is not on it, which
+        the caller turns into the ordinary "no such card". A shelf that
+        could not be read at all is a different thing and raises
+        :class:`OfficialCardUnavailableError` instead: telling a player 404
+        about a card that was in front of them a second ago is telling them
+        to stop trying, and only Cloud actually answering may say that.
+        """
+        rows = await self._gated_rows(
+            locale=locale, cloud_tenant_id=cloud_tenant_id,
+        )
+        if rows is None:
+            raise OfficialCardUnavailableError(card_id)
+        for row in rows:
+            if row.id == card_id:
+                return row
+        return None
+
+    async def _gated_rows(
+        self, *, locale: str, cloud_tenant_id: str,
+    ) -> list[OfficialCardDetail] | None:
+        """Every tier-locked card this player may see; ``None`` if unasked.
+
+        Two absences are *answers* and collapse to ``[]``: a deployment with
+        no gated client (every self-hosted one) and a player with no Cloud
+        tenant projected onto their profile. Both of those genuinely have no
+        tier-locked cards, and a caller is right to say "no such card" about
+        one — that is the fence working, and it must stay indistinguishable
+        from a card that never existed.
+
+        A Cloud that could not answer is the third case and is deliberately
+        **not** folded in with them, because one branch down the two mean
+        opposite things. Browsing renders both the same way (fail-soft: the
+        shelf minus its tier-locked rows), but a card face cannot — "you are
+        not in the circle" is a 404 and "we could not find out" is a 503, and
+        collapsing them here is what turns a one-minute outage into a
+        permanent "that card does not exist" for the tester watching it.
+        """
+        tenant = (cloud_tenant_id or "").strip()
+        if self._gated_catalog is None or not tenant:
+            return []
+        rows = await self._gated_catalog.list_gated_cards(
+            tenant_id=tenant, locale=locale,
+        )
+        if rows is None:
+            _LOGGER.warning(
+                "tier-gated official cards could not be read for tenant %s — "
+                "they are absent from this shelf", tenant,
+            )
+        return rows
 
     @staticmethod
     def _locale(primary_language: str) -> str:

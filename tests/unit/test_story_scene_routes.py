@@ -43,7 +43,6 @@ from kokoro_link.application.services.story_scene_service import (
     SceneOpenFailed,
     SceneSessionMismatch,
     StorySceneOpening,
-    StorySceneUnavailable,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import (
@@ -224,11 +223,6 @@ def test_open_returns_201_with_session_messages_and_chip_slot() -> None:
             409,
             CONVERSATION_BUSY_CODE,
         ),
-        (
-            StorySceneUnavailable("demo tier"),
-            403,
-            "story_scene_unavailable",
-        ),
         (SceneOpenFailed("writer failed"), 502, "scene_open_failed"),
         (
             StorySceneDailyLimitReached(limit=3, used=3),
@@ -242,7 +236,7 @@ def test_open_returns_201_with_session_messages_and_chip_slot() -> None:
         ),
     ],
     ids=[
-        "already-open", "no-material", "busy", "demo", "writer-failed",
+        "already-open", "no-material", "busy", "writer-failed",
         "daily-limit", "quota-unavailable",
     ],
 )

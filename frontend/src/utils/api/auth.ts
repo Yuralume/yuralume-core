@@ -85,49 +85,9 @@ export interface AuthTokenResponse {
   token: string
 }
 
-export class DemoSessionLoginError extends Error {
-  code: string
-  statusCode: number
-  retryable: boolean
-
-  constructor(input: {
-    code: string
-    message: string
-    retryable: boolean
-    statusCode: number
-  }) {
-    super(input.message)
-    this.name = 'DemoSessionLoginError'
-    this.code = input.code
-    this.statusCode = input.statusCode
-    this.retryable = input.retryable
-  }
-}
-
 export async function getAuthConfig(): Promise<AuthConfig> {
   const { data } = await axios.get<AuthConfig>(`${BASE}/config`)
   return data
-}
-
-interface DemoOAuthConfigResponse {
-  providers?: Record<string, { client_id?: string } | undefined>
-}
-
-/**
- * Public demo OAuth client ids fetched at runtime (plan Phase 5.1), so the SPA no
- * longer needs them baked into the Vite build. Returns a map keyed by provider;
- * a missing/empty id keeps the downstream missing-client-id fail-fast.
- */
-export async function getDemoOAuthConfig(): Promise<Record<string, string>> {
-  const { data } = await axios.get<DemoOAuthConfigResponse>(`${BASE}/demo/oauth/config`)
-  const ids: Record<string, string> = {}
-  for (const [provider, config] of Object.entries(data.providers ?? {})) {
-    const clientId = (config?.client_id ?? '').trim()
-    if (clientId) {
-      ids[provider] = clientId
-    }
-  }
-  return ids
 }
 
 export async function setupInitialAdmin(
@@ -161,25 +121,6 @@ export async function login(
     password,
   })
   return data
-}
-
-export async function loginWithDemoSession(payload: {
-  provider: string
-  authorization_code: string
-  redirect_uri?: string | null
-  code_verifier?: string | null
-}): Promise<AuthTokenResponse> {
-  try {
-    const { data } = await axios.post<AuthTokenResponse>(
-      `${BASE}/demo/session`,
-      payload,
-    )
-    return data
-  } catch (error) {
-    const demoError = demoSessionLoginErrorFromAxios(error)
-    if (demoError) throw demoError
-    throw error
-  }
 }
 
 export async function loginWithCloudSession(payload: {
@@ -267,63 +208,4 @@ export async function changeOwnPassword(
     },
   )
   return data
-}
-
-function demoSessionLoginErrorFromAxios(error: unknown): DemoSessionLoginError | null {
-  const response = responseFromUnknown(error)
-  if (!response) return null
-  const body = errorBodyFromUnknown(response.data)
-  if (!body) return null
-  const code = stringField(body, 'code')
-  const message = stringField(body, 'message')
-  if (!code || !message) return null
-  return new DemoSessionLoginError({
-    code,
-    message,
-    retryable: boolField(body, 'retryable', response.status >= 500),
-    statusCode: response.status,
-  })
-}
-
-function responseFromUnknown(error: unknown): {
-  status: number
-  data: unknown
-} | null {
-  if (!error || typeof error !== 'object') return null
-  const response = (error as { response?: unknown }).response
-  if (!response || typeof response !== 'object') return null
-  const status = (response as { status?: unknown }).status
-  if (typeof status !== 'number') return null
-  return {
-    status,
-    data: (response as { data?: unknown }).data,
-  }
-}
-
-function errorBodyFromUnknown(data: unknown): Record<string, unknown> | null {
-  if (!data || typeof data !== 'object') return null
-  const payload = data as Record<string, unknown>
-  if (payload.error && typeof payload.error === 'object') {
-    return payload.error as Record<string, unknown>
-  }
-  if (!payload.detail || typeof payload.detail !== 'object') return null
-  const detail = payload.detail as Record<string, unknown>
-  if (!detail.error || typeof detail.error !== 'object') return null
-  return detail.error as Record<string, unknown>
-}
-
-function stringField(payload: Record<string, unknown>, key: string): string | null {
-  const value = payload[key]
-  if (typeof value !== 'string') return null
-  const text = value.trim()
-  return text || null
-}
-
-function boolField(
-  payload: Record<string, unknown>,
-  key: string,
-  fallback: boolean,
-): boolean {
-  const value = payload[key]
-  return typeof value === 'boolean' ? value : fallback
 }

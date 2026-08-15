@@ -74,10 +74,10 @@ const runtimeLimits = useRuntimeLimits()
 
 /**
  * This plan does not include generating new pictures (U2: hosted
- * `album_generation_enabled = false`, the demo tier being the reason it
- * exists). Uploading is untouched — the server only gates the *generated*
- * path, so taking the upload button away would remove something the player
- * still has.
+ * `album_generation_enabled = false`, a per-tier switch for plans that do not
+ * carry the generation cost). Uploading is untouched — the server only gates
+ * the *generated* path, so taking the upload button away would remove
+ * something the player still has.
  *
  * True only when a loaded hosted snapshot says so: unknown, unreadable and
  * self-host all read as enabled, so nothing here can withhold a feature on

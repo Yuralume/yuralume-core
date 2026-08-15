@@ -359,15 +359,15 @@ async function chatErrorFromResponse(
   if (response.status === 429 && isSessionMessageLimit(detail)) {
     return new ChatRuntimeLimitError({
       code: 'max_messages_per_session',
-      message: 'Public demo message cap reached.',
+      message: 'Per-session message cap reached.',
       statusCode: response.status,
     })
   }
   // Cost-cap / quota throttling (backend: 429 with a structured
   // ``{code: 'cost_cap_exceeded' | 'quota_exceeded', message}`` detail,
   // shaped like the 402 insufficient-credits body above). Distinct from
-  // ``max_messages_per_session`` above — that one is the hosted demo's own
-  // session ceiling, this is the runtime hitting an operator-side cost cap
+  // ``max_messages_per_session`` above — that one is the plan's ceiling on a
+  // single conversation, this is the runtime hitting an operator-side cost cap
   // or plan quota. Surfaced as a typed error so the panel shows localized,
   // non-blaming copy instead of an opaque "Chat request failed: 429".
   if (

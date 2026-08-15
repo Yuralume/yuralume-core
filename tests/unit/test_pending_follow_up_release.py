@@ -136,15 +136,19 @@ async def test_enqueue_is_idempotent_per_row() -> None:
 class _SpyDispatcher:
     result: bool = True
     calls: list[str] = field(default_factory=list)
+    defer_flags: list[bool] = field(default_factory=list)
 
-    async def release_row(self, row, *, now):  # noqa: ANN001
+    async def release_row(self, row, *, now, defer_capabilities=False):  # noqa: ANN001
         self.calls.append(row.id)
+        self.defer_flags.append(defer_capabilities)
         return self.result
 
 
-def _claimed_release(row: PendingFollowUp) -> ClaimedJob:
+def _claimed_release(
+    row: PendingFollowUp, kind: str = PENDING_FOLLOW_UP_RELEASE_KIND,
+) -> ClaimedJob:
     return ClaimedJob(
-        id="job-1", kind=PENDING_FOLLOW_UP_RELEASE_KIND, attempt_count=1,
+        id="job-1", kind=kind, attempt_count=1,
         max_attempts=5, fencing_epoch=1, idempotency_key=f"follow_up:{row.id}:0",
         priority=1, due_at=row.scheduled_for, payload_version=1,
         payload={"follow_up_id": row.id}, lease_owner="w1",

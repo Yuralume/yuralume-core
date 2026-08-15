@@ -67,6 +67,7 @@ from kokoro_link.contracts.embedder import EmbedderPort
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story_scene import (
+    SCENE_NARRATION_SPEAKER,
     SceneSessionConflict,
     StorySceneChipsContext,
     StorySceneChipsWriterPort,
@@ -77,6 +78,7 @@ from kokoro_link.contracts.story_scene import (
     StorySceneOpeningDraft,
     StorySceneOpenerPort,
     StorySceneSessionRepositoryPort,
+    render_scene_line,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import (
@@ -117,12 +119,6 @@ class StorySceneError(RuntimeError):
     """Base for structured 起幕 failures. ``code`` reaches the client."""
 
     code = "story_scene_error"
-
-
-class StorySceneUnavailable(StorySceneError):
-    """This account may not open story scenes at all (demo tier)."""
-
-    code = "story_scene_unavailable"
 
 
 class SceneAlreadyOpen(StorySceneError):
@@ -212,7 +208,6 @@ class StorySceneService:
         chips_writer: StorySceneChipsWriterPort | None = None,
         story_arc_service: StoryArcService | None = None,
         turn_lease: ChatTurnLease | None = None,
-        account_runtime_profile_resolver=None,  # noqa: ANN001
         operator_profile_service=None,  # noqa: ANN001
         quota_guard=None,  # noqa: ANN001 - StorySceneQuotaGuard (SC3-B)
         local_tz: tzinfo | None = None,
@@ -237,7 +232,6 @@ class StorySceneService:
         self._chips_writer = chips_writer
         self._arcs = story_arc_service
         self._turn_lease = turn_lease
-        self._profiles = account_runtime_profile_resolver
         self._operator_profile_service = operator_profile_service
         self._quota_guard = quota_guard
         self._local_tz = local_tz
@@ -276,8 +270,6 @@ class StorySceneService:
         the whole action succeeds.
         """
         moment = _as_utc(now)
-        await self._ensure_account_may_open(character)
-
         live = await self._sessions.get_open_for_character(character.id)
         if live is not None:
             raise SceneAlreadyOpen(character.id)
@@ -304,8 +296,8 @@ class StorySceneService:
             # SC3-C — the one price, raised last (§3.4 red line 2).
             #
             # *Every* refusal above this line is a refusal the wallet never
-            # hears about: the demo gate, an already-running scene, the
-            # per-tier daily ceiling, an empty waterfall and a busy thread
+            # hears about: an already-running scene, the per-tier daily
+            # ceiling, an empty waterfall and a busy thread
             # are all answers this service already knows, and charging then
             # refunding them would print a spend and a refund on the
             # player's ledger for a scene that never started.
@@ -464,35 +456,6 @@ class StorySceneService:
 
     # ── steps ────────────────────────────────────────────────────────
 
-    async def _ensure_account_may_open(self, character: Character) -> None:
-        """Demo accounts do not get 起幕.
-
-        Checked against the account runtime profile rather than at the
-        route, so every future caller (a chat slash-command, an external
-        channel) inherits the same answer. Fail-closed on a resolver
-        error, matching the album / TTS gates: an account whose policy
-        cannot be read must not be handed a paid foreground action.
-        """
-        if self._profiles is None:
-            return
-        try:
-            profile = await self._profiles.resolve_for_operator(
-                getattr(character, "user_id", None) or "default",
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.exception(
-                "story scene: runtime profile lookup failed character=%s",
-                character.id,
-            )
-            raise StorySceneUnavailable(
-                "story scenes are unavailable because the account runtime "
-                "profile cannot be resolved",
-            ) from exc
-        if profile.is_demo:
-            raise StorySceneUnavailable(
-                "story scenes are not available on the demo tier",
-            )
-
     async def _resolve_material(
         self, character: Character, *, today: date_type,
     ) -> StorySceneMaterial | None:
@@ -611,8 +574,10 @@ class StorySceneService:
                 character,
                 session=session,
                 recent_lines=(
-                    draft.narration,
-                    f"{character.name}：{draft.character_line}",
+                    render_scene_line(
+                        SCENE_NARRATION_SPEAKER, draft.narration,
+                    ),
+                    render_scene_line(character.name, draft.character_line),
                 ),
                 language=language,
             ),

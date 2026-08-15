@@ -22,8 +22,8 @@ from kokoro_link.application.services.character_image_service import (
     TooManyImagesError,
 )
 from kokoro_link.application.services.character_service import CharacterService
-from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.application.services.visual_generation_style import (
     VisualGenerationStyleService,
@@ -272,13 +272,13 @@ async def test_primary_init_bypasses_album_gate_while_manual_blocked(
         image_provider=StaticActiveImageProvider(generator),
         object_storage=InMemoryObjectStorage(public_base_url="/uploads"),
         account_runtime_profile_resolver=_StaticProfileResolver(
-            DEMO_ACCOUNT_RUNTIME_PROFILE,
+            RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
         ),
     )
     chars = CharacterService(repo)
-    created = await chars.create_character(CreateCharacterRequest(name="Demo"))
+    created = await chars.create_character(CreateCharacterRequest(name="Airi"))
 
-    # Demo profile disables album generation -> the repeatable manual portrait
+    # The restrictive profile disables album generation -> the repeatable manual portrait
     # path stays blocked.
     with pytest.raises(GenerationDisabledError):
         await service.generate_portrait(created.id, positive="x")

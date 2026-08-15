@@ -941,9 +941,9 @@ async def test_set_cloud_tenant_tier_only_updates_target_tenant_cloud_operators(
     session_factory: sessionmaker,
 ) -> None:
     repo = SAOperatorProfileRepository(session_factory)
-    await repo.save(_cloud_operator("op-a1", "tenant-A", "demo"))
-    await repo.save(_cloud_operator("op-a2", "tenant-A", "demo"))
-    await repo.save(_cloud_operator("op-b1", "tenant-B", "demo"))
+    await repo.save(_cloud_operator("op-a1", "tenant-A", "basic"))
+    await repo.save(_cloud_operator("op-a2", "tenant-A", "basic"))
+    await repo.save(_cloud_operator("op-b1", "tenant-B", "basic"))
     # A local operator sharing tenant-A's key must be excluded by the
     # ``auth_provider == 'cloud'`` guard.
     await repo.save(
@@ -951,7 +951,7 @@ async def test_set_cloud_tenant_tier_only_updates_target_tenant_cloud_operators(
             id="op-local",
             display_name="Local",
             cloud_tenant_id="tenant-A",
-            cloud_tenant_tier="demo",
+            cloud_tenant_tier="basic",
             auth_provider="local",
         )
     )
@@ -961,8 +961,8 @@ async def test_set_cloud_tenant_tier_only_updates_target_tenant_cloud_operators(
     assert updated == 2
     assert (await repo.get("op-a1")).cloud_tenant_tier == "plus"  # normalised
     assert (await repo.get("op-a2")).cloud_tenant_tier == "plus"
-    assert (await repo.get("op-b1")).cloud_tenant_tier == "demo"
-    assert (await repo.get("op-local")).cloud_tenant_tier == "demo"
+    assert (await repo.get("op-b1")).cloud_tenant_tier == "basic"
+    assert (await repo.get("op-local")).cloud_tenant_tier == "basic"
 
 
 @pytest.mark.asyncio
@@ -970,11 +970,11 @@ async def test_set_cloud_tenant_tier_blank_inputs_are_noops(
     session_factory: sessionmaker,
 ) -> None:
     repo = SAOperatorProfileRepository(session_factory)
-    await repo.save(_cloud_operator("op-a1", "tenant-A", "demo"))
+    await repo.save(_cloud_operator("op-a1", "tenant-A", "basic"))
 
     assert await repo.set_cloud_tenant_tier_for_cloud_tenant("  ", "plus") == 0
     assert await repo.set_cloud_tenant_tier_for_cloud_tenant("tenant-A", "  ") == 0
-    assert (await repo.get("op-a1")).cloud_tenant_tier == "demo"
+    assert (await repo.get("op-a1")).cloud_tenant_tier == "basic"
 
 
 @pytest.mark.asyncio
@@ -986,13 +986,13 @@ async def test_ordinary_save_does_not_overwrite_pushed_tenant_tier(
     # STALE tier (e.g. a login re-projection racing/after a push) must NOT
     # revert the pushed value.
     repo = SAOperatorProfileRepository(session_factory)
-    await repo.save(_cloud_operator("op-a1", "tenant-A", "demo"))
+    await repo.save(_cloud_operator("op-a1", "tenant-A", "basic"))
 
     assert await repo.set_cloud_tenant_tier_for_cloud_tenant("tenant-A", "plus") == 1
     assert (await repo.get("op-a1")).cloud_tenant_tier == "plus"
 
-    # Re-save the aggregate carrying the OLD "demo" tier but a NEW display name.
-    stale = _cloud_operator("op-a1", "tenant-A", "demo").update(
+    # Re-save the aggregate carrying the OLD "basic" tier but a NEW display name.
+    stale = _cloud_operator("op-a1", "tenant-A", "basic").update(
         display_name="Renamed",
     )
     await repo.save(stale)

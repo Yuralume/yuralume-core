@@ -17,6 +17,7 @@ from kokoro_link.contracts.due_jobs import (
     JobCapability,
     KnobGate,
     MEMORIALIZE_KIND,
+    PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
     PENDING_FOLLOW_UP_RELEASE_KIND,
     PROACTIVE_EVALUATE_KIND,
     SCHEDULE_MAINTENANCE_KIND,
@@ -148,9 +149,12 @@ def test_feed_video_poll_never_competes_for_the_image_slot() -> None:
     assert FEED_VIDEO_POLL_KIND not in CHARACTER_KIND_REGISTRY
     assert is_character_chain_kind(FEED_VIDEO_POLL_KIND) is False
 
-    # The capability the claim filter counts by kind: image stays exactly
-    # the set it was, and the poll gets its own, generously-capped one.
-    assert kinds_for_capability(JobCapability.IMAGE.value) == (FEED_COMPOSE_KIND,)
+    # The capability the claim filter counts by kind: the poll gets its own,
+    # generously-capped one and stays out of ``image`` — whose members are the
+    # two kinds that really do occupy the card.
+    assert kinds_for_capability(JobCapability.IMAGE.value) == (
+        FEED_COMPOSE_KIND, PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
+    )
     assert kinds_for_capability(JobCapability.VIDEO_POLL.value) == (
         FEED_VIDEO_POLL_KIND,
     )
@@ -175,6 +179,41 @@ def test_player_owed_one_shots_stay_exempt_from_the_llm_ceiling() -> None:
         assert spec.capability is JobCapability.LLM
         assert spec.counts_toward_capability_cap is False
         assert kind not in kinds_for_capability(JobCapability.LLM.value)
+
+
+def test_promise_image_half_rides_the_image_ceiling_its_text_half_escapes() -> None:
+    """PF3. The two halves of one fulfilment sit on opposite sides of the cap.
+
+    Text — the overwhelming majority — keeps the player-owed exemption: an owed
+    message must never wait behind somebody else's picture. The image half is the
+    single one-shot that opts INTO ``image``, because what it runs is a GPU, and a
+    burst of promises falling due together would otherwise all render at once."""
+    spec = kind_spec(PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND)
+    assert spec is not None
+    assert spec.capability is JobCapability.IMAGE
+    assert spec.counts_toward_capability_cap is True
+    assert spec.priority == kind_spec(PENDING_FOLLOW_UP_RELEASE_KIND).priority
+    assert spec.chained is False
+    assert spec.character_scoped is False
+    assert spec.event_driven is True
+
+    image_kinds = kinds_for_capability(JobCapability.IMAGE.value)
+    assert PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND in image_kinds
+    # ...and the text half is in NO capped set at all — not image, not llm.
+    assert PENDING_FOLLOW_UP_RELEASE_KIND not in image_kinds
+    for _capability, _cap, kinds in capability_kind_sets():
+        assert PENDING_FOLLOW_UP_RELEASE_KIND not in kinds
+
+
+def test_tool_and_job_name_the_gpu_the_same_way() -> None:
+    """One physical card, one capability string.
+
+    A tool declares what it consumes; a job kind declares what its claim counts
+    against. If those two vocabularies drifted, the deferral would look up an
+    empty kind and the render would quietly run outside every ceiling."""
+    from kokoro_link.contracts.tool import TOOL_CAPABILITY_IMAGE
+
+    assert TOOL_CAPABILITY_IMAGE == JobCapability.IMAGE.value
 
 
 def test_goal_review_is_a_daily_character_chain() -> None:

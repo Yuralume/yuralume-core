@@ -103,6 +103,7 @@ from kokoro_link.application.services.persona_curiosity_observability import (
 )
 from kokoro_link.application.services.schedule_memorializer import ScheduleMemorializer
 from kokoro_link.application.services.schedule_service import ScheduleService
+from kokoro_link.application.services.stage_nudge import StageNudgeTurn
 from kokoro_link.application.services.tool_call_parser import (
     looks_like_tool_call_attempt, parse_tool_call,
 )
@@ -271,9 +272,12 @@ from kokoro_link.contracts.external_chat_execution import (
 from kokoro_link.contracts.repositories import CharacterRepositoryPort, ConversationRepositoryPort
 from kokoro_link.contracts.state import StateEnginePort
 from kokoro_link.contracts.story_scene import (
+    SCENE_NARRATION_SPEAKER,
+    SCENE_PLAYER_SPEAKER,
     StorySceneChipsContext,
     StorySceneChipsWriterPort,
     StorySceneSessionRepositoryPort,
+    render_scene_line,
 )
 from kokoro_link.contracts.character_event_mention import (
     CharacterEventMentionRepositoryPort,
@@ -859,8 +863,8 @@ class TurnPrelude:
     Everything in here is either read-only or idempotent (the unfreeze-on-
     interaction touch, the create-on-first-turn conversation row), so running
     it outside the lease cannot corrupt a concurrent turn. Keeping the runtime
-    message-cap check out here also preserves the existing precedence: a demo
-    account over its cap still gets 429, never 409.
+    message-cap check out here also preserves the existing precedence: an
+    account over its session cap still gets 429, never 409.
 
     ``active_turn`` rides along because the drain counter is claimed *before*
     any of the above runs (see ``_begin_turn``): the prelude is itself work a
@@ -1152,16 +1156,20 @@ class ChatService:
         *,
         character: Character,
         conversation_id: str | None = None,
-        user_message: Message,
+        user_message: Message | None,
         assistant_message: Message,
         model: ChatModelPort | None = None,
         model_id: str | None = None,
-    ) -> tuple[Message, Message]:
+    ) -> tuple[Message | None, Message]:
+        """``user_message=None`` = an assistant-only turn (silent 示意)."""
         summarizer = self._nsfw_safe_summarizer
         if summarizer is None:
             return user_message, assistant_message
         if (
-            user_message.content_mode is not MessageContentMode.NSFW
+            (
+                user_message is None
+                or user_message.content_mode is not MessageContentMode.NSFW
+            )
             and assistant_message.content_mode is not MessageContentMode.NSFW
         ):
             return user_message, assistant_message
@@ -1185,8 +1193,11 @@ class ChatService:
                 return message
             return replace(message, safe_summary=summary)
 
+        async def summarize_optional(message: Message | None) -> Message | None:
+            return None if message is None else await summarize(message)
+
         safe_user, safe_assistant = await asyncio.gather(
-            summarize(user_message),
+            summarize_optional(user_message),
             summarize(assistant_message),
         )
         return safe_user, safe_assistant
@@ -1221,12 +1232,13 @@ class ChatService:
         *,
         character: Character,
         conversation_id: str,
-        user_position: int,
+        user_position: int | None,
         assistant_position: int,
         content_mode: MessageContentMode,
         model: ChatModelPort | None,
         model_id: str | None,
     ) -> None:
+        """``user_position=None`` = this turn wrote no player message."""
         if (
             content_mode is not MessageContentMode.NSFW
             or self._nsfw_safe_summarizer is None
@@ -1249,7 +1261,7 @@ class ChatService:
         *,
         character: Character,
         conversation_id: str,
-        user_position: int,
+        user_position: int | None,
         assistant_position: int,
         model: ChatModelPort,
         model_id: str | None,
@@ -1257,17 +1269,18 @@ class ChatService:
         conversation = await self._conversation_repository.get(conversation_id)
         if conversation is None:
             return
-        if (
-            user_position < 0
-            or assistant_position < 0
-            or user_position >= len(conversation.messages)
-            or assistant_position >= len(conversation.messages)
-        ):
+        in_range = range(len(conversation.messages))
+        if assistant_position not in in_range:
             return
-        user_message = conversation.messages[user_position]
+        if user_position is not None and user_position not in in_range:
+            return
+        user_message = (
+            conversation.messages[user_position]
+            if user_position is not None else None
+        )
         assistant_message = conversation.messages[assistant_position]
         if (
-            user_message.role is not MessageRole.USER
+            (user_message is not None and user_message.role is not MessageRole.USER)
             or assistant_message.role is not MessageRole.ASSISTANT
         ):
             return
@@ -1279,18 +1292,23 @@ class ChatService:
             model=model,
             model_id=model_id,
         )
+        user_unchanged = (
+            user_message is None
+            or safe_user is None
+            or safe_user.safe_summary == user_message.safe_summary
+        )
         if (
-            safe_user.safe_summary == user_message.safe_summary
+            user_unchanged
             and safe_assistant.safe_summary == assistant_message.safe_summary
         ):
             return
+        replacements = {assistant_position: safe_assistant}
+        if user_position is not None and safe_user is not None:
+            replacements[user_position] = safe_user
         await self._conversation_repository.save(
             _replace_messages_at_positions(
                 conversation,
-                replacements={
-                    user_position: safe_user,
-                    assistant_position: safe_assistant,
-                },
+                replacements=replacements,
             ),
         )
 
@@ -2002,13 +2020,23 @@ class ChatService:
         forced_fired_early, cleaned_user_message = _resolve_image_trigger(
             character=character, user_message=payload.message,
         )
-        user_message = Message(
-            role=MessageRole.USER,
-            content=cleaned_user_message,
-            attachments=user_attachments,
-            content_mode=content_mode,
+        # SN1: on a 示意 turn the player's text is a scene declaration, not
+        # speech — wrapped as an action line, or absent entirely. Everything
+        # downstream reads ``turn_text`` / ``user_message`` and needs no
+        # further branch.
+        nudge = StageNudgeTurn.resolve(
+            cleaned_user_message, stage_nudge=payload.stage_nudge,
         )
-        pending_state = self._state_engine.on_user_message(character.state, cleaned_user_message)
+        turn_text = nudge.text
+        user_message: Message | None = None
+        if nudge.writes_user_message:
+            user_message = Message(
+                role=MessageRole.USER,
+                content=turn_text,
+                attachments=user_attachments,
+                content_mode=content_mode,
+            )
+        pending_state = self._state_engine.on_user_message(character.state, turn_text)
         idle_minutes = _compute_idle_minutes(character.state, now_utc)
         pending_state = await self._maybe_apply_idle_drift(
             character=character,
@@ -2038,7 +2066,7 @@ class ChatService:
         # the busy-defer decision so both the defer and the normal branch share
         # one exactly-once user row (recovery reuses it, never rewrites). On the
         # legacy path this stays deferred to the save() below the defer check.
-        if external_turn is not None:
+        if external_turn is not None and user_message is not None:
             await external_turn.persist_user_turn(conversation, user_message)
 
         # Busy-defer short-circuit: when the character is mid high-busy
@@ -2048,9 +2076,18 @@ class ChatService:
         # post-turn / journal / goal-review pipeline — the eventual
         # full reply (fired by the proactive scheduler tick) is the one
         # that warrants those side effects.
+        #
+        # A *silent* nudge (SN1) may not open a new defer row: that branch
+        # persists a user message of its own and queues a follow-up to
+        # answer it later, and there is no player message here to answer —
+        # deferring would invent an empty player bubble and a reply owed to
+        # nobody. It still goes *through* the helper, which cancels any open
+        # row first: this turn replies in full, so a queued reply left
+        # standing would land on top of it later. A nudge that carried a
+        # supplement has a player message and defers normally.
         defer = await self._maybe_defer_reply(
             character=character,
-            user_message_text=cleaned_user_message,
+            user_message_text=turn_text,
             user_attachments=user_attachments,
             current_activity=current_activity,
             pending_state=pending_state,
@@ -2063,6 +2100,7 @@ class ChatService:
             journal=journal,
             content_mode=content_mode,
             external_turn=external_turn,
+            allow_defer=user_message is not None,
         )
         if defer is not None:
             _, defer_user_msg, defer_brief_msg, defer_state, _ = defer
@@ -2083,8 +2121,13 @@ class ChatService:
         # Persist the user's turn BEFORE the LLM call so a timeout /
         # network drop can't lose it. The client refreshes → reads the
         # conversation → sees their own message and can retry the reply.
-        conversation_with_user = conversation.append(user_message)
-        if external_turn is None:
+        # A silent nudge has nothing to persist yet, so it skips the write
+        # entirely rather than re-saving an unchanged thread.
+        conversation_with_user = (
+            conversation.append(user_message)
+            if user_message is not None else conversation
+        )
+        if external_turn is None and user_message is not None:
             await self._conversation_repository.save(conversation_with_user)
         # external path: the user row was already CAS-appended via
         # ``persist_user_turn`` above; the whole-conversation replace is
@@ -2103,7 +2146,7 @@ class ChatService:
             tool_context_messages=recent_messages,
             memories=memories,
             pending_state=pending_state,
-            latest_user_message=cleaned_user_message,
+            latest_user_message=turn_text,
             active_goals=active_goals,
             current_activity=current_activity,
             upcoming_activities=upcoming_activities,
@@ -2133,6 +2176,7 @@ class ChatService:
             world_event_recall=world_event_recall,
             upcoming_day_schedules=upcoming_day_schedules,
             presence_frame=presence_frame,
+            stage_nudge=nudge.enabled,
             content_tolerance=_content_tolerance_for_model(
                 model,
                 content_mode=content_mode,
@@ -2167,7 +2211,7 @@ class ChatService:
         final_state = final_state.with_active_now(now)
         await self._track(
             character.id, SOURCE_HEURISTIC, character.state, final_state,
-            trigger=cleaned_user_message[:80],
+            trigger=turn_text[:80],
         )
         updated_character = character.with_state(final_state)
         updated_conversation = conversation_with_user.append(assistant_message)
@@ -2209,7 +2253,12 @@ class ChatService:
         self._schedule_nsfw_safe_summary_generation(
             character=character,
             conversation_id=updated_conversation.id,
-            user_position=len(updated_conversation.messages) - 2,
+            # A silent nudge wrote no user message, so ``-2`` is the
+            # *previous* turn's reply, not this turn's player line.
+            user_position=(
+                len(updated_conversation.messages) - 2
+                if user_message is not None else None
+            ),
             assistant_position=len(updated_conversation.messages) - 1,
             content_mode=content_mode,
             model=model,
@@ -2247,7 +2296,7 @@ class ChatService:
             character=character,
             conversation_id=updated_conversation.id,
             turn_record_id=turn_record_id,
-            user_text=cleaned_user_message,
+            user_text=turn_text,
             assistant_text=assistant_text,
             prior_messages=recent_messages,
             # The assistant reply is the last message on the just-saved conversation;
@@ -2257,6 +2306,7 @@ class ChatService:
             assistant_index=assistant_index,
             persona_enabled=payload.operator_persona_enabled,
             content_mode=content_mode.value,
+            has_user_message=user_message is not None,
         )
         self._maybe_schedule_goal_review(
             character=character,
@@ -2312,6 +2362,10 @@ class ChatService:
                     retry_count=generation.novelty_retry_count,
                 ),
                 "presence_frame": presence_frame.to_metadata(),
+                # SN1 deliberately reuses the ``chat`` feature key and the
+                # ``ACTION_CHAT`` price, so the usage report cannot tell a
+                # nudge from typing. This is the audit trail that can.
+                "stage_nudge": nudge.enabled,
                 **post_turn_refs,
             },
         ))
@@ -2497,13 +2551,20 @@ class ChatService:
         forced_fired_early, cleaned_user_message = _resolve_image_trigger(
             character=character, user_message=payload.message,
         )
-        user_message = Message(
-            role=MessageRole.USER,
-            content=cleaned_user_message,
-            attachments=user_attachments,
-            content_mode=content_mode,
+        # SN1 — see the matching block in ``_send_message_turn``.
+        nudge = StageNudgeTurn.resolve(
+            cleaned_user_message, stage_nudge=payload.stage_nudge,
         )
-        pending_state = self._state_engine.on_user_message(character.state, cleaned_user_message)
+        turn_text = nudge.text
+        user_message: Message | None = None
+        if nudge.writes_user_message:
+            user_message = Message(
+                role=MessageRole.USER,
+                content=turn_text,
+                attachments=user_attachments,
+                content_mode=content_mode,
+            )
+        pending_state = self._state_engine.on_user_message(character.state, turn_text)
         idle_minutes = _compute_idle_minutes(character.state, now_utc)
         pending_state = await self._maybe_apply_idle_drift(
             character=character,
@@ -2524,9 +2585,12 @@ class ChatService:
         # already persisted as the assistant message; we wrap it in a
         # single-chunk stream so the SSE client renders it once and the
         # finalizer just returns the prebuilt response.
+        # Silent nudges cancel an open row but may not open a new one, for
+        # the same reasons as the non-streaming path — same parameter, same
+        # helper, so the rule cannot drift between the two.
         defer = await self._maybe_defer_reply(
             character=character,
-            user_message_text=cleaned_user_message,
+            user_message_text=turn_text,
             user_attachments=user_attachments,
             current_activity=current_activity,
             pending_state=pending_state,
@@ -2538,6 +2602,7 @@ class ChatService:
             recent_proactive_messages=recent_proactive_messages,
             journal=journal,
             content_mode=content_mode,
+            allow_defer=user_message is not None,
         )
         if defer is not None:
             defer_conv, defer_user_msg, defer_brief_msg, defer_state, _ = defer
@@ -2568,9 +2633,14 @@ class ChatService:
 
         # Persist the user's turn BEFORE we kick off streaming so a
         # mid-stream network drop / timeout cannot lose it — client
-        # refresh will still see the user message in history.
-        conversation_with_user = conversation.append(user_message)
-        await self._conversation_repository.save(conversation_with_user)
+        # refresh will still see the user message in history. A silent
+        # nudge has no user turn, so there is nothing to save yet.
+        conversation_with_user = (
+            conversation.append(user_message)
+            if user_message is not None else conversation
+        )
+        if user_message is not None:
+            await self._conversation_repository.save(conversation_with_user)
 
         model, model_id = await self._resolve_main_chat_model(
             character=character,
@@ -2595,7 +2665,7 @@ class ChatService:
                 tool_context_messages=recent_messages,
                 memories=memories,
                 pending_state=pending_state,
-                latest_user_message=cleaned_user_message,
+                latest_user_message=turn_text,
                 active_goals=active_goals,
                 current_activity=current_activity,
                 upcoming_activities=upcoming_activities,
@@ -2625,6 +2695,7 @@ class ChatService:
                 world_event_recall=world_event_recall,
                 upcoming_day_schedules=upcoming_day_schedules,
                 presence_frame=presence_frame,
+                stage_nudge=nudge.enabled,
                 content_tolerance=_content_tolerance_for_model(
                     model,
                     content_mode=content_mode,
@@ -2663,6 +2734,7 @@ class ChatService:
                 content_mode=content_mode,
                 scene_session=scene_session,
                 operator=operator,
+                stage_nudge=nudge.enabled,
             )
             return token_stream, finalizer
 
@@ -2728,7 +2800,7 @@ class ChatService:
         register_profile = await self._load_register_profile(
             character=character,
             operator=operator,
-            latest_user_message=cleaned_user_message,
+            latest_user_message=turn_text,
             recent_dialogue_summary=older_dialogue_summary or "",
             relationship_context=tuple(
                 [
@@ -2779,7 +2851,7 @@ class ChatService:
                 recent_messages=prompt_messages_for_model,
                 memories=memories,
                 pending_state=pending_state,
-                latest_user_message=cleaned_user_message,
+                latest_user_message=turn_text,
                 active_goals=active_goals,
                 current_activity=current_activity,
                 upcoming_activities=upcoming_activities,
@@ -2824,6 +2896,7 @@ class ChatService:
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
                 include_operator_status=payload.operator_persona_enabled,
+                stage_nudge=nudge.enabled,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_context, image_urls = await _prepare_vision_prompt(
@@ -2894,7 +2967,7 @@ class ChatService:
                 recent_feed_posts=recent_feed_posts,
                 recent_messages=prompt_messages_for_model,
                 self_repetition_hint=self_repetition_hint,
-                latest_user_message=cleaned_user_message,
+                latest_user_message=turn_text,
                 content_tolerance=content_tolerance,
                 register_profile=register_profile,
                 diversity_evidence=diversity_evidence,
@@ -2939,6 +3012,7 @@ class ChatService:
                 content_mode=content_mode,
                 scene_session=scene_session,
                 operator=operator,
+                stage_nudge=nudge.enabled,
             )
             return token_stream, finalizer
 
@@ -2979,6 +3053,7 @@ class ChatService:
             content_mode=content_mode,
             scene_session=scene_session,
             operator=operator,
+            stage_nudge=nudge.enabled,
         )
         return token_stream, finalizer
 
@@ -3341,6 +3416,7 @@ class ChatService:
         journal: TurnJournal | None,
         content_mode: MessageContentMode = MessageContentMode.NORMAL,
         external_turn: ExternalChatTurnExecutionPort | None = None,
+        allow_defer: bool = True,
     ) -> tuple[Conversation, Message, Message | None, CharacterState, PendingFollowUp] | None:
         """Ask the busy-reply decider whether to short-circuit this turn.
 
@@ -3354,6 +3430,17 @@ class ChatService:
         If an existing busy-defer row is open, this helper records the
         new user message into that row for audit, cancels the row, and
         returns ``None`` so the normal chat path replies immediately.
+
+        ``allow_defer=False`` (a *silent* 示意, SN1) keeps that
+        cancellation and stops right after it: this turn produces a full
+        immediate reply that already absorbs whatever the open row was
+        owed, so leaving the row queued would have the dispatcher answer a
+        second time. Opening a *new* row is what such a turn must not do —
+        the defer branch persists a player message and promises a reply to
+        it, and a silent nudge has no player message to answer. Both chat
+        entry points route through this one parameter rather than skipping
+        the call, precisely so the cancellation cannot be fixed on one path
+        and forgotten on the other.
 
         The whole helper is fail-soft — any unexpected error returns
         ``None`` so the user always gets a reply via the standard path.
@@ -3374,6 +3461,8 @@ class ChatService:
             now_utc=now_utc,
             content_mode=content_mode,
         ):
+            return None
+        if not allow_defer:
             return None
         if current_activity is None:
             _LOGGER.info(
@@ -3581,6 +3670,12 @@ class ChatService:
         and debugging. We then let the normal chat path persist the user
         turn and assistant reply, so the user never gets a silent void
         while an earlier busy-defer promise is still open.
+
+        A turn with no player text (a silent 示意) still cancels — the
+        immediate reply it triggers is what makes the queued one redundant
+        — but appends nothing: the queue entity rejects empty content, and
+        a blank audit row would claim the player said something they did
+        not.
         """
         existing = await self._find_open_busy_defer_for_conversation(
             character_id=character.id,
@@ -3589,14 +3684,17 @@ class ChatService:
         if existing is None:
             return False
 
-        merged = existing.appended(
-            PendingFollowUpMessage.new(
-                content=user_message_text,
-                queued_at=now_utc,
-                content_mode=content_mode,
-            ),
-            now=now_utc,
-        ).cancelled(now=now_utc)
+        audited = existing
+        if user_message_text.strip():
+            audited = existing.appended(
+                PendingFollowUpMessage.new(
+                    content=user_message_text,
+                    queued_at=now_utc,
+                    content_mode=content_mode,
+                ),
+                now=now_utc,
+            )
+        merged = audited.cancelled(now=now_utc)
         try:
             assert self._pending_follow_up_repository is not None
             await self._pending_follow_up_repository.save(merged)
@@ -3875,6 +3973,7 @@ class ChatService:
         world_event_recall: tuple[str, ...] = (),
         upcoming_day_schedules: list | None = None,
         presence_frame: PresenceFrame | None = None,
+        stage_nudge: bool = False,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         routing_content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         source_surface: str = "chat",
@@ -4069,6 +4168,7 @@ class ChatService:
                     reply_diversity_evidence=diversity_evidence,
                     retry_directive=retry_directive,
                     include_operator_status=operator_persona_enabled,
+                    stage_nudge=stage_nudge,
                 )
                 prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
                 prompt, image_urls = await _prepare_vision_prompt(
@@ -4306,6 +4406,7 @@ class ChatService:
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
                 include_operator_status=operator_persona_enabled,
+                stage_nudge=stage_nudge,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_for_model, image_urls = await _prepare_vision_prompt(
@@ -4644,6 +4745,7 @@ class ChatService:
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
                 include_operator_status=operator_persona_enabled,
+                stage_nudge=stage_nudge,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
             prompt_for_model, image_urls = await _prepare_vision_prompt(
@@ -4803,11 +4905,7 @@ class ChatService:
         limit = profile.max_messages_per_session
         if limit is None:
             return
-        used = sum(
-            1
-            for message in conversation.messages
-            if message.role == MessageRole.USER
-        )
+        used = _session_messages_used(conversation)
         if used >= limit:
             raise ChatRuntimeLimitExceeded(
                 "account runtime profile session message limit reached "
@@ -5999,6 +6097,7 @@ class ChatService:
         assistant_index: int,
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
+        has_user_message: bool = True,
     ) -> dict:
         # Distributed (hosted) backend: offload the post-turn LLM extraction to a
         # worker by enqueuing ONE immediate one-shot job carrying ids / flags only
@@ -6013,6 +6112,7 @@ class ChatService:
                 assistant_index=assistant_index,
                 persona_enabled=persona_enabled,
                 content_mode=content_mode,
+                has_user_message=has_user_message,
             )
             # Fall back to in-process ONLY when no worker owns the turn (NO_LEADER).
             # INSERTED / ALREADY_ACTIVE mean a worker has it; AMBIGUOUS deliberately
@@ -6051,6 +6151,7 @@ class ChatService:
         assistant_index: int,
         persona_enabled: bool,
         content_mode: str,
+        has_user_message: bool = True,
     ) -> PostTurnEnqueueOutcome:
         """Enqueue the distributed post-turn job and return its classified outcome.
 
@@ -6069,6 +6170,7 @@ class ChatService:
                 assistant_index=assistant_index,
                 persona_enabled=persona_enabled,
                 content_mode=content_mode,
+                has_user_message=has_user_message,
                 operator_id=operator_id,
                 now=self._resolve_now(),
             )
@@ -6088,6 +6190,7 @@ class ChatService:
         assistant_index: int,
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
+        has_user_message: bool = True,
         now: datetime | None = None,
     ) -> dict:
         """Id-only post-turn entry (distributed worker) — rebuild inputs, then run.
@@ -6124,7 +6227,9 @@ class ChatService:
         conversation = await self._conversation_repository.get(conversation_id)
         if conversation is None:
             return {"post_turn_skipped": "conversation_missing"}
-        rebuilt = self._rebuild_post_turn_texts(conversation, assistant_index)
+        rebuilt = self._rebuild_post_turn_texts(
+            conversation, assistant_index, has_user_message=has_user_message,
+        )
         if rebuilt is None:
             return {"post_turn_skipped": "turn_not_found"}
         user_text, assistant_text, user_created_at = rebuilt
@@ -6143,7 +6248,11 @@ class ChatService:
         )
 
     def _rebuild_post_turn_texts(
-        self, conversation: Conversation, assistant_index: int,
+        self,
+        conversation: Conversation,
+        assistant_index: int,
+        *,
+        has_user_message: bool = True,
     ) -> "tuple[str, str, datetime] | None":
         """Locate the turn's (user_text, assistant_text, user_created_at) by index.
 
@@ -6151,13 +6260,23 @@ class ChatService:
         point. Append-only conversations keep it stable under concurrent later turns.
         Returns ``None`` when the index is out of range or the anchored message is not
         the expected assistant reply (a defensive skip rather than mis-attributing a
-        different turn's text)."""
+        different turn's text).
+
+        ``has_user_message=False`` (a silent 示意, SN1) means the turn *is* the
+        assistant message: the backward search below must not run, because the
+        nearest preceding user message belongs to an earlier turn and adopting
+        it here is exactly the mis-attribution this method otherwise guards
+        against. The turn's boundary instant becomes the reply's own.
+        """
         messages = conversation.messages
-        if assistant_index < 1 or assistant_index >= len(messages):
+        lower_bound = 1 if has_user_message else 0
+        if assistant_index < lower_bound or assistant_index >= len(messages):
             return None
         assistant_msg = messages[assistant_index]
         if assistant_msg.role is not MessageRole.ASSISTANT:
             return None
+        if not has_user_message:
+            return "", assistant_msg.content, assistant_msg.created_at
         # The user message of this turn is the nearest preceding user-role message.
         user_msg: Message | None = None
         for idx in range(assistant_index - 1, -1, -1):
@@ -7116,12 +7235,12 @@ def _render_scene_chip_lines(
         if len(text) > _SCENE_CHIP_LINE_CHARS:
             text = text[:_SCENE_CHIP_LINE_CHARS].rstrip() + "…"
         if message.kind is MessageKind.SCENE_NARRATION:
-            speaker = "旁白"
+            speaker = SCENE_NARRATION_SPEAKER
         elif message.role is MessageRole.USER:
-            speaker = "玩家"
+            speaker = SCENE_PLAYER_SPEAKER
         else:
             speaker = character.name
-        lines.append(f"{speaker}：{text}")
+        lines.append(render_scene_line(speaker, text))
     return tuple(lines)
 
 
@@ -7676,7 +7795,7 @@ class StreamFinalizer:
         service: ChatService,
         character: "Character",
         conversation: Conversation,
-        user_message: Message,
+        user_message: Message | None,
         pending_state: "CharacterState",
         used_memories: list[MemoryItem],
         prior_messages: list[Message],
@@ -7700,11 +7819,17 @@ class StreamFinalizer:
         content_mode: MessageContentMode = MessageContentMode.NORMAL,
         scene_session: "StorySceneSession | None" = None,
         operator: "OperatorProfile | None" = None,
+        stage_nudge: bool = False,
     ) -> None:
         self._service = service
         self._character = character
         self._conversation = conversation
+        # ``None`` on a silent 示意 (SN1): the turn is the character's reply
+        # alone. ``_user_text`` is the one thing the tail actually reads, so
+        # every downstream call keeps a single unbranched expression.
         self._user_message = user_message
+        self._user_text = user_message.content if user_message is not None else ""
+        self._stage_nudge = stage_nudge
         self._pending_state = pending_state
         self._used_memories = used_memories
         self._prior_messages = prior_messages
@@ -7842,7 +7967,7 @@ class StreamFinalizer:
         await self._service._track(
             self._character.id, SOURCE_HEURISTIC,
             self._character.state, final_state,
-            trigger=self._user_message.content[:80],
+            trigger=self._user_text[:80],
         )
         updated_character = self._character.with_state(final_state)
         # ``self._conversation`` already has the user message appended +
@@ -7856,7 +7981,12 @@ class StreamFinalizer:
         self._service._schedule_nsfw_safe_summary_generation(
             character=self._character,
             conversation_id=updated_conversation.id,
-            user_position=len(updated_conversation.messages) - 2,
+            # See the non-streaming path: without a user message this turn,
+            # ``-2`` belongs to the previous one.
+            user_position=(
+                len(updated_conversation.messages) - 2
+                if self._user_message is not None else None
+            ),
             assistant_position=len(updated_conversation.messages) - 1,
             content_mode=self._content_mode,
             model=self._safe_summary_model,
@@ -7879,7 +8009,7 @@ class StreamFinalizer:
             character=self._character,
             conversation_id=updated_conversation.id,
             turn_record_id=turn_record_id,
-            user_text=self._user_message.content,
+            user_text=self._user_text,
             assistant_text=assistant_text,
             prior_messages=self._prior_messages,
             # The assistant reply is the last message on the just-saved conversation;
@@ -7887,6 +8017,7 @@ class StreamFinalizer:
             assistant_index=len(updated_conversation.messages) - 1,
             persona_enabled=self._persona_enabled,
             content_mode=self._content_mode.value,
+            has_user_message=self._user_message is not None,
         )
         self._service._maybe_schedule_goal_review(
             character=self._character,
@@ -7956,6 +8087,8 @@ class StreamFinalizer:
                     retry_count=self._novelty_retry_count,
                 ),
                 "presence_frame": self._presence_frame.to_metadata(),
+                # SN1 audit trail — see the non-streaming twin.
+                "stage_nudge": self._stage_nudge,
                 **post_turn_refs,
             },
         ))
@@ -7998,6 +8131,40 @@ class StreamFinalizer:
             story_scene_session=scene_turn.closed_session,
             story_scene_closing=scene_turn.closing_narration,
         )
+
+
+def _session_messages_used(conversation: Conversation) -> int:
+    """How much of ``max_messages_per_session`` this thread has consumed.
+
+    Counted on the **character's side**, one per reply it produced. That is
+    the only measure the two shapes of a turn share: an ordinary turn is
+    user + assistant, but a silent 示意 (SN1) is assistant *alone*, so the
+    pre-SN1 count of *user* messages would have let a capped account pull an
+    unbounded number of replies by never typing anything. The knob is a
+    per-tier control-plane setting, so any tier that sets it is exposed to
+    that hole — it is not tied to any one tier.
+
+    Consequences worth naming, both accepted rather than overlooked:
+
+    - A proactive message the character sent on its own now consumes a slot
+      too. It is the same LLM reply and the same money, and no marker on a
+      persisted message distinguishes it from a nudge reply — adding one
+      would mean a new ``MessageKind`` on the player's thread, which the SN
+      plan rules out. The direction is the safe one for a spend ceiling.
+    - Scene narration is excluded so that opening a 起幕 scene (narration +
+      the character's first line) costs one slot rather than two; the
+      narration is the frame, not the character speaking, and scene
+      openings already have their own daily ceiling.
+
+    口徑變更（含 proactive／busy-defer／起幕開場佔格）已於 2026-08-15 由
+    owner 裁決接受。
+    """
+    return sum(
+        1
+        for message in conversation.messages
+        if message.role == MessageRole.ASSISTANT
+        and message.kind is not MessageKind.SCENE_NARRATION
+    )
 
 
 def _accepts_keyword(func: object, name: str) -> bool:

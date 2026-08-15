@@ -5,11 +5,30 @@ queued user messages, the brief in-character ack the user already saw,
 and the activity context around the deferral, then asks the model to
 write the actual reply.
 
-Output is plain prose — single string. No JSON. Light normalisation:
-strip optional code-fence wrappers, collapse repeated whitespace, cap
-length so a runaway model can't post a novel. Empty output (after
-trim) → fail-soft empty so the dispatcher leaves the row queued for
-retry.
+Output is plain prose. Light normalisation: strip optional code-fence
+wrappers, collapse repeated whitespace, cap length so a runaway model
+can't post a novel. Empty output (after trim) → fail-soft empty so the
+dispatcher leaves the row queued for retry.
+
+**Tool passes (PF2).** Same contract as
+:class:`LLMScheduledPromiseComposer` — read that adapter first, this
+one mirrors its three seams. When the caller offers ``available_tools``
+(a queued message asked the character to look something up or do
+something while it was busy), the prompt gains the shared tools block
+and the model may answer with a JSON tool call instead of prose; we
+parse it and return it as ``tool_calls`` for the application layer to
+execute via :mod:`kokoro_link.application.services.composer_tool_loop`
+— this adapter never runs a tool itself. On the second pass the caller
+supplies ``tool_results`` (successes *and* failures) and no tools, so
+the model writes the follow-up reply from what it actually got. Any
+JSON emitted when no tools are on offer is suppressed rather than
+shipped: a player must never receive a raw ``{"tool": …}`` blob as
+their follow-up reply.
+
+**Machine output is never the reply — on any pass**, at the width that
+pass has earned; see the sibling adapter's module docstring for why the
+guard hangs off "about to become player-visible text" rather than off
+"this pass offered tools".
 """
 
 from __future__ import annotations
@@ -19,6 +38,12 @@ import re
 from dataclasses import replace
 
 from kokoro_link.application.services.model_resolver import ModelResolver
+from kokoro_link.application.services.tool_call_parser import (
+    looks_like_object_literal,
+    looks_like_tool_call_attempt,
+    looks_like_tool_call_shape,
+    parse_tool_call,
+)
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.pending_follow_up_composer import (
@@ -43,6 +68,11 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
 )
+from kokoro_link.infrastructure.prompt.tool_outcomes_block import (
+    TOOL_PASS_CLOSING_HINT,
+    render_tool_outcomes_block,
+)
+from kokoro_link.infrastructure.prompt.tools_block import render_tools_block
 from kokoro_link.infrastructure.prompts import get_default_loader
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,8 +139,59 @@ class LLMPendingFollowUpComposer(PendingFollowUpComposerPort):
                 payload.character.id,
             )
             return PendingFollowUpComposeOutput(content_text="")
-        body = _normalize(raw)
-        return PendingFollowUpComposeOutput(content_text=body)
+        return _output_for(raw, payload)
+
+
+def _output_for(
+    raw: str, payload: PendingFollowUpComposeInput,
+) -> PendingFollowUpComposeOutput:
+    """Split the model's raw answer into "a tool call" or "the reply".
+
+    Parsing runs against ``raw`` rather than the normalised text because
+    normalisation strips fences and truncates at ``_MAX_REPLY_CHARS`` —
+    either can mangle a JSON call before we ever look at it. Mirrors
+    ``llm_scheduled_promise_composer._output_for`` exactly.
+    """
+    allowed = {tool.name for tool in payload.available_tools}
+    if allowed:
+        call = parse_tool_call(raw)
+        if call is not None and call.name in allowed:
+            return PendingFollowUpComposeOutput(
+                content_text="", tool_calls=(call,),
+            )
+        if call is not None:
+            _LOGGER.info(
+                "pending follow-up composer asked for unavailable tool %r "
+                "character=%s — treating as no output",
+                call.name, payload.character.id,
+            )
+            return PendingFollowUpComposeOutput(content_text="")
+    # Runs on *every* pass, at the width that pass has earned. The second
+    # pass offers no tools, so it lands here with the narrow judgement —
+    # which is the whole point: that is the pass whose output is handed
+    # straight to the player, and it used to have no guard at all.
+    if (
+        looks_like_tool_call_shape(raw)
+        if allowed
+        else looks_like_object_literal(raw)
+    ):
+        _LOGGER.warning(
+            "pending follow-up composer returned machine output instead of a "
+            "reply character=%s tools_offered=%d — suppressing",
+            payload.character.id, len(allowed),
+        )
+        return PendingFollowUpComposeOutput(content_text="")
+    if looks_like_tool_call_attempt(raw):
+        # Either a malformed call, or a call on the pass where no tools
+        # were offered. Shipping the blob would put raw JSON in the
+        # player's chat; empty text means "retry next tick" instead.
+        _LOGGER.warning(
+            "pending follow-up composer emitted an unusable tool call "
+            "character=%s tools_offered=%d — suppressing",
+            payload.character.id, len(allowed),
+        )
+        return PendingFollowUpComposeOutput(content_text="")
+    return PendingFollowUpComposeOutput(content_text=_normalize(raw))
 
 
 class NullPendingFollowUpComposer(PendingFollowUpComposerPort):
@@ -137,6 +218,7 @@ def _build_prompt(payload: PendingFollowUpComposeInput) -> str:
     summary = (payload.recent_dialogue_summary or "").strip()
     summary_block = "\n\n最近對話脈絡：\n" + summary[:400] if summary else ""
     elapsed = (payload.now - payload.queued_at).total_seconds() / 60.0
+    tools_block = _tools_block(payload)
     body = get_default_loader().render(
         "busy/follow_up_composer",
         persona_block=persona,
@@ -147,6 +229,11 @@ def _build_prompt(payload: PendingFollowUpComposeInput) -> str:
         elapsed_text=_humanize_minutes(elapsed),
         summary_block=summary_block,
         queued_block=queued_block,
+        tool_results_block=_tool_results_block(payload),
+        tools_block=tools_block,
+        closing_tool_hint=(
+            f"{TOOL_PASS_CLOSING_HINT}\n" if tools_block else ""
+        ),
         max_reply_chars=_MAX_REPLY_CHARS,
     )
     language_hint = render_operator_language_hint(
@@ -155,6 +242,25 @@ def _build_prompt(payload: PendingFollowUpComposeInput) -> str:
     if language_hint:
         body = f"{language_hint}\n\n{body}"
     return body
+
+
+def _tools_block(payload: PendingFollowUpComposeInput) -> str:
+    """The shared chat/proactive tools section, first pass only.
+
+    Empty on every pre-PF2 call and on the second pass — the tool has
+    already run by then, and re-offering it invites a second call the
+    loop would not execute."""
+    if not payload.available_tools:
+        return ""
+    lines = render_tools_block(list(payload.available_tools))
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
+def _tool_results_block(payload: PendingFollowUpComposeInput) -> str:
+    if not payload.tool_results:
+        return ""
+    lines = render_tool_outcomes_block(list(payload.tool_results))
+    return "\n\n" + "\n".join(lines) if lines else ""
 
 
 def _routing_tolerance_for_payload(

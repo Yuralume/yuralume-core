@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 
+import { clientsClaim } from 'workbox-core'
 import { cleanupOutdatedCaches, precacheAndRoute } from 'workbox-precaching'
 
 export {}
@@ -7,6 +8,18 @@ export {}
 declare const self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<unknown>
 }
+
+// `registerType: 'autoUpdate'` (vite.config.ts) makes the client wrapper
+// wait for the `activated` event and then reload -- it never posts a
+// `SKIP_WAITING` message (that only happens in `registerType: 'prompt'`,
+// where the update is user-triggered). For `generateSW` that pairing is
+// automatic (Workbox injects `skipWaiting`/`clientsClaim` itself); for a
+// custom `injectManifest` worker we must call them ourselves, or a
+// rebuild sits in the "waiting" state until every tab is closed and
+// players keep loading the previous deploy's JS/CSS until they manually
+// clear site data.
+self.skipWaiting()
+clientsClaim()
 
 precacheAndRoute(self.__WB_MANIFEST)
 cleanupOutdatedCaches()

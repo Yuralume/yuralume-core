@@ -79,6 +79,7 @@ from kokoro_link.contracts.character_relationship import (
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
 from kokoro_link.contracts.due_jobs import (
     FEED_VIDEO_POLL_KIND,
+    PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
     PENDING_FOLLOW_UP_RELEASE_KIND,
     POST_TURN_KIND,
     is_character_chain_kind,
@@ -222,7 +223,11 @@ class ExecutionModeRunner:
         # A per-character due job (Phase 5) routes to the CharacterKindHandler; the
         # event-driven one-shot follow-up release routes to its own handler; the
         # legacy whole-tick kinds keep their existing bodies (redrive compat).
-        is_release_kind = kind == PENDING_FOLLOW_UP_RELEASE_KIND
+        # Both release kinds route to the same handler; PF3's image half differs
+        # only in the capability it was claimed under, which the handler reads.
+        is_release_kind = kind in (
+            PENDING_FOLLOW_UP_RELEASE_KIND, PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
+        )
         is_post_turn_kind = kind == POST_TURN_KIND
         is_video_poll_kind = kind == FEED_VIDEO_POLL_KIND
         is_character_kind = is_character_chain_kind(kind)
@@ -286,6 +291,7 @@ class ExecutionModeRunner:
             if kind in (
                 SOCIAL_TICK_KIND,
                 PENDING_FOLLOW_UP_RELEASE_KIND,
+                PENDING_FOLLOW_UP_IMAGE_RELEASE_KIND,
                 POST_TURN_KIND,
                 FEED_VIDEO_POLL_KIND,
             )

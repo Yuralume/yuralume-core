@@ -5,8 +5,8 @@
  * OAuth-only and has no password — so Core's ``/login`` form is a dead end for
  * them, which is exactly where every 401 used to land. Hosted deployments that
  * advertised a Portal (``/auth/config`` → ``portal_url``) route to the expiry
- * screen instead, which offers the way back in. Self-host and Portal-less
- * deployments (demo) keep the password form.
+ * screen instead, which offers the way back in. Self-host — and any deployment
+ * that advertises no Portal — keeps the password form.
  *
  * Shared by the axios interceptor, ``authedFetch`` and the router guard so the
  * three cannot drift apart — they previously each hard-coded ``/login``.
@@ -18,6 +18,11 @@ export const SESSION_EXPIRED_PATH = '/session-expired'
 /**
  * Screens that ARE the sign-in flow. Bouncing away from one of these would
  * either loop or swallow the error the screen is trying to show.
+ *
+ * Matched whole, never by prefix: `/loginish` is an ordinary screen and must
+ * stay bounceable. Every sign-in screen is a fixed path today; a future
+ * parameterised one (`/x/:provider/callback`) would need prefix matching added
+ * back here rather than a new entry.
  */
 const SIGN_IN_FLOW_PATHS = [
   SIGN_IN_PATH,
@@ -25,8 +30,6 @@ const SIGN_IN_FLOW_PATHS = [
   SESSION_EXPIRED_PATH,
   '/cloud/callback',
 ]
-
-const SIGN_IN_FLOW_PREFIXES = ['/demo/oauth/']
 
 export interface SessionRedirectContext {
   /** Absolute Portal URL; hosted deployments only, ``null`` on self-host. */
@@ -39,10 +42,7 @@ export interface SignInRoute {
 }
 
 export function isSignInFlowPath(path: string): boolean {
-  return (
-    SIGN_IN_FLOW_PATHS.includes(path)
-    || SIGN_IN_FLOW_PREFIXES.some(prefix => path.startsWith(prefix))
-  )
+  return SIGN_IN_FLOW_PATHS.includes(path)
 }
 
 export function signInRouteFor(

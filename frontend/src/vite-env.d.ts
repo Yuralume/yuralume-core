@@ -1,10 +1,7 @@
 /// <reference types="vite/client" />
+/// <reference types="vite-plugin-pwa/client" />
 
-interface ImportMetaEnv {
-  readonly VITE_YURALUME_DEMO_DISCORD_CLIENT_ID?: string
-  readonly VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID?: string
-  readonly VITE_YURALUME_DEMO_TIER0_URL?: string
-  readonly VITE_YURALUME_DEMO_WAITLIST_URL?: string
-  readonly VITE_YURALUME_DEMO_DISCORD_URL?: string
-  readonly VITE_YURALUME_DEMO_SELF_HOST_URL?: string
-}
+// No build-time `VITE_*` variables are read by the SPA: every runtime value it
+// needs arrives from the backend (`/auth/config`, `/runtime/limits`, …), so the
+// same built bundle serves self-host and hosted alike. Re-declare
+// `ImportMetaEnv` here if that ever stops being true.

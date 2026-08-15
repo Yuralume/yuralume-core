@@ -50,7 +50,11 @@ export default defineConfig(({ mode }) => {
         srcDir: 'src',
         filename: 'sw.ts',
         registerType: 'autoUpdate',
-        injectRegister: 'auto',
+        // Registered manually via `virtual:pwa-register` in
+        // `src/utils/registerServiceWorker.ts` so we can poll for updates
+        // on a long-lived SPA tab -- the injected script only calls
+        // `register()` once on load and never checks again.
+        injectRegister: false,
         manifest: {
           name: 'Yuralume',
           short_name: 'Yuralume',

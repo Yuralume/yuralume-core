@@ -261,37 +261,6 @@ export const messages: MessageSchema = {
       usePassword: 'メールとパスワードでログイン',
     },
   },
-  demo: {
-    start: {
-      openingTitle: 'デモを開いています',
-      openingBody: '認証済みサインインへ移動しています。',
-      unavailableTitle: 'デモは利用できません',
-      unsupportedProvider: 'このログイン方法には対応していません。',
-      startFailed: '現在ライブデモを利用できません。',
-    },
-    callback: {
-      connectingTitle: 'デモを開始しています',
-      connectingBody: '認証済みアカウントを接続しています。',
-      readyTitle: 'デモの準備ができました',
-      redirecting: '移動しています。',
-      missingCallbackData: 'OAuth コールバックのデータが不足しています。',
-    },
-    errors: {
-      busyTitle: 'デモは満席です',
-      busyBody: '公開デモの席はすべて使用中です。Tier 0 を試すか、順番待ちリストに登録するか、Discord で次の公開時間をご確認ください。',
-      rateLimitedTitle: 'デモの上限に達しました',
-      rateLimitedBody: 'このブラウザまたはネットワークはデモ開始の上限に達しました。Tier 0 を試すか、Discord に参加するか、セルフホストでお試しください。',
-      unavailableTitle: 'デモは利用できません',
-      unavailableBody: 'デモセッションを開始できませんでした。スクリプト版キャラクターを試すか、Discord で状況を確認するか、セルフホストをご利用ください。',
-    },
-    actions: {
-      tier0: 'Tier 0 を試す',
-      waitlist: '順番待ちに登録',
-      discord: 'Discord に参加',
-      selfHost: 'セルフホスト',
-      backToLogin: 'ログインに戻る',
-    },
-  },
   announcements: {
     dot: {
       label: '新しいお知らせ',
@@ -629,7 +598,6 @@ export const messages: MessageSchema = {
         exhausted: '直近 24 時間の幕開けをすべて使いきりました。時間が経てば、また幕を開けられるようになります。',
       },
       errors: {
-        unavailable: 'ここではシーンをご利用いただけません。',
         inProgress: 'すでにシーンが進行中です。まずは演じきりましょう。',
         noMaterial: 'まだ幕を開けられる物語がありません。少し会話してからお試しください。',
         conversationBusy: 'このターンがまだ続いています。返信を待ってから幕を開けてください。',
@@ -643,6 +611,11 @@ export const messages: MessageSchema = {
         generic: '幕開けできませんでした。しばらくしてからお試しください。',
         endGeneric: 'シーンを終えられませんでした。しばらくしてからお試しください。',
       },
+    },
+    stageNudge: {
+      title: '{name}に先に話してもらう',
+      placeholder: '今の場面を補足（空欄でも可）。例：ドアを開けて入ってくる',
+      confirm: '話す',
     },
     actions: {
       undo: '直前のターンを取り消す',
@@ -693,9 +666,9 @@ export const messages: MessageSchema = {
     errors: {
       uploadFailed: 'アップロードに失敗しました',
       streamError: 'エラー：{reason}（メッセージは保存済みです。再読み込みで続行できます）',
-      demoMaxMessages: 'この公開デモのチャットはメッセージ上限に達しました。Tier 2、BYOK、または self-host でこのキャラクターを続けられます。',
-      demoMaxMessagesCta: 'Yuralume アカウントセンターへ',
-      demoMaxMessagesCloud: 'この体験チャットはメッセージ上限に達しました。正式プランに登録すると、このキャラクターとの続きを楽しめます。',
+      sessionMessageCap: 'この会話は、ランタイムプロファイルで設定された 1 会話あたりのメッセージ上限に達しました。新しい会話を始めれば続けられます。上限は該当プロファイルの max_messages_per_session で変更できます。',
+      sessionMessageCapCta: 'Yuralume アカウントセンターへ',
+      sessionMessageCapCloud: 'この会話は、現在のプランで決まっている 1 会話あたりのメッセージ上限に達しました。新しい会話を始めれば続けられます。上限を広げたい場合はアカウントセンターからプランを変更してください。',
       subscriptionFrozen: 'サブスクリプションが失効したため、このキャラクターはロックされています。プランを更新すると会話を再開し、バックグラウンド活動も復元されます。',
       characterContractEnded: 'このキャラクターは現在お休み中です。ライセンス契約が終了したため会話を停止しています。これまでの記録はそのまま保存され、契約が再開されれば元どおり続けられます。',
       costCapExceeded: '今月のサービス利用が安全上限に達しました。すでに把握して対応を進めていますので、しばらくしてからもう一度お試しください。',

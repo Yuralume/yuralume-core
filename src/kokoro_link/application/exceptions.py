@@ -56,24 +56,6 @@ class SetupNotAllowed(AuthError):
         super().__init__(reason)
 
 
-class DemoSessionUnavailable(AuthError):
-    """Public demo session could not be created for a known demo reason."""
-
-    def __init__(
-        self,
-        *,
-        status_code: int,
-        code: str,
-        message: str,
-        retryable: bool,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.code = code
-        self.message = message
-        self.retryable = retryable
-
-
 class PermissionDenied(AuthError):
     """Non-admin caller attempted an admin-only operation, or attempted
     to delete themselves / the last admin. Translated to 403."""

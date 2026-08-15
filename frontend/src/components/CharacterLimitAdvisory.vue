@@ -31,9 +31,9 @@ const limits = useRuntimeLimits()
 
 const message = computed<string | null>(() => {
   const blocked = limits.characterCreationBlocked.value
-  // Both walls at once (the demo profile's everyday state: 1 slot, 1
-  // create/day) must NOT get the slots-only sentence — its "say goodbye to
-  // make room" promise is false while the daily ledger is spent, and a
+  // Both walls at once (the everyday state of any tight profile — say 1 slot
+  // with 1 create/day) must NOT get the slots-only sentence — its "say goodbye
+  // to make room" promise is false while the daily ledger is spent, and a
   // deletion here is irreversible.
   if (blocked === 'slots_and_daily') {
     return t('characterCreate.limits.slotsFullToday', {

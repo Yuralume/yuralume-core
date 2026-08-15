@@ -134,6 +134,10 @@ async def test_enqueue_creates_priority_three_post_turn_job() -> None:
         "assistant_index": 3,
         "persona_enabled": True,
         "content_mode": "normal",
+        # SN1: whether the turn had a player message at all. A silent 示意
+        # has none, and the worker must not walk back and adopt the
+        # previous turn's line as this turn's input.
+        "has_user_message": True,
     }
 
 
@@ -148,6 +152,7 @@ async def test_enqueue_payload_carries_no_chat_content() -> None:
     assert keys == {
         "turn_record_id", "conversation_id", "character_id",
         "assistant_index", "persona_enabled", "content_mode",
+        "has_user_message",
     }
     # No free-text content field leaked in.
     for forbidden in ("user_text", "assistant_text", "prior_messages", "prompt"):

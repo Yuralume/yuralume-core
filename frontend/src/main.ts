@@ -8,6 +8,7 @@ import App from './App.vue'
 import router from './router'
 import { i18n } from '@/i18n'
 import { clearStoredToken, getStoredToken, useAuth } from '@/composables/useAuth'
+import { registerServiceWorker } from '@/utils/registerServiceWorker'
 import { bounceToSignIn } from '@/utils/sessionBounce'
 
 // Global axios interceptors — auth header + 401 handling.
@@ -47,3 +48,5 @@ app.use(Antd)
 app.use(i18n)
 app.use(router)
 app.mount('#app')
+
+registerServiceWorker()

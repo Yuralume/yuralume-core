@@ -97,12 +97,6 @@ jobs:
             YURALUME_BUILD_TAG=${{ env.IMAGE_TAG }}
             YURALUME_BUILD_SHA=${{ github.sha }}
             YURALUME_BUILD_TIME=${{ steps.build_time.outputs.value }}
-            VITE_YURALUME_DEMO_DISCORD_CLIENT_ID=${{ vars.VITE_YURALUME_DEMO_DISCORD_CLIENT_ID }}
-            VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID=${{ vars.VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID }}
-            VITE_YURALUME_DEMO_TIER0_URL=${{ vars.VITE_YURALUME_DEMO_TIER0_URL }}
-            VITE_YURALUME_DEMO_WAITLIST_URL=${{ vars.VITE_YURALUME_DEMO_WAITLIST_URL }}
-            VITE_YURALUME_DEMO_DISCORD_URL=${{ vars.VITE_YURALUME_DEMO_DISCORD_URL }}
-            VITE_YURALUME_DEMO_SELF_HOST_URL=${{ vars.VITE_YURALUME_DEMO_SELF_HOST_URL }}
           # Layer cache shared across runs for this matrix entry —
           # rebuilds that touch only `src/` or `frontend/` skip the
           # base-image + dependency layers.

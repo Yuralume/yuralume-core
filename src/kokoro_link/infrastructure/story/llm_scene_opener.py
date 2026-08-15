@@ -47,7 +47,7 @@ from kokoro_link.infrastructure.story.date_context import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_MAX_NARRATION_CHARS = 700
+_MAX_NARRATION_CHARS = 1200
 _MAX_LINE_CHARS = 500
 _MAX_TITLE_CHARS = 60
 _MAX_LABEL_CHARS = 40
@@ -128,7 +128,7 @@ class LLMStorySceneOpener(StorySceneOpenerPort):
             )
             return None
 
-        narration = _clean(parsed.get("narration"), _MAX_NARRATION_CHARS)
+        narration = _clean_prose(parsed.get("narration"), _MAX_NARRATION_CHARS)
         character_line = _clean(parsed.get("character_line"), _MAX_LINE_CHARS)
         # Both halves are load-bearing: narration alone is a scene nobody
         # is in, a line alone is indistinguishable from ordinary chat.
@@ -249,7 +249,11 @@ def _parse_payload(raw: str) -> dict | None:
     if payload is None:
         return None
     try:
-        parsed = json.loads(payload)
+        # ``strict=False``: models asked for multi-paragraph narration
+        # often put *literal* newlines inside the JSON string instead of
+        # \n escapes. Strict parsing rejects those control characters,
+        # and a failed parse here fails the whole paid action.
+        parsed = json.loads(payload, strict=False)
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -259,6 +263,30 @@ def _clean(value: object, max_chars: int) -> str:
     if not isinstance(value, str):
         return ""
     text = re.sub(r"\s+", " ", value.strip())
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
+def _clean_prose(value: object, max_chars: int) -> str:
+    """Like :func:`_clean`, but paragraph breaks survive.
+
+    The narration is interactive-fiction prose whose blank lines are the
+    frontend's paragraph separators (``SceneFrame`` splits on newline
+    runs), so flattening them — which ``_clean`` exists to do for labels
+    and single spoken lines — would turn a staged opening back into the
+    wall of text this writer was reworked to stop producing. Newline
+    runs normalise to one blank line; whitespace inside a paragraph
+    still collapses.
+    """
+    if not isinstance(value, str):
+        return ""
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [
+        re.sub(r"\s+", " ", part).strip()
+        for part in re.split(r"\n+", normalized)
+    ]
+    text = "\n\n".join(part for part in paragraphs if part)
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "…"
     return text

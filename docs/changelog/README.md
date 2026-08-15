@@ -19,6 +19,7 @@ Plain-language release notes for everyday users — what each update actually fe
 
 | 版本 / Version | 繁中 | EN | 日本語 |
 |---|---|---|---|
+| 2026.08.14 — 起幕開場更有故事感、快速回覆說回你的話、答應的事會真的去做 / scene openings read like a story, quick replies speak as you, promises actually get done / 幕開けがもっと物語らしく・クイック返信はあなたの言葉に・約束は本当に果たされる | [zh-TW](zh-TW/2026-08-14.md) | [en-US](en-US/2026-08-14.md) | [ja-JP](ja-JP/2026-08-14.md) |
 | 2026.08.12 — 同一家供應商可留多組連線、答應的事會回來赴約、回覆語言更穩 / several connections per provider, promises are kept on time, steadier reply language / 同一プロバイダーの接続を複数保持・約束はちゃんと果たされる・返信言語がより安定 | [zh-TW](zh-TW/2026-08-12.md) | [en-US](en-US/2026-08-12.md) | [ja-JP](ja-JP/2026-08-12.md) |
 | 2026.08.11 — 角色可整隻加密備份帶著走、提過的新聞追問得下去、聊天捲動與串接錯誤提示改善 / full encrypted character backup, follow up on news she shared, chat scrolling & connection error hints / キャラ丸ごと暗号化バックアップ・話したニュースを聞き返せる・スクロールと連携エラー表示改善 | [zh-TW](zh-TW/2026-08-11.md) | [en-US](en-US/2026-08-11.md) | [ja-JP](ja-JP/2026-08-11.md) |
 | 2026.08.07 — 影片貼文改成背景生成不卡流程、刪除角色時相關資料一次收乾淨 / video posts generate in the background, deleting a character clears everything that belonged to it / 動画投稿はバックグラウンド生成に・キャラ削除時に関連データをまとめて片付け | [zh-TW](zh-TW/2026-08-07.md) | [en-US](en-US/2026-08-07.md) | [ja-JP](ja-JP/2026-08-07.md) |

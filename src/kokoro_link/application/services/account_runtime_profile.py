@@ -6,7 +6,6 @@ from kokoro_link.contracts.cloud_tier_runtime_profile import (
 from kokoro_link.contracts.operator_profile import OperatorProfileRepositoryPort
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
 )
 
@@ -14,11 +13,11 @@ from kokoro_link.domain.value_objects.account_runtime_profile import (
 class AccountRuntimeProfileResolver:
     """Resolve hosted account policy from the operator's cloud projection.
 
-    The demo tier stays a hardcoded restrictive profile. Every other paid
-    tier's profile comes from the control-plane through ``tier_profile_port``
-    (a cached, non-raising resolver) — Core carries no tier->knob table. When
-    the port is unwired (self-host, or cloud without runtime-config) paid
-    tiers resolve to the permissive default, preserving today's behavior.
+    Every tier's profile comes from the control-plane through
+    ``tier_profile_port`` (a cached, non-raising resolver) — Core carries no
+    tier->knob table at all. When the port is unwired (self-host, or cloud
+    without runtime-config) tiers resolve to the permissive default,
+    preserving today's behavior.
     """
 
     def __init__(
@@ -36,8 +35,6 @@ class AccountRuntimeProfileResolver:
         if not (profile.auth_provider == "cloud" and profile.cloud_account_id):
             return DEFAULT_ACCOUNT_RUNTIME_PROFILE
         tier = profile.cloud_tenant_tier
-        if tier == "demo":
-            return DEMO_ACCOUNT_RUNTIME_PROFILE
         if self._tier_profile_port is None:
             return DEFAULT_ACCOUNT_RUNTIME_PROFILE
         tier_profile = await self._tier_profile_port.fetch(tier)
@@ -55,7 +52,7 @@ class PermissiveAccountRuntimeProfileResolver:
     resolver *unconditionally* — calling ``resolve_for_operator`` and reading
     the (permissive) profile — instead of scattering ``if resolver is None``
     branches that only ever fire in tests. The real resolver returns the same
-    ``DEFAULT_ACCOUNT_RUNTIME_PROFILE`` for non-cloud / non-demo operators, so
+    ``DEFAULT_ACCOUNT_RUNTIME_PROFILE`` for non-cloud operators, so
     behaviour is identical in self-host.
     """
 

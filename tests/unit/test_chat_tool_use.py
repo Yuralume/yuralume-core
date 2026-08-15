@@ -37,8 +37,8 @@ from kokoro_link.contracts.generation_trigger import (
     current_generation_trigger,
 )
 from kokoro_link.contracts.llm import ChatModelPort
-from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.infrastructure.llm.registry import InMemoryChatModelRegistry
 from kokoro_link.infrastructure.memory.in_memory import InMemoryMemoryRepository
@@ -66,7 +66,7 @@ _FAKE_IMAGE_URL = "/uploads/stub/fake.png"
 
 class _StaticDemoRuntimeProfileResolver:
     async def resolve_for_operator(self, operator_id: str):
-        return DEMO_ACCOUNT_RUNTIME_PROFILE
+        return RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE
 
 
 class _MutableClock:

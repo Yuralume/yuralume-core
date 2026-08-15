@@ -32,8 +32,8 @@ from kokoro_link.application.services.character_image_service import (
     TooManyImagesError,
 )
 from kokoro_link.application.services.character_service import CharacterService
-from kokoro_link.domain.value_objects.account_runtime_profile import (
-    DEMO_ACCOUNT_RUNTIME_PROFILE,
+from tests.unit._runtime_profiles import (
+    RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.infrastructure.repositories.in_memory_characters import (
     InMemoryCharacterRepository,
@@ -85,7 +85,7 @@ class _FakeClient:
 
 class _StaticDemoRuntimeProfileResolver:
     async def resolve_for_operator(self, operator_id: str):
-        return DEMO_ACCOUNT_RUNTIME_PROFILE
+        return RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE
 
 
 def _service(

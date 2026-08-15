@@ -2,25 +2,6 @@ FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca440
 
 WORKDIR /app
 
-# Demo OAuth client ids + conversion links are Vite build-time constants
-# (import.meta.env.VITE_*). They must exist during `npm run build`, otherwise the
-# shipped SPA bundle bakes empty client ids and the live demo OAuth start page
-# fails with "Demo unavailable" before it can redirect to Discord/Google.
-# Pass real values via --build-arg (or compose build.args) for a hosted demo;
-# leaving them empty keeps self-host builds unchanged.
-ARG VITE_YURALUME_DEMO_DISCORD_CLIENT_ID=
-ARG VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID=
-ARG VITE_YURALUME_DEMO_TIER0_URL=
-ARG VITE_YURALUME_DEMO_WAITLIST_URL=
-ARG VITE_YURALUME_DEMO_DISCORD_URL=
-ARG VITE_YURALUME_DEMO_SELF_HOST_URL=
-ENV VITE_YURALUME_DEMO_DISCORD_CLIENT_ID=${VITE_YURALUME_DEMO_DISCORD_CLIENT_ID} \
-    VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID=${VITE_YURALUME_DEMO_GOOGLE_CLIENT_ID} \
-    VITE_YURALUME_DEMO_TIER0_URL=${VITE_YURALUME_DEMO_TIER0_URL} \
-    VITE_YURALUME_DEMO_WAITLIST_URL=${VITE_YURALUME_DEMO_WAITLIST_URL} \
-    VITE_YURALUME_DEMO_DISCORD_URL=${VITE_YURALUME_DEMO_DISCORD_URL} \
-    VITE_YURALUME_DEMO_SELF_HOST_URL=${VITE_YURALUME_DEMO_SELF_HOST_URL}
-
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm ci
 

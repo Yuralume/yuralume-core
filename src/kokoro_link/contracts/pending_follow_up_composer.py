@@ -26,12 +26,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from typing import Protocol
 
+from kokoro_link.contracts.prompt import PromptToolDescriptor, ToolOutcomeMessage
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.pending_follow_up import (
     PendingFollowUpMessage,
 )
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.content_flow import CONTENT_TOLERANCE_FRONTIER
+from kokoro_link.domain.value_objects.tool_call import ToolCall
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,15 @@ class PendingFollowUpComposeInput:
     Frontier calls must not receive queued NSFW-mode raw text; community
     calls may keep the original queued text.
     """
+    available_tools: tuple[PromptToolDescriptor, ...] = ()
+    """Tools this character may call while writing the deferred reply,
+    already filtered by ``character.allowed_tools``. Empty = pure prose
+    call. Shared shape with the scheduled-promise composer so a single
+    two-pass loop (``composer_tool_loop``) drives both; the busy-defer
+    adapter starts honouring it in PF2."""
+    tool_results: tuple[ToolOutcomeMessage, ...] = ()
+    """What the requested tools returned — second pass only, failures
+    included (see ``ScheduledPromiseComposeInput.tool_results``)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +95,10 @@ class PendingFollowUpComposeOutput:
     """The full reply text. Empty string means "no usable output" — the
     dispatcher leaves the pending row in ``queued`` state so a later
     tick can retry."""
+    tool_calls: tuple[ToolCall, ...] = ()
+    """Tools to run before the reply can be written. Non-empty only on
+    a first pass that was offered ``available_tools``; the application
+    layer executes them and composes again."""
 
 
 class PendingFollowUpComposerPort(Protocol):

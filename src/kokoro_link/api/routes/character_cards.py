@@ -21,6 +21,13 @@ the content language, not the UI locale — because that is what decides which
 approved translation the official catalog answers with. It is read even when
 nothing is being translated, so one code path serves both sources; the
 alternative was branching on the id prefix in three routes.
+
+The same three routes also carry the caller's Cloud tenant id, which is the
+only thing that makes this shelf differ between two players of one
+deployment: an official card may be fenced to a tenant tier (TG series), and
+such a card is invisible — not merely un-installable — to everybody else.
+The tenant *id* travels and the tenant's tier does not, because the tier is
+Cloud's to answer and Core's copy of it is a cache that drifts (plan D4).
 """
 
 from __future__ import annotations
@@ -32,7 +39,11 @@ from kokoro_link.api.character_runtime import (
     ensure_character_primary_image,
     enqueue_character_runtime_initialization,
 )
-from kokoro_link.api.dependencies import get_container, get_current_user_id
+from kokoro_link.api.dependencies import (
+    get_container,
+    get_current_user,
+    get_current_user_id,
+)
 from kokoro_link.api.operator_language import (
     resolve_stored_operator_primary_language,
 )
@@ -59,6 +70,7 @@ from kokoro_link.application.services.official_card_pack_source import (
     OfficialCardUnavailableError,
 )
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.infrastructure.character_card.packager import (
     InvalidCharacterCardError,
 )
@@ -116,6 +128,19 @@ def _unreadable_card(exc: Exception) -> HTTPException:
     return HTTPException(status_code=status_code, detail=str(exc))
 
 
+def _cloud_tenant_id(user: OperatorProfile) -> str:
+    """The caller's Cloud tenant, or ``""`` for an account that has none.
+
+    ``""`` is an ordinary answer rather than an error: a self-hosted
+    operator has no tenant at all, and a hosted account can predate the
+    projection or have lost it to a binding problem. Both simply see the
+    anonymous shelf — a tier-fenced card is invisible to them, which is the
+    fail-soft direction (plan R-TG-5 is the reminder that "the tester cannot
+    see the card" is worth checking this field for).
+    """
+    return (getattr(user, "cloud_tenant_id", None) or "").strip()
+
+
 def _require_pack_service(container: ServiceContainer):
     service = container.character_card_pack_service
     if service is None:  # pragma: no cover — wired in build_container
@@ -129,13 +154,14 @@ def _require_pack_service(container: ServiceContainer):
 @router.get("/character-cards", response_model=CharacterCardCatalogResponse)
 async def list_character_cards(
     container: ServiceContainer = Depends(get_container),
-    current_user_id: str = Depends(get_current_user_id),
+    user: OperatorProfile = Depends(get_current_user),
 ) -> CharacterCardCatalogResponse:
     """List the character cards available to install, official ones first."""
     catalogue = await _require_pack_service(container).list_available(
         primary_language=await resolve_stored_operator_primary_language(
-            container, current_user_id,
+            container, user.id,
         ),
+        cloud_tenant_id=_cloud_tenant_id(user),
     )
     return CharacterCardCatalogResponse(
         cards=catalogue.cards,
@@ -174,12 +200,12 @@ async def preview_character_card_pack(
     pack_id: str,
     translate: bool = Query(default=False),
     container: ServiceContainer = Depends(get_container),
-    current_user_id: str = Depends(get_current_user_id),
+    user: OperatorProfile = Depends(get_current_user),
 ) -> CharacterCardPreview:
     """Preview one card, optionally translated for this operator."""
     service = _require_pack_service(container)
     language = await resolve_stored_operator_primary_language(
-        container, current_user_id,
+        container, user.id,
     )
     try:
         return await service.preview(
@@ -187,6 +213,7 @@ async def preview_character_card_pack(
             translate=translate,
             target_language=language if translate else "",
             primary_language=language,
+            cloud_tenant_id=_cloud_tenant_id(user),
         )
     except CharacterCardPackNotFoundError as exc:
         raise HTTPException(
@@ -212,10 +239,11 @@ async def install_character_card(
     translate: bool = Query(default=False),
     install_request: InstallCharacterCardRequest | None = Body(default=None),
     container: ServiceContainer = Depends(get_container),
-    current_user_id: str = Depends(get_current_user_id),
+    user: OperatorProfile = Depends(get_current_user),
 ) -> InstallCharacterCardResponse:
     """Install a catalogue card as a new character owned by the caller."""
     service = _require_pack_service(container)
+    current_user_id = user.id
     effective_translate = (
         install_request.translate
         if install_request and install_request.translate is not None
@@ -234,6 +262,7 @@ async def install_character_card(
             initial_relationship=(
                 install_request.initial_relationship if install_request else None
             ),
+            cloud_tenant_id=_cloud_tenant_id(user),
         )
     except ExclusiveCardEntitlementRequiredError as exc:
         # An IP card sold behind an entitlement this build has no port to

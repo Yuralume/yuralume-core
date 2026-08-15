@@ -239,7 +239,7 @@ describe('useRuntimeLimits character-creation advisory', () => {
   })
 
   it('names both walls when both are up', async () => {
-    // The demo profile's everyday state (1 slot, 1 create/day). A slots-only
+    // The everyday state of a tight profile (1 slot, 1 create/day). A slots-only
     // sentence promises that saying goodbye makes room, but a deletion never
     // refunds the daily ledger — the player would trade an irreversible
     // delete for a creation the server still refuses today.

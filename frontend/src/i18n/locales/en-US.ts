@@ -263,37 +263,6 @@ export const messages: MessageSchema = {
       usePassword: 'Sign in with a password instead',
     },
   },
-  demo: {
-    start: {
-      openingTitle: 'Opening demo',
-      openingBody: 'Redirecting to your verified sign-in.',
-      unavailableTitle: 'Demo unavailable',
-      unsupportedProvider: 'Unsupported demo provider.',
-      startFailed: 'The live demo is not available right now.',
-    },
-    callback: {
-      connectingTitle: 'Starting demo',
-      connectingBody: 'Connecting your verified account.',
-      readyTitle: 'Demo ready',
-      redirecting: 'Redirecting.',
-      missingCallbackData: 'Missing OAuth callback data.',
-    },
-    errors: {
-      busyTitle: 'Demo is full',
-      busyBody: 'All public demo seats are in use. Try Tier 0 now, join the waitlist, or follow Discord for the next live-demo window.',
-      rateLimitedTitle: 'Demo limit reached',
-      rateLimitedBody: 'This browser or network has reached the demo start limit. Try Tier 0, join Discord, or use the self-host path while the public demo resets.',
-      unavailableTitle: 'Demo unavailable',
-      unavailableBody: 'The demo session could not be started. Try the scripted character, join Discord for status, or continue through self-host.',
-    },
-    actions: {
-      tier0: 'Try Tier 0',
-      waitlist: 'Join waitlist',
-      discord: 'Join Discord',
-      selfHost: 'Self-host path',
-      backToLogin: 'Back to login',
-    },
-  },
   announcements: {
     dot: {
       label: 'New notice',
@@ -631,7 +600,6 @@ export const messages: MessageSchema = {
         exhausted: 'You have used up your scene openings for the last 24 hours — the allowance frees up again as time passes.',
       },
       errors: {
-        unavailable: 'Scenes are not available here.',
         inProgress: 'A scene is already running — play it out first.',
         noMaterial: 'There is nothing to open a scene with yet. Talk a while, then try again.',
         conversationBusy: 'This turn is still going. Wait for the reply, then raise the curtain.',
@@ -645,6 +613,11 @@ export const messages: MessageSchema = {
         generic: 'Could not start the scene. Please try again later.',
         endGeneric: 'Could not end the scene. Please try again later.',
       },
+    },
+    stageNudge: {
+      title: 'Let {name} speak first',
+      placeholder: 'Add context for this moment (optional), e.g. "I walk through the door"',
+      confirm: 'Speak',
     },
     actions: {
       undo: 'Undo last turn',
@@ -695,9 +668,9 @@ export const messages: MessageSchema = {
     errors: {
       uploadFailed: 'Upload failed',
       streamError: 'Error: {reason} (the message is saved; refresh to continue)',
-      demoMaxMessages: 'This public demo chat has reached its message cap. Continue in Tier 2, bring your own key, or self-host to keep this character going.',
-      demoMaxMessagesCta: 'Go to the Yuralume account centre',
-      demoMaxMessagesCloud: 'This trial chat has reached its message limit. Sign up for a full plan to keep going with this character.',
+      sessionMessageCap: 'This conversation has reached the per-session message cap set by its runtime profile. Start a new conversation to continue, or raise max_messages_per_session on that profile.',
+      sessionMessageCapCta: 'Go to the Yuralume account centre',
+      sessionMessageCapCloud: 'This conversation has reached the per-session message limit on your current plan. Start a new conversation to keep going, or upgrade your plan from your account centre to raise the limit.',
       subscriptionFrozen: 'Your subscription has lapsed, so this character is locked. Renew your plan to resume the conversation and restore background activity.',
       characterContractEnded: 'This character is on hold: its licensing agreement has ended, so conversations are paused. Your history is kept, and everything resumes if the agreement is renewed.',
       costCapExceeded: 'We have reached this month\'s safety cap on service usage. We\'ve already been notified and are on it — please try again shortly.',

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from kokoro_link.application.dto.character import CharacterStatePayload, state_to_payload
 from kokoro_link.contracts.repositories import ConversationMessagePage
@@ -101,7 +101,25 @@ class SendChatMessageRequest(BaseModel):
     Admin/debug callers may still pass explicit values to override that
     route for one request.
     """
-    message: str = Field(min_length=1)
+    message: str = ""
+    """The player's line for this turn.
+
+    Required in practice: empty is only legal on a ``stage_nudge`` turn,
+    and :meth:`_reject_empty_message_outside_nudge` enforces the old
+    ``min_length=1`` rule for everything else. The constraint moved from
+    the field to a validator because it is now conditional — a bare
+    ``min_length`` cannot see the flag next to it.
+    """
+    stage_nudge: bool = False
+    """SN1 — this turn is 「讓{角色}先開口」, not the player talking.
+
+    ``message`` then carries an optional *supplement*: something the
+    player declares about the scene ("我推開門進來"), stored as an
+    ordinary user message wrapped in the asterisk-action convention.
+    Empty means the player only signalled presence, and nothing is stored
+    on the player side at all. Either way it is one ordinary chat turn:
+    same lease, same ``ACTION_CHAT`` charge, same post-turn pipeline.
+    """
     attachment_urls: list[str] = Field(default_factory=list)
     """Server-relative URLs (e.g. ``/uploads/chat-uploads/abc.png``) of
     images the user attached to this turn. Uploaded separately via
@@ -142,6 +160,47 @@ class SendChatMessageRequest(BaseModel):
     Carried on the turn rather than raised by its own request because the
     picture is decided by the model mid-turn — there is no moment where the
     client could be asked again."""
+
+    @model_validator(mode="after")
+    def _reject_empty_message_outside_nudge(self) -> "SendChatMessageRequest":
+        """Preserve the pre-SN1 ``min_length=1`` rule for ordinary turns.
+
+        Only a nudge may arrive with nothing typed. Note this is the same
+        rejection as before — a length test on the raw string, not a
+        ``strip()`` — so a whitespace-only message keeps being accepted
+        exactly as it always was.
+        """
+        if not self.stage_nudge and len(self.message) < 1:
+            raise ValueError(
+                "message must not be empty unless stage_nudge is set",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_attachments_on_a_silent_nudge(self) -> "SendChatMessageRequest":
+        """A picture needs a player message to live on.
+
+        Attachments hang off the *user* row, and a silent nudge writes
+        none — yet the upload still reaches this turn's vision prompt, so
+        the character sees the image and talks about it. Reload the thread
+        and the picture is gone: the character is left commenting on
+        something nobody sent, and the post-turn pipeline has no message to
+        attribute it to either.
+
+        Rejected rather than promoted to "this counts as a supplement" —
+        the latter would have to invent what an empty-text-plus-image
+        player bubble looks like, which is a product decision this feature
+        did not make. The official client always sends an empty
+        ``attachment_urls`` on a nudge; only a direct API caller gets here.
+        """
+        if self.stage_nudge and not self.message.strip() and self.attachment_urls:
+            raise ValueError(
+                "a stage_nudge turn with attachments needs a written "
+                "supplement — attachments are stored on the player's "
+                "message and a silent nudge writes none; add text, or send "
+                "the images as an ordinary message",
+            )
+        return self
 
     def resolved_presence_frame(self) -> PresenceFrame:
         has_attachments = bool(self.attachment_urls)
@@ -315,7 +374,14 @@ class ConversationResponse(BaseModel):
 
 class ChatReplyResponse(BaseModel):
     conversation_id: str
-    user_message: ChatMessageResponse
+    user_message: ChatMessageResponse | None = None
+    """The player's message for this turn, when the turn had one.
+
+    ``null`` only on a silent 示意 (``stage_nudge`` with no supplement):
+    the player pressed "let them speak first" and typed nothing, so no
+    user message was written and there is none to echo back. Every other
+    turn — including a nudge *with* a supplement — still carries it.
+    """
     assistant_message: ChatMessageResponse | None = None
     state: CharacterStatePayload
     suggested_actions: list[SuggestedActionResponse] = Field(
@@ -349,7 +415,7 @@ class ChatReplyResponse(BaseModel):
         cls,
         *,
         conversation_id: str,
-        user_message: Message,
+        user_message: Message | None,
         assistant_message: Message | None,
         state: CharacterState,
         assistant_turn_record_id: str | None = None,
@@ -359,7 +425,10 @@ class ChatReplyResponse(BaseModel):
     ) -> "ChatReplyResponse":
         return cls(
             conversation_id=conversation_id,
-            user_message=ChatMessageResponse.from_domain(user_message),
+            user_message=(
+                ChatMessageResponse.from_domain(user_message)
+                if user_message is not None else None
+            ),
             assistant_message=(
                 ChatMessageResponse.from_domain(
                     assistant_message,

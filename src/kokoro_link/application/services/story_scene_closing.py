@@ -47,10 +47,13 @@ from kokoro_link.contracts.embedder import EmbedderPort
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story_scene import (
+    SCENE_NARRATION_SPEAKER,
+    SCENE_PLAYER_SPEAKER,
     StorySceneClosingContext,
     StorySceneClosingDraft,
     StorySceneCloserPort,
     StorySceneSessionRepositoryPort,
+    render_scene_line,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import (
@@ -479,13 +482,13 @@ def render_scene_transcript(
         if not text:
             continue
         if message.kind is MessageKind.SCENE_NARRATION:
-            speaker = "旁白"
+            speaker = SCENE_NARRATION_SPEAKER
         elif message.role is MessageRole.USER:
-            speaker = "玩家"
+            speaker = SCENE_PLAYER_SPEAKER
             player_lines.append(text)
         else:
             speaker = character.name
-        lines.append(f"{speaker}：{text}")
+        lines.append(render_scene_line(speaker, text))
     return tuple(lines), tuple(player_lines)
 
 

@@ -126,6 +126,7 @@ class PostTurnRunnerCallback(Protocol):
         assistant_index: int,
         persona_enabled: bool,
         content_mode: str,
+        has_user_message: bool = True,
         now: datetime | None = None,
     ) -> Mapping[str, Any]:
         ...
@@ -161,6 +162,7 @@ class PostTurnEnqueuer:
         assistant_index: int,
         persona_enabled: bool,
         content_mode: str,
+        has_user_message: bool = True,
         operator_id: str | None = None,
         tenant_id: str | None = None,
         now: datetime | None = None,
@@ -197,6 +199,11 @@ class PostTurnEnqueuer:
                 "assistant_index": int(assistant_index),
                 "persona_enabled": bool(persona_enabled),
                 "content_mode": content_mode,
+                # SN1: a silent 示意 turn has no user message, so the worker
+                # must not walk backwards and adopt the *previous* turn's
+                # line as this turn's input. Absent on jobs enqueued before
+                # SN1, where the handler's default (``True``) is correct.
+                "has_user_message": bool(has_user_message),
             },
         )
         last_exc: Exception | None = None
@@ -331,6 +338,7 @@ class PostTurnHandler:
             assistant_index=assistant_index,
             persona_enabled=persona_enabled,
             content_mode=content_mode,
+            has_user_message=bool(payload.get("has_user_message", True)),
             now=resolved_now,
         )
         reason = str((result or {}).get("post_turn_skipped") or "executed")

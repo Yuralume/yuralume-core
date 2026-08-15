@@ -54,39 +54,9 @@ class CloudAuthUpstreamError(Exception):
     """User service could not complete the auth request."""
 
 
-class CloudDemoSessionRejected(Exception):
-    """User service returned a structured public demo-session error."""
-
-    def __init__(
-        self,
-        *,
-        status_code: int,
-        code: str,
-        message: str,
-        retryable: bool,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.code = code
-        self.message = message
-        self.retryable = retryable
-
-
 class CloudUserServicePort(Protocol):
     async def login(self, *, email: str, password: str) -> CloudAccountIdentity:
         """Validate cloud credentials and return account projection facts."""
-
-    async def create_demo_session(
-        self,
-        *,
-        provider: str,
-        authorization_code: str,
-        redirect_uri: str | None = None,
-        code_verifier: str | None = None,
-        source_ip: str | None = None,
-        device_id: str | None = None,
-    ) -> CloudAccountIdentity:
-        """Exchange demo OAuth material with trusted browser-source context."""
 
     async def exchange_hosted_play_code(
         self,
@@ -94,13 +64,3 @@ class CloudUserServicePort(Protocol):
         code: str,
     ) -> CloudAccountIdentity:
         """Exchange a portal-issued one-time hosted-play code for account facts."""
-
-
-class CloudDemoSessionReleasePort(Protocol):
-    async def release_demo_session(
-        self,
-        *,
-        tenant_id: str,
-        account_id: str,
-    ) -> None:
-        """Release/revoke an active hosted demo session for one account."""

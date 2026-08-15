@@ -36,7 +36,7 @@ class CloudGatewayEmbedder(EmbedderPort):
 
     The User profile field is intentionally optional during the rollout. A profile
     without embedding_feature_presets falls back to the cloud env/default preset;
-    Gateway remains the final entitlement/demo-allowlist boundary.
+    Gateway remains the final entitlement/allowlist boundary.
 
     TODO(user-service): expose embedding in CoreProfileResponse/effective scopes and
     preflight before making this capability credit-billable.

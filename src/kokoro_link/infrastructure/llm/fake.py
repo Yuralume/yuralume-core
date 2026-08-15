@@ -19,7 +19,16 @@ class FakeChatModel(ChatModelPort):
         image_urls: Sequence[str] = (),
         model: str | None = None,
     ) -> str:
-        latest_line = prompt.split(LATEST_USER_MESSAGE_MARKER, maxsplit=1)[-1].strip()
+        # A silent 示意 renders no latest-user-message line at all, and
+        # ``split`` would then hand back the whole prompt — echoing the
+        # system context as if the character had said it. No marker means
+        # no player line, which is the same case as an empty one.
+        if LATEST_USER_MESSAGE_MARKER in prompt:
+            latest_line = prompt.split(
+                LATEST_USER_MESSAGE_MARKER, maxsplit=1,
+            )[-1].strip()
+        else:
+            latest_line = ""
         # The prompt ends with the instruction line; strip everything after
         # the first newline so the echoed content is just the user message.
         latest_line = latest_line.split("\n", maxsplit=1)[0].strip()

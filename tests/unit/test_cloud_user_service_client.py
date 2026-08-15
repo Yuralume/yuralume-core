@@ -6,7 +6,6 @@ from pytest import MonkeyPatch
 
 from kokoro_link.contracts.cloud_auth import (
     CloudAuthRejected,
-    CloudDemoSessionRejected,
     CloudAuthUpstreamError,
 )
 from kokoro_link.infrastructure.cloud.user_service_client import (
@@ -38,7 +37,7 @@ async def test_cloud_user_service_client_maps_login_payload(
             "account_id": "acct_1",
             "role": "admin",
             "status": "active",
-            "tenant_tier": "demo",
+            "tenant_tier": "basic",
             "email": "player@example.com",
             "display_name": "Player",
             "primary_language": "en-US",
@@ -58,7 +57,7 @@ async def test_cloud_user_service_client_maps_login_payload(
     assert identity.account_id == "acct_1"
     assert identity.tenant_id == "tenant_1"
     assert identity.role == "admin"
-    assert identity.tenant_tier == "demo"
+    assert identity.tenant_tier == "basic"
     assert identity.session_token == "ys_token"
 
 
@@ -96,141 +95,6 @@ async def test_cloud_user_service_client_requires_identity_fields(
 
     with pytest.raises(CloudAuthUpstreamError):
         await client.login(email="player@example.com", password="secret")
-
-
-@pytest.mark.asyncio
-async def test_cloud_user_service_client_releases_demo_session(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    seen: dict[str, object] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["body"] = request.read().decode()
-        return httpx.Response(204)
-
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
-    )
-
-    client = CloudUserServiceClient(base_url="https://users.example/")
-    await client.release_demo_session(tenant_id="tenant_1", account_id="acct_1")
-
-    assert seen["url"] == "https://users.example/internal/v1/demo/sessions/release"
-    assert '"tenant_id":"tenant_1"' in str(seen["body"])
-    assert '"account_id":"acct_1"' in str(seen["body"])
-
-
-@pytest.mark.asyncio
-async def test_cloud_user_service_client_creates_demo_session(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    seen: dict[str, object] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["body"] = request.read().decode()
-        seen["headers"] = dict(request.headers)
-        return httpx.Response(200, json={
-            "session_token": "ys_demo",
-            "tenant_id": "demo_tenant",
-            "account_id": "demo_acct",
-            "role": "member",
-            "status": "active",
-            "tenant_tier": "demo",
-            "email": "demo@example.com",
-            "display_name": "Demo Player",
-        })
-
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
-    )
-
-    client = CloudUserServiceClient(
-        base_url="https://users.example/",
-        internal_service_credential=(
-            "core-kid|core|yuralume-user|demo-session:create|core-secret"
-        ),
-    )
-    identity = await client.create_demo_session(
-        provider="discord",
-        authorization_code="oauth-code",
-        redirect_uri="https://app.example/demo/oauth/discord/callback",
-        code_verifier="pkce",
-        source_ip="198.51.100.44",
-        device_id="device-1",
-    )
-
-    assert seen["url"] == "https://users.example/internal/v1/demo/sessions"
-    body = str(seen["body"])
-    assert '"provider":"discord"' in body
-    assert '"authorization_code":"oauth-code"' in body
-    assert '"redirect_uri":"https://app.example/demo/oauth/discord/callback"' in body
-    assert '"code_verifier":"pkce"' in body
-    headers = seen["headers"]
-    assert isinstance(headers, dict)
-    assert headers["x-yuralume-service-token"] == "core-secret"
-    assert headers["x-yuralume-client-ip"] == "198.51.100.44"
-    assert headers["x-yuralume-demo-device"] == "device-1"
-    assert identity.account_id == "demo_acct"
-    assert identity.tenant_tier == "demo"
-    assert identity.session_token == "ys_demo"
-
-
-@pytest.mark.asyncio
-async def test_cloud_user_service_client_preserves_demo_session_error(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={
-            "error": {
-                "code": "demo_busy",
-                "message": "demo slots are full",
-                "retryable": True,
-            },
-        })
-
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
-    )
-
-    client = CloudUserServiceClient(base_url="https://users.example/")
-
-    with pytest.raises(CloudDemoSessionRejected) as raised:
-        await client.create_demo_session(
-            provider="discord",
-            authorization_code="oauth-code",
-        )
-
-    assert raised.value.status_code == 503
-    assert raised.value.code == "demo_busy"
-    assert raised.value.message == "demo slots are full"
-    assert raised.value.retryable is True
-
-
-@pytest.mark.asyncio
-async def test_cloud_user_service_client_release_maps_upstream_error(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "busy"})
-
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: _MockAsyncClient(handler, **kwargs),
-    )
-
-    client = CloudUserServiceClient(base_url="https://users.example/")
-
-    with pytest.raises(CloudAuthUpstreamError):
-        await client.release_demo_session(tenant_id="tenant_1", account_id="acct_1")
 
 
 @pytest.mark.asyncio

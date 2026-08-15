@@ -1,6 +1,6 @@
 """Phase 3 tail: cloud image/video/TTS resolve their preset/voice from the
 control-plane routing profile (env presets are the deprecated fallback), mirroring
-the LLM profile path. A strict (demo) account fails closed on a missing media preset
+the LLM profile path. A strict account fails closed on a missing media preset
 so it can never silently fall through to a paid env preset.
 """
 
@@ -50,13 +50,13 @@ def _character() -> Character:
     )
 
 
-def _demo_operator() -> OperatorProfile:
+def _hosted_operator() -> OperatorProfile:
     return OperatorProfile(
         id="cloud:acct_1",
-        display_name="Demo Player",
+        display_name="Hosted Player",
         cloud_account_id="acct_1",
         cloud_tenant_id="tenant_1",
-        cloud_tenant_tier="demo",
+        cloud_tenant_tier="strict-tier",
         auth_provider="cloud",
     )
 
@@ -103,9 +103,9 @@ class _RecordingImageProvider:
 @pytest.mark.asyncio
 async def test_image_profile_mode_resolves_preset_with_no_env_default() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
-        _routing_profile(image={FEATURE_IMAGE_PORTRAIT: "demo-image"}, strict=True)
+        _routing_profile(image={FEATURE_IMAGE_PORTRAIT: "strict-image"}, strict=True)
     )
     built: list[_RecordingImageProvider] = []
     provider = CloudActiveImageProvider(
@@ -118,17 +118,17 @@ async def test_image_profile_mode_resolves_preset_with_no_env_default() -> None:
 
     await provider.resolve(FEATURE_IMAGE_PORTRAIT, character=_character())
 
-    assert built[-1].preset == "demo-image"
-    assert port.scopes == [("tenant_1", "acct_1", "acct_1", "demo")]
+    assert built[-1].preset == "strict-image"
+    assert port.scopes == [("tenant_1", "acct_1", "acct_1", "strict-tier")]
 
 
 @pytest.mark.asyncio
 async def test_image_profile_disabled_feature_fails_closed() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     profile = CloudRoutingProfile(
         llm_feature_presets={},
-        image_feature_presets={FEATURE_IMAGE_PORTRAIT: "demo-image"},
+        image_feature_presets={FEATURE_IMAGE_PORTRAIT: "strict-image"},
         video_feature_presets={},
         tts_voice_defaults={},
         strict_no_fallback=True,
@@ -150,7 +150,7 @@ async def test_image_profile_disabled_feature_fails_closed() -> None:
 @pytest.mark.asyncio
 async def test_image_profile_strict_missing_names_feature_key_and_source() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(_routing_profile(image={}, strict=True))
     provider = CloudActiveImageProvider(
         provider_factory=lambda fk, preset: _RecordingImageProvider(fk, preset),
@@ -186,9 +186,9 @@ async def test_image_env_fallback_when_no_profile_port() -> None:
 @pytest.mark.asyncio
 async def test_video_profile_mode_resolves_preset() -> None:
     repo = InMemoryOperatorProfileRepository()
-    await repo.save(_demo_operator())
+    await repo.save(_hosted_operator())
     port = _RecordingProfilePort(
-        _routing_profile(video={FEATURE_VIDEO_FEED: "demo-video"}, strict=True)
+        _routing_profile(video={FEATURE_VIDEO_FEED: "strict-video"}, strict=True)
     )
     built: list[_RecordingImageProvider] = []
     provider = CloudActiveVideoProvider(
@@ -201,7 +201,7 @@ async def test_video_profile_mode_resolves_preset() -> None:
 
     await provider.resolve(FEATURE_VIDEO_FEED, character=_character())
 
-    assert built[-1].preset == "demo-video"
+    assert built[-1].preset == "strict-video"
 
 
 # ----------------------------------------------------------------------- tts
@@ -211,14 +211,14 @@ class _MockAsyncClient(httpx.AsyncClient):
         super().__init__(transport=httpx.MockTransport(handler), timeout=kwargs["timeout"])
 
 
-class _DemoIdentityResolver:
+class _StubIdentityResolver:
     async def resolve_context(self, context) -> CloudGatewayIdentity:
         return CloudGatewayIdentity(
             operator_id=context.operator_id,
             account_id="acct_1",
             tenant_id="tenant_1",
             character_ref="chr_abc",
-            tenant_tier="demo",
+            tenant_tier="strict-tier",
         )
 
 
@@ -241,7 +241,7 @@ async def test_tts_profile_mode_resolves_voice_default(
         deployment_token="ykl_deploy",
         default_voice_id="env_voice",
         character_repository=repo,
-        identity_resolver=_DemoIdentityResolver(),
+        identity_resolver=_StubIdentityResolver(),
         routing_profile_port=_RecordingProfilePort(
             _routing_profile(tts={"tts_synthesis": "profile_voice"}, strict=True)
         ),
@@ -272,7 +272,7 @@ async def test_tts_falls_back_to_env_voice_when_profile_has_no_voice(
         deployment_token="ykl_deploy",
         default_voice_id="env_voice",
         character_repository=repo,
-        identity_resolver=_DemoIdentityResolver(),
+        identity_resolver=_StubIdentityResolver(),
         routing_profile_port=_RecordingProfilePort(_routing_profile(tts={}, strict=True)),
     )
 

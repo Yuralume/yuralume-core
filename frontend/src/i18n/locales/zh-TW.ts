@@ -262,37 +262,6 @@ export const messages = {
       usePassword: '改用帳號密碼登入',
     },
   },
-  demo: {
-    start: {
-      openingTitle: '正在開啟試玩',
-      openingBody: '正在帶你前往驗證登入。',
-      unavailableTitle: '試玩暫時無法使用',
-      unsupportedProvider: '不支援這個登入方式。',
-      startFailed: '試玩目前無法開始，請稍後再試。',
-    },
-    callback: {
-      connectingTitle: '正在啟動試玩',
-      connectingBody: '正在連結你的已驗證帳號。',
-      readyTitle: '試玩已就緒',
-      redirecting: '正在轉向。',
-      missingCallbackData: '缺少登入回傳資料。',
-    },
-    errors: {
-      busyTitle: '試玩人數已滿',
-      busyBody: '公開試玩的座位目前都在使用中。可以先試 Tier 0、加入候補名單，或到 Discord 等下一次開放。',
-      rateLimitedTitle: '已達試玩次數上限',
-      rateLimitedBody: '這個瀏覽器或網路已達試玩啟動上限。可以先試 Tier 0、到 Discord 看看，或先用自架方式體驗。',
-      unavailableTitle: '試玩暫時無法使用',
-      unavailableBody: '無法開始試玩。可以先試試腳本角色、到 Discord 看狀態，或改用自架方式。',
-    },
-    actions: {
-      tier0: '試試 Tier 0',
-      waitlist: '加入候補名單',
-      discord: '加入 Discord',
-      selfHost: '自架方式',
-      backToLogin: '回到登入頁',
-    },
-  },
   announcements: {
     dot: {
       label: '有新公告',
@@ -630,7 +599,6 @@ export const messages = {
         exhausted: '近 24 小時的起幕次數已經用完了，稍晚額度釋出後就能再揭開下一幕。',
       },
       errors: {
-        unavailable: '這裡還沒有開放劇情場景。',
         inProgress: '已經有一個場景正在進行，先把它演完吧。',
         noMaterial: '現在還沒有可以開場的劇情，多聊幾句之後再試試。',
         conversationBusy: '這一輪還沒說完，等回覆結束再起幕。',
@@ -644,6 +612,11 @@ export const messages = {
         generic: '起幕失敗，請稍後再試。',
         endGeneric: '結束場景失敗，請稍後再試。',
       },
+    },
+    stageNudge: {
+      title: '讓 {name} 先開口',
+      placeholder: '補充現在的場景（可留空），例：我推開門進來',
+      confirm: '開口',
     },
     actions: {
       undo: '撤回最近一輪',
@@ -694,9 +667,9 @@ export const messages = {
     errors: {
       uploadFailed: '上傳失敗',
       streamError: '錯誤：{reason}（訊息已保存，重新整理即可繼續）',
-      demoMaxMessages: '這個公開試玩聊天室已達訊息上限。可升級 Tier 2、使用自己的 API key，或 self-host 繼續保留這個角色。',
-      demoMaxMessagesCta: '前往 Yuralume 帳號中心',
-      demoMaxMessagesCloud: '這個試玩聊天室已達訊息上限。註冊正式方案就能繼續跟這個角色相處。',
+      sessionMessageCap: '這個對話的訊息數已達執行設定檔（runtime profile）的單場上限。開一個新對話就能繼續，或調高該設定檔的 max_messages_per_session。',
+      sessionMessageCapCta: '前往 Yuralume 帳號中心',
+      sessionMessageCapCloud: '這個對話的訊息數已達目前方案的單場上限。開一個新對話就能接著聊，也可以到帳號中心升級方案放寬上限。',
       subscriptionFrozen: '訂閱已到期，這個角色暫時被鎖住。續訂方案後即可繼續對話並恢復背景活動。',
       characterContractEnded: '這個角色目前暫停中：授權合約已結束，所以對話先停下來。你們的記錄都會完整保留，合約重新談成就能接著聊。',
       costCapExceeded: '服務用量已達本月安全上限，我們已收到通知並正在處理，請稍後再試。',

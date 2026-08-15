@@ -16,7 +16,6 @@ Front-end startup flow:
 from __future__ import annotations
 
 import logging
-from ipaddress import ip_address
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -36,7 +35,6 @@ from kokoro_link.api.dependencies import (
 )
 from kokoro_link.application.exceptions import (
     AuthError,
-    DemoSessionUnavailable,
     InvalidCredentials,
     PermissionDenied,
     SetupAlreadyComplete,
@@ -106,20 +104,6 @@ class AuthConfigResponse(BaseModel):
     only controls UI rendering."""
 
 
-class DemoOAuthProviderConfigResponse(BaseModel):
-    client_id: str
-
-
-class DemoOAuthConfigResponse(BaseModel):
-    """Public demo OAuth client ids, fetched by the SPA at runtime (plan Phase 5.1).
-
-    Removes the Vite build-time client-id bake so changing a client id no longer
-    needs a fresh SPA image. Values are public client ids only — never secrets.
-    """
-
-    providers: dict[str, DemoOAuthProviderConfigResponse]
-
-
 class SetupStatusResponse(BaseModel):
     needs_setup: bool
 
@@ -172,13 +156,6 @@ class SetupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1)
-
-
-class DemoSessionLoginRequest(BaseModel):
-    provider: str = Field(..., min_length=1, max_length=32)
-    authorization_code: str = Field(..., min_length=1)
-    redirect_uri: str | None = Field(default=None, max_length=512)
-    code_verifier: str | None = Field(default=None, max_length=256)
 
 
 class CloudPlaySessionRequest(BaseModel):
@@ -348,17 +325,6 @@ def _translate_auth_error(exc: AuthError) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
         )
-    if isinstance(exc, DemoSessionUnavailable):
-        return HTTPException(
-            status_code=exc.status_code,
-            detail={
-                "error": {
-                    "code": exc.code,
-                    "message": exc.message,
-                    "retryable": exc.retryable,
-                },
-            },
-        )
     if isinstance(exc, UserAlreadyExists):
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc),
@@ -413,28 +379,6 @@ def _client_ip_from_request(request: Request) -> str | None:
     return request.client.host
 
 
-def _trusted_edge_client_ip(request: Request) -> str | None:
-    """Return an edge-overwritten literal for security-sensitive forwarding.
-
-    Hosted nginx replaces X-Real-IP with its socket peer. X-Forwarded-For is
-    deliberately ignored here because append-style proxy configuration can
-    preserve a browser-supplied first element. A direct literal socket peer is
-    an acceptable fallback when no reverse proxy is present.
-    """
-    candidates = [request.headers.get("x-real-ip", "")]
-    if request.client is not None:
-        candidates.append(request.client.host)
-    for raw in candidates:
-        value = raw.strip()
-        if not value:
-            continue
-        try:
-            return str(ip_address(value))
-        except ValueError:
-            continue
-    return None
-
-
 def _ip_header_candidates_from_request(request: Request) -> dict[str, str]:
     candidates: dict[str, str] = {}
     for name in _IP_HEADER_CANDIDATE_NAMES:
@@ -481,7 +425,7 @@ def _profile_seed_from_location(location: GeoLocation | None) -> CloudProfileSee
     """Project a GeoIP result into the creation-time seed the cloud auth
     strategy consumes. Timezone and country ride along so the strategy can
     pin the operator's immutable timezone (and language fallback) the first
-    time a cloud/demo account is provisioned; an absent location yields an
+    time a cloud account is provisioned; an absent location yields an
     empty seed and the strategy falls back to identity / deployment values.
     """
     if location is None:
@@ -631,31 +575,6 @@ async def get_auth_config(
     )
 
 
-@router.get("/demo/oauth/config", response_model=DemoOAuthConfigResponse)
-async def get_demo_oauth_config(
-    container: ServiceContainer = Depends(get_container),
-) -> DemoOAuthConfigResponse:
-    """Runtime public config for the demo OAuth SPA flow (cloud mode only).
-
-    The SPA fetches the client id here before constructing the PKCE authorize
-    URL, instead of relying on a value baked into the Vite build."""
-    if not is_cloud_mode(container):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="demo oauth config is only available in cloud mode",
-        )
-    settings = getattr(container, "app_settings", None)
-    demo_oauth = getattr(settings, "demo_oauth", None)
-    discord = getattr(demo_oauth, "discord_client_id", "") if demo_oauth else ""
-    google = getattr(demo_oauth, "google_client_id", "") if demo_oauth else ""
-    return DemoOAuthConfigResponse(
-        providers={
-            "discord": DemoOAuthProviderConfigResponse(client_id=discord),
-            "google": DemoOAuthProviderConfigResponse(client_id=google),
-        },
-    )
-
-
 @router.get("/setup-status", response_model=SetupStatusResponse)
 async def get_setup_status(
     container: ServiceContainer = Depends(get_container),
@@ -727,40 +646,6 @@ async def login(
     return AuthTokenResponse(user=UserResponse.from_domain(user), token=token)
 
 
-@router.post("/demo/session", response_model=AuthTokenResponse)
-async def create_demo_session_login(
-    payload: DemoSessionLoginRequest,
-    request: Request,
-    container: ServiceContainer = Depends(get_container),
-) -> AuthTokenResponse:
-    if not is_cloud_mode(container):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="demo session login is only available in cloud mode",
-        )
-    strategy = _require_auth_strategy(container)
-    location = await _location_from_request(request=request, container=container)
-    try:
-        user, token = await strategy.login_with_demo_session(
-            provider=payload.provider,
-            authorization_code=payload.authorization_code,
-            redirect_uri=payload.redirect_uri,
-            code_verifier=payload.code_verifier,
-            source_ip=_trusted_edge_client_ip(request),
-            device_id=request.headers.get("x-yuralume-demo-device"),
-            profile_seed=_profile_seed_from_location(location),
-        )
-        user = await _seed_missing_location_from_login(
-            user=user, request=request, container=container,
-        )
-    except AuthError as exc:
-        raise _translate_auth_error(exc) from exc
-    await _record_login_location_hint(
-        user=user, location=location, container=container,
-    )
-    return AuthTokenResponse(user=UserResponse.from_domain(user), token=token)
-
-
 # ----------------------------------------------------------------------
 # Current user (bearer)
 # ----------------------------------------------------------------------
@@ -773,10 +658,10 @@ async def create_cloud_session_login(
     container: ServiceContainer = Depends(get_container),
 ) -> AuthTokenResponse:
     """Exchange a portal-issued one-time hosted-play code for a Core JWT
-    (plan H0). Cloud mode only — mirrors ``POST /auth/demo/session``: a
-    GeoIP seed pins the operator's immutable timezone/location the first
-    time an account enters, and application auth errors are translated to
-    HTTP the same way."""
+    (plan H0). Cloud mode only: a GeoIP seed pins the operator's immutable
+    timezone/location the first time an account enters, and application
+    auth errors are translated to HTTP the same way as the other login
+    routes."""
     if not is_cloud_mode(container):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

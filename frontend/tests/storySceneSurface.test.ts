@@ -267,29 +267,6 @@ describe('StorySceneControl', () => {
     }
   })
 
-  it('withdraws itself where scenes are not offered, saying why once', async () => {
-    // The trial: a 403 answers the press, so the explanation is shown and
-    // the button goes — not a control that would refuse every press after.
-    const html = await render(StorySceneControl, {
-      sceneOpen: false,
-      unavailable: true,
-      errorMessage: L.errors.unavailable,
-    })
-
-    expect(visibleText(html)).toContain(L.errors.unavailable)
-    expect(visibleText(html)).not.toContain(L.action)
-    expect(visibleText(html)).not.toContain(L.actionHint)
-  })
-
-  it('renders nothing at all once the refusal is behind us', async () => {
-    const html = await render(StorySceneControl, {
-      sceneOpen: false,
-      unavailable: true,
-    })
-
-    expect(html).not.toContain('story-scene-control')
-  })
-
   it('leaves a clean, empty mount point for the hosted price', async () => {
     // The control itself stays free of billing knowledge; the number is
     // slotted in from outside, and self-host slots in nothing.
