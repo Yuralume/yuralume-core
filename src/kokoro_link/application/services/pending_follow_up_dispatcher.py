@@ -19,7 +19,9 @@ Per-character flow:
    be retried while a stale row sits in flight), call the LLM composer
    for the full reply, then call
    ``ProactiveDispatcher.deliver_pre_composed`` to fan out to web SSE +
-   Telegram / LINE bindings.
+   Telegram / LINE bindings — pinned to the binding resolved BEFORE the
+   compose, because that resolution is also what decided whether the
+   message may carry the player's own declaration.
 
    That compose goes through :class:`ComposerToolLoop` when one is
    wired (PF1), so a promise to *do* something — look a fact up, take a
@@ -108,6 +110,7 @@ class PendingFollowUpDispatcher:
         scheduled_promise_composer: ScheduledPromiseComposerPort | None = None,
         tool_loop: ComposerToolLoop | None = None,
         operator_persona_service=None,  # noqa: ANN001 - optional app service
+        player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         visible_slot_port=None,  # noqa: ANN001 - VisibleSlotPort | None (avoid import cycle)
         local_tz: tzinfo | None = None,
@@ -128,6 +131,9 @@ class PendingFollowUpDispatcher:
         # busy-defer adapter to read available_tools / emit tool_calls.
         self._tool_loop = tool_loop
         self._operator_persona_service = operator_persona_service
+        # PP3 — the player's declared identity for this pair. Read only;
+        # this dispatcher never writes one.
+        self._player_persona_note_repository = player_persona_note_repository
         # FRONTEND_I18N_PLAN — pin the deferred-reply language to the
         # same operator language chat / proactive use. Optional so the
         # legacy single-user wiring keeps working with "zh-TW" default.
@@ -274,6 +280,10 @@ class PendingFollowUpDispatcher:
         persona_lines = await self._safe_operator_persona_lines(character.id)
         operator_language = await self._resolve_operator_language(character)
         local_tz = await self._resolve_operator_timezone(character)
+        # Resolved BEFORE the compose and carried to the send — the note in
+        # the prompt and the endpoint that receives it must be the same
+        # decision (see ``_resolve_release_target``).
+        sink, player_persona_note = await self._resolve_release_target(character)
         compose_input = PendingFollowUpComposeInput(
             character=character,
             queued_messages=resolving.messages,
@@ -286,6 +296,7 @@ class PendingFollowUpDispatcher:
             now=now,
             local_tz=local_tz,
             operator_persona_lines=tuple(persona_lines),
+            player_persona_note=player_persona_note,
             operator_primary_language=operator_language,
         )
         try:
@@ -330,6 +341,7 @@ class PendingFollowUpDispatcher:
             ),
             character_id=character.id,
             attachments=composed.attachments,
+            sink=sink,
             now=now,
         )
 
@@ -394,6 +406,8 @@ class PendingFollowUpDispatcher:
         )
         operator_language = await self._resolve_operator_language(character)
         local_tz = await self._resolve_operator_timezone(character)
+        # Same single resolution as the busy-defer path above.
+        sink, player_persona_note = await self._resolve_release_target(character)
         compose_input = ScheduledPromiseComposeInput(
             character=character,
             promise_intent=resolving.promise_intent,
@@ -404,6 +418,7 @@ class PendingFollowUpDispatcher:
             recent_dialogue_summary=summary,
             now=now,
             operator_persona_lines=tuple(persona_lines),
+            player_persona_note=player_persona_note,
             operator_primary_language=operator_language,
             local_tz=local_tz,
             promise_content_mode=promise_content_mode,
@@ -446,6 +461,7 @@ class PendingFollowUpDispatcher:
             reason=f"scheduled-promise release: {resolving.promise_intent[:60]}",
             character_id=character.id,
             attachments=composed.attachments,
+            sink=sink,
             now=now,
         )
 
@@ -658,10 +674,18 @@ class PendingFollowUpDispatcher:
         reason: str,
         character_id: str,
         attachments: tuple[OutboundAttachment, ...] = (),
+        sink=None,  # noqa: ANN001 - ResolvedProactiveSink | None (no import cycle)
         now: datetime,
     ) -> bool:
         """Common tail for both kinds: fan out via deliver_pre_composed
         and flip status to resolved/failed.
+
+        ``sink`` is the endpoint this release was gated against, pinned all
+        the way from :meth:`_resolve_release_target` to the send so the
+        message cannot land anywhere the gate did not authorise. It is only
+        forwarded when we actually have one: a ``None`` sink means the
+        dispatcher never gave us a resolver to begin with, and such a
+        stand-in has no ``target`` parameter to receive either.
 
         ``attachments`` carries whatever a tool produced while the
         promise was being fulfilled (a generated photo, typically) into
@@ -700,6 +724,7 @@ class PendingFollowUpDispatcher:
                 reason=reason,
                 attachments=attachments,
                 now=now,
+                **({"target": sink} if sink is not None else {}),
             )
         except Exception:
             _LOGGER.exception(
@@ -862,6 +887,112 @@ class PendingFollowUpDispatcher:
             return timezone_for_id(getattr(operator, "timezone_id", "UTC"))
         except ValueError:
             return self._local_tz
+
+    async def _resolve_release_target(self, character):  # noqa: ANN001, ANN201
+        """Resolve, ONCE, where this release goes and what it may say.
+
+        Both facts come out of a single
+        ``ProactiveDispatcher.resolve_proactive_sink`` call because they are
+        one decision wearing two hats: "may this message carry the owner's
+        declared identity" is answered *from* the endpoint it will reach.
+        Asking twice — gate now, endpoint again after the compose — is the
+        defect this method exists to close: the compose is a tool loop that
+        can run for tens of seconds, and any ``ChannelBinding.updated_at``
+        bump inside that window (the owner flipping ``accepts_proactive``,
+        a ``with_conversation`` self-heal) re-orders the candidates. A
+        multi-speaker group binding could therefore receive a message that
+        was cleared, and written, for the owner's own DM.
+
+        Returns ``(sink, note)``; ``sink is None`` means we could not pin
+        one — an older dispatcher stand-in without the resolver, or a lookup
+        that failed. That leaves the delivery resolving for itself exactly
+        as it did before, and the note fails closed.
+        """
+        sink = await self._resolve_delivery_sink(character.id)
+        return sink, await self._safe_player_persona_note(character, sink=sink)
+
+    async def _resolve_delivery_sink(self, character_id: str):  # noqa: ANN202
+        resolver = getattr(
+            self._proactive_dispatcher, "resolve_proactive_sink", None,
+        )
+        if resolver is None:
+            return None
+        try:
+            return await resolver(character_id)
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: sink resolution failed character=%s",
+                character_id,
+            )
+            return None
+
+    async def _disclosure_allowed(self, character_id: str, sink) -> bool:  # noqa: ANN001
+        """Whether owner-attached text may ride this release.
+
+        Fail-closed everywhere, **``sink is None`` included**. The verdict is
+        read off the pinned snapshot so it and the send provably describe the
+        same endpoint; an unpinned release has no endpoint to describe, and
+        re-asking the dispatcher for an unpinned second opinion is precisely
+        the two-lookup shape the pin exists to remove.
+
+        That second lookup was not merely redundant, it reopened the leak:
+        ``resolve_proactive_sink`` swallows its own exceptions and answers
+        ``None``, so a transient query failure produced no pin — and the
+        retry a moment later could well succeed, put the declaration in the
+        prompt, and then leave ``deliver_pre_composed`` to resolve the
+        endpoint for itself, including a group binding bumped mid-compose.
+        No pin, no disclosure; the release still goes out, just without the
+        owner's declared identity in it.
+
+        A dispatcher that cannot answer at all (an older stand-in without
+        :meth:`~ProactiveDispatcher.persona_disclosure_allowed_for`, a
+        verdict that raised) is likewise not permission to disclose.
+        """
+        if sink is None:
+            return False
+        verdict = getattr(
+            self._proactive_dispatcher, "persona_disclosure_allowed_for", None,
+        )
+        if verdict is None:
+            return False
+        try:
+            return bool(verdict(sink))
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: disclosure verdict failed character=%s",
+                character_id,
+            )
+            return False
+
+    async def _safe_player_persona_note(  # noqa: ANN001
+        self, character, *, sink=None,
+    ) -> str:
+        """The player's declaration, when this release may carry it.
+
+        The release is handed to ``ProactiveDispatcher.deliver_pre_composed``,
+        which fans it out to the very same external binding a proactive
+        ping would reach — so the gate is the proactive dispatcher's, asked
+        rather than re-derived. ``sink`` is that gate's already-resolved
+        answer (see :meth:`_resolve_release_target`); its absence is a
+        refusal, not an invitation to look the answer up again.
+        """
+        repository = self._player_persona_note_repository
+        if repository is None:
+            return ""
+        if not await self._disclosure_allowed(character.id, sink):
+            return ""
+        operator_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        try:
+            row = await repository.get(
+                character_id=character.id, operator_id=operator_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: player persona note load failed character=%s",
+                character.id,
+            )
+            return ""
+        return row.note if row is not None else ""
 
     async def _safe_operator_persona_lines(self, character_id: str) -> list[str]:
         service = self._operator_persona_service

@@ -296,10 +296,18 @@ class PostTurnProcessorPort(Protocol):
         content_mode: str = "normal",
         now: datetime | None = None,
         peer_context_lines: list[str] | None = None,
+        player_persona_note: str = "",
     ) -> PostTurnResult:
         """Extract memories, suggest state updates, propose schedule
         adjustments, and — when an arc is active — emit optional arc
         adjustments based on conversation content.
+
+        ``player_persona_note`` is here for the *opposite* reason it is
+        everywhere else. Other surfaces receive it so the character acts
+        on it; the extractor receives it so it stops re-extracting it. A
+        declaration is already supplied to every prompt on every turn, so
+        a memory that repeats it buys nothing and quietly spends the
+        character's recall budget on facts it cannot forget anyway.
 
         ``recent_messages`` is prior dialogue (excluding the current
         turn). A single turn often isn't enough to understand context

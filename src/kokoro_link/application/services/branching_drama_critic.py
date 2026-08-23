@@ -30,8 +30,13 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.branching_drama import (
+    DEFAULT_OPERATOR_POSITION,
     DramaNode,
     DramaSessionTurn,
+)
+from kokoro_link.infrastructure.prompt.drama_operator_position_lines import (
+    STAGE_CRITIC,
+    render_drama_operator_position_block,
 )
 from kokoro_link.domain.value_objects.drama_critique import (
     DramaCritique,
@@ -81,6 +86,8 @@ class BranchingDramaCritic:
         narration_text: str,
         briefs: Sequence[CharacterBrief],
         previous_turns: Sequence[DramaSessionTurn] = (),
+        operator_position: str = DEFAULT_OPERATOR_POSITION,
+        operator_note: str | None = None,
     ) -> DramaCritique:
         if not narration_text.strip():
             return DramaCritique.clean()
@@ -93,6 +100,8 @@ class BranchingDramaCritic:
             paragraphs=paragraphs,
             briefs=briefs,
             previous_turns=previous_turns,
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
         try:
             raw = await self._resolver.generate(full_prompt)
@@ -132,6 +141,8 @@ def _build_prompt(
     paragraphs: Sequence[str],
     briefs: Sequence[CharacterBrief],
     previous_turns: Sequence[DramaSessionTurn],
+    operator_position: str = DEFAULT_OPERATOR_POSITION,
+    operator_note: str | None = None,
 ) -> str:
     cast = "、".join(b.short_label() for b in briefs) or "（未指定）"
     enumerated = "\n\n".join(
@@ -143,7 +154,7 @@ def _build_prompt(
         f"本段取向：{node.tone}" if node.tone else "本段取向：（未指定）"
     )
 
-    return get_default_loader().render(
+    body = get_default_loader().render(
         "branching/critic",
         cast=cast,
         node_title=node.title,
@@ -154,6 +165,18 @@ def _build_prompt(
         enumerated=enumerated,
         max_findings=_MAX_FINDINGS,
     )
+    # BD2, on the code side — the shipped prompt pack is frozen. Without
+    # it the critic reviews every narration against the 主演 framing and
+    # would flag an 旁觀者 drama's third-person prose as a defect, undoing
+    # exactly what the player asked for.
+    #
+    # Prefixed, not appended: the template ends with its 輸出規則 block and
+    # anything past that competes with the JSON contract ``_parse_critique``
+    # depends on.
+    position_block = render_drama_operator_position_block(
+        operator_position, operator_note, stage=STAGE_CRITIC,
+    )
+    return f"{position_block}\n\n{body}" if position_block else body
 
 
 def _parse_critique(

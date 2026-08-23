@@ -92,16 +92,14 @@ async def update_operator_profile(
             status_code=503,
             detail="operator profile service not available",
         )
+    # ``payload.current_status`` is accepted-and-ignored — see
+    # ``UpdateOperatorProfileRequest`` docstring — so it is deliberately
+    # never forwarded to the service below.
     updated = await container.operator_profile_service.update_for_user(
         current_user_id,
         display_name=payload.display_name,
         aliases=payload.aliases,
         pronouns=payload.pronouns,
-        current_status=(
-            payload.current_status
-            if "current_status" in payload.model_fields_set
-            else UNSET
-        ),
         country_code=(
             payload.country_code
             if "country_code" in payload.model_fields_set

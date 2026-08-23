@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSSRApp } from 'vue'
+import { computed, createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createI18n } from 'vue-i18n'
 
 import badgeSource from '@/components/CloudCreditsBadge.vue?raw'
+import dramaPageSource from '@/pages/BranchingDramaPage.vue?raw'
+import dramaPlayerSource from '@/components/branching-drama/BranchingDramaPlayer.vue?raw'
 import personalSettingsSource from '@/components/PersonalSettingsSection.vue?raw'
+import {
+  isCloudDeployment,
+  setDeploymentMode,
+} from '@/composables/deploymentMode'
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
 
 // No DOM test infra exists in this repo (@vue/test-utils / jsdom are not
@@ -12,13 +18,16 @@ import { messages as zhTW } from '@/i18n/locales/zh-TW'
 // cloud gating, the self-host parity promise, and the low-balance / stale
 // affordances. See fusionStoryExitHub.test.ts for the same pattern.
 const authState = vi.hoisted(() => ({
-  cloudMode: true,
   portalUrl: null as string | null,
 }))
 
+// `cloudMode` is derived from the real deployment-mode module rather than
+// being a second switch this file owns: in production the badge's `v-if` and
+// the composable's request gate read the same fact, and a test able to set
+// them apart would prove nothing about the shipped behaviour.
 vi.mock('@/composables/useAuth', () => ({
   useAuth: () => ({
-    cloudMode: { value: authState.cloudMode },
+    cloudMode: computed(() => isCloudDeployment()),
     portalUrl: { value: authState.portalUrl },
   }),
 }))
@@ -37,8 +46,11 @@ const PortalAccountLink = (await import('@/components/PortalAccountLink.vue')).d
 const mockedFetch = vi.mocked(fetchCloudCredits)
 const L = zhTW.credits
 
-async function render(component: unknown): Promise<string> {
-  const app = createSSRApp(component as Parameters<typeof createSSRApp>[0])
+async function render(
+  component: unknown,
+  props: Record<string, unknown> = {},
+): Promise<string> {
+  const app = createSSRApp(component as Parameters<typeof createSSRApp>[0], props)
   app.use(createI18n({
     legacy: false,
     locale: 'zh-TW',
@@ -61,7 +73,7 @@ async function seedBalance(
 beforeEach(() => {
   vi.clearAllMocks()
   useCloudCredits().reset()
-  authState.cloudMode = true
+  setDeploymentMode('cloud')
   authState.portalUrl = null
 })
 
@@ -78,7 +90,7 @@ describe('CloudCreditsBadge', () => {
   it('renders nothing on self-host', async () => {
     // Hard requirement: the self-host sidebar output must not change at all.
     await seedBalance({ gift_cr: 10, purchased_cr: 10, total_cr: 20 })
-    authState.cloudMode = false
+    setDeploymentMode('self_host')
 
     const html = await render(CloudCreditsBadge)
 
@@ -140,6 +152,75 @@ describe('CloudCreditsBadge', () => {
   })
 })
 
+/**
+ * FX5-3. The badge grew a second home: the 分歧劇場 header and the VN player's
+ * top bar are horizontal toolbars, where the sidebar behaviours are wrong in
+ * two ways the caller could not fix from outside (an account card two lines
+ * tall in a row sized for one; an expanded card in normal flow that grew the
+ * whole row and squeezed the dialogue underneath it).
+ *
+ * The variant is additive: every assertion in the block above renders the
+ * default and must keep passing untouched. These pin the delta.
+ */
+describe('CloudCreditsBadge variant="inline"', () => {
+  it('still shows the balance pill', async () => {
+    await seedBalance({ gift_cr: 800, purchased_cr: 4540, total_cr: 5340 })
+
+    const html = await render(CloudCreditsBadge, { variant: 'inline' })
+
+    expect(html).toContain('5,340')
+    expect(html).toContain('credits-badge--inline')
+  })
+
+  it('renders nothing at all when the balance is unknown', async () => {
+    // The toolbar case: no number means no pill, *not* the sidebar's
+    // two-line account card standing in for it. The way back to the Portal
+    // is still one click away in the sidebar of the surface around it.
+    authState.portalUrl = 'https://app.yuralume.com'
+    mockedFetch.mockResolvedValueOnce({ kind: 'degraded' })
+    await useCloudCredits().refresh()
+
+    const html = await render(CloudCreditsBadge, { variant: 'inline' })
+
+    expect(html).not.toContain('credits-badge')
+    expect(html).not.toContain(L.portalEntry.title)
+  })
+
+  it('leaves the sidebar behaviour alone', async () => {
+    // Same state, default variant: the account entry must still be there.
+    authState.portalUrl = 'https://app.yuralume.com'
+    mockedFetch.mockResolvedValueOnce({ kind: 'degraded' })
+    await useCloudCredits().refresh()
+
+    const html = await render(CloudCreditsBadge)
+
+    expect(html).toContain(L.portalEntry.title)
+    expect(html).not.toContain('credits-badge--inline')
+  })
+})
+
+/**
+ * Source-level, because SSR only ever renders the collapsed pill: the
+ * expanded card must leave the flow in `inline`, and the two toolbars must
+ * ask for the variant rather than re-growing the `:deep()` overrides that
+ * caused the squeeze in the first place.
+ */
+describe('inline card does not resize the toolbar it sits in', () => {
+  it('takes the expanded card out of the flow', () => {
+    const inlineCard = badgeSource.slice(
+      badgeSource.indexOf('.credits-badge--inline .credits-card'),
+    )
+    expect(inlineCard).toContain('position: absolute')
+  })
+
+  it('is what the two drama toolbars use, without reaching in themselves', () => {
+    for (const source of [dramaPageSource, dramaPlayerSource]) {
+      expect(source).toContain('<CloudCreditsBadge variant="inline"')
+      expect(source).not.toContain(':deep(.credits-badge__trigger)')
+    }
+  })
+})
+
 describe('InsufficientCreditsNotice', () => {
   it('states the promise: nothing ran, daily life is unaffected', async () => {
     const html = await render(InsufficientCreditsNotice)
@@ -176,7 +257,7 @@ describe('PortalAccountLink', () => {
   })
 
   it('renders nothing on self-host even if a portal url leaked into config', async () => {
-    authState.cloudMode = false
+    setDeploymentMode('self_host')
     authState.portalUrl = 'https://app.yuralume.com'
 
     const html = await render(PortalAccountLink)
@@ -209,5 +290,24 @@ describe('account centre entry placement', () => {
   it('is gone from the personal settings pane', () => {
     expect(personalSettingsSource).not.toContain('<PortalAccountLink')
     expect(personalSettingsSource).not.toContain("from './PortalAccountLink.vue'")
+  })
+})
+
+/**
+ * PP1 tore out the retired "current status" field along with the only
+ * player-visible feedback slot `loadOperatorProfile`'s catch had — a plain
+ * `console.error` left the player with zero indication a profile load
+ * failed. This pins the regression fix: the catch must surface something
+ * a player can see, not just log to a console they will never open.
+ */
+describe('operator profile load failure feedback', () => {
+  it('shows the player something, not only a console log', () => {
+    const catchBlock = personalSettingsSource.slice(
+      personalSettingsSource.indexOf('async function loadOperatorProfile'),
+      personalSettingsSource.indexOf('async function saveDisplayName'),
+    )
+    expect(catchBlock).toContain('} catch (err) {')
+    expect(catchBlock).toContain('displayNameFeedback.value')
+    expect(catchBlock).toContain('playerSidebar.displayName.loadFailed')
   })
 })

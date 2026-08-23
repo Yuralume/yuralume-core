@@ -17,7 +17,10 @@
  * inherits it instead of re-inventing two thirds of it.
  */
 
-import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
+import {
+  apiStatusErrorStatus,
+  isInsufficientCreditsError,
+} from '@/utils/api/insufficientCredits'
 import { isPriceChangedError } from '@/utils/api/priceChanged'
 import { useActionPricing } from '@/composables/useActionPricing'
 
@@ -28,6 +31,24 @@ export function billingRefusalKind(err: unknown): BillingRefusalKind | null {
   if (isInsufficientCreditsError(err)) return 'insufficient_credits'
   if (isPriceChangedError(err)) return 'price_changed'
   return null
+}
+
+/**
+ * True for the *transient* `409` — "another replica is already generating
+ * this, come back in a moment" — and only that one.
+ *
+ * `409` is overloaded on the priced routes: the branching drama's
+ * `BranchingGenerationInProgress` and the scene redraw's
+ * `SceneRegenerationInProgress` answer with a plain string `detail` and do
+ * clear by waiting, while `price_changed` answers with a structured
+ * `{code, message, current_price_cr}` body and never does. Discriminating on
+ * the *shape* (the parsed body already became a typed `PriceChangedError`)
+ * rather than on the status is what keeps a moved price from being sat on
+ * through a full retry window and then thrown at the player as a fault.
+ */
+export function isRetryableConflict(err: unknown): boolean {
+  if (billingRefusalKind(err) !== null) return false
+  return apiStatusErrorStatus(err) === 409
 }
 
 /**

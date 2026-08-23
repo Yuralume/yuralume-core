@@ -64,6 +64,14 @@ class IntakeQuestion:
     field: str
     question: str
     suggestions: tuple[str, ...] = ()
+    # Most follow-up questions gate creation until answered (the original
+    # design: any returned question means "not ready yet"). A question can
+    # opt out via blocking=False — it is still worth asking (nudges the
+    # operator toward a better setup) but must not withhold the create
+    # button. The proactive-cadence-hint nudge is the first such case: IR4
+    # widened the pre-message-proactive gate to only require
+    # proactive_permission, so cadence is advisory-only from here on.
+    blocking: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +194,15 @@ def _analysis_from_json(
     questions = tuple(_question_from_json(item) for item in _coerce_list(data.get("questions"))[:_MAX_QUESTIONS])
     questions = tuple(item for item in questions if item is not None)
     missing = tuple(_coerce_str_list(data.get("missing_required"), limit=_MAX_QUESTIONS))
+    # IR4 code-level guarantee, mirrored here for the LLM JSON path: the
+    # cadence-hint nudge must never gate creation, regardless of whether the
+    # model followed the prompt's "blocking: false" / "don't put this in
+    # missing_required" instructions. Without this, a model that reverts to
+    # its old habit of treating every question as blocking (or lists the
+    # field in missing_required) silently re-blocks character creation on
+    # cadence again — the same failure the fallback path already guards
+    # against at :399-415.
+    missing = tuple(key for key in missing if key != "proactive_cadence_hint")
     warnings = tuple(_warning_from_json(item) for item in _coerce_list(data.get("warnings"))[:_MAX_WARNINGS])
     warnings = tuple(item for item in warnings if item is not None)
     relationship = _relationship_from_json(
@@ -194,9 +211,10 @@ def _analysis_from_json(
     )
     profile = _profile_from_json(data.get("normalized_user_profile"))
     has_blocking_warning = any(item.blocking for item in warnings)
+    has_blocking_question = any(item.blocking for item in questions)
     can_create = (
         bool(data.get("can_create"))
-        and not questions
+        and not has_blocking_question
         and not missing
         and not has_blocking_warning
     )
@@ -251,7 +269,7 @@ def _merge_personality_analysis(
     return IntakeAnalysis(
         can_create=(
             analysis.can_create
-            and not limited_questions
+            and not any(item.blocking for item in limited_questions)
             and not limited_missing
             and not any(item.blocking for item in limited_warnings)
         ),
@@ -286,10 +304,15 @@ def _question_from_json(item: object) -> IntakeQuestion | None:
     if not question:
         return None
     field = _clean_text(item.get("field"), max_len=64) or "relationship"
+    # Same IR4 guarantee as the missing_required strip above: force
+    # non-blocking for the cadence-hint question even if the model omitted
+    # "blocking" (defaults True below) or echoed a stale "blocking": true.
+    blocking = False if field == "proactive_cadence_hint" else bool(item.get("blocking", True))
     return IntakeQuestion(
         field=field,
         question=question,
         suggestions=tuple(_coerce_str_list(item.get("suggestions"), limit=4, max_len=40)),
+        blocking=blocking,
     )
 
 
@@ -387,7 +410,12 @@ def _fallback_analysis(
             ),
         ))
     if relationship.proactive_permission and not relationship.proactive_cadence_hint.strip():
-        missing.append("proactive_cadence_hint")
+        # Advisory only (IR4): the pre-message-proactive gate now runs on
+        # proactive_permission alone, so an unset cadence hint is no longer
+        # a reason to withhold create. Still worth asking — an explicit
+        # cadence keeps the character's judgment call from surprising the
+        # operator — so the question stays, just non-blocking and out of
+        # missing_required (which is reserved for fields that do gate).
         questions.append(IntakeQuestion(
             field="proactive_cadence_hint",
             question=_q("proactive_cadence_hint"),
@@ -396,6 +424,7 @@ def _fallback_analysis(
                 "proactive_cadence_hint.only_important",
                 "proactive_cadence_hint.wait_for_me",
             ),
+            blocking=False,
         ))
     if (
         relationship.schedule_involvement_policy != "none"
@@ -413,7 +442,7 @@ def _fallback_analysis(
     capped_questions = tuple(questions[:_MAX_QUESTIONS])
     capped_missing = tuple(missing[:_MAX_QUESTIONS])
     return IntakeAnalysis(
-        can_create=not capped_questions,
+        can_create=not any(item.blocking for item in capped_questions),
         missing_required=capped_missing,
         questions=capped_questions,
         normalized_relationship=relationship,
@@ -470,7 +499,9 @@ def _build_prompt(
         "- 不要要求敏感資料，例如收入、創傷、秘密、家庭細節、精確住址或真實姓名。\n"
         "- 如果使用者設定既有關係但沒有說可知道的背景，要問自然問題。\n"
         "- 如果關係語意暗示共同生活（例如寵物、貼身精靈、家人、室友、同居），但沒有說明住在一起還是分開住，要自然反問居住安排；語意判斷交給你，不要只照字面標籤。\n"
-        "- 如果允許創角後主動找使用者，必須有頻率或時機限制。\n"
+        "- 如果允許創角後主動找使用者但還沒有頻率或時機提示，可以自然建議補充，"
+        "但這不是必填：這一題的 questions 項目要帶 \"blocking\": false，"
+        "也不要把它放進 missing_required、不要因此讓 can_create 為 false。\n"
         "- 如果使用者能出現在行程裡，要確認不要跨過的界線。\n"
         "- 每輪最多 3 題；問題要像創作協助，不像表單錯誤。\n"
         "- normalized_* 只能整理明確內容，不得補完未提供的過去事件。\n"
@@ -479,11 +510,13 @@ def _build_prompt(
         "{\n"
         '  "can_create": boolean,\n'
         '  "missing_required": ["known_context"],\n'
-        '  "questions": [{"field": "known_context", "question": "...", "suggestions": ["..."]}],\n'
+        '  "questions": [{"field": "known_context", "question": "...", "suggestions": ["..."], "blocking": true}],\n'
         '  "normalized_relationship": {},\n'
         '  "normalized_user_profile": {},\n'
         '  "warnings": [{"kind": "personality_type_conflict", "message": "...", "blocking": false}]\n'
         "}\n"
+        "questions[].blocking 預設 true（必須先回答才能建角）；"
+        "只有像頻率提示這種「值得問但不該擋創建」的建議才設 false。\n"
         f"輸入：{json.dumps(payload, ensure_ascii=False)}"
     )
 

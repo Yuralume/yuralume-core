@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -23,8 +22,6 @@ class OperatorProfileResponse(BaseModel):
     timezone_id: str
     has_real_name: bool
     display_name_locked: bool = False
-    current_status: str | None = None
-    current_status_set_at: datetime | None = None
     country_code: str | None = None
     latitude: float | None = None
     longitude: float | None = None
@@ -40,8 +37,6 @@ class OperatorProfileResponse(BaseModel):
             timezone_id=profile.timezone_id,
             has_real_name=profile.has_real_name(),
             display_name_locked=profile.display_name_locked,
-            current_status=profile.current_status,
-            current_status_set_at=profile.current_status_set_at,
             country_code=profile.country_code,
             latitude=profile.latitude,
             longitude=profile.longitude,
@@ -57,6 +52,15 @@ class UpdateOperatorProfileRequest(BaseModel):
     distinguish "clear" — for now empty strings are also "leave alone"
     since the caller almost always wants to keep at least a name.
     ``aliases=None`` leaves the list alone; an empty list clears it.
+
+    ``current_status`` is retired (PP series — superseded by the
+    per-character ``player_persona_note``). The field stays declared here,
+    accepted and silently dropped rather than removed, because an
+    already-deployed self-hosted frontend still sends it on every save;
+    dropping the field from the model would make pydantic's default
+    ``extra="ignore"`` do the same thing implicitly, which is fragile if
+    that default ever changes. Nothing reads this value past the route —
+    see ``update_operator_profile``.
     """
 
     display_name: str | None = None

@@ -154,6 +154,13 @@ class DueJobReconciler:
             return ReconcileResult()
 
         tenant_cache: dict[str, str | None] = {}
+        # One profile resolution per operator per pass. Every computation below
+        # needs the owner's runtime profile (NF4 dormancy covers the un-gated
+        # kinds too), and one operator owns many characters × ten kinds — so
+        # without this memo a pass re-derives the same answer up to hundreds of
+        # times, each an uncached DB read. Staleness is bounded by the pass
+        # itself, which is shorter than the reconcile interval it runs on.
+        profile_scope = self._calculator.new_profile_scope()
         reseeded = skipped_chained = skipped_stopped = 0
         for character in characters:
             for kind in character_chain_kinds():
@@ -171,6 +178,7 @@ class DueJobReconciler:
                 )
                 next_due = await self._calculator.compute(
                     character, kind, now=resolved, explicit_next_due=reseed_due,
+                    profile_scope=profile_scope,
                 )
                 if next_due is None:
                     # Frozen / subscription-locked — chain intentionally stopped.

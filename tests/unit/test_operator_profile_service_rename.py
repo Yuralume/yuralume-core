@@ -45,7 +45,7 @@ async def test_no_name_change_does_not_push_or_relock() -> None:
     service = await _service_with(
         OperatorProfile(id="op1", display_name="Alice", display_name_locked=False),
     )
-    updated = await service.update_for_user("op1", current_status="busy")
+    updated = await service.update_for_user("op1", pronouns="他")
     assert updated.aliases == ()
     assert updated.display_name_locked is False
 

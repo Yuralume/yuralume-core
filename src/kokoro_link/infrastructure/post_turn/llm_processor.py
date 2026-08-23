@@ -46,6 +46,9 @@ from kokoro_link.domain.value_objects.timezone import timezone_for_id, to_timezo
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_lines,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
     render_date_anchor_lines,
@@ -128,6 +131,7 @@ class LLMPostTurnProcessor(PostTurnProcessorPort):
         content_mode: str = "normal",
         peer_context_lines: list[str] | None = None,
         resolved_player_address: ResolvedAddress | None = None,
+        player_persona_note: str = "",
     ) -> PostTurnResult:
         # Short-circuit when the operator picked the fake provider —
         # fake emits deterministic text that won't parse as the JSON
@@ -147,6 +151,7 @@ class LLMPostTurnProcessor(PostTurnProcessorPort):
             content_mode=content_mode,
             peer_context_lines=peer_context_lines or [],
             resolved_player_address=resolved_player_address,
+            player_persona_note=player_persona_note,
         )
         try:
             raw = await self._resolver.generate(prompt, character=character)
@@ -187,6 +192,7 @@ def _build_prompt(
     content_mode: str = "normal",
     peer_context_lines: list[str] | None = None,
     resolved_player_address: ResolvedAddress | None = None,
+    player_persona_note: str = "",
 ) -> str:
     state = character.state
     ref_now = ensure_utc(now) if now is not None else datetime.now(timezone.utc)
@@ -225,6 +231,11 @@ def _build_prompt(
             ),
         ),
         *_render_content_mode_context(content_mode),
+        # Extraction reads the declaration as a *stop* list, not as
+        # material: the same text is injected into every reply prompt
+        # already, so a memory row repeating it is pure duplication that
+        # will still be there long after the player rewrites the note.
+        *_render_player_persona_note_context(player_persona_note),
         *(peer_context_lines or []),
     ]
     operator_section = "\n".join(operator_lines)
@@ -253,6 +264,17 @@ def _build_prompt(
     if peer_context_lines:
         prompt += _peer_meet_intent_extension(character_name=character.name)
     return prompt
+
+
+def _render_player_persona_note_context(note: str) -> list[str]:
+    """The declaration plus the one line that makes it a dedupe rule."""
+    lines = render_player_persona_note_lines(note)
+    if not lines:
+        return []
+    return [
+        *lines,
+        "- 玩家自述設定已由系統長期供給，其中已載明的事實不需再抽成記憶。",
+    ]
 
 
 def _peer_meet_intent_extension(*, character_name: str) -> str:

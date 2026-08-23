@@ -375,6 +375,16 @@ def _render_dialogue_block(recent_dialogue_summary: str) -> str:
     relationship temperature, and the promises already made. What it is
     not is a topic list to reshuffle, hence the explicit demand for one
     external event the conversation has never mentioned.
+
+    FB1 — that demand has an escape route the planner actually took: with
+    the chat log ruled out as material but an unfamiliar event still owed,
+    the cheapest "external" event is the player's own real-life business,
+    re-skinned into the character's world and padded out with invented
+    names and dates (a player mentioned signing a work contract and got an
+    arc about meeting an agent at a company nobody had ever named). So the
+    external event's *domain* is pinned here too: it happens in the
+    character's world, never in the player's. This bounds where material
+    may come from; it does not relax the anti-stagnation demand above.
     """
     summary = recent_dialogue_summary.strip()
     if not summary:
@@ -386,6 +396,15 @@ def _render_dialogue_block(recent_dialogue_summary: str) -> str:
         "以及已經對使用者許下的承諾都必須接得上，不能寫得像那些事沒發生過。",
         "但它不是新 arc 的題材來源——新 arc 不可以只是把近期聊天話題重新排列一次；"
         "至少要引入一個近期對話裡完全沒出現過的外部事件，讓角色的世界自己往前走一步。",
+        "紅線：使用者本人的現實事務（他的工作、簽約、考試、家人、健康、金錢等他自己講過的事）"
+        "屬於使用者的世界，不是這條 arc 的題材；上面要求的「外部事件」必須發生在角色自己的"
+        "世界裡（角色的工作、朋友、家鄉、興趣、身邊的人事物），不是發生在使用者身上。",
+        "因此：不得把使用者提過的現實事務改編、換皮、平移或鏡像成角色劇情裡的事件——"
+        "例如使用者說他要簽一份工作合約，就不可以生出「角色要跟某某經紀人談約」這種同構情節，"
+        "換掉人名場景也不行。",
+        "beat 若真的要提到使用者的現實事務，只能按上面脈絡裡他實際說過的內容引用，"
+        "不得替它補上他沒說過的人名、公司、機構、職稱、地點、日期或進度；"
+        "他沒講的細節就是你不知道，讓角色以不知道的姿態面對它。",
     ])
 
 

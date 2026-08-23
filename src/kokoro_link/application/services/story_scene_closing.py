@@ -153,6 +153,7 @@ class SceneClosingCoordinator:
         conversation: Conversation | None = None,
         today: date_type | None = None,
         language: str = "zh-TW",
+        player_persona_note: str = "",
     ) -> StorySceneClosingDraft | None:
         """Is this scene finished? ``None`` whenever it is not, or unknown.
 
@@ -167,6 +168,7 @@ class SceneClosingCoordinator:
             conversation=conversation,
             today=today,
             language=language,
+            player_persona_note=player_persona_note,
         )
         if draft is None or not draft.resolved:
             return None
@@ -185,6 +187,7 @@ class SceneClosingCoordinator:
         conversation: Conversation | None = None,
         today: date_type | None = None,
         language: str = "zh-TW",
+        player_persona_note: str = "",
     ) -> SceneClosing:
         moment = ensure_utc(now)
         scene_thread = await self._scene_thread(session, conversation)
@@ -196,6 +199,7 @@ class SceneClosingCoordinator:
                 conversation=scene_thread,
                 today=today,
                 language=language,
+                player_persona_note=player_persona_note,
             )
 
         closed = await self._sessions.close(
@@ -239,6 +243,7 @@ class SceneClosingCoordinator:
         conversation: Conversation | None,
         today: date_type | None,
         language: str,
+        player_persona_note: str = "",
     ) -> StorySceneClosingDraft | None:
         if self._closer is None:
             return None
@@ -256,6 +261,7 @@ class SceneClosingCoordinator:
                     player_lines=player_lines,
                     today=today,
                     operator_primary_language=language,
+                    player_persona_note=player_persona_note,
                 ),
             )
         except Exception:  # noqa: BLE001 - the port owns its own failures

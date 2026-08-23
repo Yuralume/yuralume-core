@@ -21,6 +21,7 @@ const UNLIMITED = {
   album_generation_enabled: true,
   tts_enabled: true,
   video_generation_enabled: true,
+  background: null,
 }
 
 describe('fetchRuntimeLimits', () => {
@@ -33,6 +34,7 @@ describe('fetchRuntimeLimits', () => {
       album_generation_enabled: true,
       tts_enabled: true,
       video_generation_enabled: false,
+      background: { dormancy_days: 14 },
     }))
 
     await expect(fetchRuntimeLimits()).resolves.toEqual({
@@ -45,6 +47,7 @@ describe('fetchRuntimeLimits', () => {
         album_generation_enabled: true,
         tts_enabled: true,
         video_generation_enabled: false,
+        background: { dormancyDays: 14 },
       },
     })
     expect(mockedAuthedFetch).toHaveBeenCalledWith('/api/v1/cloud/runtime-limits')
@@ -106,6 +109,76 @@ describe('fetchRuntimeLimits', () => {
     await expect(fetchRuntimeLimits()).resolves.toEqual({
       kind: 'ok',
       snapshot: UNLIMITED,
+    })
+  })
+
+  describe('background (NF4/NF5)', () => {
+    it('reads a real dormancy window', async () => {
+      mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(200, {
+        ...UNLIMITED,
+        background: { dormancy_days: 7 },
+      }))
+
+      await expect(fetchRuntimeLimits()).resolves.toEqual({
+        kind: 'ok',
+        snapshot: { ...UNLIMITED, background: { dormancyDays: 7 } },
+      })
+    })
+
+    it('reports "never dormant" as a real object with a null day count', async () => {
+      // A tier with no dormancy still answers with an object — `null` here
+      // is a stated fact ("this tier never sleeps"), not an absent field.
+      mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(200, {
+        ...UNLIMITED,
+        background: { dormancy_days: null },
+      }))
+
+      await expect(fetchRuntimeLimits()).resolves.toEqual({
+        kind: 'ok',
+        snapshot: { ...UNLIMITED, background: { dormancyDays: null } },
+      })
+    })
+
+    it('collapses a missing background object to null rather than guessing', async () => {
+      mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(200, {
+        character_slots: null,
+        character_daily_creates: null,
+        story_scenes_daily: null,
+        session_message_limit: null,
+        album_generation_enabled: true,
+        tts_enabled: true,
+        video_generation_enabled: true,
+        // `background` deliberately omitted — an older backend body.
+      }))
+
+      await expect(fetchRuntimeLimits()).resolves.toEqual({
+        kind: 'ok',
+        snapshot: UNLIMITED,
+      })
+    })
+
+    it('treats a nonsense day count the same as no ceiling at all', async () => {
+      mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(200, {
+        ...UNLIMITED,
+        background: { dormancy_days: '7' },
+      }))
+
+      await expect(fetchRuntimeLimits()).resolves.toEqual({
+        kind: 'ok',
+        snapshot: { ...UNLIMITED, background: { dormancyDays: null } },
+      })
+    })
+
+    it('treats a malformed background field as absent', async () => {
+      mockedAuthedFetch.mockResolvedValueOnce(jsonResponse(200, {
+        ...UNLIMITED,
+        background: 'not an object',
+      }))
+
+      await expect(fetchRuntimeLimits()).resolves.toEqual({
+        kind: 'ok',
+        snapshot: UNLIMITED,
+      })
     })
   })
 })

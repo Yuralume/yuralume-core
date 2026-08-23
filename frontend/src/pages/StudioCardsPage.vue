@@ -271,7 +271,12 @@ function totalSeriesMembers(items: ArcSeries[]): number {
         <p id="card-preview-title" class="spark-label">
           {{ t('studio.cards.previewTitle') }}
         </p>
-        <CharacterCardFace :card="previewCard" />
+        <!-- `:key` ＝這張預覽是誰。`CharacterCardPreview` 裡沒有身分欄位
+             （`pack_id` 在這裡恆為 null），所以卡面自己分不出「換了一個角色」
+             與「同一個角色的預覽被重算」——兩個都沒有圖的角色互換時，卡面的
+             重置 watch 不會醒，詳情區會保持展開。身分在這一頁手上，就由這一頁
+             出：換角色重掛，換系列勾選（同一個 `selectedCharacterId`）不重掛。 -->
+        <CharacterCardFace :key="selectedCharacterId" :card="previewCard" />
       </aside>
     </div>
   </section>

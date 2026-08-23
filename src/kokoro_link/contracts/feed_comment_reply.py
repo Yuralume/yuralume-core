@@ -48,6 +48,13 @@ class FeedCommentReplyInput:
     (FRONTEND_I18N_PLAN). Pinned via the same fact line that chat /
     proactive / feed-composer use so a comment reply doesn't drift to
     a different language than the post it's attached to."""
+    player_persona_note: str = ""
+    """What the player declared about themselves for this pair.
+
+    Injected here and **not** into the post composer: a post is written to
+    nobody in particular, while a comment reply is the character speaking
+    to this player, which is the only place the declaration is staging
+    rather than trivia. Empty leaves the prompt byte-identical."""
 
 
 @dataclass(frozen=True, slots=True)

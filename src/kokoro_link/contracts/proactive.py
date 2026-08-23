@@ -175,6 +175,15 @@ class ProactiveContext:
     """Prompt-ready lines describing what this character has learned
     about the operator. Per-character and already thresholded by
     OperatorPersonaService; empty when disabled or unknown."""
+    player_persona_note: str = ""
+    """What the player *declared* about themselves for this pair — the
+    counterpart of ``operator_persona_lines``, which is what the
+    character worked out on its own.
+
+    Empty is the norm and leaves the composed prompt byte-identical. The
+    dispatcher blanks it whenever the outbound sink could carry someone
+    other than the account owner: one compose is fanned out to every
+    sink, so the least private sink decides what may be staged."""
     initial_relationship_lines: tuple[str, ...] = ()
     """Prompt-ready user-confirmed initial relationship context for this
     character/operator pair. It may tune address, tone and proactive

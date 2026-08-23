@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSSRApp, ref, type Ref } from 'vue'
+import { computed, createSSRApp, ref, type ComputedRef, type Ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createI18n } from 'vue-i18n'
 
+import {
+  isCloudDeployment,
+  setDeploymentMode,
+} from '@/composables/deploymentMode'
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
 import { messages as enUS } from '@/i18n/locales/en-US'
 import { messages as jaJP } from '@/i18n/locales/ja-JP'
@@ -19,7 +23,7 @@ import { findJargon } from './fixtures/cloud-jargon-denylist'
  *   3. none of it speaks in operator jargon.
  */
 const holder = vi.hoisted(() => ({
-  cloudMode: null as Ref<boolean> | null,
+  cloudMode: null as ComputedRef<boolean> | null,
   portalUrl: null as Ref<string | null> | null,
   currentUser: null as Ref<Record<string, unknown> | null> | null,
 }))
@@ -45,8 +49,10 @@ vi.mock('@/utils/api/cloudCredits', () => ({
   fetchCloudCredits: vi.fn(async () => ({ kind: 'degraded' as const })),
 }))
 
-const cloudMode = ref(true)
-holder.cloudMode = cloudMode
+// One switch, not two: in production a component's `v-if="cloudMode"` and a
+// composable's request gate read the same deployment fact, so the tests move
+// `setDeploymentMode` and let both follow.
+holder.cloudMode = computed(() => isCloudDeployment())
 holder.portalUrl = ref<string | null>(null)
 holder.currentUser = ref<Record<string, unknown> | null>({ id: 'user-1' })
 
@@ -60,6 +66,8 @@ const InsufficientCreditsNotice
   = (await import('@/components/InsufficientCreditsNotice.vue')).default
 const QuotaOverageSettings
   = (await import('@/components/QuotaOverageSettings.vue')).default
+const DramaExitHub
+  = (await import('@/components/branching-drama/DramaExitHub.vue')).default
 
 const mockedPricing = vi.mocked(fetchCloudPricing)
 const mockedOverage = vi.mocked(fetchOverageSettings)
@@ -153,7 +161,7 @@ async function seedOverage(settings: {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  cloudMode.value = true
+  setDeploymentMode('cloud')
   useActionPricing().reset()
   useOverageSettings().reset()
 })
@@ -200,7 +208,7 @@ describe('ActionPriceHint', () => {
   it('renders nothing on self-host', async () => {
     // Hard requirement: the self-host composer and image panel are unchanged.
     await seedPricing([fixedTier([['chat', 'per_message', 3]])])
-    cloudMode.value = false
+    setDeploymentMode('self_host')
 
     const html = await render(ActionPriceHint, { actionKey: ACTION_CHAT })
 
@@ -254,6 +262,40 @@ describe('ActionPriceHint', () => {
     expect(visibleText(en)).toContain('Lumes')
     expect(visibleText(ja)).toContain('1通あたり')
     expect(visibleText(ja)).toContain('蛍火')
+  })
+})
+
+/**
+ * FX2 — 「換條路再走」 is a *press that costs money*, and every other such
+ * press in the drama already says so before it is pressed. Starting a
+ * playthrough writes the opening beat and is billed as one advance (FX1), so
+ * this quotes the advance price, not the (already paid) build price.
+ */
+describe('the ending’s replay CTA quotes what pressing it costs', () => {
+  it('shows the advance price beside 「換條路再走」', async () => {
+    await seedPricing([fixedTier([
+      ['branching_drama_advance', 'per_iteration', 6],
+      ['branching_drama_create', 'per_drama', 40],
+    ])])
+
+    const html = await render(DramaExitHub, { dramaTitle: 'Glass Signal' })
+
+    expect(html).toContain(zhTW.branchingDrama.exitHub.replay)
+    expect(html).toContain('action-price')
+    expect(html).toContain('6')
+    expect(html).toContain(L.price.dramaStartTooltip)
+    // Emphatically not the build price — that press already happened.
+    expect(html).not.toContain('40')
+  })
+
+  it('renders no chip at all on self-host', async () => {
+    await seedPricing([fixedTier([['branching_drama_advance', 'per_iteration', 6]])])
+    setDeploymentMode('self_host')
+
+    const html = await render(DramaExitHub, { dramaTitle: 'Glass Signal' })
+
+    expect(html).toContain(zhTW.branchingDrama.exitHub.replay)
+    expect(html).not.toContain('action-price')
   })
 })
 
@@ -376,7 +418,7 @@ describe('QuotaOverageSettings', () => {
 
   it('renders nothing on self-host', async () => {
     await seedOverage({})
-    cloudMode.value = false
+    setDeploymentMode('self_host')
 
     const html = await render(QuotaOverageSettings)
 

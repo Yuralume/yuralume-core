@@ -87,6 +87,22 @@ class QuotaUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class BackgroundPolicySnapshot:
+    """The hosted account's background-scheduling policy, for display only.
+
+    Unlike every quota above it, this is not a ceiling the player can spend
+    against — it is the shape of what happens when they *stop* playing, which
+    the SPA needs in order to say so before it happens rather than leaving the
+    player to notice their character went quiet.
+    """
+
+    dormancy_days: int | None
+    """``background_dormancy_days`` — days without a foreground interaction
+    after which this account's characters stop scheduling background work
+    (NF4). ``None`` = never (self-host, and any tier that has not set it)."""
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerRuntimeLimitsSnapshot:
     """What the SPA needs to show a limit before the player hits it.
 
@@ -102,6 +118,12 @@ class PlayerRuntimeLimitsSnapshot:
     album_generation_enabled: bool
     tts_enabled: bool
     video_generation_enabled: bool
+    background: BackgroundPolicySnapshot = BackgroundPolicySnapshot(
+        dormancy_days=None,
+    )
+    """Additive (NF4), defaulted so no existing constructor call changes. The
+    default is the permissive one for the same reason every quota's is: a
+    caller that does not know about dormancy must not accidentally assert it."""
 
 
 class PlayerRuntimeLimitsService:
@@ -162,6 +184,13 @@ class PlayerRuntimeLimitsService:
             album_generation_enabled=profile.album_generation_enabled,
             tts_enabled=profile.tts_enabled,
             video_generation_enabled=profile.video_generation_enabled,
+            # Read straight off the profile: unlike the quotas there is no
+            # counter to pair it with, so there is nothing here that can fail
+            # softly — either the profile resolved or the whole snapshot did
+            # not.
+            background=BackgroundPolicySnapshot(
+                dormancy_days=profile.background_dormancy_days,
+            ),
         )
 
     async def _roster(

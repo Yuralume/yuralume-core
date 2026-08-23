@@ -35,6 +35,21 @@ export interface RuntimeLimitUsage {
   limit: number
 }
 
+/**
+ * How background scheduling behaves for this account when the player is
+ * away (NF4/NF5). Not a ceiling like the fields above — it is the one entry
+ * on this route that exists to be said out loud *before* it is noticed as an
+ * unexplained silence, not to gate a button.
+ */
+export interface BackgroundPolicy {
+  /**
+   * Days without a foreground interaction after which characters stop
+   * scheduling background work (proactive messages, schedule, world
+   * events). `null` = this tier never goes dormant.
+   */
+  dormancyDays: number | null
+}
+
 export interface RuntimeLimitsSnapshot {
   /** Concurrent characters. `null` = uncapped. */
   character_slots: RuntimeLimitUsage | null
@@ -47,6 +62,12 @@ export interface RuntimeLimitsSnapshot {
   album_generation_enabled: boolean
   tts_enabled: boolean
   video_generation_enabled: boolean
+  /**
+   * `null` when the payload did not include a `background` object at all
+   * (an older backend, or a malformed body) — never fabricated, so a
+   * consumer that only checks `dormancyDays` still can't render on a guess.
+   */
+  background: BackgroundPolicy | null
 }
 
 export type RuntimeLimitsResult =
@@ -84,6 +105,7 @@ function normalize(payload: unknown): RuntimeLimitsSnapshot {
     album_generation_enabled: enabledField(body.album_generation_enabled),
     tts_enabled: enabledField(body.tts_enabled),
     video_generation_enabled: enabledField(body.video_generation_enabled),
+    background: backgroundField(body.background),
   }
 }
 
@@ -112,6 +134,18 @@ function positiveField(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
     : null
+}
+
+/**
+ * Tolerant like every other field on this route: a missing or malformed
+ * `background` object (self-host on an older bundle, an unexpected shape)
+ * collapses to `null` rather than throwing, so the advisory simply never
+ * renders instead of crashing the read.
+ */
+function backgroundField(value: unknown): BackgroundPolicy | null {
+  if (!value || typeof value !== 'object') return null
+  const entry = value as Record<string, unknown>
+  return { dormancyDays: positiveField(entry.dormancy_days) }
 }
 
 /**

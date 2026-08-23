@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { UiBadge, UiButton, UiImage } from '@/components/ui'
+import { UiBadge, UiButton, UiImage, UiLightbox } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
 import {
   canInstallCard,
   isCloudCard,
@@ -32,12 +33,18 @@ const { t } = useI18n()
 const detailsOpen = ref(false)
 const activeImageIndex = ref(0)
 const failedImageIndexes = ref<Set<number>>(new Set())
+const zoomOpen = ref(false)
+const zoomIndex = ref(0)
 
 const title = computed(() => props.card.name || props.card.title)
 const intro = computed(() => props.card.summary || props.card.description)
 const activeImage = computed(() => props.card.image_urls[activeImageIndex.value] ?? '')
 const showImage = computed(() => activeImage.value && !failedImageIndexes.value.has(activeImageIndex.value))
 const initial = computed(() => (props.card.name || title.value || '?').trim().charAt(0).toUpperCase())
+/** 浮窗的集合＝這張卡全部的圖，跟卡面 dots 切的是同一份 `image_urls`。 */
+const lightboxItems = computed<LightboxItem[]>(() =>
+  props.card.image_urls.map((url) => ({ url })),
+)
 
 // A cloud-exclusive card on a deployment that cannot install it: the card
 // stays on the shelf, the button stops pretending. Both come from the
@@ -128,10 +135,45 @@ const cadenceLabel = computed(() => props.card.proactive_enabled
   })
   : t('playerSidebar.characterCards.details.cadenceDisabled'))
 
-watch(() => props.card, () => {
+// 判準用「這張卡目前顯示哪些圖」而不是物件識別（FIX-C）：`browseCards`
+// computed（`PlayerCharacterCardPanel.vue`）在翻譯（`setBrowseTranslate`）或
+// 背景細節請求（`ensureActiveBrowseCardDetailed`）回來時，會拿同一張卡的新
+// 資料重建一個新的 `CharacterCardPreview` 物件——`pack_id`／`image_urls` 都
+// 沒變，只是物件識別換了。原本 `watch(() => props.card, ...)` 抓的正是物件
+// 識別，於是玩家在瀏覽 modal 開著翻譯、等待期間點卡面圖放大，翻譯一回來就
+// 被這條 watch 誤判成「換卡片」，浮窗和翻到第幾張一起被無預警關掉。
+//
+// 真正決定這條 watch 該不該重置的，是 `activeImageIndex` 索引進去的是不是
+// 同一份圖清單：只要 `image_urls` 內容沒變，索引指的仍是正確的圖，重置
+// （尤其是關掉浮窗）就沒有必要、只會打斷玩家。這跟 `ChatBubble.vue` 附件
+// watch（同一份理由：`imageAttachments.value.map(att => att.url).join('\n')`）
+// 用的是同一招。
+//
+// FIX-E：判準換寬之後多出一個缺口——「換到另一張 `image_urls` 內容相同的卡」
+// 不再重置。所以再併上 `pack_id`。**只能是 `pack_id`**：
+//
+// - `name` / `title` / `summary` 一律不行。`name` 正是翻譯會改寫的欄位之一
+//   （後端 `PROFILE_SCALAR_FIELDS` 明列 name／summary／speaking_style…），
+//   把它放進鍵就等於把 FIX-C 修掉的那個 bug 原樣裝回去。
+// - `pack_id` 是翻譯與細節回填的**字典鍵本身**（`translatedBrowseCards[pack_id]`
+//   / `enrichedBrowseCards[pack_id]`），同一張卡的新物件必然帶同一個值，所以
+//   它不會誤判；不同 pack 則必然不同，所以它擋得住「兩張都沒有圖的卡原地互換」。
+//
+// 仍有一個 `pack_id` 蓋不到的角落：`StudioCardsPage` 的預覽卡 `pack_id` 恆為
+// `null`（它是從 `Character` 現組的，那個 DTO 裡根本沒有身分欄位），兩個都沒
+// 有圖的角色互換時這條 watch 仍不會醒。那一邊改由頁面自己出身分——它有
+// `selectedCharacterId`，`<CharacterCardFace :key>` 直接重掛，比在這裡猜一個
+// 湊合的身分欄位誠實。
+watch(() => `${props.card.pack_id ?? ''}\n${props.card.image_urls.join('\n')}`, () => {
   detailsOpen.value = false
   activeImageIndex.value = 0
   failedImageIndexes.value = new Set()
+  // 換卡片時浮窗必須關掉：索引指向的是舊卡片那份 image_urls，留著會在新卡片
+  // 落地的瞬間變成「同一格位置的另一張卡的圖」。`CharacterCardGalleryModal`
+  // 用 `:key="activeIndex"` 整段重掛這個元件，換卡時通常不會走到這裡；但
+  // `StudioCardsPage` 是原地換 `props.card`（無 key 重掛），這條 watch 是那
+  // 邊唯一會清掉浮窗狀態的地方。
+  zoomOpen.value = false
 })
 
 function addRow(
@@ -169,6 +211,22 @@ function markImageFailed() {
   next.add(activeImageIndex.value)
   failedImageIndexes.value = next
 }
+
+/**
+ * 從卡面目前顯示的那張圖開始放大。`showImage` 為假（載入失敗、走 initial
+ * 字母 fallback）時觸發鍵根本不會渲染，這裡的判斷只是防禦。
+ */
+function openZoom() {
+  if (!showImage.value) return
+  zoomIndex.value = activeImageIndex.value
+  zoomOpen.value = true
+}
+
+// 浮窗裡換圖（←→ 鍵或點導覽鍵）要回寫卡面的 dots，關窗後卡面停在玩家最後
+// 看到的那張，而不是彈回原本點進浮窗前的那張。
+watch(zoomIndex, (index) => {
+  activeImageIndex.value = index
+})
 </script>
 
 <template>
@@ -185,21 +243,33 @@ function markImageFailed() {
         <!-- The card is capped at 320px; the art window gives back 7px of
              foil padding and 12px of margin either side, so 282px is its
              ceiling. `@error` still reaches `markImageFailed` — UiImage
-             re-emits it — and the `v-else` initial is the real fallback. -->
-        <UiImage
+             re-emits it — and the `v-else` initial is the real fallback.
+             LB7：只有真的畫得出圖時才給放大入口——initial fallback 沒有東西
+             可以放大。button 只包住圖片本身，光澤層仍是圖片的手足，不受影響。 -->
+        <button
           v-if="showImage"
-          class="character-card-face__image"
-          variant="content"
-          :src="activeImage"
-          :alt="title"
-          sizes="282px"
-          aspect-ratio="3 / 4"
-          @error="markImageFailed"
-        />
+          type="button"
+          class="character-card-face__art-trigger"
+          :title="t('common.actions.zoom')"
+          :aria-label="t('common.actions.zoomAria', { name: title })"
+          @click="openZoom"
+        >
+          <UiImage
+            class="character-card-face__image"
+            variant="content"
+            :src="activeImage"
+            :alt="title"
+            sizes="282px"
+            aspect-ratio="3 / 4"
+            @error="markImageFailed"
+          />
+        </button>
         <div v-else class="character-card-face__fallback" aria-hidden="true">
           {{ initial }}
         </div>
 
+        <!-- pointer-events: none（見下方樣式）——光澤層蓋在圖上純視覺，不得
+             吃掉放大鍵的點擊。 -->
         <span class="character-card-face__sheen" aria-hidden="true" />
 
         <div v-if="card.image_urls.length > 1" class="character-card-face__dots">
@@ -293,6 +363,20 @@ function markImageFailed() {
         </UiButton>
       </div>
     </div>
+
+    <!-- LB7：浮窗自己 Teleport 到 body、z-index 1500，疊放位置與這張卡在
+         DOM 裡的哪個位置無關；放在 article 裡只是讓它跟卡片同生命週期。
+         鍵盤打架（Esc／←→ 同時被 CharacterCardGalleryModal 的 window 監聽
+         攔截）由浮窗自己解：UiLightbox 以 capture 階段掛 window keydown，
+         對它處理的鍵 stopPropagation()，事件到不了下面那層 bubble 監聽。
+         這裡與上層都不需要（也不該有）手寫讓位。 -->
+    <UiLightbox
+      v-model:index="zoomIndex"
+      :visible="zoomOpen"
+      :items="lightboxItems"
+      :label="title"
+      @close="zoomOpen = false"
+    />
   </article>
 </template>
 
@@ -378,6 +462,25 @@ function markImageFailed() {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.16) inset,
     0 8px 22px rgba(0, 0, 0, 0.42);
+}
+
+/* 放大入口：只包住圖片本身，把原生 button 的邊框/底色/內距清乾淨，讓它看起來
+   還是那張圖，不是一顆按鈕。 */
+.character-card-face__art-trigger {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+  appearance: none;
+}
+
+.character-card-face__art-trigger:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 
 .character-card-face__image {

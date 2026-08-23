@@ -64,6 +64,9 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
 )
@@ -203,7 +206,12 @@ class NullScheduledPromiseComposer(ScheduledPromiseComposerPort):
 def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
     character = payload.character
     persona = "\n".join(_persona_block(character))
-    operator_block_lines = _operator_persona_block(payload.operator_persona_lines)
+    # Same assembly as the busy-defer composer: declaration first, then
+    # the inferred portrait, into the one existing template slot.
+    operator_block_lines = [
+        *render_player_persona_note_lines(payload.player_persona_note),
+        *_operator_persona_block(payload.operator_persona_lines),
+    ]
     operator_block = "\n" + "\n".join(operator_block_lines) if operator_block_lines else ""
     schedule_block = "\n".join(_schedule_block(payload))
     summary = (payload.recent_dialogue_summary or "").strip()

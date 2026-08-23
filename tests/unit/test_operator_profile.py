@@ -4,8 +4,6 @@ in-memory repository round-trip. Phase 1 of the world-system roadmap.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 import pytest
 
 from kokoro_link.application.services.operator_profile_service import (
@@ -80,27 +78,6 @@ def test_profile_update_can_clear_aliases():
     )
     updated = profile.update(aliases=[])
     assert updated.aliases == ()
-
-
-def test_profile_update_can_set_preserve_and_clear_current_status():
-    profile = OperatorProfile(id="default", display_name="艾力")
-    set_at = datetime(2026, 5, 29, 10, 30, tzinfo=timezone.utc)
-
-    updated = profile.update(
-        current_status="  今天到學校演講  ",
-        current_status_set_at=set_at,
-    )
-
-    assert updated.current_status == "今天到學校演講"
-    assert updated.current_status_set_at == set_at
-
-    renamed = updated.update(display_name="阿力")
-    assert renamed.current_status == "今天到學校演講"
-    assert renamed.current_status_set_at == set_at
-
-    cleared = renamed.update(current_status=None)
-    assert cleared.current_status is None
-    assert cleared.current_status_set_at is None
 
 
 def test_profile_location_fields_normalise_and_update_tristate():
@@ -211,13 +188,10 @@ def test_profile_rejects_malformed_location_fields(field: str, value: object):
         OperatorProfile(**kwargs)  # type: ignore[arg-type]
 
 
-def test_operator_profile_dto_exposes_current_status_and_field_presence():
-    set_at = datetime(2026, 5, 29, 10, 30, tzinfo=timezone.utc)
+def test_operator_profile_dto_exposes_location_and_field_presence():
     profile = OperatorProfile(
         id="default",
         display_name="艾力",
-        current_status="今天到學校演講",
-        current_status_set_at=set_at,
         country_code="TW",
         latitude=25.033,
         longitude=121.565,
@@ -225,19 +199,14 @@ def test_operator_profile_dto_exposes_current_status_and_field_presence():
     )
 
     response = OperatorProfileResponse.from_domain(profile)
-    assert response.current_status == "今天到學校演講"
-    assert response.current_status_set_at == set_at
+    assert not hasattr(response, "current_status")
     assert response.country_code == "TW"
     assert response.latitude == 25.033
     assert response.longitude == 121.565
     assert response.location_label == "台北"
 
     untouched = UpdateOperatorProfileRequest()
-    assert "current_status" not in untouched.model_fields_set
     assert "country_code" not in untouched.model_fields_set
-
-    clear = UpdateOperatorProfileRequest(current_status=None)
-    assert "current_status" in clear.model_fields_set
 
     clear_location = UpdateOperatorProfileRequest(country_code=None)
     assert "country_code" in clear_location.model_fields_set
@@ -281,26 +250,6 @@ async def test_service_update_preserves_other_fields():
     fetched = await service.get_current()
     assert fetched.display_name == "阿力"
     assert fetched.pronouns == "他"
-
-
-@pytest.mark.asyncio
-async def test_service_update_for_user_sets_and_clears_current_status():
-    repo = InMemoryOperatorProfileRepository()
-    service = OperatorProfileService(repository=repo)
-
-    saved = await service.update_for_user(
-        "user-1",
-        display_name="艾力",
-        current_status="今天到學校演講",
-    )
-
-    assert saved.current_status == "今天到學校演講"
-    assert saved.current_status_set_at is not None
-
-    cleared = await service.update_for_user("user-1", current_status=None)
-    assert cleared.display_name == "艾力"
-    assert cleared.current_status is None
-    assert cleared.current_status_set_at is None
 
 
 @pytest.mark.asyncio

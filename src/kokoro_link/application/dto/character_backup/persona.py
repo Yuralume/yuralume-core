@@ -2,7 +2,7 @@
 
 ``operator_profile_fields`` (five-layer interpersonal portrait) /
 ``operator_address_preferences`` / ``operator_address_change_log`` /
-``character_operator_relationship_seeds`` /
+``player_persona_notes`` / ``character_operator_relationship_seeds`` /
 ``persona_curiosity_attempts``.
 
 ``operator_id`` values are carried verbatim; the restore job remaps
@@ -55,6 +55,13 @@ class OperatorAddressChangeLogBackupRecord(BackupRecord):
     source: str = "player_edit"
     effective_at: datetime
     created_at: datetime
+
+
+class PlayerPersonaNoteBackupRecord(BackupRecord):
+    character_id: str
+    operator_id: str
+    note: str
+    updated_at: datetime
 
 
 class CharacterOperatorRelationshipSeedBackupRecord(BackupRecord):

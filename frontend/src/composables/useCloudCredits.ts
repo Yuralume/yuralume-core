@@ -26,10 +26,15 @@
  * Fail-soft (plan §1-4): a `404` means there is no ledger at all and the
  * badge hides for good; any other failure keeps the last-known-good value on
  * screen. The badge never renders a fabricated zero.
+ *
+ * Self-host never issues a request at all — see `isCloudDeployment`, which is
+ * checked inside `load()` rather than at each of the dozen post-action call
+ * sites.
  */
 
 import { computed, ref } from 'vue'
 
+import { isCloudDeployment } from '@/composables/deploymentMode'
 import {
   fetchCloudCredits,
   type CloudCreditsSnapshot,
@@ -56,6 +61,11 @@ let inFlight: Promise<void> | null = null
 let generation = 0
 
 async function load(options: { refresh?: boolean } = {}): Promise<void> {
+  // Self-host has no ledger and no route to ask one. The badge's own mount
+  // guard covers itself, but `refreshAfterAction()` is called from a dozen
+  // completion points that have no reason to know about deployment shape —
+  // so the gate lives here, at the single point every read passes through.
+  if (!isCloudDeployment()) return
   if (!supported.value) return
   // Collapse concurrent callers (badge mount + a just-finished action) onto
   // one request rather than racing two reads of the same value.

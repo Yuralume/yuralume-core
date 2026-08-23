@@ -45,6 +45,22 @@ class AccountRuntimeProfile:
     background_activity_multiplier: int = 1
     idle_downshift_days: int | None = None
     idle_multiplier: int = 1
+    background_dormancy_days: int | None = None
+    """NF4 — days without a foreground interaction after which a character
+    stops scheduling background jobs *at all*.
+
+    Sibling of ``idle_downshift_days`` in shape (1..3650, ``None`` = off) but
+    NOT in kind: idle down-shift stretches the cadence, dormancy stops the
+    chain (:class:`~kokoro_link.application.services.due_job_scheduler.NextDueCalculator`
+    returns ``None``, exactly as for a frozen character). A character that has
+    never had a foreground interaction is dormant from the start — that is the
+    "背景在玩家開口前不啟動" half of the knob, and the reason the dormancy
+    anchor deliberately does not fall back to ``created_at`` the way the idle
+    anchor does.
+
+    ``None`` (the default) means "never dormant" and is the only spelling of
+    it: self-host never receives a value here, so its scheduling is bit-for-bit
+    what it was before this knob existed."""
     character_ttl: timedelta | None = None
     max_characters: int | None = None
     daily_character_create_limit: int | None = None
@@ -159,6 +175,16 @@ class AccountRuntimeProfile:
             idle_multiplier=_int_knob(
                 data, "idle_multiplier", minimum=1, maximum=288,
                 default=default.idle_multiplier, nullable=False, name=name,
+            ),
+            # NF4: same bounds and nullability as ``idle_downshift_days`` — the
+            # control-plane CHECK is ``IS NULL OR BETWEEN 1 AND 3650``. Fail-open
+            # like every other knob here: a malformed value falls back to the
+            # permissive default (``None`` = never dormant) rather than silencing
+            # a paying tenant's characters.
+            background_dormancy_days=_int_knob(
+                data, "background_dormancy_days", minimum=1, maximum=3650,
+                default=default.background_dormancy_days, nullable=True,
+                name=name,
             ),
             character_ttl=(
                 timedelta(days=ttl_days) if ttl_days is not None else None

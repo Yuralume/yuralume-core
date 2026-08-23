@@ -118,7 +118,11 @@ html, body, #app {
   background: var(--color-bg);
   color: var(--color-text);
   /* 避免 iOS 長按橡皮筋滾動暴露底色，以及雙擊縮放 */
+  /* 兩行都要：Gecko 完全不認 -webkit- 前綴（CSS.supports 為 false），而
+     Firefox for Android 正是唯一會做文字自動放大的環境——只寫前綴版等於
+     沒鎖住。landing/shared/base.css 一直是兩行都寫的。 */
   -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior: none;
   touch-action: manipulation;

@@ -59,6 +59,15 @@ const historyPage = ref<{ hasMore: boolean, nextBefore: number | null }>({
   hasMore: false,
   nextBefore: null,
 })
+/**
+ * 上一次歷史讀取是失敗收場的。
+ *
+ * `loadHistoryFor` 的 catch 把失敗折疊成「空的對話」——這對聊天畫面本身
+ * 無害（下一次送訊息就會復原），但對任何「零訊息＝新玩家」的判斷是致命
+ * 的誤導。`ChatPanel` 的首開人設彈窗就是這種判斷，所以失敗這件事必須
+ * 傳得出去，而不是只活在那個 catch 裡。
+ */
+const historyFailed = ref(false)
 
 function getStageLocalStorage(): Storage | null {
   if (typeof window === 'undefined') return null
@@ -510,6 +519,7 @@ onBeforeUnmount(() => {
  */
 async function loadHistoryFor(characterId: string) {
   historyLoading.value = true
+  historyFailed.value = false
   try {
     const snapshot = await getLatestConversation(characterId)
     if (snapshot) {
@@ -528,6 +538,9 @@ async function loadHistoryFor(characterId: string) {
     conversationId.value = null
     messages.value = []
     historyPage.value = { hasMore: false, nextBefore: null }
+    // 空陣列是「不知道」的佔位，不是「這個人沒聊過」的事實。誰要拿
+    // `messages.length === 0` 下判斷，就得先看得到這一格。
+    historyFailed.value = true
   } finally {
     historyLoading.value = false
   }
@@ -744,6 +757,7 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
           :messages="messages"
           :history-page="historyPage"
           :loading-history="historyLoading"
+          :history-failed="historyFailed"
           :show-layout-toggle="!isPortrait"
           :stage-layout-mode="stageLayoutMode"
           @conversation-update="handleConversationUpdate"
@@ -860,7 +874,6 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(23, 37, 56, 0.78);
   backdrop-filter: blur(12px) saturate(1.2);
-  -webkit-backdrop-filter: blur(12px) saturate(1.2);
   color: #fff;
   display: inline-flex;
   align-items: center;
@@ -1121,7 +1134,6 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
        這裡用 CSS var 控透明度，比 color-mix() 相容性好。 */
     background: rgba(22, 33, 62, var(--chat-opacity, 0.78));
     backdrop-filter: blur(var(--chat-blur, 14px)) saturate(1.2);
-    -webkit-backdrop-filter: blur(var(--chat-blur, 14px)) saturate(1.2);
     border-top: none;
     box-shadow: none;
     display: flex;

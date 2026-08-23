@@ -1698,13 +1698,6 @@ class OperatorProfileRow(Base):
     )
     """IANA timezone id for user-facing civil dates and visible clock
     times. DB/server instants stay UTC; this is not character-specific."""
-    current_status: Mapped[str | None] = mapped_column(Text, nullable=True)
-    """Operator-authored current real-world situation for Scene Access.
-    This is only fed into the Scene Access judge, not the general chat
-    prompt."""
-    current_status_set_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
     country_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
     """ISO 3166-1 alpha-2 country code for location-aware fact providers."""
     latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -2147,6 +2140,29 @@ class OperatorAddressPreferenceRow(Base):
         String(16), nullable=False, default="medium",
     )
     evidence_quote: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class PlayerPersonaNoteRow(Base):
+    """Player-declared identity / world premise for one pair.
+
+    Composite PK (character_id, operator_id) — one declaration per pair.
+    Deliberately separate from ``operator_profile_fields``: that table is
+    what the character inferred (confidence, evidence, decay), this one is
+    what the player asserted, which none of those columns apply to.
+    """
+
+    __tablename__ = "player_persona_notes"
+
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    operator_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )

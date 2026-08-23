@@ -196,7 +196,6 @@ function submit() {
     max(24px, var(--safe-area-left));
   background: rgba(0, 0, 0, 0.62);
   backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
 }
 
 .backup-password-modal {

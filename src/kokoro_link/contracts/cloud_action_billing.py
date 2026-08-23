@@ -67,6 +67,22 @@ ACTION_FUSION_STORY_ITERATE = "fusion_story_iterate"
 #: actions: their cost is already inside this one price.
 ACTION_STORY_SCENE_OPEN = "story_scene_open"
 
+#: 分歧劇場 (BD plan D2). The drama family used to bill per Gateway call
+#: because a tree has no bounded unit of work — until the unit was named:
+#: it is not "the drama", it is *each button the player presses*. Creating
+#: the tree (root plan, the first layers, their pictures) is one fixed
+#: price; every ``advance`` is another (the beat's narration, the lazily
+#: planned next layer and its prefetched art all amortised into it); every
+#: ``interact`` is another again, because an open-ended in-beat loop is a
+#: real LLM call each time and a free one would simply be chat with the
+#: meter switched off. Redrawing a single scene by hand is its own action
+#: (``branching_drama_scene_regen``), so the player can pay for one picture
+#: without paying for a beat.
+ACTION_BRANCHING_DRAMA_CREATE = "branching_drama_create"
+ACTION_BRANCHING_DRAMA_ADVANCE = "branching_drama_advance"
+ACTION_BRANCHING_DRAMA_INTERACT = "branching_drama_interact"
+ACTION_BRANCHING_DRAMA_SCENE_REGEN = "branching_drama_scene_regen"
+
 
 #: Actions already paid for by an *enclosing* charge, keyed by the action key
 #: their entry point would otherwise raise. AP4's quota overage is the only

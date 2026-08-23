@@ -169,6 +169,10 @@ class CharacterCreationIntakeQuestionResponse(BaseModel):
     field: str
     question: str
     suggestions: list[str] = Field(default_factory=list)
+    # False for advisory-only nudges (e.g. proactive cadence hint, IR4) that
+    # are worth asking but must not withhold the create button — mirrors
+    # CharacterCreationIntakeWarningResponse.blocking below.
+    blocking: bool = True
 
 
 class CharacterCreationIntakeWarningResponse(BaseModel):
@@ -370,6 +374,7 @@ async def analyze_character_creation_intake(
                 field=item.field,
                 question=item.question,
                 suggestions=list(item.suggestions),
+                blocking=item.blocking,
             )
             for item in result.questions
         ],

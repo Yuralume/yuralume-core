@@ -10,7 +10,7 @@ import pytest
 from kokoro_link.application.services.due_job_reconciler import DueJobReconciler
 from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.background_jobs import COORDINATOR_LEASE_NAME
-from kokoro_link.contracts.due_jobs import character_chain_kinds
+from kokoro_link.contracts.due_jobs import character_chain_kinds, kind_spec
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
@@ -54,8 +54,13 @@ class _FakeRepo:
 
 
 class _FakeResolver:
+    def __init__(
+        self, profile: AccountRuntimeProfile = DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+    ) -> None:
+        self._profile = profile
+
     async def resolve_for_operator(self, operator_id: str) -> AccountRuntimeProfile:
-        return DEFAULT_ACCOUNT_RUNTIME_PROFILE
+        return self._profile
 
 
 async def _distributed_ownership() -> InMemoryRuntimeOwnership:
@@ -64,13 +69,15 @@ async def _distributed_ownership() -> InMemoryRuntimeOwnership:
     return ownership
 
 
-async def _wiring(characters, *, ownership=None):
+async def _wiring(characters, *, ownership=None, profile=None):
     lease = InMemoryBackgroundCoordinatorLease()
     queue = InMemoryBackgroundJobQueue(lease=lease)
     epoch = await lease.acquire(
         COORDINATOR_LEASE_NAME, "coord", ttl_seconds=30, now=BASE,
     )
-    calc = NextDueCalculator(resolver=_FakeResolver())
+    calc = NextDueCalculator(
+        resolver=_FakeResolver(profile or DEFAULT_ACCOUNT_RUNTIME_PROFILE),
+    )
     reconciler = DueJobReconciler(
         queue=queue,
         character_repository=_FakeRepo(characters),
@@ -204,6 +211,64 @@ async def test_dead_chain_is_not_reseeded() -> None:
     assert second.reseeded == 0
 
 
+# --- NF4 dormancy: the stop, and the wake that reuses the thaw path -------- #
+
+_DORMANT_TIER = AccountRuntimeProfile(name="free", background_dormancy_days=7)
+
+#: The kinds NF4 exempts from dormancy (see ``KindSpec.dormancy_exempt``); a
+#: dormant character keeps exactly these chains and nothing else.
+_EXEMPT = tuple(
+    kind for kind in character_chain_kinds() if kind_spec(kind).dormancy_exempt
+)
+
+
+async def test_dormant_character_is_reseeded_only_for_exempt_kinds() -> None:
+    """Dormancy reaches the reseeder through the calculator, exactly as
+    freeze does — the reconciler needs no dormancy knowledge of its own."""
+    queue, reconciler, _ = await _wiring(
+        [_FakeCharacter("c1")],  # never interacted → dormant from creation
+        ownership=await _distributed_ownership(),
+        profile=_DORMANT_TIER,
+    )
+    result = await reconciler.run_once(now=BASE)
+
+    assert result.reseeded == len(_EXEMPT)
+    assert result.skipped_stopped == len(character_chain_kinds()) - len(_EXEMPT)
+    assert await queue.active_chain_keys() == {(kind, "c1") for kind in _EXEMPT}
+
+
+async def test_foreground_interaction_relinks_every_chain() -> None:
+    """恢復 reuses the thaw path verbatim (cf. ``test_thaw_relinks_chain``): the
+    foreground turn moves ``last_active_at``, and the next reconcile pass — the
+    same one that reseeds after an unfreeze — brings the whole chain set back."""
+    character = _FakeCharacter("c1")
+    queue, reconciler, _ = await _wiring(
+        [character],
+        ownership=await _distributed_ownership(),
+        profile=_DORMANT_TIER,
+    )
+    await reconciler.run_once(now=BASE)  # dormant: only the exempt chains
+
+    character.state.last_active_at = BASE  # the player finally says something
+
+    result = await reconciler.run_once(now=BASE)
+    assert result.reseeded == len(character_chain_kinds()) - len(_EXEMPT)
+    assert await queue.active_chain_keys() == {
+        (kind, "c1") for kind in character_chain_kinds()
+    }
+
+
+async def test_null_dormancy_reseeds_everything_as_before() -> None:
+    """self-host / any tier without the knob: unchanged, including the
+    never-interacted character that a dormant tier would have stopped."""
+    queue, reconciler, _ = await _wiring(
+        [_FakeCharacter("c1")], ownership=await _distributed_ownership(),
+    )
+    result = await reconciler.run_once(now=BASE)
+    assert result.reseeded == len(character_chain_kinds())
+    assert result.skipped_stopped == 0
+
+
 async def test_passive_coordinator_does_nothing() -> None:
     # epoch_provider returns None → not the leader.
     lease = InMemoryBackgroundCoordinatorLease()
@@ -218,3 +283,70 @@ async def test_passive_coordinator_does_nothing() -> None:
     result = await reconciler.run_once(now=BASE)
     assert result.reseeded == 0
     assert await queue.active_chain_keys() == set()
+
+
+# --- NF4 follow-up: what one pass costs ------------------------------------ #
+
+
+class _CountingResolver:
+    def __init__(
+        self, profile: AccountRuntimeProfile = DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+    ) -> None:
+        self._profile = profile
+        self.calls: list[str] = []
+
+    async def resolve_for_operator(self, operator_id: str) -> AccountRuntimeProfile:
+        self.calls.append(operator_id)
+        return self._profile
+
+
+async def _counting_wiring(characters, *, profile=_DORMANT_TIER):
+    lease = InMemoryBackgroundCoordinatorLease()
+    queue = InMemoryBackgroundJobQueue(lease=lease)
+    epoch = await lease.acquire(
+        COORDINATOR_LEASE_NAME, "coord", ttl_seconds=30, now=BASE,
+    )
+    resolver = _CountingResolver(profile)
+    reconciler = DueJobReconciler(
+        queue=queue,
+        character_repository=_FakeRepo(characters),
+        next_due_calculator=NextDueCalculator(resolver=resolver),
+        epoch_provider=lambda: epoch,
+        runtime_ownership=await _distributed_ownership(),
+    )
+    return reconciler, resolver
+
+
+async def test_one_pass_resolves_each_operator_exactly_once() -> None:
+    """Dormancy needs the profile for (nearly) every kind, so without the
+    pass-scoped memo a pass costs characters × kinds uncached reads of the
+    same row — the shape that turns 20k dormant characters into a standing
+    load on the operator table."""
+    characters = [_FakeCharacter(f"c{i}") for i in range(20)]
+    reconciler, resolver = await _counting_wiring(characters)
+
+    await reconciler.run_once(now=BASE)
+
+    assert resolver.calls == ["op1"]
+
+
+async def test_each_operator_is_resolved_once_not_each_character() -> None:
+    characters = [
+        _FakeCharacter("a1", user_id="op1"),
+        _FakeCharacter("a2", user_id="op1"),
+        _FakeCharacter("b1", user_id="op2"),
+    ]
+    reconciler, resolver = await _counting_wiring(characters)
+
+    await reconciler.run_once(now=BASE)
+
+    assert sorted(resolver.calls) == ["op1", "op2"]
+
+
+async def test_the_next_pass_re_reads_the_policy() -> None:
+    """The memo is per pass, so a tier change lands within one reconcile
+    interval — the staleness the reconciler already lives with."""
+    reconciler, resolver = await _counting_wiring([_FakeCharacter("c1")])
+    await reconciler.run_once(now=BASE)
+    await reconciler.run_once(now=BASE)
+    assert resolver.calls == ["op1", "op1"]

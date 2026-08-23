@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSSRApp, h, ref, type Ref } from 'vue'
+import { computed, createSSRApp, h, ref, type ComputedRef, type Ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createI18n } from 'vue-i18n'
 
+import {
+  isCloudDeployment,
+  setDeploymentMode,
+} from '@/composables/deploymentMode'
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
 import { messages as enUS } from '@/i18n/locales/en-US'
 import { messages as jaJP } from '@/i18n/locales/ja-JP'
@@ -21,8 +25,12 @@ import { findJargon } from './fixtures/cloud-jargon-denylist'
  *
  * SSR rather than DOM, per the repo convention (no jsdom / test-utils here).
  */
+// `cloudMode` is derived from the real deployment-mode module rather than a
+// second switch this file owns: in production the component's `v-if` and the
+// composable's request gate read the same fact, and a test able to set them
+// apart would prove nothing about the shipped behaviour.
 const holder = vi.hoisted(() => ({
-  cloudMode: null as Ref<boolean> | null,
+  cloudMode: null as ComputedRef<boolean> | null,
   portalUrl: null as Ref<string | null> | null,
   currentUser: null as Ref<Record<string, unknown> | null> | null,
 }))
@@ -37,8 +45,7 @@ vi.mock('@/composables/useAuth', () => ({
 
 vi.mock('@/utils/api/cloudPricing', () => ({ fetchCloudPricing: vi.fn() }))
 
-const cloudMode = ref(true)
-holder.cloudMode = cloudMode
+holder.cloudMode = computed(() => isCloudDeployment())
 holder.portalUrl = ref<string | null>(null)
 holder.currentUser = ref<Record<string, unknown> | null>({ id: 'user-1' })
 
@@ -132,7 +139,7 @@ const OPENING = {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  cloudMode.value = true
+  setDeploymentMode('cloud')
   useActionPricing().reset()
 })
 
@@ -386,7 +393,7 @@ describe('the hosted price on the button (SC3-C)', () => {
     // Not a hidden element, not a dash — nothing. Self-host has no wallet
     // and must not carry the shape of one.
     await seedScenePrice(6)
-    cloudMode.value = false
+    setDeploymentMode('self_host')
 
     const html = await render(PricedControl)
 
@@ -502,9 +509,9 @@ describe('self-host parity', () => {
     ]
 
     for (const [name, component, props] of surfaces) {
-      cloudMode.value = true
+      setDeploymentMode('cloud')
       const hosted = await render(component, props)
-      cloudMode.value = false
+      setDeploymentMode('self_host')
       const selfHost = await render(component, props)
 
       expect(selfHost, name).toEqual(hosted)

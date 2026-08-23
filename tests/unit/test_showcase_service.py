@@ -30,6 +30,10 @@ from kokoro_link.application.services.showcase.filters import (
     mechanical_filter,
     select_public_activities,
 )
+from kokoro_link.application.services.showcase.image_review import (
+    MAX_REFERENCE_IMAGES,
+    ShowcaseImageReviewer,
+)
 from kokoro_link.application.services.showcase.review import (
     VERDICT_FLAG,
     VERDICT_NEEDS_MANUAL_REVIEW,
@@ -41,6 +45,7 @@ from kokoro_link.application.services.showcase.service import (
     ShowcaseNotFound,
     ShowcaseService,
     TranslationRequest,
+    _reference_image_urls,
     post_source_hash,
 )
 from kokoro_link.application.services.showcase.snapshot import (
@@ -212,12 +217,37 @@ def passthrough_translator(prefixes: dict[str, str] | None = None):  # noqa: ANN
     return _translate
 
 
+class FakeObjectStorage:
+    """Resolves ``/v1/public/<key>`` refs; the bytes are the key itself so a
+    test can tell the resulting data URLs apart."""
+
+    def object_key_from_url(self, url):  # noqa: ANN001
+        if url and url.startswith("/v1/public/"):
+            return url.removeprefix("/v1/public/")
+        return None
+
+    async def stat(self, *, object_key):  # noqa: ANN001
+        return None
+
+    async def get_bytes(self, *, object_key):  # noqa: ANN001
+        return object_key.encode()
+
+
+def storage_data_url(path: str) -> str:
+    """What ``FakeObjectStorage`` turns a ``/v1/public/...`` ref into."""
+    import base64
+
+    key = path.removeprefix("/v1/public/")
+    return "data:image/png;base64," + base64.b64encode(key.encode()).decode()
+
+
 def build_service(
     *,
     characters=None,  # noqa: ANN001
     posts=(),  # noqa: ANN001
     provider=None,  # noqa: ANN001
     tenants=None,  # noqa: ANN001
+    object_storage=None,  # noqa: ANN001
 ) -> ShowcaseService:
     roster = characters if characters is not None else [make_character()]
     return ShowcaseService(
@@ -227,6 +257,7 @@ def build_service(
         ),
         feed_post_repository=FakeFeedPostRepository(posts),
         active_llm_provider=provider,
+        object_storage=object_storage,
     )
 
 
@@ -874,12 +905,25 @@ async def test_review_only_answers_for_posts_the_filter_kept():
         provider=provider,
     )
 
-    summary = await service.review_posts(
+    report = await service.review_posts(
         tenant_id=TENANT, character_id="char-1", post_ids=["p1", "p2"],
     )
 
-    assert [review.post_id for review in summary.reviews] == ["p1", "p2"]
-    assert provider.feature_keys == ["showcase_review", "showcase_review"]
+    assert [review.post_id for review in report.text.reviews] == ["p1", "p2"]
+    # Text pass first for the whole batch, then the image pass; the image
+    # route is unrouted in this double, which is a per-post failure, not
+    # a batch one.
+    assert provider.feature_keys == [
+        "showcase_review",
+        "showcase_review",
+        "showcase_image_review",
+        "showcase_image_review",
+    ]
+    assert set(report.images) == {"p1", "p2"}
+    assert all(
+        review.verdict == VERDICT_NEEDS_MANUAL_REVIEW
+        for review in report.images.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -902,3 +946,217 @@ async def test_translation_reports_the_locales_it_could_not_produce():
 
     assert results[0].translations == {"en": "The sky is blue."}
     assert results[0].missing == ("ja",)
+
+
+# --------------------------------------------------------------------------- #
+# 5. image-consistency review
+# --------------------------------------------------------------------------- #
+
+
+class VisionScriptedModel(ScriptedModel):
+    """Scripted model that claims vision support and records the images
+    each call was shown, in order."""
+
+    supports_vision = True
+
+    def __init__(self, answers):  # noqa: ANN001
+        super().__init__(answers)
+        self.image_urls: list[tuple[str, ...]] = []
+
+    async def generate(self, prompt: str, **kwargs) -> str:  # noqa: ANN003
+        self.image_urls.append(tuple(kwargs.get("image_urls") or ()))
+        return await super().generate(prompt, **kwargs)
+
+
+async def _identity_media(url: str, prefer_public: bool) -> str | None:  # noqa: ARG001
+    return url
+
+
+def _image_reviewer(model, *, media=_identity_media) -> ShowcaseImageReviewer:  # noqa: ANN001
+    from kokoro_link.application.services.model_resolver import ModelResolver
+
+    provider = ScriptedProvider({"showcase_image_review": model})
+    return ShowcaseImageReviewer(
+        ModelResolver(provider=provider, feature_key="showcase_image_review"),
+        media=media,
+    )
+
+
+def _candidate(
+    post_id: str = "p1", *, image_url: str | None = "/v1/public/feed/p1.png",
+) -> ShowcaseCandidate:
+    return ShowcaseCandidate(
+        id=post_id, kind="daily", created_at=NOW, text="海邊散步。", image_url=image_url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_flag_carries_reasons_and_the_images_shown():
+    model = VisionScriptedModel(
+        ['{"verdict": "flag", "reasons": ["髮色從金色長髮變成黑色短髮"]}'],
+    )
+    reviewer = _image_reviewer(model)
+
+    review = await reviewer.review(
+        _candidate(),
+        character=make_character(),
+        reference_urls=("/v1/public/characters/mira.png", "/v1/public/feed/p2.png"),
+    )
+
+    assert review.verdict == VERDICT_FLAG
+    assert review.reasons == ("髮色從金色長髮變成黑色短髮",)
+    # Post image first, then the references, in the order the prompt names.
+    assert model.image_urls == [
+        (
+            "/v1/public/feed/p1.png",
+            "/v1/public/characters/mira.png",
+            "/v1/public/feed/p2.png",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_non_vision_route_is_manual_review_not_a_clean_bill():
+    model = ScriptedModel(['{"verdict": "pass", "reasons": []}'])  # no supports_vision
+    reviewer = _image_reviewer(model)
+
+    review = await reviewer.review(_candidate(), character=make_character())
+
+    assert review.verdict == VERDICT_NEEDS_MANUAL_REVIEW
+    assert any("不支援視覺" in reason for reason in review.reasons)
+    assert model.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_post_image_is_manual_review():
+    model = VisionScriptedModel(['{"verdict": "pass", "reasons": []}'])
+
+    async def broken_media(url: str, prefer_public: bool) -> str | None:  # noqa: ARG001
+        return None
+
+    reviewer = _image_reviewer(model, media=broken_media)
+
+    review = await reviewer.review(_candidate(), character=make_character())
+
+    assert review.verdict == VERDICT_NEEDS_MANUAL_REVIEW
+    assert model.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_without_an_image_passes_without_a_model_call():
+    model = VisionScriptedModel([])
+    reviewer = _image_reviewer(model)
+
+    review = await reviewer.review(
+        _candidate(image_url=None), character=make_character(),
+    )
+
+    assert review.verdict == VERDICT_PASS
+    assert model.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_image_answer_is_manual_review():
+    reviewer = _image_reviewer(VisionScriptedModel(["looks like the same girl to me"]))
+
+    review = await reviewer.review(_candidate(), character=make_character())
+
+    assert review.verdict == VERDICT_NEEDS_MANUAL_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_reference_never_kills_the_review():
+    """One unreadable reference costs that reference, not the verdict."""
+    model = VisionScriptedModel(['{"verdict": "pass", "reasons": []}'])
+
+    async def flaky_media(url: str, prefer_public: bool) -> str | None:  # noqa: ARG001
+        return None if "broken" in url else url
+
+    reviewer = _image_reviewer(model, media=flaky_media)
+
+    review = await reviewer.review(
+        _candidate(),
+        character=make_character(),
+        reference_urls=("/v1/public/feed/broken.png", "/v1/public/feed/ok.png"),
+    )
+
+    assert review.verdict == VERDICT_PASS
+    assert model.image_urls == [("/v1/public/feed/p1.png", "/v1/public/feed/ok.png")]
+
+
+def test_reference_images_prefer_portrait_then_older_out_of_batch_posts():
+    candidates = tuple(
+        _candidate(post_id, image_url=f"/v1/public/feed/{post_id}.png")
+        for post_id in ("p1", "p2", "p3", "p4", "p5")  # newest first
+    )
+
+    references = _reference_image_urls(
+        candidates[1],  # reviewing p2
+        candidates,
+        selected_ids={"p1", "p2", "p3"},  # p3 is in the same unvetted batch
+        character=make_character(),
+    )
+
+    # Portrait first; p1 is newer, p3 is in-batch — the nearest usable
+    # references are p4 and p5.
+    assert references == (
+        "/v1/public/characters/mira.png",
+        "/v1/public/feed/p4.png",
+        "/v1/public/feed/p5.png",
+    )
+    assert len(references) <= MAX_REFERENCE_IMAGES
+
+
+def test_reference_images_fall_back_to_the_portrait_alone():
+    candidates = (_candidate("p1"),)
+
+    references = _reference_image_urls(
+        candidates[0], candidates, selected_ids={"p1"}, character=make_character(),
+    )
+
+    assert references == ("/v1/public/characters/mira.png",)
+
+
+@pytest.mark.asyncio
+async def test_review_posts_reports_text_and_image_verdicts_independently():
+    """The vision route being down (or flagging) must not disturb the text
+    verdicts, and vice versa."""
+    vision = VisionScriptedModel(
+        ['{"verdict": "flag", "reasons": ["圖中人物髮色與立繪不符"]}'],
+    )
+    provider = ScriptedProvider(
+        {
+            "showcase_review": ScriptedModel(['{"verdict": "pass", "reasons": []}']),
+            "showcase_image_review": vision,
+        },
+    )
+    service = build_service(
+        posts=[
+            make_post("p1", image_url="/v1/public/feed/p1.png"),
+            make_post(
+                "p2",
+                image_url="/v1/public/feed/p2.png",
+                created_at=NOW - timedelta(days=1),
+            ),
+        ],
+        provider=provider,
+        object_storage=FakeObjectStorage(),
+    )
+
+    report = await service.review_posts(
+        tenant_id=TENANT, character_id="char-1", post_ids=["p1"],
+    )
+
+    assert report.text.reviews[0].verdict == VERDICT_PASS
+    image = report.images["p1"]
+    assert image.verdict == VERDICT_FLAG
+    assert image.reasons == ("圖中人物髮色與立繪不符",)
+    # The vision model saw the post image (inlined through storage), then
+    # the portrait and the older post as references.
+    assert vision.image_urls == [
+        (
+            storage_data_url("/v1/public/feed/p1.png"),
+            storage_data_url("/v1/public/characters/mira.png"),
+            storage_data_url("/v1/public/feed/p2.png"),
+        ),
+    ]

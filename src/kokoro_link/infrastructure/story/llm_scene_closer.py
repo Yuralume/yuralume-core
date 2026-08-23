@@ -61,6 +61,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.operator_scene_position import (
     render_closer_operator_position_block,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
@@ -213,8 +216,11 @@ def _build_prompt(context: StorySceneClosingContext) -> str:
         # question; the verdict then rests on the transcript alone, which
         # is what the placeholder tells the model.
         dramatic_question=session.dramatic_question or _UNSPECIFIED,
-        operator_position_block=render_closer_operator_position_block(
-            session.operator_position, session.operator_note,
+        operator_position_block=_operator_block_with_persona_note(
+            render_closer_operator_position_block(
+                session.operator_position, session.operator_note,
+            ),
+            context.player_persona_note,
         ),
         today=context.today.isoformat() if context.today else _UNSPECIFIED,
         date_context_block=(
@@ -238,6 +244,19 @@ def _build_prompt(context: StorySceneClosingContext) -> str:
         ),
     )
     return f"{language_hint}\n\n{body}" if language_hint else body
+
+
+def _operator_block_with_persona_note(position_block: str, note: str) -> str:
+    """Mirror of the opener's assembly — see its docstring.
+
+    The wrap-up needs the same staging the opening had, or a scene opened
+    on the player's declared identity gets summarised as if the player
+    were somebody else.
+    """
+    note_lines = render_player_persona_note_lines(note)
+    if not note_lines:
+        return position_block
+    return "\n".join([position_block, *note_lines])
 
 
 def _parse_draft(

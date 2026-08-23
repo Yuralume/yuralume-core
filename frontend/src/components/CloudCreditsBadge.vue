@@ -19,6 +19,25 @@
  * the only way back to the Portal because a balance read degraded would be a
  * worse failure than showing no number — so it stands alone in this slot in
  * that case. On self-host the whole component stays silent.
+ *
+ * ## `variant` — where the badge is standing (FX5-3)
+ *
+ * `stack` (default) is everything above, unchanged: the player sidebar's
+ * vertical column, where a full-width pill and a card that pushes the rest of
+ * the column down are both correct.
+ *
+ * `inline` is for a horizontal toolbar (the 分歧劇場 header and the VN
+ * player's top bar), where those two behaviours are wrong in ways the
+ * *caller* could not fix without reaching into this component:
+ *
+ * - The fallback account card is two lines of text in a row sized for one.
+ *   The reasoning that put it there — "the account centre's only entrance
+ *   must not vanish with a degraded balance read" — is about the sidebar,
+ *   which is that entrance; these toolbars never were. So in a toolbar the
+ *   honest answer to "balance unknown" is to occupy no space at all.
+ * - The expanded card is normal-flow, so opening it grew the whole header
+ *   row and squeezed the VN dialogue underneath. Here it is an overlay
+ *   anchored to the pill instead, and the row never moves.
  */
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -32,17 +51,36 @@ import {
 } from '@/utils/creditsFormat'
 import PortalAccountLink from './PortalAccountLink.vue'
 
+/** Which layout the badge is standing in. See the block comment above. */
+type CloudCreditsBadgeVariant = 'stack' | 'inline'
+
+const props = withDefaults(
+  defineProps<{ variant?: CloudCreditsBadgeVariant }>(),
+  { variant: 'stack' },
+)
+
 const { t } = useI18n()
 const { cloudMode, portalUrl } = useAuth()
 const credits = useCloudCredits()
 
 const expanded = ref(false)
 
+const isInline = computed(() => props.variant === 'inline')
+
 /** Mirrors `PortalAccountLink`'s own guard, so the fallback branch never
  *  renders an empty container on a cloud deployment without a Portal. */
 const hasPortal = computed(() => portalHomeUrl(portalUrl.value) !== null)
+/**
+ * The account-card fallback is a `stack` affordance only: in a toolbar row
+ * an unknown balance renders nothing at all rather than two lines of account
+ * text where a pill was expected.
+ */
+const showAccountFallback = computed(
+  () => !isInline.value && hasPortal.value,
+)
 const visible = computed(
-  () => cloudMode.value && (credits.hasBalance.value || hasPortal.value),
+  () => cloudMode.value
+    && (credits.hasBalance.value || showAccountFallback.value),
 )
 const topUpHref = computed(() => portalCreditsUrl(portalUrl.value))
 
@@ -67,7 +105,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <div v-if="visible" class="credits-badge">
+  <div
+    v-if="visible"
+    class="credits-badge"
+    :class="{ 'credits-badge--inline': isInline }"
+  >
     <template v-if="credits.hasBalance.value">
       <button
         type="button"
@@ -111,8 +153,10 @@ onMounted(() => {
     </template>
 
     <!-- Balance unknown (degraded read, or no ledger at all): no number, but
-         the way back to the account centre must not disappear with it. -->
-    <PortalAccountLink v-else />
+         in the sidebar the way back to the account centre must not disappear
+         with it. In a toolbar (`inline`) `visible` is already false here, so
+         the component emits nothing rather than an account card. -->
+    <PortalAccountLink v-else-if="showAccountFallback" />
   </div>
 </template>
 
@@ -237,5 +281,31 @@ onMounted(() => {
 
 .credits-card__link:hover {
   text-decoration: underline;
+}
+
+/* ----------------------------------------------------------------------
+   `inline` — the badge standing in a horizontal toolbar (FX5-3).
+
+   Two changes, both about not disturbing the row: the pill shrinks to its
+   text instead of claiming the column width, and the card leaves the flow
+   entirely. The card used to be normal-flow, so opening it grew the header
+   it sits in and pushed the VN dialogue down the screen; as an overlay
+   anchored to the pill (`.credits-badge` is already `position: relative`)
+   the row keeps its height whether the card is open or not.
+   ---------------------------------------------------------------------- */
+.credits-badge--inline {
+  padding: 0;
+}
+
+.credits-badge--inline .credits-badge__trigger {
+  width: auto;
+}
+
+.credits-badge--inline .credits-card {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 30;
+  min-width: 200px;
 }
 </style>

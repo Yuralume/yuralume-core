@@ -293,6 +293,16 @@ describe('UiImage (SSR render) — caller overrides', () => {
  * account avatar), the two collectible-card faces, and the fusion roster,
  * which did not even carry `loading="lazy"`.
  *
+ * LB1 added the primitive that sits on top of all of them:
+ * `components/ui/UiLightbox.vue` is where a picture is shown at full size, so
+ * it is the one place where a hand-rolled `<img>` would cost the most — the
+ * enlarged view is precisely the moment the original bytes get asked for, and
+ * a lightbox that skipped the component would ask for them without
+ * `decoding="async"`, without a reserved box, and without the `?v=full` key
+ * its own neighbour prefetch warms. Its six consumers (album, chat bubble,
+ * LumeGram card, character images panel, drama gallery, card face) were all
+ * already on this list.
+ *
  * OC6-IV added `FusionStoryPage.vue`'s shelf cover — the character's
  * `image_urls[0]` (the same 1024x1536 original) rendered at 44x58 in a list
  * of stories, one more spot IV5 never reached because it isn't on the stage
@@ -329,6 +339,8 @@ const IMAGE_HOT_SPOTS = [
   'components/CharacterCardThumb.vue',
   'components/CharacterCardFace.vue',
   'components/fusion-story/CharacterMultiSelect.vue',
+  'components/branching-drama/DramaSceneGallery.vue',
+  'components/ui/UiLightbox.vue',
   'pages/FusionStoryPage.vue',
 ]
 

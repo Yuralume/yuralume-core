@@ -113,7 +113,6 @@ onBeforeUnmount(() => {
    * browsers / screenshot pipelines that drop backdrop-filter. */
   background: rgba(8, 6, 22, 0.92);
   backdrop-filter: blur(10px) saturate(1.1);
-  -webkit-backdrop-filter: blur(10px) saturate(1.1);
   display: flex;
   align-items: stretch;
   justify-content: center;

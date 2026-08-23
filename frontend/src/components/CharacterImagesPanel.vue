@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount, onMounted } from 'vue'
+import { computed, nextTick, ref, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ZoomInOutlined } from '@ant-design/icons-vue'
 import type { Character } from '@/types/character'
 import {
   commitPortraitCandidates,
@@ -15,7 +16,9 @@ import {
   billingRefusalKind,
   refreshQuotedPrices,
 } from '@/utils/api/billingRefusal'
-import { UiButton, UiImage } from '@/components/ui'
+import { UiButton, UiImage, UiLightbox } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
+import { syncZoomAfterUrlsChange } from '@/utils/imageZoomSync'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import {
@@ -115,6 +118,90 @@ const albumCount = computed(() =>
   Array.from(candidateTargets.value.values()).filter((t) => t === 'album').length,
 )
 const commitCount = computed(() => stageCount.value + albumCount.value)
+
+// ---------------------------------------------------------------- 放大檢視
+//
+// 這個面板本來**完全看不到大圖**（LB5）：舞台縮圖只有 90px、格子上只有排序／
+// 封存／刪除；候選圖整格的點擊語意被「循環挑選」佔走，而挑圖正是最需要看清楚
+// 的時刻。這裡補上的是一個從來沒有的能力，不是換掉既有行為。
+//
+// 兩處各自一份集合，刻意**不合併**：舞台圖是「已經在用的」，候選圖是「還沒
+// 決定去留的」，混成一份會讓左右鍵從候選圖滑進舞台圖，等於在謊報集合的邊界。
+
+const stageZoomOpen = ref(false)
+const stageZoomIndex = ref(0)
+const candidateZoomOpen = ref(false)
+const candidateZoomIndex = ref(0)
+
+const stageLightboxItems = computed<LightboxItem[]>(() =>
+  props.character.image_urls.map((url, index) => ({
+    url,
+    alt: t('characterImagesPanel.imageAlt', {
+      name: props.character.name,
+      index: index + 1,
+    }),
+  })),
+)
+
+const candidateLightboxItems = computed<LightboxItem[]>(() =>
+  candidateUrls.value.map(url => ({
+    url,
+    alt: t('characterImagesPanel.candidates.imageAlt'),
+  })),
+)
+
+function openStageZoom(at: number) {
+  stageZoomIndex.value = at
+  stageZoomOpen.value = true
+}
+
+function openCandidateZoom(at: number) {
+  candidateZoomIndex.value = at
+  candidateZoomOpen.value = true
+}
+
+/**
+ * 舞台清單在浮窗開著時被換掉：排序讓同一張圖換位置（跟著走），刪除／封存讓它
+ * 整筆消失（關窗）。判斷本身在 `syncZoomAfterUrlsChange`——索引是位置不是身分，
+ * 不跟就會無聲地變成在看另一張圖。
+ */
+watch(
+  () => props.character.image_urls,
+  (after, before) => {
+    const result = syncZoomAfterUrlsChange({
+      open: stageZoomOpen.value,
+      index: stageZoomIndex.value,
+      before,
+      after,
+    })
+    if (result.outcome === 'close') stageZoomOpen.value = false
+    else if (result.outcome === 'move') stageZoomIndex.value = result.index
+  },
+)
+
+/** 候選圖被 commit／捨棄掉（集合變空）時，蓋在上面的浮窗也要跟著收。 */
+watch(candidateUrls, (after, before) => {
+  const result = syncZoomAfterUrlsChange({
+    open: candidateZoomOpen.value,
+    index: candidateZoomIndex.value,
+    before,
+    after,
+  })
+  if (result.outcome === 'close') candidateZoomOpen.value = false
+  else if (result.outcome === 'move') candidateZoomIndex.value = result.index
+})
+
+/**
+ * 換角色：整份清單都是別人的，索引指向的位置在新清單裡是另一個人的圖。
+ * 上面兩條 watch 多半也會抓到，但那依賴「新舊清單剛好沒有同一個 URL」——
+ * 換人這件事本身就足以關窗，不必繞過內容比對。
+ */
+watch(() => props.character.id, () => {
+  stageZoomOpen.value = false
+  stageZoomIndex.value = 0
+  candidateZoomOpen.value = false
+  candidateZoomIndex.value = 0
+})
 
 async function handleFilePick(event: Event) {
   const input = event.target as HTMLInputElement
@@ -339,6 +426,13 @@ function candidateBadgeLabel(target: CandidateTarget): string {
 
 // 候選 modal 開啟時鎖 body 捲動 + 接 ESC 當作「全部捨棄」的捷徑
 // （刻意不把點擊背景當成關閉，避免手滑刪掉剛生成的圖）
+//
+// 這支監聽是 bubble 階段（`addEventListener` 預設）。放大浮窗開著時 Esc 到不了
+// 這裡——`UiLightbox` 以 **capture 階段**掛在 `window` 上（事件路徑的第一站）
+// 並對 Esc 呼叫 `stopPropagation()`。這條很要緊：這裡的 Esc 是「全部捨棄」，
+// 會一次抹掉剛花點數生出來的整批候選圖，而玩家在放大檢視時按 Esc 的意思只是
+// 「關掉這張大圖」。**不要在這裡補手寫讓位守衛**——攔截責任在浮窗，宿主自己
+// 記得讓位的那套模式漏一個就是一次不可復原的破壞，而且不會有測試變紅。
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (candidateUrls.value.length === 0) return
@@ -347,16 +441,32 @@ function onKeydown(event: KeyboardEvent) {
   discardAllCandidates()
 }
 
-watch(candidateUrls, (urls) => {
+/**
+ * 候選 modal 的背景捲動鎖。
+ *
+ * **要說兩次。** `UiLightbox` 有自己的一套鎖（模組層級計數 ＋ 記住「上鎖那一
+ * 刻的 overflow」），它解鎖時還原的正是那個值——而候選圖上的浮窗，上鎖那一刻
+ * 看到的就是這個 modal 寫下的 `hidden`。子元件的 watcher 與 unmount hook 一律
+ * 排在本元件之後，所以「候選圖連同浮窗一起收掉」時，只寫一次會被浮窗的還原
+ * 蓋回 `hidden`，留下一個沒有任何 modal 卻捲不動的頁面。等它做完再說一次。
+ */
+function applyCandidateScrollLock(locked: boolean) {
   if (typeof document === 'undefined') return
-  document.body.style.overflow = urls.length > 0 ? 'hidden' : ''
+  document.body.style.overflow = locked ? 'hidden' : ''
+}
+
+watch(candidateUrls, (urls) => {
+  const locked = urls.length > 0
+  applyCandidateScrollLock(locked)
+  void nextTick(() => applyCandidateScrollLock(locked))
 })
 
 if (typeof window !== 'undefined') {
   window.addEventListener('keydown', onKeydown)
   onBeforeUnmount(() => {
     window.removeEventListener('keydown', onKeydown)
-    if (typeof document !== 'undefined') document.body.style.overflow = ''
+    applyCandidateScrollLock(false)
+    void nextTick(() => applyCandidateScrollLock(false))
   })
 }
 </script>
@@ -379,12 +489,25 @@ if (typeof window !== 'undefined') {
         :key="url"
         class="image-tile"
       >
-        <UiImage
-          :src="url"
-          :alt="t('characterImagesPanel.imageAlt', { name: character.name, index: index + 1 })"
-          variant="thumb"
-          sizes="90px"
-        />
+        <!-- 90px 縮圖以前完全點不開（LB5）。整張縮圖就是放大入口；排序／封存／
+             刪除留在格子上，而且是這顆按鈕的**兄弟**不是子孫——包進去的話那四顆
+             按下去會一路冒泡成「開浮窗」。 -->
+        <button
+          type="button"
+          class="image-zoom-button"
+          :title="t('common.actions.zoom')"
+          :aria-label="t('common.actions.zoomAria', {
+            name: t('characterImagesPanel.imageAlt', { name: character.name, index: index + 1 }),
+          })"
+          @click="openStageZoom(index)"
+        >
+          <UiImage
+            :src="url"
+            :alt="t('characterImagesPanel.imageAlt', { name: character.name, index: index + 1 })"
+            variant="thumb"
+            sizes="90px"
+          />
+        </button>
         <div class="image-actions">
           <button
             class="tile-btn"
@@ -525,7 +648,7 @@ if (typeof window !== 'undefined') {
           <div class="candidate-modal-body">
             <div class="candidate-modal-grid">
               <div
-                v-for="url in candidateUrls"
+                v-for="(url, index) in candidateUrls"
                 :key="url"
                 :class="[
                   'candidate-tile',
@@ -539,6 +662,21 @@ if (typeof window !== 'undefined') {
                   variant="thumb"
                   sizes="(max-width: 640px) 140px, 260px"
                 />
+                <!-- 整格的點擊是「循環挑選 採用／捨棄」，那是挑圖流程的主要
+                     操作，絕不能被放大搶走——所以放大另給一顆明確的鍵，並
+                     `.stop` 掉冒泡。挑圖正是最需要看清楚的時刻，所以它不藏在
+                     hover 後面（觸控裝置根本觸發不了 hover）。 -->
+                <button
+                  type="button"
+                  class="candidate-zoom-btn"
+                  :title="t('common.actions.zoom')"
+                  :aria-label="t('common.actions.zoomAria', {
+                    name: `${t('characterImagesPanel.candidates.imageAlt')} ${index + 1}`,
+                  })"
+                  @click.stop="openCandidateZoom(index)"
+                >
+                  <ZoomInOutlined aria-hidden="true" />
+                </button>
                 <span class="candidate-target-badge">
                   {{ candidateBadgeLabel(candidateTargets.get(url) ?? 'discard') }}
                 </span>
@@ -561,6 +699,26 @@ if (typeof window !== 'undefined') {
         </div>
       </div>
     </Teleport>
+
+    <!-- 兩份集合各一個浮窗（計畫 §3.3：排序／封存／刪除／挑選都留在縮圖格子
+         上，primitive 不開 actions slot）。兩者都在候選 modal 之外宣告：候選圖
+         被 commit／捨棄的瞬間，浮窗要由上面那條 watch 明確收掉，而不是靠自己
+         被拆掉。元件自己 Teleport 到 body、z-index 1500，疊得過本面板的 1200，
+         也不會被 sidebar 的 transform 困住。 -->
+    <UiLightbox
+      v-model:index="stageZoomIndex"
+      :visible="stageZoomOpen"
+      :items="stageLightboxItems"
+      :label="t('characterImagesPanel.title')"
+      @close="stageZoomOpen = false"
+    />
+    <UiLightbox
+      v-model:index="candidateZoomIndex"
+      :visible="candidateZoomOpen"
+      :items="candidateLightboxItems"
+      :label="t('characterImagesPanel.candidates.title')"
+      @close="candidateZoomOpen = false"
+    />
   </div>
 </template>
 
@@ -623,6 +781,27 @@ if (typeof window !== 'undefined') {
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* 縮圖外面新包的按鈕（LB5）。按鈕自帶的 padding / border / 系統底色要清掉，
+   否則格子會多出一圈邊；:focus-visible 內縮，才不會被 .image-tile 的
+   overflow: hidden 裁掉。 */
+.image-zoom-button {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 高度說兩次：`.image-tile` 的高度來自它自己的 aspect-ratio，而百分比高度要
+     父層高度是「確定的」才解得出來。自己也帶一份比例，兩條路得到同一個box。 */
+  aspect-ratio: 3 / 4;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+}
+
+.image-zoom-button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 
 .image-actions {
@@ -898,6 +1077,47 @@ if (typeof window !== 'undefined') {
 .candidate-tile.target-stage img,
 .candidate-tile.target-album img {
   opacity: 1;
+}
+
+/* 放大鍵浮在候選圖左上（徽章佔了右上）。44px 是觸控目標的下限——這顆鍵和整格
+   的「循環挑選」擠在同一格裡，按不準的代價是誤改了去留。 */
+.candidate-zoom-btn {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 17px;
+  line-height: 1;
+  cursor: zoom-in;
+  opacity: 0.88;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.candidate-zoom-btn:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.82);
+}
+
+.candidate-zoom-btn:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .candidate-zoom-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 16px;
+  }
 }
 
 .candidate-target-badge {

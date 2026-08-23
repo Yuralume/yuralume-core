@@ -33,6 +33,9 @@ from kokoro_link.domain.value_objects.content_flow import (
 from kokoro_link.infrastructure.prompt.character_identity import (
     render_character_identity_lines,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
@@ -78,6 +81,7 @@ class ChatAssistService:
         operator_profile_service: "OperatorProfileService | None" = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
         cloud_mode: bool = False,
+        player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
     ) -> None:
         self._character_service = character_service
         self._active_llm_provider = active_llm_provider
@@ -87,6 +91,11 @@ class ChatAssistService:
         self._world_event_repository = world_event_repository
         self._operator_profile_service = operator_profile_service
         self._subscription_access_guard = subscription_access_guard
+        # PP3 — the player's declared identity. This surface writes lines
+        # *for* the player rather than for the character, so the rail that
+        # travels with the note has to be extended here (see
+        # ``_player_persona_note_lines``) instead of reused as-is.
+        self._player_persona_note_repository = player_persona_note_repository
         # GF6 — the arc's tone label rides into this prompt too, so the
         # hosted tone policy applies here as well. Default ``False``
         # keeps self-host prompts byte-identical.
@@ -146,6 +155,9 @@ class ChatAssistService:
     ) -> str:
         operator = await self._load_operator(user_id)
         operator_language = getattr(operator, "primary_language", None)
+        player_persona_note_lines = await self._player_persona_note_lines(
+            character, operator=operator, user_id=user_id,
+        )
         schedule = await self._load_schedule(character)
         today = (
             await self._schedule_service.today_for_character(character)
@@ -191,6 +203,7 @@ class ChatAssistService:
             "",
             "RSS / 世界事件上下文：",
             *(_world_event_lines(world_events) or ["- 沒有可用的近期世界事件"]),
+            *player_persona_note_lines,
             "",
             "輸出要求：",
             f"- 產生 {count} 個彼此不同的選項。",
@@ -204,6 +217,46 @@ class ChatAssistService:
             ),
         ]
         return "\n".join(line for line in lines if line is not None)
+
+    async def _player_persona_note_lines(
+        self,
+        character: Character,
+        *,
+        operator: object | None,
+        user_id: str,
+    ) -> list[str]:
+        """The declaration, plus the one instruction this rail needs.
+
+        Every other seam hands the note to the *character* and tells it to
+        act on the setting. Here the model is drafting the **player's** own
+        lines, so acting on the setting means writing in the voice of the
+        person the player says they are — a different instruction, appended
+        to the shared block rather than replacing it. The block itself
+        (header, rail, clip) stays shared so there is exactly one ceiling
+        on this field's prompt cost.
+        """
+        repository = self._player_persona_note_repository
+        if repository is None:
+            return []
+        operator_id = getattr(operator, "id", None) or user_id
+        try:
+            row = await repository.get(
+                character_id=character.id, operator_id=operator_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "chat assist player persona note lookup failed character=%s",
+                character.id,
+            )
+            return []
+        lines = render_player_persona_note_lines(row.note if row else None)
+        if not lines:
+            return []
+        return [
+            *lines,
+            "- 建議台詞是玩家要說出口的話，必須符合上面這份玩家自述的身分與世界觀；"
+            "不要把設定本身寫成台詞念出來。",
+        ]
 
     async def _load_operator(self, user_id: str) -> object | None:
         if self._operator_profile_service is None:

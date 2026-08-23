@@ -43,6 +43,9 @@ from dataclasses import dataclass
 from datetime import date as date_type, datetime, timezone, tzinfo
 from typing import Sequence
 
+from kokoro_link.application.services.character_activity_anchor import (
+    CharacterActivityAnchor,
+)
 from kokoro_link.application.services.chat_turn_lease import (
     ChatTurnLease,
     release_turn_lease,
@@ -81,6 +84,7 @@ from kokoro_link.contracts.story_scene import (
     render_scene_line,
 )
 from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.entities.conversation import (
     SOURCE_WEB,
     Conversation,
@@ -224,6 +228,18 @@ class StorySceneService:
         action_billing: (
             CloudActionBillingService | NullActionBillingService | None
         ) = None,
+        # PP3 — the player's standing declaration about themselves, read
+        # for both the opening and the wrap-up so one scene is staged from
+        # one account of who the player is. Appended for the same
+        # signature-compatibility reason as every block above.
+        player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
+        # NF4 — 起幕 is a paid foreground interaction, so opening a scene must
+        # move the character's foreground-interaction anchor just like a chat
+        # turn does. Without it a player who only presses 起幕 reads as
+        # "never interacted" to dormancy / idle down-shift / freeze reaping.
+        # Appended and optional for the same signature-compatibility reason as
+        # every block above.
+        activity_anchor: CharacterActivityAnchor | None = None,
     ) -> None:
         self._sessions = sessions
         self._conversations = conversations
@@ -234,6 +250,8 @@ class StorySceneService:
         self._turn_lease = turn_lease
         self._operator_profile_service = operator_profile_service
         self._quota_guard = quota_guard
+        self._player_persona_note_repository = player_persona_note_repository
+        self._activity_anchor = activity_anchor
         self._local_tz = local_tz
         self._action_billing: (
             CloudActionBillingService | NullActionBillingService
@@ -291,6 +309,7 @@ class StorySceneService:
         # are two calls the player reads side by side, so they must not
         # be able to disagree about which language they are written in.
         language = await self._resolve_operator_language(character)
+        player_persona_note = await self._load_player_persona_note(character)
         lease = await self._acquire_turn_lease(conversation.id)
         try:
             # SC3-C — the one price, raised last (§3.4 red line 2).
@@ -323,8 +342,9 @@ class StorySceneService:
                     material=material,
                     today=today,
                     language=language,
+                    player_persona_note=player_persona_note,
                 )
-                return await self._persist_opening(
+                opening = await self._persist_opening(
                     character,
                     conversation_id=conversation.id,
                     material=material,
@@ -332,6 +352,15 @@ class StorySceneService:
                     now=moment,
                     language=language,
                 )
+                # NF4: the curtain is up and the player paid for it — that is
+                # a foreground interaction with this character by every
+                # definition the rest of the system uses. After the write, so
+                # a refusal that never opened a scene is not counted as one;
+                # fail-soft inside the anchor, so bookkeeping can never turn
+                # a delivered opening into an error (and a refund for it).
+                if self._activity_anchor is not None:
+                    await self._activity_anchor.touch(character, now=moment)
+                return opening
         finally:
             await release_turn_lease(lease)
 
@@ -382,6 +411,9 @@ class StorySceneService:
                 conversation=conversation,
                 today=await self._today_for_character(character, moment),
                 language=await self._resolve_operator_language(character),
+                player_persona_note=await self._load_player_persona_note(
+                    character,
+                ),
             )
         finally:
             await release_turn_lease(lease)
@@ -406,12 +438,16 @@ class StorySceneService:
         moment = _as_utc(now)
         today = await self._today_for_character(character, moment)
         language = await self._resolve_operator_language(character)
+        # One read for both calls below: the verdict and the wrap-up it
+        # may trigger must be staged from the same declaration.
+        player_persona_note = await self._load_player_persona_note(character)
         verdict = await self._closing.judge(
             character,
             session=session,
             conversation=conversation,
             today=today,
             language=language,
+            player_persona_note=player_persona_note,
         )
         if verdict is None:
             return None
@@ -424,6 +460,7 @@ class StorySceneService:
             conversation=conversation,
             today=today,
             language=language,
+            player_persona_note=player_persona_note,
         )
         # Losing the close race means someone else already wrapped this
         # scene up and their narration is in the thread; reporting ours
@@ -486,12 +523,14 @@ class StorySceneService:
         material: StorySceneMaterial,
         today: date_type,
         language: str,
+        player_persona_note: str = "",
     ) -> StorySceneOpeningDraft:
         context = StorySceneOpeningContext(
             character=character,
             material=material,
             today=today,
             operator_primary_language=language,
+            player_persona_note=player_persona_note,
         )
         try:
             draft = await self._opener.write_opening(context)
@@ -737,6 +776,29 @@ class StorySceneService:
         if operator is None:
             return default
         return (getattr(operator, "primary_language", "") or "").strip() or default
+
+    async def _load_player_persona_note(self, character: Character) -> str:
+        """The player's declared identity for this pair, or nothing.
+
+        Fail-soft in the same direction as the language resolve above: a
+        scene that opens without the declaration is a weaker scene, a
+        scene that fails to open is a charged button that did nothing.
+        """
+        repository = self._player_persona_note_repository
+        if repository is None:
+            return ""
+        operator_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        try:
+            row = await repository.get(
+                character_id=character.id, operator_id=operator_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "story scene: player persona note load failed character=%s",
+                character.id,
+            )
+            return ""
+        return row.note if row is not None else ""
 
 
 def _as_utc(value: datetime | None) -> datetime:

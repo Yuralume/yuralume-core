@@ -29,6 +29,7 @@
 | `UiSection` | 表單分組 | `title`, `description`, `bordered`；slots: `header` / `default` |
 | `UiBadge` | 狀態徽章 | `variant: default \| primary \| success \| warning \| danger` |
 | `UiImage` | 物件儲存圖片（自動選尺寸變體） | `src`, `variant: avatar \| thumb \| content \| full`, `alt`, `sizes`, `width`/`height`, `aspectRatio`, `loading` |
+| `UiProgressRing` | 環形進度（小尺寸，適合塞進按鈕/徽章） | `ratio`（0–1）, `size`, `thickness`, `trackColor`, `progressColor`；default slot 放環中央內容。SVG 本身 `aria-hidden`，語意由呼叫端給 |
 
 ### `UiImage` 的用途導向 API
 

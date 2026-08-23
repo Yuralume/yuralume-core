@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchCloudCredits } from '@/utils/api/cloudCredits'
 import type { CloudCreditsResult } from '@/utils/api/cloudCredits'
 import { notifyIdentityChanged } from '@/utils/identityLifecycle'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 import {
   LOW_BALANCE_THRESHOLD_CR,
   useCloudCredits,
@@ -29,6 +30,7 @@ function snapshot(total: number, stale = false) {
 beforeEach(() => {
   vi.clearAllMocks()
   useCloudCredits().reset()
+  setDeploymentMode('cloud')
 })
 
 describe('useCloudCredits state machine', () => {
@@ -243,5 +245,38 @@ describe('useCloudCredits identity binding', () => {
     await credits.ensureLoaded()
 
     expect(credits.total.value).toBe(640)
+  })
+})
+
+describe('useCloudCredits deployment gating', () => {
+  it('asks nothing on self-host — not on mount, not after a charged action', async () => {
+    setDeploymentMode('self_host')
+    const credits = useCloudCredits()
+
+    await credits.ensureLoaded()
+    // The badge guards its own mount, but this one is called from a dozen
+    // completion points (chat, TTS, portraits, the branching drama) that have
+    // no reason to know the deployment shape. Before the gate moved into
+    // `load()`, each of those fired a real `GET /cloud/credits` that self-host
+    // does not route, once per page load.
+    credits.refreshAfterAction()
+    await Promise.resolve()
+
+    expect(mockedFetch).not.toHaveBeenCalled()
+    expect(credits.hasBalance.value).toBe(false)
+  })
+
+  it('does not latch self-host: a late cloud probe still loads', async () => {
+    setDeploymentMode('self_host')
+    const credits = useCloudCredits()
+    await credits.ensureLoaded()
+
+    // `/auth/config` has landed — a badge that mounted before it must not be
+    // stuck reporting no ledger for the rest of the session.
+    setDeploymentMode('cloud')
+    mockedFetch.mockResolvedValueOnce(snapshot(300))
+    await credits.ensureLoaded()
+
+    expect(credits.total.value).toBe(300)
   })
 })

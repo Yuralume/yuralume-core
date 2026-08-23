@@ -4,6 +4,10 @@ RUN CGO_ENABLED=0 go install github.com/tianon/gosu@1.19
 
 FROM pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
 
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # The upstream image's gosu binary was built with an older Go standard
 # library. Rebuild the same privilege-drop helper from its tagged source using
 # a patched Go toolchain, then keep the official entrypoint behavior unchanged.

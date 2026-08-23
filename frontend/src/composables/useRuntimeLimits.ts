@@ -5,7 +5,10 @@
  * scenes per rolling 24h and messages per session, and switches album / TTS /
  * video generation on or off. All of it is enforced server-side; this module
  * exists so a surface can *warn before* the click rather than surface an
- * error after it.
+ * error after it. NF4/NF5 add one entry that is not a ceiling —
+ * `backgroundDormancyDays`, the window of player absence after which a
+ * character's background life stops — carried for the same reason: better
+ * said in advance than discovered as a silence with no explanation.
  *
  * Module-scope refs make it a de-facto singleton, matching `useCloudCredits`
  * and `useActionPricing`: a sidebar, a create modal and a card panel all
@@ -38,7 +41,7 @@
 
 import { computed, ref } from 'vue'
 
-import { useAuth } from '@/composables/useAuth'
+import { isCloudDeployment } from '@/composables/deploymentMode'
 import {
   fetchRuntimeLimits,
   type RuntimeLimitUsage,
@@ -73,22 +76,14 @@ let generation = 0
  */
 let requestSeq = 0
 
-/**
- * Cloud mode is read live rather than latched, because `useAuth` starts at
- * `self_host` and flips only after the auth config probe resolves. Latching
- * would make an early `ensureLoaded()` (a component mounting before the probe
- * lands) permanently mark a hosted deployment as limitless.
- */
-function isCloud(): boolean {
-  return useAuth().cloudMode.value
-}
-
-const supported = computed(() => isCloud() && backendSupported.value)
+const supported = computed(
+  () => isCloudDeployment() && backendSupported.value,
+)
 
 async function load(options: { force?: boolean } = {}): Promise<void> {
   // Self-host never asks: the route is not mounted there, and a 404 per page
   // load is noise that also teaches nothing.
-  if (!isCloud()) return
+  if (!isCloudDeployment()) return
   if (!backendSupported.value) return
   // Collapsing onto an in-flight read is only correct for ensureLoaded():
   // a forced refresh was triggered *by an event the in-flight read predates*,
@@ -184,6 +179,17 @@ const characterDailyCreates = computed(
 const storyScenesDaily = computed(() => usage(snap => snap.story_scenes_daily))
 
 /**
+ * The dormancy window advertised for this account's tier (NF4/NF5), or
+ * `null` when unsupported, unloaded, degraded, or the tier never goes
+ * dormant. Unlike the counters above there is no "reached" state to derive —
+ * a consumer either has a day count to say or it has nothing to say.
+ */
+const backgroundDormancyDays = computed<number | null>(() => {
+  if (!supported.value) return null
+  return snapshot.value?.background?.dormancyDays ?? null
+})
+
+/**
  * Why a new character would be refused right now, or `null` when the SPA
  * cannot say so with certainty.
  *
@@ -224,6 +230,7 @@ export function useRuntimeLimits() {
     characterSlots,
     characterDailyCreates,
     storyScenesDaily,
+    backgroundDormancyDays,
 
     // feature switches (default enabled — unknown is never "off")
     albumGenerationEnabled: computed(

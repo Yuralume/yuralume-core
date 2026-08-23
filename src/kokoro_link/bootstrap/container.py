@@ -44,7 +44,17 @@ from kokoro_link.application.services.account_runtime_profile import (
 from kokoro_link.application.services.auto_consolidation_trigger import (
     AutoConsolidationTrigger,
 )
+from kokoro_link.application.services.account_runtime_profile_cache import (
+    CachedAccountRuntimeProfileResolver,
+    DEFAULT_PROFILE_CACHE_TTL_SECONDS,
+)
 from kokoro_link.application.services.channel_binding_service import ChannelBindingService
+from kokoro_link.application.services.character_activity_anchor import (
+    CharacterActivityAnchor,
+)
+from kokoro_link.application.services.character_activity_stats import (
+    CharacterActivityStatsService,
+)
 from kokoro_link.application.services.character_draft_service import CharacterDraftService
 from kokoro_link.application.services.character_creation_intake_service import (
     CharacterCreationIntakeService,
@@ -112,6 +122,7 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_VIDEO_STORYBOARD,
     FEATURE_BRANCHING_DRAMA,
     FEATURE_BRANCHING_DRAMA_CRITIC,
+    FEATURE_BRANCHING_DRAMA_SCENE,
     FEATURE_CHARACTER_DRAFT,
     FEATURE_CHAT_ASSIST,
     FEATURE_CHAT_REPETITION_CHECK,
@@ -466,6 +477,9 @@ from kokoro_link.application.services.fusion_material_stats import (
 from kokoro_link.application.services.fusion_story_service import (
     FusionStoryService,
 )
+from kokoro_link.application.services.drama_to_arc_draft_service import (
+    DramaToArcDraftService,
+)
 from kokoro_link.application.services.fusion_to_arc_service import (
     FusionToArcDraftService,
 )
@@ -680,6 +694,12 @@ from kokoro_link.application.services.address_preference_observer_service import
 from kokoro_link.application.services.relationship_names_service import (
     RelationshipNamesService,
 )
+from kokoro_link.contracts.player_persona_note import (
+    PlayerPersonaNoteRepositoryPort,
+)
+from kokoro_link.application.services.player_persona_note_service import (
+    PlayerPersonaNoteService,
+)
 from kokoro_link.contracts.address_change_log import (
     AddressChangeLogRepositoryPort,
 )
@@ -751,6 +771,9 @@ from kokoro_link.infrastructure.story.llm_scene_closer import (
 )
 from kokoro_link.infrastructure.story.llm_scene_opener import (
     LLMStorySceneOpener,
+)
+from kokoro_link.infrastructure.story.drama_to_arc_adapter import (
+    LLMDramaToArcAdapter,
 )
 from kokoro_link.infrastructure.story.fusion_to_arc_adapter import (
     LLMFusionToArcAdapter,
@@ -909,12 +932,20 @@ from kokoro_link.application.services.active_video_provider import (
 from kokoro_link.bootstrap.image_profiles import load_image_profiles
 from kokoro_link.bootstrap.video_profiles import load_video_profiles
 from kokoro_link.contracts.active_image import ActiveImageProviderPort
+from kokoro_link.contracts.scene_image import SceneImagePort
+from kokoro_link.domain.entities.branching_drama import IMAGE_PREFETCH_DEPTH
 from kokoro_link.contracts.active_video import ActiveVideoProviderPort
 from kokoro_link.contracts.image_profile import (
     ExternalImageApiProfileConfig,
 )
 from kokoro_link.contracts.video_profile import (
     ExternalVideoApiProfileConfig,
+)
+from kokoro_link.infrastructure.image.active_provider_scene_image import (
+    ActiveProviderSceneImageAdapter,
+)
+from kokoro_link.infrastructure.image.comfy_scene_image import (
+    ComfySceneImageAdapter,
 )
 from kokoro_link.infrastructure.image.profile_registry import (
     ImageProfileRegistry,
@@ -1197,6 +1228,10 @@ class ServiceContainer:
     # Exposed for the admin character-freeze surface (site-wide overview
     # + immediate freeze/unfreeze) which needs list / get / set_frozen.
     character_repository: "CharacterRepositoryPort | None" = None
+    #: Aggregate character census for the Cloud admin dashboard's load card
+    #: (``/cloud/stats/characters``). ``None`` without a database — the route
+    #: then answers 503 rather than inventing a zero.
+    character_activity_stats_service: "CharacterActivityStatsService | None" = None
     proactive_event_bus: ProactiveEventBus | None = None
     feed_post_repository: FeedPostRepositoryPort | None = None
     feed_reaction_repository: FeedReactionRepositoryPort | None = None
@@ -1231,6 +1266,9 @@ class ServiceContainer:
     fusion_material_stats_service: FusionMaterialStatsService | None = None
     fusion_to_arc_draft_service: FusionToArcDraftService | None = None
     branching_drama_service: "BranchingDramaService | None" = None
+    drama_to_arc_draft_service: DramaToArcDraftService | None = None
+    """BD7 — 分歧劇場結局頁的「把這條路寫成劇本」. ``None`` on a rig
+    without a branching-drama service, where the route answers 503."""
     studio_job_repository: StudioJobRepositoryPort | None = None
     studio_job_recovery_service: StudioJobRecoveryService | None = None
     # CB2 — durable ``.lumebackup`` export jobs + orchestration. Both are
@@ -1292,6 +1330,9 @@ class ServiceContainer:
     # HUMANIZATION_ROADMAP §4.2 — observed register / address preference.
     address_preference_repository: "OperatorAddressPreferenceRepositoryPort | None" = None
     address_preference_service: "AddressPreferenceObserverService | None" = None
+    # Player-declared identity / world premise (PP series).
+    player_persona_note_repository: "PlayerPersonaNoteRepositoryPort | None" = None
+    player_persona_note_service: "PlayerPersonaNoteService | None" = None
     # Per-pair rename log + names edit.
     address_change_log_repository: "AddressChangeLogRepositoryPort | None" = None
     relationship_names_service: "RelationshipNamesService | None" = None
@@ -2122,6 +2163,44 @@ def _build_scene_generator(
     )
 
 
+def _build_scene_image_port(
+    *,
+    settings: AppSettings,
+    active_image_provider: ActiveImageProviderPort,
+) -> SceneImagePort | None:
+    """Pick the branching-drama scene renderer for this deployment.
+
+    Cloud first: a hosted deployment has no local GPU, so before BD1 its
+    dramas landed with every node picture-less and nothing said so. It now
+    borrows the same active image provider every other hosted image
+    surface uses. Self-host keeps the local ComfyUI renderer, wrapped so
+    the service sees one port. Neither configured → ``None``, which the
+    service already treats as "skip images", unchanged.
+    """
+    if settings.cloud.active:
+        return ActiveProviderSceneImageAdapter(
+            image_provider=active_image_provider,
+            feature_key=FEATURE_BRANCHING_DRAMA_SCENE,
+        )
+    generator = _build_scene_generator(settings=settings)
+    if generator is None:
+        return None
+    return ComfySceneImageAdapter(generator)
+
+
+def _drama_image_prefetch_depth() -> int:
+    """How many tree layers of scene art to draw ahead of the player.
+
+    Self-host draws on its own GPU and keeps the historical depth. Hosted
+    deployments pay per image for branches most players never walk into,
+    so 1 is the recommended setting there; ``0`` switches drama scene art
+    off without unwiring the renderer.
+    """
+    return _env_int(
+        "KOKORO_DRAMA_IMAGE_PREFETCH_DEPTH", IMAGE_PREFETCH_DEPTH,
+    )
+
+
 def _build_tool_registry(
     *,
     settings: AppSettings,
@@ -2824,6 +2903,19 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
                 internal_credential=app_settings.cloud.internal_service_credential,
             ),
         )
+    # Character census for the Cloud admin dashboard's load card. Built
+    # wherever a database is (the read model is SQL-only by design), and given
+    # the SAME tier profile port the due-job cluster resolves dormancy with, so
+    # "active" on the card means what "will be reseeded" means in the cluster.
+    character_activity_stats_service: CharacterActivityStatsService | None = None
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_character_activity_stats import (
+            SACharacterActivityStats,
+        )
+        character_activity_stats_service = CharacterActivityStatsService(
+            stats=SACharacterActivityStats(db_session_factory),
+            tier_profiles=tier_runtime_profile_port,
+        )
     # U3 — hosted credit ("螢火") balance proxy. Cloud mode + a configured User
     # service only; self-host leaves it None so the route 404s by construction.
     cloud_credit_service: CloudCreditService | None = None
@@ -2875,6 +2967,22 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     account_runtime_profile_resolver = AccountRuntimeProfileResolver(
         operator_profile_repository,
         tier_profile_port=tier_runtime_profile_port,
+    )
+    # NF4 made the runtime profile a read on EVERY due computation (dormancy
+    # covers the un-gated kinds too), and the resolver above sits on an
+    # uncached operator-profile row. A short TTL in front of it turns the
+    # steady state back into "one read per operator per minute"; a reconcile
+    # pass's own per-run memo handles the repeats *within* one pass. Scoped to
+    # the due-job cluster on purpose — every other consumer keeps reading
+    # through, so no foreground surface starts answering from a memo.
+    due_job_profile_resolver = CachedAccountRuntimeProfileResolver(
+        account_runtime_profile_resolver,
+        ttl_seconds=float(
+            _env_int(
+                "YURALUME_DUE_PROFILE_TTL",
+                int(DEFAULT_PROFILE_CACHE_TTL_SECONDS),
+            ),
+        ),
     )
     # AP2 — action-level charging. The real service is only built in cloud
     # mode; everywhere else the null object keeps every instrumented entry
@@ -3760,6 +3868,54 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         provider=active_llm_provider,
         feature_key=FEATURE_STORY_SCENE_CHIPS,
     )
+    # Player-declared identity / world premise — read by every composer
+    # that speaks to the player (chat, proactive, busy-defer release,
+    # 起幕, LumeGram reply, 發話輔助) and by the post-turn extractor as a
+    # do-not-re-extract list; written by the per-character PUT.
+    #
+    # Built here, ahead of the first consumer, rather than beside the
+    # other per-pair repositories further down: the story-scene service is
+    # wired before that point and a repository that arrives late is a
+    # dependency that silently stays ``None``.
+    from kokoro_link.infrastructure.repositories.in_memory_player_persona_notes import (
+        InMemoryPlayerPersonaNoteRepository,
+    )
+    player_persona_note_repository: PlayerPersonaNoteRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_player_persona_note_repository import (
+            SAPlayerPersonaNoteRepository,
+        )
+        player_persona_note_repository = SAPlayerPersonaNoteRepository(
+            db_session_factory,
+        )
+    else:
+        player_persona_note_repository = InMemoryPlayerPersonaNoteRepository()
+    player_persona_note_service = PlayerPersonaNoteService(
+        player_persona_note_repository,
+    )
+    # NF4: the foreground-interaction anchor (``CharacterState.last_active_at``)
+    # for the paid foreground surfaces that are not chat — chat writes it as
+    # part of its own turn save, everything else needs this targeted, monotonic
+    # single-column touch. One instance, shared: it holds no state.
+    #
+    # **Cloud mode only** (plan §5 "self-host 行為零變化"). Dormancy is the
+    # reason this exists and it can only ever fire under a control-plane knob
+    # self-host never receives — but ``last_active_at`` is NOT a dormancy-only
+    # field: on self-host it is also read by ``_has_user_started_interaction``
+    # (NULL ⇒ "the player never opened their mouth" ⇒ no proactive messages at
+    # all), ``_compute_idle_minutes``, the feed's silence anchor and the
+    # runtime activity gate. Advancing it from 分歧劇場／起幕／融合故事 would
+    # therefore make a self-host player who only plays those surfaces start
+    # receiving proactive messages they never used to get — a behaviour change
+    # with the knob still NULL. So self-host gets ``None`` (the three services
+    # treat it as "don't track" and keep their pre-NF4 path byte for byte) and
+    # the anchor stays what its docstring claims: neutral BY CONSTRUCTION.
+    character_activity_anchor: CharacterActivityAnchor | None = None
+    if app_settings.cloud.active:
+        character_activity_anchor = CharacterActivityAnchor(
+            character_repository, clock=clock,
+        )
+
     story_scene_service = StorySceneService(
         sessions=story_scene_session_repository,
         conversations=conversation_repository,
@@ -3822,6 +3978,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # null object as every other instrumented service, so self-host and
         # token-billed tiers keep the exact path they had before.
         action_billing=action_billing_service,
+        player_persona_note_repository=player_persona_note_repository,
+        activity_anchor=character_activity_anchor,
     )
 
     self_repetition_extractor = LLMSelfRepetitionExtractor(
@@ -4481,6 +4639,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             if app_settings.humanization.address_preference_enabled
             else None
         ),
+        player_persona_note_repository=player_persona_note_repository,
         address_change_log_repository=address_change_log_repository,
         relationship_names_service=relationship_names_service,
         experiment_overlay_service=experiment_overlay_service,
@@ -4866,6 +5025,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # player from outside it. Pause only; the
         # tick after the scene closes evaluates exactly as it did before.
         story_scene_sessions=story_scene_session_repository,
+        player_persona_note_repository=player_persona_note_repository,
     )
     # Phase 3 of SCENE_BEAT_PLAN — runs on every tick so an offline
     # user still sees beats land in memory by the time they come back.
@@ -5014,6 +5174,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_profile_service=operator_profile_service,
         notification_service=notification_service,
         visible_slot_port=visible_slot_port,
+        player_persona_note_repository=player_persona_note_repository,
     )
     # PF1 — the two-pass compose→tool→compose loop shared by every kind of
     # pending follow-up. Same registry / orchestrator / public-URL resolver the
@@ -5050,6 +5211,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # byte-identical.
         visible_slot_port=visible_slot_port,
         local_tz=local_tz,
+        player_persona_note_repository=player_persona_note_repository,
     )
     # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). Built ONLY for a
     # scheduler-owning role (all / background) when YURALUME_BACKGROUND_SHADOW=
@@ -5262,7 +5424,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # + per pair encounter) on the same leader + cadence as the character
         # reconcile. Shares the ONE NextDueCalculator and the coordinator's epoch.
         _reconcile_next_due = NextDueCalculator(
-            resolver=account_runtime_profile_resolver, clock=clock,
+            resolver=due_job_profile_resolver, clock=clock,
         )
         _reseed_jitter = _env_int("YURALUME_DUE_RESEED_JITTER", 300)
         _social_reconciler = SocialDueJobReconciler(
@@ -5337,7 +5499,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         assert db_session_factory is not None
         assert background_job_queue is not None
         _worker_next_due = NextDueCalculator(
-            resolver=account_runtime_profile_resolver, clock=clock,
+            # Same short-TTL memo as the reconciler's: the worker now resolves
+            # a profile in every handler pre-flight (NF4 dormancy) as well as
+            # in every chain advance.
+            resolver=due_job_profile_resolver, clock=clock,
         )
         _worker_deferral = DueJobDeferral(
             feed_post_repository=feed_post_repository,
@@ -5709,6 +5874,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_profile_service=operator_profile_service,
         subscription_access_guard=subscription_access_guard,
         cloud_mode=app_settings.cloud.active,
+        player_persona_note_repository=player_persona_note_repository,
     )
     if operator_persona_service is not None:
         operator_persona_projection_service = OperatorPersonaProjectionService(
@@ -5743,6 +5909,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         notifications=notification_service,
         execution_lease=studio_execution_lease,
         action_billing=action_billing_service,
+        activity_anchor=character_activity_anchor,
     )
     # Fusion material-richness stats (Creator Studio C1-P1). Shares
     # ``select_brief_memories`` with the brief builder above so the picker
@@ -5976,7 +6143,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         official_cards=official_card_source,
     )
 
-    scene_generator = _build_scene_generator(settings=app_settings)
+    scene_image_port = _build_scene_image_port(
+        settings=app_settings,
+        active_image_provider=active_image_provider,
+    )
 
     branching_drama_service = BranchingDramaService(
         repository=branching_drama_repository,
@@ -6001,12 +6171,31 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             feature_key=FEATURE_BRANCHING_DRAMA_CRITIC,
         ),
         uploads_dir=app_settings.uploads_dir,
-        scene_generator=scene_generator,
+        scene_image=scene_image_port,
         object_storage=object_storage,
         event_seed_dispenser=event_seed_dispenser,
         visual_style_service=visual_generation_style_service,
         jobs=studio_job_repository,
         execution_lease=studio_execution_lease,
+        image_prefetch_depth=_drama_image_prefetch_depth(),
+        action_billing=action_billing_service,
+        activity_anchor=character_activity_anchor,
+    )
+
+    # BD7 — the exit from a finished playthrough: the line the player
+    # walked becomes an unsaved arc-template draft the創作專區 wizard
+    # picks up. Same ``arc_adapt`` feature key as the fusion conversion
+    # (converting a finished work has one price), and the same fail-soft
+    # relationship material for the two modes that put the player in it.
+    drama_to_arc_draft_service = DramaToArcDraftService(
+        drama_service=branching_drama_service,
+        character_service=character_service,
+        adapter=LLMDramaToArcAdapter(
+            provider=active_llm_provider,
+            feature_key=FEATURE_ARC_ADAPT,
+        ),
+        relationship_seed_repository=relationship_seed_repository,
+        operator_profile_service=operator_profile_service,
     )
 
     # Startup recovery for interrupted Creator Studio pipelines —
@@ -6107,6 +6296,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         external_chat_attachment_service=external_chat_attachment_service,
         external_chat_turn_service=external_chat_turn_service,
         character_repository=character_repository,
+        character_activity_stats_service=character_activity_stats_service,
         proactive_event_bus=proactive_event_bus,
         story_seed_repository=story_seed_repository,
         story_event_repository=story_event_repository,
@@ -6154,6 +6344,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         fusion_material_stats_service=fusion_material_stats_service,
         fusion_to_arc_draft_service=fusion_to_arc_draft_service,
         branching_drama_service=branching_drama_service,
+        drama_to_arc_draft_service=drama_to_arc_draft_service,
         studio_job_repository=studio_job_repository,
         studio_job_recovery_service=studio_job_recovery_service,
         character_backup_job_repository=character_backup_job_repository,
@@ -6174,6 +6365,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         relationship_seed_repository=relationship_seed_repository,
         address_change_log_repository=address_change_log_repository,
         relationship_names_service=relationship_names_service,
+        player_persona_note_repository=player_persona_note_repository,
+        player_persona_note_service=player_persona_note_service,
         persona_extraction_service=persona_extraction_service,
         persona_dream_service=persona_dream_service,
         persona_curiosity_service=persona_curiosity_service,

@@ -24,6 +24,7 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.branching_drama import (
+    DEFAULT_OPERATOR_POSITION,
     TONE_DARK,
     TONE_NEUTRAL,
     TONE_SUNNY,
@@ -31,6 +32,12 @@ from kokoro_link.domain.entities.branching_drama import (
     DramaSessionTurn,
     Exchange,
     VALID_TONES,
+)
+from kokoro_link.infrastructure.prompt.drama_operator_position_lines import (
+    STAGE_DIRECTOR,
+    STAGE_DIRECTOR_INTERACT,
+    render_drama_interact_framing,
+    render_drama_operator_position_lines,
 )
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
@@ -66,6 +73,8 @@ class BranchingDramaDirector:
         previous_turns: Sequence[DramaSessionTurn],
         player_input: str = "",
         operator_primary_language: str = "zh-TW",
+        operator_position: str = DEFAULT_OPERATOR_POSITION,
+        operator_note: str | None = None,
     ) -> str:
         if await self._resolver.is_fake():
             return _synthetic_narration(node)
@@ -76,6 +85,8 @@ class BranchingDramaDirector:
             previous_turns=previous_turns,
             player_input=player_input,
             operator_primary_language=operator_primary_language,
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
         try:
             raw = await self._resolver.generate(prompt)
@@ -95,6 +106,8 @@ class BranchingDramaDirector:
         exchanges: Sequence[Exchange],
         player_input: str,
         operator_primary_language: str = "zh-TW",
+        operator_position: str = DEFAULT_OPERATOR_POSITION,
+        operator_note: str | None = None,
     ) -> tuple[str, str | None]:
         """Generate an in-scene response and optionally suggest advancement.
 
@@ -112,6 +125,8 @@ class BranchingDramaDirector:
             exchanges=exchanges,
             player_input=player_input,
             operator_primary_language=operator_primary_language,
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
         try:
             raw = await self._resolver.generate(prompt)
@@ -154,6 +169,8 @@ def _build_narrate_prompt(
     previous_turns: Sequence[DramaSessionTurn],
     player_input: str,
     operator_primary_language: str = "zh-TW",
+    operator_position: str = DEFAULT_OPERATOR_POSITION,
+    operator_note: str | None = None,
 ) -> str:
     appearing_ids = set(node.appearing_character_ids)
     relevant_briefs = [b for b in briefs if b.character_id in appearing_ids]
@@ -191,6 +208,12 @@ def _build_narrate_prompt(
         f"本段標題：{node.title}",
         f"劇本綱要：{node.summary}",
         tone_note,
+        # BD2 — who the player is in this drama. Sits above 要求 so the
+        # framing is context the requirements are written against, not one
+        # more bullet competing with them.
+        *render_drama_operator_position_lines(
+            operator_position, operator_note, stage=STAGE_DIRECTOR,
+        ),
         "",
         "之前發生的事：",
         history_block or "（這是第一幕，沒有前情）",
@@ -218,6 +241,8 @@ def _build_scene_response_prompt(
     exchanges: Sequence[Exchange],
     player_input: str,
     operator_primary_language: str = "zh-TW",
+    operator_position: str = DEFAULT_OPERATOR_POSITION,
+    operator_note: str | None = None,
 ) -> str:
     appearing_ids = set(node.appearing_character_ids)
     relevant_briefs = [b for b in briefs if b.character_id in appearing_ids]
@@ -230,10 +255,16 @@ def _build_scene_response_prompt(
     tone_note = (
         f"\n本段取向：{_tone_label(node.tone)}\n" if node.tone else ""
     )
+    # FX3 — the skeleton of this prompt (what the round is, what the
+    # player's text is, what to produce from it) is itself framed by the
+    # player's position. Written as protagonist-only literals it used to
+    # contradict the spectator block further down, and unlike ``narrate``
+    # this path has no critic pass to notice which framing won.
+    framing = render_drama_interact_framing(operator_position)
 
     body = "\n".join([
         "你是「分歧劇場」的場景導演。",
-        "玩家正在當前段落中與角色互動，你需要以角色身分回應玩家的行動或對話。",
+        framing.brief,
         "",
         "出場角色資料：",
         brief_block,
@@ -248,13 +279,19 @@ def _build_scene_response_prompt(
         "本段已有的互動：",
         exchange_block or "（尚無互動）",
         "",
-        f"玩家現在的行動/台詞：\n{player_input.strip()}",
+        f"{framing.input_label}\n{player_input.strip()}",
         "",
         "要求：",
-        "- 以角色身分自然回應玩家，貼合角色說話風格",
+        framing.requirement,
         "- 推動場景氛圍，但不要跳出本段劇本綱要的範圍",
         "- 篇幅 150~300 字",
         "- response 與 advance_hint 都是玩家可見自然語言，必須使用上方「玩家可見自然語言輸出語言（BCP 47 標籤）」指定的語言。",
+        # The position block closes the instructions rather than opening
+        # them (as it does in ``narrate``): here it is the tie-breaker for
+        # the fixed lines above, so it has to be read after them.
+        *render_drama_operator_position_lines(
+            operator_position, operator_note, stage=STAGE_DIRECTOR_INTERACT,
+        ),
         "",
         "你的回覆必須是以下 JSON 格式（不加 markdown 標記）：",
         '{"response": "場景回應文字", "advance_hint": null}',

@@ -2,6 +2,7 @@ import type {
   InitialRelationshipPayload,
   ScheduleInvolvementPolicy,
 } from '@/types/character'
+import type { InitialRelationshipEditPatch } from '@/utils/api/initialRelationship'
 
 export interface InitialRelationshipForm {
   relationship_label: string
@@ -89,4 +90,66 @@ export function buildInitialRelationshipPayload(
     || hasSafeProfile,
   )
   return hasValues ? payload : null
+}
+
+/**
+ * 建立後編輯關係 seed 用的欄位子集（IR2）。
+ *
+ * 拿掉 `profile_interests` / `profile_routine` / `profile_life_goals`：
+ * 那三個只在建立當下組成 `safe_user_profile`，`PATCH
+ * /initial-relationship` 的可寫欄位裡沒有它們，編輯表單留著只會是永遠
+ * 沒有作用的死欄位。
+ */
+export type InitialRelationshipEditForm = Omit<
+  InitialRelationshipForm,
+  'profile_interests' | 'profile_routine' | 'profile_life_goals'
+>
+
+const EDIT_TEXT_FIELDS = [
+  'relationship_label',
+  'known_context',
+  'living_arrangement',
+  'user_address_name',
+  'character_address_name',
+  'tone_distance',
+  'familiarity_boundary',
+  'proactive_cadence_hint',
+  'user_profile_notes',
+] as const satisfies readonly (keyof InitialRelationshipEditForm)[]
+
+export function emptyInitialRelationshipEditForm(): InitialRelationshipEditForm {
+  const {
+    profile_interests: _interests,
+    profile_routine: _routine,
+    profile_life_goals: _lifeGoals,
+    ...rest
+  } = emptyInitialRelationshipForm()
+  return rest
+}
+
+/**
+ * 對照「原本載入的值」與「目前表單」，只把真的改過的欄位送出去
+ * （tri-state：缺席＝不動，空字串＝清空）。全部沒改就回傳 `null`，讓呼叫
+ * 端可以把它當「不用存」的訊號，不會把沒動過的欄位誤送成空字串。
+ */
+export function buildInitialRelationshipEditPatch(
+  original: InitialRelationshipEditForm,
+  current: InitialRelationshipEditForm,
+): InitialRelationshipEditPatch | null {
+  const patch: InitialRelationshipEditPatch = {}
+
+  for (const field of EDIT_TEXT_FIELDS) {
+    const next = current[field].trim()
+    if (next !== original[field].trim()) {
+      patch[field] = next
+    }
+  }
+  if (current.schedule_involvement_policy !== original.schedule_involvement_policy) {
+    patch.schedule_involvement_policy = current.schedule_involvement_policy
+  }
+  if (current.proactive_permission !== original.proactive_permission) {
+    patch.proactive_permission = current.proactive_permission
+  }
+
+  return Object.keys(patch).length > 0 ? patch : null
 }

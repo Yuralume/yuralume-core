@@ -22,8 +22,9 @@ Companion to :class:`CharacterKindHandler`. That handler owns the per-character
     -slot ledgers protect anything already emitted.
 
 Two invariants carried from Phase 3 (§3.3, red line), identical to the character
-handler: a stopped character (frozen / locked / disabled relationship) runs no step
-AND breaks its chain (the reconciler reseeds after a thaw); the B1 multiplier is
+handler: a stopped character (frozen / locked / dormant / disabled relationship)
+runs no step AND breaks its chain (the reconciler reseeds after a thaw or the
+player's next foreground interaction); the B1 multiplier is
 spent scaling the cadence at due time, so the step does not re-filter — except the
 encounter §4.3.2 both-side gate, which is the pair analogue of the character kinds'
 already-spent multiplier (idle is per-character, so both sides must be on-phase).
@@ -142,6 +143,11 @@ class SocialKindHandler:
             return SocialHandlerResult(kind, executed=False, chain_stopped=True)
         if not await self._social.subscription_allows(character):
             return SocialHandlerResult(kind, executed=False, chain_stopped=True)
+        # NF4: dormancy joins the pre-flight for the same reason as freeze —
+        # an already-queued job must not spend an LLM call on a character
+        # nobody has spoken to and only then break its chain.
+        if await self._calculator.is_chain_dormant(character, kind, now=resolved):
+            return SocialHandlerResult(kind, executed=False, chain_stopped=True)
         if kind == PERSONA_DREAM_KIND:
             await self._social.step_persona_dream(character, now=resolved)
         elif kind == PEER_KNOWLEDGE_KIND:
@@ -177,6 +183,14 @@ class SocialKindHandler:
                 return SocialHandlerResult(kind, executed=False, chain_stopped=True)
             if not await self._social.subscription_allows(character):
                 return SocialHandlerResult(kind, executed=False, chain_stopped=True)
+        # NF4, both sides — the same "either side stops the pair" shape as the
+        # two guards above, and evaluated in the same place so a queued
+        # encounter never takes the pair lease and runs the model for a pair
+        # whose player is gone.
+        if await self._calculator.is_chain_dormant(
+            char_a, kind, now=resolved, co_characters=(char_b,),
+        ):
+            return SocialHandlerResult(kind, executed=False, chain_stopped=True)
 
         contended = gated = abandoned = executed = False
         async with EncounterPairLeaseSession(
@@ -223,6 +237,7 @@ class SocialKindHandler:
         if gated:
             chained = await self._advance_chain(
                 char_a, kind, resolved, relationship.id, last_due, fencing_epoch,
+                co_characters=(char_b,),
                 explicit_next_due=resolved + timedelta(seconds=_GATE_DEFER_SECONDS),
                 # Sub-interval push (300s < 1800s base grid): key it in the defer
                 # namespace so it does not collide with THIS still-claimed job's
@@ -236,6 +251,7 @@ class SocialKindHandler:
             )
         chained = await self._advance_chain(
             char_a, kind, resolved, relationship.id, last_due, fencing_epoch,
+            co_characters=(char_b,),
             extra_payload=self._pair_payload(char_a, char_b, relationship),
         )
         return SocialHandlerResult(
@@ -287,6 +303,7 @@ class SocialKindHandler:
         last_due: datetime | None,
         fencing_epoch: int | None,
         *,
+        co_characters: tuple[Character, ...] = (),
         explicit_next_due: datetime | None = None,
         defer_grid_seconds: float | None = None,
         extra_payload: dict[str, str] | None = None,
@@ -302,9 +319,13 @@ class SocialKindHandler:
             character, kind, now=now, last_due=last_due,
             explicit_next_due=explicit_next_due, scope_id=scope_id,
             defer_grid_seconds=defer_grid_seconds,
+            # A pair chain belongs to both characters: ``character`` here is
+            # only the canonical-low side, so the stop conditions must see the
+            # other one too (NF4 dormancy is "any side stops it", like freeze).
+            co_characters=co_characters,
         )
         if next_due is None:
-            return False  # frozen mid-run — chain stops
+            return False  # frozen / dormant mid-run — chain stops
         operator_id = character.user_id or None
         payload: dict[str, object] = {"chained": True}
         if extra_payload is not None:

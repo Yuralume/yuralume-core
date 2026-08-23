@@ -65,8 +65,13 @@ class _FrozenClock(ClockPort):
 
 
 class _FakeResolver:
+    def __init__(
+        self, profile: AccountRuntimeProfile = DEFAULT_ACCOUNT_RUNTIME_PROFILE,
+    ) -> None:
+        self._profile = profile
+
     async def resolve_for_operator(self, operator_id: str) -> AccountRuntimeProfile:
-        return DEFAULT_ACCOUNT_RUNTIME_PROFILE
+        return self._profile
 
 
 class _FakeSocialExecutor:
@@ -122,7 +127,7 @@ class _AllowGate:
         return True
 
 
-async def _wiring(*, encounter_service=None, pair_lease=None):
+async def _wiring(*, encounter_service=None, pair_lease=None, profile=None):
     lease = InMemoryBackgroundCoordinatorLease()
     queue = InMemoryBackgroundJobQueue(lease=lease)
     epoch = await lease.acquire(
@@ -133,7 +138,9 @@ async def _wiring(*, encounter_service=None, pair_lease=None):
         social_executor=social,
         encounter_service=encounter_service or _FakeEncounterService(),
         queue=queue,
-        next_due_calculator=NextDueCalculator(resolver=_FakeResolver()),
+        next_due_calculator=NextDueCalculator(
+            resolver=_FakeResolver(profile or DEFAULT_ACCOUNT_RUNTIME_PROFILE),
+        ),
         epoch_provider=lambda: epoch,
         pair_lease=pair_lease,
         clock=_FrozenClock(BASE),
@@ -338,3 +345,99 @@ async def test_disabled_relationship_stops_pair_chain() -> None:
     assert result.chain_stopped is True
     assert encounter.pair_calls == []
     assert await queue.active_chain_keys() == set()
+
+
+# -- NF4: dormancy in the pre-flight, both sides of a pair ------------------- #
+#
+# The chain-advance already refused to enqueue the next occurrence for a
+# dormant character, but that happens AFTER the step. On the day the knob is
+# switched on, every already-scheduled job would otherwise run one full LLM
+# turn — a dream composed, an encounter played out — for a player who has been
+# gone for months, and only then break its chain.
+
+_DORMANT_TIER = AccountRuntimeProfile(name="free", background_dormancy_days=7)
+
+
+def _active(char_id: str) -> _FakeCharacter:
+    return _FakeCharacter(char_id, state=_State(last_active_at=BASE))
+
+
+async def test_dormant_character_runs_no_social_step() -> None:
+    queue, handler, social, _ = await _wiring(profile=_DORMANT_TIER)
+    result = await handler.handle_character(
+        _FakeCharacter("c1"),  # never interacted → dormant
+        PERSONA_DREAM_KIND, now=BASE, last_due=BASE, fencing_epoch=1,
+    )
+    assert result.executed is False
+    assert result.chain_stopped is True
+    assert social.dream_calls == []
+    assert await queue.active_chain_keys() == set()
+
+
+async def test_active_character_still_runs_its_social_step() -> None:
+    queue, handler, social, _ = await _wiring(profile=_DORMANT_TIER)
+    result = await handler.handle_character(
+        _active("c1"), PEER_KNOWLEDGE_KIND,
+        now=BASE, last_due=BASE, fencing_epoch=1,
+    )
+    assert result.executed is True
+    assert social.peer_calls == ["c1"]
+
+
+async def test_dormant_second_side_stops_the_encounter_before_the_lease() -> None:
+    """Either side stops the pair — and it stops it in the pre-flight, so the
+    pair lease is never taken and the model never runs."""
+    encounter = _FakeEncounterService()
+    queue, handler, _, _ = await _wiring(
+        encounter_service=encounter, pair_lease=InMemoryPairLease(),
+        profile=_DORMANT_TIER,
+    )
+    result = await handler.handle_pair(
+        _active("c-01"), _FakeCharacter("c-99"), _relationship("c-01", "c-99"),
+        now=BASE, last_due=BASE, fencing_epoch=1, gate=_AllowGate(),
+    )
+    assert result.executed is False
+    assert result.chain_stopped is True
+    assert encounter.pair_calls == []
+    assert await queue.active_chain_keys() == set()
+
+
+async def test_dormant_first_side_stops_the_encounter_too() -> None:
+    encounter = _FakeEncounterService()
+    queue, handler, _, _ = await _wiring(
+        encounter_service=encounter, pair_lease=InMemoryPairLease(),
+        profile=_DORMANT_TIER,
+    )
+    result = await handler.handle_pair(
+        _FakeCharacter("c-01"), _active("c-99"), _relationship("c-01", "c-99"),
+        now=BASE, last_due=BASE, fencing_epoch=1, gate=_AllowGate(),
+    )
+    assert result.chain_stopped is True
+    assert encounter.pair_calls == []
+
+
+async def test_encounter_runs_when_both_sides_are_active() -> None:
+    encounter = _FakeEncounterService()
+    queue, handler, _, _ = await _wiring(
+        encounter_service=encounter, pair_lease=InMemoryPairLease(),
+        profile=_DORMANT_TIER,
+    )
+    rel = _relationship("c-01", "c-99")
+    result = await handler.handle_pair(
+        _active("c-01"), _active("c-99"), rel,
+        now=BASE, last_due=BASE, fencing_epoch=1, gate=_AllowGate(),
+    )
+    assert result.executed is True
+    assert encounter.pair_calls == [rel.id]
+    assert (ENCOUNTER_TICK_KIND, rel.id) in await queue.active_chain_keys()
+
+
+async def test_dormancy_pre_flight_is_inert_without_the_knob() -> None:
+    """self-host: a never-interacted character keeps every social chain."""
+    queue, handler, social, _ = await _wiring()
+    result = await handler.handle_character(
+        _FakeCharacter("c1"), PERSONA_DREAM_KIND,
+        now=BASE, last_due=BASE, fencing_epoch=1,
+    )
+    assert result.executed is True
+    assert social.dream_calls == ["c1"]

@@ -43,6 +43,9 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompt.persona_curiosity import (
     render_persona_curiosity_plan_lines,
 )
@@ -207,6 +210,16 @@ def _build_prompt(context: ProactiveContext) -> str:
                 + "\n- 首則或早期主動訊息只能引用這些明示設定作為語氣與邊界來源；"
                 "不可說成你們已經在系統內聊過或共同經歷過。"
             )
+
+    # Adjacent to the inferred portrait below, never folded into it: one
+    # is what the player said is true, the other is what the character
+    # guessed. The declaration goes first so the guesses are read against
+    # it rather than the other way round.
+    player_persona_note_lines = render_player_persona_note_lines(
+        context.player_persona_note,
+    )
+    if player_persona_note_lines:
+        sections.append("\n".join(player_persona_note_lines).strip())
 
     if context.operator_persona_lines:
         persona_lines = [

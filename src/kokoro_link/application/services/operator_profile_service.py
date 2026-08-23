@@ -11,8 +11,6 @@ the fallback.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from kokoro_link.contracts.operator_profile import OperatorProfileRepositoryPort
 from kokoro_link.domain.entities.operator_profile import (
     DEFAULT_OPERATOR_ID,
@@ -64,7 +62,6 @@ class OperatorProfileService:
         display_name: str | None = None,
         aliases: tuple[str, ...] | list[str] | None = None,
         pronouns: str | None = None,
-        current_status: str | None | _Unset = UNSET,
         country_code: str | None | _Unset = UNSET,
         latitude: float | None | _Unset = UNSET,
         longitude: float | None | _Unset = UNSET,
@@ -76,7 +73,6 @@ class OperatorProfileService:
         applies the partial update, and saves it back. Returns the
         post-update entity for the caller to surface in the response."""
         existing = await self._repository.get_default()
-        status, status_set_at = _normalise_current_status_update(current_status)
         if existing is None:
             base = OperatorProfile(
                 id=DEFAULT_OPERATOR_ID,
@@ -90,8 +86,6 @@ class OperatorProfileService:
                 pronouns=(
                     pronouns.strip() if pronouns and pronouns.strip() else None
                 ),
-                current_status=status,
-                current_status_set_at=status_set_at,
                 country_code=None if country_code is UNSET else country_code,
                 latitude=None if latitude is UNSET else latitude,
                 longitude=None if longitude is UNSET else longitude,
@@ -109,8 +103,6 @@ class OperatorProfileService:
             aliases=rename_aliases,
             pronouns=pronouns,
             display_name_locked=display_name_locked,
-            current_status=current_status,
-            current_status_set_at=status_set_at,
             country_code=country_code,
             latitude=latitude,
             longitude=longitude,
@@ -126,7 +118,6 @@ class OperatorProfileService:
         display_name: str | None = None,
         aliases: tuple[str, ...] | list[str] | None = None,
         pronouns: str | None = None,
-        current_status: str | None | _Unset = UNSET,
         country_code: str | None | _Unset = UNSET,
         latitude: float | None | _Unset = UNSET,
         longitude: float | None | _Unset = UNSET,
@@ -141,7 +132,6 @@ class OperatorProfileService:
         endpoint. Operator-row absence means the user was created by
         AuthService but never saved a profile."""
         existing = await self._repository.get(user_id)
-        status, status_set_at = _normalise_current_status_update(current_status)
         if existing is None:
             # Synthesise a placeholder row keyed by the real user_id.
             # ``display_name`` may be empty here — Pydantic accepts that
@@ -160,8 +150,6 @@ class OperatorProfileService:
                 pronouns=(
                     pronouns.strip() if pronouns and pronouns.strip() else None
                 ),
-                current_status=status,
-                current_status_set_at=status_set_at,
                 country_code=None if country_code is UNSET else country_code,
                 latitude=None if latitude is UNSET else latitude,
                 longitude=None if longitude is UNSET else longitude,
@@ -179,8 +167,6 @@ class OperatorProfileService:
             aliases=rename_aliases,
             pronouns=pronouns,
             display_name_locked=display_name_locked,
-            current_status=current_status,
-            current_status_set_at=status_set_at,
             country_code=country_code,
             latitude=latitude,
             longitude=longitude,
@@ -232,13 +218,3 @@ def _dedupe_cap(items: list[str], *, exclude: str) -> tuple[str, ...]:
         seen.add(text)
         out.append(text)
     return tuple(out[:_MAX_STORED_ALIASES])
-
-
-def _normalise_current_status_update(
-    current_status: str | None | _Unset,
-) -> tuple[str | None, datetime | None]:
-    if current_status is UNSET:
-        return None, None
-    if isinstance(current_status, str) and current_status.strip():
-        return current_status.strip(), datetime.now(timezone.utc)
-    return None, None

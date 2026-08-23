@@ -83,17 +83,102 @@ async def test_analyze_parses_llm_questions_and_caps_to_three() -> None:
     )
 
     assert result.can_create is False
-    assert result.missing_required == ("known_context", "proactive_cadence_hint", "boundary")
+    # IR4 code-level guarantee, mirrored for the LLM JSON path: even though
+    # the model echoed proactive_cadence_hint into missing_required (the
+    # old, pre-IR4 habit the prompt tells it not to repeat), the service
+    # strips it — cadence must never gate creation.
+    assert result.missing_required == ("known_context", "boundary")
     assert [item.field for item in result.questions] == [
         "known_context",
         "user_address_name",
         "proactive_cadence_hint",
     ]
+    blocking_by_field = {item.field: item.blocking for item in result.questions}
+    assert blocking_by_field["known_context"] is True
+    # The model also omitted "blocking" on the cadence question (its old
+    # default-to-blocking habit); the service forces it non-blocking rather
+    # than trusting the JSON default of True.
+    assert blocking_by_field["proactive_cadence_hint"] is False
     assert result.normalized_relationship.relationship_label == "朋友"
     assert result.normalized_relationship.living_arrangement == "住在使用者家裡"
     assert result.normalized_user_profile.interests == ["音樂"]
     assert result.warnings[0].kind == "personality_type_conflict"
     assert "operator" not in (model.last_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_llm_cadence_question_without_blocking_key_does_not_gate_create() -> None:
+    """LLM JSON path counterpart to test_fallback_suggests_cadence_without_blocking_create:
+    a model that reverts to its old habit of omitting "blocking" (or setting
+    it true) on the cadence question, and/or lists the field in
+    missing_required, must still not block character creation — IR4 pinned
+    this as advisory-only, and that guarantee cannot depend on prompt
+    adherence alone.
+    """
+    payload = {
+        "can_create": True,
+        "missing_required": ["proactive_cadence_hint"],
+        "questions": [
+            {"field": "proactive_cadence_hint", "question": "多久找你一次？"},
+        ],
+        "normalized_relationship": {},
+        "normalized_user_profile": {},
+        "warnings": [],
+    }
+    service = CharacterCreationIntakeService(
+        model=_FakeModel(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    result = await service.analyze(
+        draft=CharacterCreationDraftContext(name="澪"),
+        relationship=InitialRelationshipPayload(
+            relationship_label="創作夥伴",
+            proactive_permission=True,
+        ),
+    )
+
+    assert result.can_create is True
+    assert result.missing_required == ()
+    assert [item.field for item in result.questions] == ["proactive_cadence_hint"]
+    assert result.questions[0].blocking is False
+
+
+@pytest.mark.asyncio
+async def test_llm_other_blocking_question_still_gates_create() -> None:
+    """Counter-example: the cadence-specific override must not leak into
+    other fields — a genuinely blocking question (e.g. living_arrangement)
+    still withholds can_create.
+    """
+    payload = {
+        "can_create": False,
+        "missing_required": ["living_arrangement"],
+        "questions": [
+            {"field": "living_arrangement", "question": "你們住在一起還是分開住？"},
+            {"field": "proactive_cadence_hint", "question": "多久找你一次？", "blocking": True},
+        ],
+        "normalized_relationship": {},
+        "normalized_user_profile": {},
+        "warnings": [],
+    }
+    service = CharacterCreationIntakeService(
+        model=_FakeModel(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    result = await service.analyze(
+        draft=CharacterCreationDraftContext(name="澪"),
+        relationship=InitialRelationshipPayload(
+            relationship_label="創作夥伴",
+            proactive_permission=True,
+        ),
+    )
+
+    assert result.can_create is False
+    assert result.missing_required == ("living_arrangement",)
+    blocking_by_field = {item.field: item.blocking for item in result.questions}
+    assert blocking_by_field["living_arrangement"] is True
+    # Even an explicit "blocking": true from the model is overridden for
+    # this one field — cadence is never allowed to gate creation.
+    assert blocking_by_field["proactive_cadence_hint"] is False
 
 
 @pytest.mark.asyncio
@@ -166,7 +251,34 @@ async def test_analyze_runs_personality_type_analyzer_and_blocks_conflict() -> N
 
 
 @pytest.mark.asyncio
-async def test_fallback_requires_cadence_when_pre_first_message_proactive_allowed() -> None:
+async def test_fallback_suggests_cadence_without_blocking_create() -> None:
+    """IR4: the backend gate now only requires proactive_permission, so a
+    blank cadence hint must not withhold can_create — it stays a
+    non-blocking nudge (still worth asking; the character otherwise has to
+    judge cadence on its own).
+    """
+    service = CharacterCreationIntakeService(model=_CrashingModel())
+
+    result = await service.analyze(
+        draft=CharacterCreationDraftContext(name="澪"),
+        relationship=InitialRelationshipPayload(
+            relationship_label="創作夥伴",
+            known_context="在社群認識，還沒有系統內共同回憶。",
+            living_arrangement="分開住",
+            proactive_permission=True,
+        ),
+    )
+
+    assert result.can_create is True
+    assert result.missing_required == ()
+    assert [question.field for question in result.questions] == [
+        "proactive_cadence_hint",
+    ]
+    assert result.questions[0].blocking is False
+
+
+@pytest.mark.asyncio
+async def test_fallback_still_blocks_on_other_missing_fields_alongside_cadence_nudge() -> None:
     service = CharacterCreationIntakeService(model=_CrashingModel())
 
     result = await service.analyze(
@@ -179,14 +291,14 @@ async def test_fallback_requires_cadence_when_pre_first_message_proactive_allowe
     )
 
     assert result.can_create is False
-    assert result.missing_required == (
-        "living_arrangement",
-        "proactive_cadence_hint",
-    )
+    assert result.missing_required == ("living_arrangement",)
     assert [question.field for question in result.questions] == [
         "living_arrangement",
         "proactive_cadence_hint",
     ]
+    blocking_by_field = {q.field: q.blocking for q in result.questions}
+    assert blocking_by_field["living_arrangement"] is True
+    assert blocking_by_field["proactive_cadence_hint"] is False
 
 
 @pytest.mark.asyncio

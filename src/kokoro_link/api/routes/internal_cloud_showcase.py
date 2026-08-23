@@ -192,15 +192,22 @@ async def review(
     container: ServiceContainer = Depends(get_container),
 ) -> dict[str, object]:
     """Advisory pre-review. Never approves anything; a post that could not
-    be reviewed comes back ``needs_manual_review`` with the reason."""
+    be reviewed comes back ``needs_manual_review`` with the reason.
+
+    Each review carries two independent verdicts: the text one
+    (``verdict`` / ``reasons`` / ``rewrite``) and the image-consistency
+    one (``image_verdict`` / ``image_reasons``). They fail separately —
+    a vision route being down must not take the text verdicts with it.
+    """
     service = build_showcase_service(container)
     with _translated_errors():
-        summary = await service.review_posts(
+        report = await service.review_posts(
             tenant_id=payload.tenant_id,
             character_id=payload.character_id,
             post_ids=payload.post_ids,
             limit=payload.limit,
         )
+    summary = report.text
     return {
         "passed": summary.passed,
         "flagged": summary.flagged,
@@ -211,6 +218,8 @@ async def review(
                 "verdict": item.verdict,
                 "reasons": list(item.reasons),
                 "rewrite": item.rewrite,
+                "image_verdict": _image_verdict_of(report, item.post_id),
+                "image_reasons": _image_reasons_of(report, item.post_id),
             }
             for item in summary.reviews
         ],
@@ -326,6 +335,19 @@ def _iso(moment: datetime | None) -> str | None:
     if moment is None:
         return None
     return moment.isoformat()
+
+
+def _image_verdict_of(report, post_id: str) -> str:  # noqa: ANN001
+    review = report.images.get(post_id)
+    # An absent entry means the image pass never looked at this post;
+    # "needs_manual_review" is the honest spelling of that, same as a
+    # failed text review.
+    return review.verdict if review is not None else "needs_manual_review"
+
+
+def _image_reasons_of(report, post_id: str) -> list[str]:  # noqa: ANN001
+    review = report.images.get(post_id)
+    return list(review.reasons) if review is not None else ["圖片未經預審"]
 
 
 __all__ = ["SHOWCASE_SCOPE", "router"]

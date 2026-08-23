@@ -7,10 +7,12 @@ enqueue it, so the coordinator never has to re-enqueue this chain.
 Two invariants carried straight from Phase 3 (§3.3, red line):
 
 * **Handler pre-flight guard** — every kind re-validates the character *after* claim:
-  existence, ``frozen`` / ``subscription_locked`` and the subscription access guard.
-  A stopped character runs no step AND enqueues no next job — the chain stops, and the
-  reconciler reseeds it after a thaw. This is the shared cheap DB-only recheck that the
-  Phase 3 spec put at the top of every tick.
+  existence, ``frozen`` / ``subscription_locked``, the subscription access guard and
+  (NF4) dormancy. A stopped character runs no step AND enqueues no next job — the
+  chain stops, and the reconciler reseeds it after a thaw / a foreground interaction.
+  This is the shared cheap DB-only recheck that the Phase 3 spec put at the top of
+  every tick; dormancy belongs in it for the same reason freeze does — the job was
+  scheduled under the old answer, and the step is where the money is spent.
 * **No provider filtering re-applied** — the B1 knob multiplier was already spent
   scaling the chain cadence at due time (§4.3.1); the handler does not re-filter, only
   the underlying services' own cooldown / cap gates decide whether visible work happens.
@@ -134,6 +136,16 @@ class CharacterKindHandler:
         if character.frozen or character.subscription_locked:
             return HandlerResult(kind, executed=False, chain_stopped=True)
         if not await self._executor.subscription_allows(character):
+            return HandlerResult(kind, executed=False, chain_stopped=True)
+        # NF4, same guard shape as freeze: a job already queued when the knob
+        # was set — or when the player went quiet — must not run its step and
+        # THEN discover at chain-advance time that the character is dormant.
+        # That ordering is the difference between "the chain stops" and "three
+        # thousand absent players each get one more real picture composed and
+        # one more real message pushed at them first". Stopping here also stops
+        # the chain (no advance), and the reconciler reseeds on the same
+        # foreground-interaction recovery path a thaw uses.
+        if await self._calculator.is_chain_dormant(character, kind, now=resolved):
             return HandlerResult(kind, executed=False, chain_stopped=True)
 
         needs_floor_retry = await self._run_step(

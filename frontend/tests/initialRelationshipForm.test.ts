@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildInitialRelationshipEditPatch,
   buildInitialRelationshipPayload,
+  emptyInitialRelationshipEditForm,
   emptyInitialRelationshipForm,
   splitList,
+  type InitialRelationshipEditForm,
 } from '@/composables/useInitialRelationshipForm'
 
 describe('initial relationship form helpers', () => {
@@ -51,5 +54,118 @@ describe('initial relationship form helpers', () => {
       life_goals: ['整理作品集', '練習日文'],
     })
     expect(splitList('A, B，C\nD')).toEqual(['A', 'B', 'C', 'D'])
+  })
+})
+
+// ----------------------------------------------------------------------
+// The post-creation editor (IR2): diffing against what was actually
+// loaded, not against a blank form, so "didn't touch this field" and
+// "cleared this field" never collapse into the same PATCH body.
+// ----------------------------------------------------------------------
+
+describe('initial relationship edit form helpers', () => {
+  it('drops the create-only safe-profile fields the PATCH endpoint cannot accept', () => {
+    const editForm = emptyInitialRelationshipEditForm()
+
+    expect(editForm).not.toHaveProperty('profile_interests')
+    expect(editForm).not.toHaveProperty('profile_routine')
+    expect(editForm).not.toHaveProperty('profile_life_goals')
+    expect(editForm.schedule_involvement_policy).toBe('none')
+    expect(editForm.proactive_permission).toBe(false)
+  })
+
+  it('returns null when nothing in the form changed', () => {
+    const loaded: InitialRelationshipEditForm = {
+      ...emptyInitialRelationshipEditForm(),
+      relationship_label: '朋友',
+      user_address_name: '阿丹',
+    }
+
+    expect(buildInitialRelationshipEditPatch(loaded, { ...loaded })).toBeNull()
+  })
+
+  it('trims whitespace-only edits down to "no change"', () => {
+    const loaded: InitialRelationshipEditForm = {
+      ...emptyInitialRelationshipEditForm(),
+      relationship_label: '朋友',
+    }
+    const current = { ...loaded, relationship_label: '  朋友  ' }
+
+    expect(buildInitialRelationshipEditPatch(loaded, current)).toBeNull()
+  })
+
+  it('sends only the fields that actually changed, trimmed', () => {
+    const loaded: InitialRelationshipEditForm = {
+      ...emptyInitialRelationshipEditForm(),
+      relationship_label: '朋友',
+      tone_distance: '有點距離',
+      user_profile_notes: '喜歡貓',
+    }
+    const current: InitialRelationshipEditForm = {
+      ...loaded,
+      tone_distance: '  更親近一點  ',
+    }
+
+    expect(buildInitialRelationshipEditPatch(loaded, current)).toEqual({
+      tone_distance: '更親近一點',
+    })
+  })
+
+  it('sends an empty string for a field the player cleared, never for an untouched one', () => {
+    const loaded: InitialRelationshipEditForm = {
+      ...emptyInitialRelationshipEditForm(),
+      relationship_label: '朋友',
+      known_context: '在同一間咖啡店認識',
+    }
+    const current: InitialRelationshipEditForm = {
+      ...loaded,
+      known_context: '',
+    }
+
+    const patch = buildInitialRelationshipEditPatch(loaded, current)
+    expect(patch).toEqual({ known_context: '' })
+    expect(patch).not.toHaveProperty('relationship_label')
+  })
+
+  it('includes a changed schedule policy even when it reverts to "none"', () => {
+    const loaded: InitialRelationshipEditForm = {
+      ...emptyInitialRelationshipEditForm(),
+      schedule_involvement_policy: 'invite_required',
+    }
+    const current: InitialRelationshipEditForm = {
+      ...loaded,
+      schedule_involvement_policy: 'none',
+    }
+
+    expect(buildInitialRelationshipEditPatch(loaded, current)).toEqual({
+      schedule_involvement_policy: 'none',
+    })
+  })
+
+  it('includes a flipped proactive_permission as a boolean, not a string', () => {
+    const loaded = emptyInitialRelationshipEditForm()
+    const current: InitialRelationshipEditForm = { ...loaded, proactive_permission: true }
+
+    expect(buildInitialRelationshipEditPatch(loaded, current)).toEqual({
+      proactive_permission: true,
+    })
+  })
+
+  it('folds several simultaneous edits into one patch, including the two address names', () => {
+    const loaded = emptyInitialRelationshipEditForm()
+    const current: InitialRelationshipEditForm = {
+      ...loaded,
+      user_address_name: '小夏',
+      character_address_name: '前輩',
+      proactive_permission: true,
+      proactive_cadence_hint: '一天最多一次',
+    }
+
+    expect(buildInitialRelationshipEditPatch(loaded, current)).toEqual({
+      user_address_name: '小夏',
+      character_address_name: '前輩',
+      proactive_permission: true,
+      proactive_cadence_hint: '一天最多一次',
+    })
   })
 })

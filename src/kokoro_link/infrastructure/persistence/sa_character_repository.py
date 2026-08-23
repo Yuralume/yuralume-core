@@ -135,6 +135,29 @@ class SACharacterRepository(CharacterRepositoryPort):
             await session.commit()
             return bool(result.rowcount)
 
+    async def touch_last_active(self, character_id: str, now: datetime) -> bool:
+        """Targeted, monotonic single-column UPDATE of the activity anchor.
+
+        Targeted so it never races the aggregate ``save()`` on unrelated
+        fields (the caller may have been holding its entity across a long
+        model call); monotonic so a slow foreground action cannot drag the
+        anchor back behind a chat turn that landed while it ran."""
+        moment = _ensure_utc(now)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(CharacterRow)
+                .where(
+                    CharacterRow.id == character_id,
+                    or_(
+                        CharacterRow.state_last_active_at.is_(None),
+                        CharacterRow.state_last_active_at < moment,
+                    ),
+                )
+                .values(state_last_active_at=moment)
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
     async def claim_consolidation_slot(
         self, character_id: str, *, cooldown: timedelta,
     ) -> bool:

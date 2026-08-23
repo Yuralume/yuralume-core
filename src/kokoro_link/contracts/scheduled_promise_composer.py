@@ -65,6 +65,13 @@ class ScheduledPromiseComposeInput:
     """Prompt-ready lines from OperatorPersonaService for this
     character/operator pair. Empty when persona is disabled or not yet
     learned."""
+    player_persona_note: str = ""
+    """What the player declared about themselves for this pair — a
+    performance authorization, not something the character inferred.
+
+    Empty leaves the prompt byte-identical. Gated by the dispatcher on
+    the same outbound-sink test as the busy-defer follow-up: the
+    promised message travels the same proactive delivery path."""
     operator_primary_language: str = "zh-TW"
     """BCP 47 tag of the character owner's pinned content language
     (FRONTEND_I18N_PLAN). The promised callback uses the same language

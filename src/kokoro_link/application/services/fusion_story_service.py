@@ -68,6 +68,9 @@ if TYPE_CHECKING:
         NotificationService,
     )
 
+from kokoro_link.application.services.character_activity_anchor import (
+    CharacterActivityAnchor,
+)
 from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.cloud_action_billing_service import (
     ActionChargeHandle,
@@ -196,6 +199,11 @@ class FusionStoryService:
         action_billing: (
             CloudActionBillingService | NullActionBillingService | None
         ) = None,
+        # NF4 — a fusion create / iterate is a paid foreground press naming
+        # this cast, so it moves their foreground-interaction anchor for the
+        # same reason a 分歧劇場 press does. Optional (``None`` → not tracked)
+        # so rigs without a character repository keep working unchanged.
+        activity_anchor: CharacterActivityAnchor | None = None,
     ) -> None:
         self._repository = repository
         self._character_service = character_service
@@ -221,6 +229,7 @@ class FusionStoryService:
         self._action_billing: (
             CloudActionBillingService | NullActionBillingService
         ) = action_billing or NullActionBillingService()
+        self._activity_anchor = activity_anchor
         # Active background tasks per story id — keeping a strong ref
         # is required (asyncio's task registry holds only weak refs and
         # an unobserved exception would silently disappear).
@@ -228,6 +237,16 @@ class FusionStoryService:
         # Per-story locks gate concurrent iterate operations from a
         # double-clicking operator. The HTTP layer maps that to 409.
         self._locks: dict[str, asyncio.Lock] = {}
+
+    async def _mark_cast_engaged(self, characters: Sequence[Character]) -> None:
+        """NF4: this press was a foreground interaction with the whole cast.
+
+        After the work landed — a press that raised delivered nothing and was
+        refunded, so it is not evidence of anything. Fail-soft inside the
+        anchor: bookkeeping must never turn a delivered story into an error."""
+        if self._activity_anchor is None:
+            return
+        await self._activity_anchor.touch_all(characters)
 
     # ---- public read surface ----------------------------------------
 
@@ -301,6 +320,7 @@ class FusionStoryService:
             # Nothing was generated, so nothing was covered — a full refund.
             await self._action_billing.release(charge)
             raise
+        await self._mark_cast_engaged(characters)
         return story
 
     # ---- iterate ----------------------------------------------------
@@ -359,6 +379,7 @@ class FusionStoryService:
         except BaseException:
             await self._action_billing.release(charge)
             raise
+        await self._mark_cast_engaged(characters)
         return snapshot
 
     async def iterate_beat(
@@ -419,6 +440,7 @@ class FusionStoryService:
         except BaseException:
             await self._action_billing.release(charge)
             raise
+        await self._mark_cast_engaged(characters)
         return snapshot
 
     async def iterate_polish(
@@ -465,6 +487,7 @@ class FusionStoryService:
         except BaseException:
             await self._action_billing.release(charge)
             raise
+        await self._mark_cast_engaged(characters)
         return snapshot
 
     # ---- restore (C0-6 版本回溯) --------------------------------------

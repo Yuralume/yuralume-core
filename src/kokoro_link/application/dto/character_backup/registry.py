@@ -76,6 +76,7 @@ from kokoro_link.application.dto.character_backup.persona import (
     OperatorAddressPreferenceBackupRecord,
     OperatorProfileFieldBackupRecord,
     PersonaCuriosityAttemptBackupRecord,
+    PlayerPersonaNoteBackupRecord,
 )
 from kokoro_link.application.dto.character_backup.schedule import (
     DailyScheduleBackupRecord,
@@ -301,6 +302,15 @@ CHARACTER_BACKUP_TABLE_RULES: tuple[BackupTableRule, ...] = (
         classification=BackupClassification.CARRY,
         reason="觀察到的稱呼／語距偏好。",
         dto=OperatorAddressPreferenceBackupRecord,
+    ),
+    BackupTableRule(
+        table="player_persona_notes",
+        classification=BackupClassification.CARRY,
+        reason=(
+            "玩家為這段關係自述的身分與世界觀設定——是玩家給角色的演出"
+            "授權，關係還原後角色必須繼續接得住。"
+        ),
+        dto=PlayerPersonaNoteBackupRecord,
     ),
     BackupTableRule(
         table="operator_address_change_log",

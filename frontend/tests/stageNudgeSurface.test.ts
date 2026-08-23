@@ -215,6 +215,25 @@ describe('ChatPanel wiring', () => {
     expect(match).not.toBeNull()
   })
 
+  it('opens in stage mode, so the button is visible without the player switching', () => {
+    // The scene-access judge call that once made stage costlier to open by
+    // default was retired 2026-07-30 (SA series); there is no remaining
+    // cost reason to start narrower in DM. See owner ruling in the SN plan.
+    expect(src).toContain("const interactionMode = ref<ChatInteractionMode>('stage')")
+  })
+
+  it('does not snap the player back to DM when the character changes', () => {
+    // A forced `interactionMode.value = 'dm'` inside the character-id
+    // watcher would undo the player's own mid-session choice every time
+    // they switch characters — pin its absence directly in that watcher's
+    // body, not just "somewhere in the file".
+    const watcherMatch = src.match(
+      /watch\(\(\) => props\.character\?\.id[\s\S]*?\}, \{ immediate: true \}\)/,
+    )
+    expect(watcherMatch).not.toBeNull()
+    expect(watcherMatch![0]).not.toContain("interactionMode.value = 'dm'")
+  })
+
   it('shares the story-scene busy guard rather than inventing a second one', () => {
     // "sending／串流中禁用" — the same computed StorySceneControl already
     // uses (`!character || sending || undoing`), not a parallel definition

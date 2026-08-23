@@ -53,6 +53,9 @@ from kokoro_link.application.dto.chat import PresenceFramePayload, SendChatMessa
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.chat_turn_lease import ConversationBusyError
 from kokoro_link.application.services.drain_state import ServerDrainingError
+from kokoro_link.application.services.persona_disclosure_gate import (
+    persona_safe_for_account,
+)
 from kokoro_link.application.services.outbound_message_segments import (
     send_segmented_outbound,
 )
@@ -491,10 +494,9 @@ class MessagingDispatcher:
 def _persona_safe_for_account(account: MessagingAccount) -> bool:
     """Allow persona learning only when one external human is identified.
 
-    Empty allowlist means "accept anyone" and multi-entry allowlists can
-    represent group / shared accounts. Both cases would write several
-    humans into the same DEFAULT_OPERATOR_ID, so persona extraction is
-    disabled for those inbound turns.
+    Kept as a name here because this is the inbound side's vocabulary,
+    but the rule itself moved to
+    :mod:`kokoro_link.application.services.persona_disclosure_gate` once
+    the outbound composers needed the same test — one rule, one place.
     """
-    senders = tuple(ref for ref in account.allowed_sender_refs if ref)
-    return len(senders) == 1
+    return persona_safe_for_account(account)

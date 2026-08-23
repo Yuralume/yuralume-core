@@ -26,6 +26,7 @@ import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { isPriceChangedError } from '@/utils/api/priceChanged'
 import { billingRefusalKind, refreshQuotedPrices } from '@/utils/api/billingRefusal'
 import { creditAmountText } from '@/utils/creditsFormat'
+import { composerHeightFor } from '@/utils/composerAutoResize'
 import { suggestChatAssistMessages } from '@/utils/api/chatAssist'
 import { getCharacter } from '@/utils/api/characters'
 import { notification } from 'ant-design-vue'
@@ -38,6 +39,9 @@ import StorySceneChips from '@/components/StorySceneChips.vue'
 import StorySceneControl from '@/components/StorySceneControl.vue'
 import StageNudgeControl from '@/components/StageNudgeControl.vue'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
+import PlayerGuideEntry from '@/components/playerGuide/PlayerGuideEntry.vue'
+import PlayerPersonaNoteChip from '@/components/PlayerPersonaNoteChip.vue'
+import PlayerPersonaNoteModal from '@/components/PlayerPersonaNoteModal.vue'
 import InsufficientCreditsNotice from '@/components/InsufficientCreditsNotice.vue'
 import NsfwModeAtmosphere from '@/components/NsfwModeAtmosphere.vue'
 import { UiButton } from '@/components/ui'
@@ -73,6 +77,12 @@ import {
   rememberChatAssistHintDismissed,
   shouldShowChatAssistHint,
 } from '@/utils/chatAssistDiscovery'
+import { usePlayerPersonaNote } from '@/composables/usePlayerPersonaNote'
+import {
+  isPlayerPersonaNoteDismissed,
+  rememberPlayerPersonaNoteDismissed,
+  shouldPromptPlayerPersonaNote,
+} from '@/utils/playerPersonaNote'
 
 const { t, locale } = useI18n()
 const { timeZone } = useTimezone()
@@ -144,6 +154,14 @@ const props = defineProps<{
   messages: ChatMessage[]
   historyPage?: ChatHistoryPage | null
   loadingHistory?: boolean
+  /**
+   * 上一次歷史讀取是失敗收場的（見 StagePage.loadHistoryFor 的 catch）。
+   *
+   * 失敗時 `messages` 被折疊成空陣列，「零訊息」與「讀不到」在這裡長得
+   * 一模一樣——少了這個旗標，聊過幾百則的老玩家一遇到讀取失敗就會被當成
+   * 第一次進來，吃到首開彈窗。
+   */
+  historyFailed?: boolean
   // 桌面 landscape 版面偏好 toggle：只在非 portrait 時顯示（由
   // StagePage 決定是否傳入 true）。StagePage 持有 stageLayout 狀態，
   // ChatPanel 純顯示 + emit 事件，不在此另開一份 localStorage 讀寫。
@@ -204,9 +222,29 @@ const chatAssistLoading = ref(false)
 const chatAssistError = ref<string | null>(null)
 const chatAssistSuggestions = ref<ChatAssistSuggestion[]>([])
 const chatAssistCharacterId = ref<string | null>(null)
-const chatAssistDiscovered = ref(isChatAssistDiscovered(getChatAssistDiscoveryStorage()))
-const chatAssistHintDismissed = ref(isChatAssistHintDismissed(getChatAssistDiscoveryStorage()))
+const chatAssistDiscovered = ref(isChatAssistDiscovered(getSafeLocalStorage()))
+const chatAssistHintDismissed = ref(isChatAssistHintDismissed(getSafeLocalStorage()))
 const composingInput = ref(false)
+
+// --- 玩家人設補充（PP4）-----------------------------------------------
+// 這個面板只持有「填了沒」與「要不要主動問」；編輯與寫入都在
+// PlayerPersonaNoteModal 裡，設定頁用的是同一顆 modal。
+const {
+  note: playerPersonaNoteText,
+  loaded: playerPersonaNoteLoaded,
+  loading: playerPersonaNoteLoading,
+  load: loadPlayerPersonaNote,
+  reload: reloadPlayerPersonaNote,
+  apply: applyPlayerPersonaNote,
+} = usePlayerPersonaNote()
+const playerPersonaNoteOpen = ref(false)
+/** 這一輪進場已經主動彈過（關掉之後不該被同一條規則立刻再彈開）。 */
+const playerPersonaNotePrompted = ref(false)
+/** 這台裝置上，玩家對這個角色按過「之後再說」。 */
+const playerPersonaNoteDismissed = ref(false)
+const playerPersonaNoteFilled = computed(
+  () => playerPersonaNoteText.value.trim().length > 0,
+)
 
 // --- Story scene ("Start a Scene") -----------------------------------
 // Declared here, above the character watcher, because that watcher runs
@@ -264,9 +302,11 @@ function releaseSendingLock(lockId: number) {
 type ChatInteractionMode = 'stage' | 'dm'
 // Both surfaces are the player's to pick, with no gate in between (plan
 // SA, D1): switching is local state only — no request, no wait, no charge.
-// DM stays the opening default because a first message is the gentler
-// entry, not because same-space has to be earned.
-const interactionMode = ref<ChatInteractionMode>('dm')
+// Same-space (stage) is the opening default: the scene-access judge call
+// that once made stage costlier to open by default was retired 2026-07-30
+// (SA series), so there is no remaining cost reason to start narrower in
+// DM. Players can still switch to DM at any time.
+const interactionMode = ref<ChatInteractionMode>('stage')
 
 const panelClass = computed(() => [
   'chat-panel',
@@ -595,7 +635,9 @@ function closeChatAssist() {
   chatAssistOpen.value = false
 }
 
-function getChatAssistDiscoveryStorage(): Storage | null {
+// 隱私模式下光是碰 `window.localStorage` 就會 throw，所以取用一律經過這裡。
+// 同一份 getter 給 chat-assist 的探索記憶與玩家人設的「之後再說」共用。
+function getSafeLocalStorage(): Storage | null {
   if (typeof window === 'undefined') return null
   try {
     return window.localStorage
@@ -605,13 +647,34 @@ function getChatAssistDiscoveryStorage(): Storage | null {
 }
 
 function markChatAssistDiscovered() {
-  rememberChatAssistDiscovered(getChatAssistDiscoveryStorage())
+  rememberChatAssistDiscovered(getSafeLocalStorage())
   chatAssistDiscovered.value = true
 }
 
 function dismissChatAssistHint() {
-  rememberChatAssistHintDismissed(getChatAssistDiscoveryStorage())
+  rememberChatAssistHintDismissed(getSafeLocalStorage())
   chatAssistHintDismissed.value = true
+}
+
+function openPlayerPersonaNote() {
+  // 手動打開也算「已經問過」——玩家關掉之後，自動規則不該再把它彈回來。
+  playerPersonaNotePrompted.value = true
+  // 先前那次 GET 失敗過（或還沒跑）：趁開窗重試一次。成功前 modal 是鎖著
+  // 的說明狀態，不會給出一個會清掉既有自述的空白編輯框。
+  if (!playerPersonaNoteLoaded.value && !playerPersonaNoteLoading.value) {
+    void reloadPlayerPersonaNote()
+  }
+  playerPersonaNoteOpen.value = true
+}
+
+function dismissPlayerPersonaNote() {
+  rememberPlayerPersonaNoteDismissed(getSafeLocalStorage(), props.character?.id ?? null)
+  playerPersonaNoteDismissed.value = true
+  playerPersonaNoteOpen.value = false
+}
+
+function handlePlayerPersonaNoteSaved(note: string) {
+  applyPlayerPersonaNote(note)
 }
 
 // Minimal click-outside directive — closes the action menu when the
@@ -824,12 +887,18 @@ watch(() => props.character?.id ?? null, (characterId) => {
   clearStoryScene()
   storySceneBillingErrorKey.value = null
   closingNarrationIndex.value = null
+  playerPersonaNoteOpen.value = false
+  playerPersonaNotePrompted.value = false
+  playerPersonaNoteDismissed.value = isPlayerPersonaNoteDismissed(
+    getSafeLocalStorage(),
+    characterId,
+  )
+  void loadPlayerPersonaNote(characterId)
   if (activityTimer) {
     clearInterval(activityTimer)
     activityTimer = null
   }
   if (characterId) {
-    interactionMode.value = 'dm'
     // A scene lives in the database, not in this tab: reopening the thread
     // (or reloading the page mid-scene) must come back to the scene the
     // player left, not to a button that would refuse them.
@@ -848,6 +917,28 @@ watch(chatAssistEnabled, (enabled) => {
     chatAssistOpen.value = false
   }
 })
+
+// 首次進入某個角色的聊天時主動問一次人設。整組條件在
+// `shouldPromptPlayerPersonaNote` 裡（純函式，單獨掛測試）；這裡只負責
+// 把當下狀態餵進去，並在它說「該問」時開窗。
+watch(
+  () => shouldPromptPlayerPersonaNote({
+    characterId: props.character?.id ?? null,
+    loadingHistory: props.loadingHistory ?? false,
+    historyFailed: props.historyFailed ?? false,
+    noteLoaded: playerPersonaNoteLoaded.value,
+    note: playerPersonaNoteText.value,
+    messageCount: localMessages.value.length,
+    dismissed: playerPersonaNoteDismissed.value,
+    alreadyPrompted: playerPersonaNotePrompted.value,
+  }),
+  (shouldPrompt) => {
+    if (!shouldPrompt) return
+    playerPersonaNotePrompted.value = true
+    playerPersonaNoteOpen.value = true
+  },
+  { immediate: true },
+)
 
 onUnmounted(() => {
   if (activityTimer) clearInterval(activityTimer)
@@ -1388,7 +1479,12 @@ function autoResizeTextarea() {
   const el = textareaRef.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = `${el.scrollHeight}px`
+  // 空輸入時 composerHeightFor 回 null：把 inline height 拿掉、交還給 CSS 的
+  // min-height。Blink 會把折行後的 placeholder 算進 scrollHeight，照抄就會讓
+  // 送出後的空輸入框永久卡在 max-height（詳見 composerAutoResize）。
+  const height = composerHeightFor(el)
+  if (height === null) el.style.removeProperty('height')
+  else el.style.height = height
 }
 
 // Re-run on every inputText change so shrinking after send / paste
@@ -1480,6 +1576,15 @@ onUnmounted(() => {
           <span v-if="loadingHistory" class="header-status">{{ t('chat.header.loadingHistory') }}</span>
           <span v-else-if="conversationId" class="header-status">{{ t('chat.header.conversationOngoing') }}</span>
           <span v-else class="header-status">{{ t('chat.header.newConversation') }}</span>
+          <!-- 玩法總覽的常駐入口（PG1）：一次性提示錯過了也還能回來查。 -->
+          <PlayerGuideEntry />
+          <!-- 常駐入口：不管首次彈窗有沒有被跳過，玩家隨時能回來補人設。 -->
+          <PlayerPersonaNoteChip
+            :filled="playerPersonaNoteFilled"
+            :character-name="character.name"
+            :disabled="playerPersonaNoteLoading"
+            @open="openPlayerPersonaNote"
+          />
           <UiButton
             v-if="showLayoutToggle"
             variant="ghost"
@@ -1853,6 +1958,19 @@ onUnmounted(() => {
           />
         </div>
       </div>
+
+      <PlayerPersonaNoteModal
+        :visible="playerPersonaNoteOpen"
+        :character-id="character.id"
+        :character-name="character.name"
+        :initial-note="playerPersonaNoteText"
+        :note-loaded="playerPersonaNoteLoaded"
+        :loading="playerPersonaNoteLoading"
+        @close="playerPersonaNoteOpen = false"
+        @dismiss="dismissPlayerPersonaNote"
+        @saved="handlePlayerPersonaNoteSaved"
+        @reload="reloadPlayerPersonaNote"
+      />
     </template>
   </div>
 </template>

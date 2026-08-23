@@ -17,6 +17,7 @@ import {
 } from '@/utils/api/fusionStory'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { isInsufficientCreditsFailure } from '@/utils/studioFailure'
+import { fusionIterationLabel } from '@/utils/fusionIterationLabel'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import { ACTION_FUSION_STORY_ITERATE } from '@/composables/useActionPricing'
 import {
@@ -475,7 +476,7 @@ async function handlePolish() {
         >
           <div class="viewer__version-head">
             <span class="viewer__version-pill">v{{ v.version_number }}</span>
-            <span class="viewer__version-label">{{ v.iteration_label }}</span>
+            <span class="viewer__version-label">{{ fusionIterationLabel(v.iteration_label, t) }}</span>
             <span>{{ formatDateTime(v.created_at, locale, timeZone) }}</span>
             <span class="viewer__version-title">{{ v.title }}</span>
             <button

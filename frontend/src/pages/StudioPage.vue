@@ -1,13 +1,30 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+import { computed, ref } from 'vue'
+import { RouterView, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 
 import { UiButton } from '@/components/ui'
+import StudioGuideModal from '@/components/studio/StudioGuideModal.vue'
+import StudioTabCard from '@/components/studio/StudioTabCard.vue'
+import { useAuth } from '@/composables/useAuth'
+import {
+  isStudioGuideCoachmarkDismissed,
+  rememberStudioGuideCoachmarkDismissed,
+} from '@/utils/arcDiscovery'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
+const { cloudMode } = useAuth()
+
+/**
+ * 場景圖是選配能力，自架站沒接圖片後端就永遠沒有圖（而前端看不到那份
+ * 配置），所以承諾「會畫成圖」的句子分兩版——與 `StudioGuideModal` 的
+ * `siteAware()` 同一條規則。
+ */
+function siteAwareCopy(key: string): string {
+  return t(cloudMode.value ? key : `${key}SelfHost`)
+}
 
 const tabs = computed(() => [
   {
@@ -16,6 +33,9 @@ const tabs = computed(() => [
     description: t('studio.tabs.authoringHint'),
     icon: '✦',
     accent: 'var(--color-primary)',
+    what: t('studio.tabs.authoringWhat'),
+    how: t('studio.tabs.authoringHow'),
+    next: t('studio.tabs.authoringNext'),
   },
   {
     routeName: 'studio-fusion-stories',
@@ -23,6 +43,9 @@ const tabs = computed(() => [
     description: t('studio.tabs.fusionHint'),
     icon: '◇',
     accent: 'var(--color-primary-light)',
+    what: t('studio.tabs.fusionWhat'),
+    how: t('studio.tabs.fusionHow'),
+    next: t('studio.tabs.fusionNext'),
   },
   {
     routeName: 'studio-branching-dramas',
@@ -30,6 +53,9 @@ const tabs = computed(() => [
     description: t('studio.tabs.branchingHint'),
     icon: '◈',
     accent: 'var(--color-secondary)',
+    what: t('studio.tabs.branchingWhat'),
+    how: t('studio.tabs.branchingHow'),
+    next: siteAwareCopy('studio.tabs.branchingNext'),
   },
   {
     routeName: 'studio-character-cards',
@@ -37,8 +63,41 @@ const tabs = computed(() => [
     description: t('studio.tabs.cardsHint'),
     icon: '✧',
     accent: 'var(--color-spark)',
+    what: t('studio.tabs.cardsWhat'),
+    how: t('studio.tabs.cardsHow'),
+    next: t('studio.tabs.cardsNext'),
   },
 ])
+
+/** Guarded so SSR / privacy-mode never throws at setup. */
+function getStudioStorage(): Storage | null {
+  if (typeof window === 'undefined') return null
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+const guideOpen = ref(false)
+const coachmarkDismissed = ref(
+  isStudioGuideCoachmarkDismissed(getStudioStorage()),
+)
+const showCoachmark = computed(() => !coachmarkDismissed.value)
+
+function dismissCoachmark() {
+  rememberStudioGuideCoachmarkDismissed(getStudioStorage())
+  coachmarkDismissed.value = true
+}
+
+/**
+ * 開導覽也算「看過提示」：提示唯一的目的就是把人送到這裡，送到了就不必
+ * 再問第二次。所以入口按鈕與提示本身共用同一次熄燈。
+ */
+function openGuide() {
+  dismissCoachmark()
+  guideOpen.value = true
+}
 </script>
 
 <template>
@@ -53,25 +112,51 @@ const tabs = computed(() => [
           <h1 class="display-title display-title--gradient">{{ t('studio.title') }}</h1>
           <p>{{ t('studio.subtitle') }}</p>
         </div>
+        <UiButton
+          class="studio-shell__guide glass-panel"
+          variant="ghost"
+          size="sm"
+          @click="openGuide"
+        >
+          {{ t('studio.guide.openLabel') }}
+        </UiButton>
       </header>
 
+      <div v-if="showCoachmark" class="studio-coachmark" role="note">
+        <span class="studio-coachmark__body">{{ t('studio.guide.coachmark') }}</span>
+        <UiButton variant="chip" size="sm" @click="openGuide">
+          {{ t('studio.guide.coachmarkAction') }}
+        </UiButton>
+        <button
+          type="button"
+          class="studio-coachmark__close"
+          :aria-label="t('studio.guide.coachmarkDismiss')"
+          @click="dismissCoachmark"
+        >
+          ×
+        </button>
+      </div>
+
       <nav class="studio-tabs" :aria-label="t('studio.tabs.aria')">
-        <RouterLink
+        <StudioTabCard
           v-for="tab in tabs"
           :key="tab.routeName"
-          class="studio-tab sheen-hover"
-          :class="{ 'studio-tab--active': route.name === tab.routeName }"
-          :to="{ name: tab.routeName }"
-          :style="{ '--studio-tab-accent': tab.accent }"
-        >
-          <span class="studio-tab__icon" aria-hidden="true">{{ tab.icon }}</span>
-          <span class="studio-tab__label">{{ tab.label }}</span>
-          <small>{{ tab.description }}</small>
-        </RouterLink>
+          :route-name="tab.routeName"
+          :label="tab.label"
+          :description="tab.description"
+          :icon="tab.icon"
+          :accent="tab.accent"
+          :what="tab.what"
+          :how="tab.how"
+          :next="tab.next"
+          :active="route.name === tab.routeName"
+        />
       </nav>
 
       <RouterView />
     </div>
+
+    <StudioGuideModal :visible="guideOpen" @close="guideOpen = false" />
   </main>
 </template>
 
@@ -113,12 +198,13 @@ const tabs = computed(() => [
 
 .studio-shell__header {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
 }
 
-.studio-shell__back {
+.studio-shell__back,
+.studio-shell__guide {
   border-radius: 999px;
 }
 
@@ -143,84 +229,54 @@ const tabs = computed(() => [
   line-height: 1.6;
 }
 
+.studio-coachmark {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 10px 38px 10px var(--space-3);
+  border-radius: 8px;
+  border: 1px solid rgba(var(--color-spark-rgb), 0.32);
+  background: rgba(13, 23, 34, 0.9);
+}
+
+.studio-coachmark__body {
+  min-width: 0;
+  flex: 1 1 240px;
+  font-size: var(--font-md);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.studio-coachmark__close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.72);
+  font: inherit;
+  font-size: 17px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.studio-coachmark__close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
 .studio-tabs {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-2);
-}
-
-.studio-tab {
-  --studio-tab-accent: var(--color-primary);
-  min-width: 0;
-  min-height: 92px;
-  padding: var(--space-3);
-  border: 1px solid color-mix(in srgb, var(--studio-tab-accent) 32%, transparent);
-  border-radius: 8px;
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.025)),
-    rgba(18, 12, 42, 0.58);
-  color: var(--color-text);
-  text-decoration: none;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  grid-template-rows: auto 1fr;
-  align-items: center;
-  justify-content: center;
-  column-gap: var(--space-2);
-  row-gap: 4px;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.025) inset;
-  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
-}
-
-.studio-tab:hover {
-  transform: translateY(-2px);
-  border-color: color-mix(in srgb, var(--studio-tab-accent) 68%, transparent);
-  box-shadow:
-    0 12px 28px rgba(0, 0, 0, 0.22),
-    0 0 22px color-mix(in srgb, var(--studio-tab-accent) 20%, transparent);
-}
-
-.studio-tab--active {
-  border-color: color-mix(in srgb, var(--studio-tab-accent) 82%, transparent);
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--studio-tab-accent) 22%, transparent), rgba(255, 255, 255, 0.03)),
-    rgba(18, 12, 42, 0.66);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--studio-tab-accent) 28%, transparent) inset,
-    0 0 26px color-mix(in srgb, var(--studio-tab-accent) 20%, transparent);
-}
-
-.studio-tab__icon {
-  width: 30px;
-  height: 30px;
-  border-radius: 999px;
-  color: var(--studio-tab-accent);
-  background: color-mix(in srgb, var(--studio-tab-accent) 14%, transparent);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  line-height: 1;
-}
-
-.studio-tab__label {
-  font-weight: 650;
-  overflow-wrap: anywhere;
-}
-
-.studio-tab small {
-  grid-column: 2;
-  color: var(--color-text-secondary);
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .studio-tab,
-  .studio-tab:hover {
-    transform: none;
-    transition: none;
-  }
+  align-items: start;
 }
 
 @media (max-width: 820px) {

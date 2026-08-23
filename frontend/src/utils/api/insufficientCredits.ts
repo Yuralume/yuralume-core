@@ -125,16 +125,37 @@ export function insufficientCreditsFromAxios(
 }
 
 /**
+ * An `Error` from `apiErrorFromResponse` that isn't one of the typed
+ * refusals above. `statusCode` lets a caller branch on the HTTP status
+ * (e.g. retry a transient `409`) without re-parsing the response body it
+ * already consumed.
+ */
+export interface ApiStatusError extends Error {
+  statusCode: number
+}
+
+export function apiStatusErrorStatus(error: unknown): number | null {
+  if (!(error instanceof Error)) return null
+  const status = (error as Partial<ApiStatusError>).statusCode
+  return typeof status === 'number' ? status : null
+}
+
+/**
  * Turn a non-ok `fetch` `Response` into either the typed credit error or a
  * plain `Error` carrying the server message. Reads the body exactly once,
  * so it is a drop-in replacement for `throw new Error(await
  * readErrorResponse(res))` in the hand-rolled fetch clients.
+ *
+ * The fallback `Error` also carries `statusCode` (see `ApiStatusError`) —
+ * additive, so existing callers that only read `.message` are unaffected.
  */
 export async function apiErrorFromResponse(res: Response): Promise<Error> {
   const body = await readErrorBody(res)
-  return (
+  const typed =
     insufficientCreditsFromBody(body, res.status)
     ?? priceChangedFromBody(body, res.status)
-    ?? new Error(formatErrorBody(body, res))
-  )
+  if (typed) return typed
+  const error = new Error(formatErrorBody(body, res)) as ApiStatusError
+  error.statusCode = res.status
+  return error
 }

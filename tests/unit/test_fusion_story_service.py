@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from kokoro_link.application.services.character_activity_anchor import (
+    CharacterActivityAnchor,
+)
 from kokoro_link.application.services.fusion_character_brief import (
     CharacterBrief,
     FusionCharacterBriefBuilder,
@@ -218,6 +221,7 @@ def _dirty_critique() -> FusionStoryCritique:
 def _service(
     *,
     planner=None, writer=None, polisher=None, critic=None,
+    characters=None,
 ):
     repo = InMemoryFusionStoryRepository()
     chars = {
@@ -233,6 +237,12 @@ def _service(
         writer=writer or _ScriptedWriter(),  # type: ignore[arg-type]
         polisher=polisher or _ScriptedPolisher(),  # type: ignore[arg-type]
         critic=critic or _ScriptedCritic(),  # type: ignore[arg-type]
+        # NF4: wired only when a test supplies a character repository, so the
+        # rest of this file exercises the path it always did.
+        activity_anchor=(
+            CharacterActivityAnchor(characters)
+            if characters is not None else None
+        ),
     )
 
 
@@ -654,3 +664,29 @@ class TestFailureMode:
         assert final is not None
         assert final.status == STATUS_FAILED
         assert final.error_message
+
+
+# ── NF4: a fusion press is a foreground interaction with its cast ────
+
+
+@pytest.mark.asyncio
+async def test_creating_a_fusion_story_marks_the_cast_engaged() -> None:
+    """Same argument as 分歧劇場: the player paid, named this cast, and got
+    prose starring them. If that does not count as engagement, a player who
+    works in the studio reads as never having interacted."""
+    from kokoro_link.infrastructure.repositories.in_memory_characters import (
+        InMemoryCharacterRepository,
+    )
+
+    characters = InMemoryCharacterRepository()
+    for letter in ("a", "b"):
+        await characters.save(_make_character(letter))
+    _, service = _service(characters=characters)
+
+    story = await service.create(
+        character_ids=["c-a", "c-b"], prompt="兩人的一天",
+    )
+    await _await_terminal(service, story.id)
+
+    assert (await characters.get("c-a")).state.last_active_at is not None
+    assert (await characters.get("c-b")).state.last_active_at is not None

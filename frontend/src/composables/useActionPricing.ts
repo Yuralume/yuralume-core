@@ -26,6 +26,7 @@
 
 import { computed, ref } from 'vue'
 
+import { isCloudDeployment } from '@/composables/deploymentMode'
 import {
   fetchCloudPricing,
   type ActionPrice,
@@ -51,6 +52,17 @@ export const ACTION_FUSION_STORY_ITERATE = 'fusion_story_iterate'
  * shows this number next to the button and not on the scene itself.
  */
 export const ACTION_STORY_SCENE_OPEN = 'story_scene_open'
+
+/**
+ * 分歧劇場 (plan BD, D2). One price per button rather than one per drama:
+ * building the tree, advancing a beat and talking inside a beat are three
+ * separate presses and three separate prices. `branching_drama_scene_regen`
+ * is declared here too so the redraw button (BD6) quotes from the same table.
+ */
+export const ACTION_BRANCHING_DRAMA_CREATE = 'branching_drama_create'
+export const ACTION_BRANCHING_DRAMA_ADVANCE = 'branching_drama_advance'
+export const ACTION_BRANCHING_DRAMA_INTERACT = 'branching_drama_interact'
+export const ACTION_BRANCHING_DRAMA_SCENE_REGEN = 'branching_drama_scene_regen'
 
 const BILLING_SHAPE_ACTION_FIXED = 'action_fixed'
 
@@ -98,6 +110,9 @@ export function resolveActionPrice(
 }
 
 async function load(options: { refresh?: boolean } = {}): Promise<void> {
+  // Self-host charges nothing and does not mount the price route; every hint
+  // that would quote from this list is already hidden there.
+  if (!isCloudDeployment()) return
   if (!supported.value) return
   if (inFlight) return inFlight
   loading.value = true

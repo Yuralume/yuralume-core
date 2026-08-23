@@ -63,7 +63,12 @@ const particles = buildNsfwAtmosphereParticles()
     rgba(255, 151, 178, 0.72),
     rgba(255, 255, 255, 0)
   );
+  /* 前綴在前、標準在後：反過來寫的話 lightningcss 會把標準那份併掉，只留
+     -webkit- 版，Firefox 就完全沒有遮罩——這圈漸層邊框會變成整塊實心。 */
   -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;

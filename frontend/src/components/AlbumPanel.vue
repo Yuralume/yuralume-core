@@ -3,20 +3,39 @@
  * 角色相簿面板。
  *
  * 顯示該角色相簿圖片（工具生成 + 從舞台轉來），支援：
- * - 點圖預覽（新分頁開啟原圖）
+ * - 點圖在浮窗中放大（`UiLightbox`，左右鍵在已載入的相簿項目之間連續切換）
  * - 刪除（檔案一起刪）
  * - 晉升為舞台圖（加回 image_urls）
  * - 往下捲載入更多（keyset 分頁，）
  *
  * 跟 CharacterImagesPanel 分開：此面板處理的是「長期收藏」，
  * 舞台面板處理的是「目前輪播中」。兩邊互相移動資料。
+ *
+ * LB2（計畫 `IMAGE_LIGHTBOX_PLAN.md`）：相簿是浮窗的第一個真實消費者，也是
+ * 唯一集合會**非同步成長**的一個——走到已載入的最後一張還要往前時，浮窗會
+ * 發 `load-more`，這裡把它接到既有的 `loadMore()`（跟往下捲用的是同一條路徑
+ * 與同一組 keyset 游標，所以兩個入口不會各自打亂分頁狀態）。
+ *
+ * 集合會非同步成長，就代表「玩家按下下一張」與「那一張真的存在」中間隔著一次
+ * HTTP 往返，而那段空窗裡玩家仍然可以操作。**那段空窗的規矩全部在浮窗自己
+ * 身上**（等待記號、以及「玩家自己走了一步就不欠他了」的作廢），面板這裡只剩
+ * 一件它獨有的事：
+ *
+ * - **續載失敗訊息綁「這次開窗」而不是綁面板**（`openZoom` / `closeZoom`）。
+ *   綁面板會讓上一次開窗的紅字跟著下一次開窗一起出現。
+ *
+ * 這裡曾經多一套「只把補走那一步給還站在原地的人」的准駁（單向 `:index` ＋
+ * 一個 flush 窗）。那是在浮窗被別的票佔用時的邊界補償：產生點仍在浮窗，面板
+ * 只是在收下之前擋掉，而且靠 Vue 的 flush 順序才成立、下一個會非同步成長的
+ * 消費者得整套重抄。根因修在浮窗之後（FIX-E），這裡回到單純的 `v-model:index`。
  */
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { usePlayerCopy } from '@/composables/usePlayerCopy'
 
 import type { AlbumItem } from '@/types/album'
-import { UiBadge, UiButton, UiImage } from '@/components/ui'
+import { UiBadge, UiButton, UiImage, UiLightbox } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
 import {
   deleteAlbumItem,
   listAlbum,
@@ -25,7 +44,6 @@ import {
 import { useTimezone } from '@/composables/useTimezone'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { formatDateTime } from '@/i18n/formatters'
-import { safeMediaHref } from '@/utils/safeMediaUrl'
 
 const props = defineProps<{
   characterId: string | null
@@ -61,8 +79,63 @@ const busyItemId = ref<string | null>(null)
 const errorMsg = ref<string | null>(null)
 const sentinel = ref<HTMLElement | null>(null)
 
+// ---------------------------------------------------------------- 放大檢視
+
+const zoomOpen = ref(false)
+const zoomIndex = ref(0)
+/**
+ * 續載失敗要在浮窗裡自己說一次。
+ *
+ * 不重用下面那個面板層的 `errorMsg`：浮窗開著時整個面板都在 overlay 底下，
+ * 玩家看不到它；而 `errorMsg` 同時也承載刪除／晉升的失敗，把它整條餵給浮窗
+ * 等於讓浮窗顯示與續載無關的訊息，還會連帶讓浮窗的重試鍵重試錯的東西。
+ */
+const loadMoreError = ref<string | null>(null)
+
+/**
+ * 浮窗的集合＝**目前已載入的那些**。
+ *
+ * 刻意不預先展開到 `total`：沒載到的項目沒有 URL，放進來只會變成一格永遠
+ * 空白的圖。走到末端時改用 `hasMore` 讓浮窗去要下一頁（見上方檔頭）。
+ */
+const lightboxItems = computed<LightboxItem[]>(() =>
+  items.value.map(item => ({ url: item.url, caption: item.caption })),
+)
+
+function openZoom(at: number) {
+  // 續載失敗訊息的生命週期綁「這次開窗」，不是綁面板。上一次開窗在末端續載失敗
+  // 留下的紅字，會原封不動地出現在玩家接著點開的另一張圖底下——而當下根本沒有
+  // 任何請求發生過；更糟的是那顆重試鍵還是活的，按下去續載成功就把索引往前推，
+  // 玩家看的圖從他點的那張變成下一張。
+  loadMoreError.value = null
+  zoomIndex.value = at
+  zoomOpen.value = true
+}
+
+/** 關窗與開窗對稱地收掉續載狀態，理由同 `openZoom`。 */
+function closeZoom() {
+  zoomOpen.value = false
+  loadMoreError.value = null
+}
+
+/**
+ * 浮窗走到已載入的末端了——去要下一頁，就這樣。
+ *
+ * `loadMore()` 本身不知道也不該知道浮窗的存在（往下捲的 sentinel 走的是同一
+ * 支）；「這一頁回來之後要不要把玩家往前推一格」也不是這裡的事，浮窗自己記著
+ * 那次續載是誰、從哪一張按出來的。
+ */
+function onLightboxLoadMore() {
+  void loadMore()
+}
+
 /** 換角色即重抓第一頁，捨棄先前的分頁狀態。 */
 async function reload() {
+  // 換角色時浮窗必須關掉：它的索引指向的是舊角色那份清單，留著就會在新清單
+  // 落地的瞬間變成「同一格位置的另一個人的圖」。
+  zoomOpen.value = false
+  zoomIndex.value = 0
+  loadMoreError.value = null
   hasMore.value = false
   nextBefore.value = null
   if (!props.characterId) {
@@ -85,12 +158,19 @@ async function reload() {
   }
 }
 
-/** 捲到底時載入下一頁（keyset：帶上前一頁最舊一張的 created_at）。 */
+/**
+ * 載入下一頁（keyset：帶上前一頁最舊一張的 created_at）。
+ *
+ * 兩個入口共用這一支：往下捲的 sentinel，以及浮窗走到已載入末端時發的
+ * `load-more`。共用是刻意的——兩邊各自維護游標會讓同一頁被要兩次。前面的
+ * `loadingMore` 去重同時也是「玩家在載入中連按下一張」的擋板。
+ */
 async function loadMore() {
   if (!props.characterId || !hasMore.value) return
   if (loading.value || loadingMore.value) return
   loadingMore.value = true
   errorMsg.value = null
+  loadMoreError.value = null
   try {
     const res = await listAlbum(props.characterId, { before: nextBefore.value })
     items.value = [...items.value, ...res.items]
@@ -98,7 +178,10 @@ async function loadMore() {
     hasMore.value = res.has_more
     nextBefore.value = res.next_before
   } catch (err) {
-    errorMsg.value = extractError(err) ?? t('albumPanel.errors.loadFailed')
+    const message = extractError(err) ?? t('albumPanel.errors.loadFailed')
+    errorMsg.value = message
+    // 浮窗開著時面板的錯誤列被 overlay 蓋住，所以同一則訊息也交給浮窗自己畫。
+    loadMoreError.value = message
   } finally {
     loadingMore.value = false
   }
@@ -235,16 +318,21 @@ defineExpose({ reload })
     </div>
     <div v-else class="album-grid">
       <div
-        v-for="item in items"
+        v-for="(item, index) in items"
         :key="item.id"
         class="album-tile"
       >
-        <a
-          :href="safeMediaHref(item.url)"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="album-image-link"
-          :title="item.caption ?? ''"
+        <!-- 原本是開新分頁的 anchor：連續看相簿要一張一張開再一張一張關，
+             手機上每開一張多一個分頁。改成就地放大的浮窗（LB2）。仍是按鈕不是
+             連結——它不導向任何地方；「看原檔／另存」那條路由浮窗自己保留。 -->
+        <button
+          type="button"
+          class="album-image-button"
+          :title="item.caption || t('common.actions.zoom')"
+          :aria-label="t('common.actions.zoomAria', {
+            name: item.caption || t('albumPanel.imageAlt'),
+          })"
+          @click="openZoom(index)"
         >
           <UiImage
             :src="item.url"
@@ -252,7 +340,7 @@ defineExpose({ reload })
             variant="thumb"
             sizes="140px"
           />
-        </a>
+        </button>
         <div class="album-meta">
           <div class="album-caption" :title="item.caption ?? ''">
             {{ item.caption || t('albumPanel.noCaption') }}
@@ -297,6 +385,20 @@ defineExpose({ reload })
     </div>
 
     <div v-if="errorMsg" class="album-error">{{ errorMsg }}</div>
+
+    <!-- 刪除／晉升刻意留在縮圖格子上（計畫 §3.3，primitive 不開 actions slot）。
+         浮窗只有固定的「開原圖」與導覽。 -->
+    <UiLightbox
+      v-model:index="zoomIndex"
+      :visible="zoomOpen"
+      :items="lightboxItems"
+      :has-more="hasMore"
+      :loading-more="loadingMore"
+      :load-more-error="loadMoreError"
+      :label="t('albumPanel.title')"
+      @close="closeZoom"
+      @load-more="onLightboxLoadMore"
+    />
   </div>
 </template>
 
@@ -371,14 +473,21 @@ defineExpose({ reload })
   overflow: hidden;
 }
 
-.album-image-link {
+/* 從 <a> 換成 <button>（LB2）。按鈕自帶的 padding / border / 系統底色要清掉，
+   否則格子會多出一圈邊；鍵盤可達與 focus 環則是換掉 anchor 之後必須自己補回
+   來的那一半——:focus-visible 內縮，才不會被 .album-tile 的 overflow 裁掉。 */
+.album-image-button {
   display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
   aspect-ratio: 3 / 4;
   overflow: hidden;
   background: var(--color-surface);
+  cursor: zoom-in;
 }
 
-.album-image-link img {
+.album-image-button img {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -386,8 +495,13 @@ defineExpose({ reload })
   transition: transform 0.15s;
 }
 
-.album-image-link:hover img {
+.album-image-button:hover img {
   transform: scale(1.03);
+}
+
+.album-image-button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 
 .album-meta {

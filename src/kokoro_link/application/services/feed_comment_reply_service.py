@@ -96,6 +96,7 @@ from kokoro_link.domain.entities.feed_comment import (
 )
 from kokoro_link.domain.entities.feed_post import FeedPost
 from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
 
@@ -167,6 +168,7 @@ class FeedCommentReplyService:
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         notification_service: NotificationService | None = None,
         visible_slot_port: VisibleSlotPort | None = None,
+        player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
     ) -> None:
         self._posts = post_repository
         self._comments = comment_repository
@@ -195,6 +197,10 @@ class FeedCommentReplyService:
         self._operator_profile_service = operator_profile_service
         self._notification_service = notification_service
         self._visible_slot_port = visible_slot_port
+        # PP3 — the player's declared identity. A reply is the character
+        # talking *to this player*, so the declaration is staging here in
+        # a way it is not on the post composer, which addresses nobody.
+        self._player_persona_note_repository = player_persona_note_repository
 
     async def tick(
         self,
@@ -457,6 +463,9 @@ class FeedCommentReplyService:
                 user_comments=tuple(candidate.unanswered),
                 busy_hint=self._build_busy_hint(character),
                 operator_primary_language=operator_language,
+                player_persona_note=await self._load_player_persona_note(
+                    character,
+                ),
             ))
         except Exception:
             _LOGGER.exception(
@@ -466,6 +475,29 @@ class FeedCommentReplyService:
             return ""
         body = (output.content_text or "").strip()
         return body
+
+    async def _load_player_persona_note(self, character: Character) -> str:
+        """The player's declared identity for this pair, or nothing.
+
+        Fail-soft in the same direction as the language resolve below: a
+        reply written without the declaration is a weaker reply, a reply
+        that raised is a comment left hanging.
+        """
+        repository = self._player_persona_note_repository
+        if repository is None:
+            return ""
+        operator_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        try:
+            row = await repository.get(
+                character_id=character.id, operator_id=operator_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "feed reply: player persona note load failed character=%s",
+                character.id,
+            )
+            return ""
+        return row.note if row is not None else ""
 
     async def _resolve_operator_language(self, character: Character) -> str:
         """Same shape as the schedule / proactive / feed-composer paths

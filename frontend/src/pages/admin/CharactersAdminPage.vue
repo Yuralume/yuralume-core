@@ -14,19 +14,25 @@
  * admin page；那些舊子頁仍鏡像保留，角色卡只是把同一套 inner editor 收斂
  * 到一處呈現。
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { notification } from 'ant-design-vue'
 import { CloseOutlined } from '@ant-design/icons-vue'
-import type { Character } from '@/types/character'
+import type { Character, InitialRelationshipPayload } from '@/types/character'
 import CharacterBackupPanel from '@/components/CharacterBackupPanel.vue'
 import CharacterBackupRestorePanel from '@/components/CharacterBackupRestorePanel.vue'
 import CharacterCardEditor from '@/components/admin/CharacterCardEditor.vue'
 import CharacterCardMarketplace from '@/components/admin/CharacterCardMarketplace.vue'
 import CharacterCreateModal from '@/components/CharacterCreateModal.vue'
 import AdminCharacterPicker from '@/components/admin/AdminCharacterPicker.vue'
+import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
 import { UiCard, UiBadge, UiButton } from '@/components/ui'
-import { downloadCharacterCard, importCharacterCard } from '@/utils/api/characters'
+import {
+  downloadCharacterCard,
+  importCharacterCard,
+  previewCharacterCard,
+  type CharacterCardPreview,
+} from '@/utils/api/characters'
 
 const { t } = useI18n()
 
@@ -34,8 +40,22 @@ const pickerRef = ref<InstanceType<typeof AdminCharacterPicker> | null>(null)
 const createModalOpen = ref(false)
 const exportingId = ref<string | null>(null)
 const importFileRef = ref<HTMLInputElement | null>(null)
+// `previewing` covers the silent preview fetch that powers the relationship
+// wizard (card name / suggested known context / intake analysis); `importing`
+// covers the final import call the wizard's confirm triggers. Same two-name
+// split PlayerCharacterCardPanel uses for its preview→wizard→import chain.
+const previewing = ref(false)
 const importing = ref(false)
+const relationshipWizardVisible = ref(false)
+const pendingImportFile = ref<File | null>(null)
+const pendingImportPreview = ref<CharacterCardPreview | null>(null)
 const backupPanelCharacter = ref<Character | null>(null)
+
+const relationshipWizardCardName = computed(() => (
+  pendingImportPreview.value?.name
+  || pendingImportPreview.value?.title
+  || ''
+))
 
 async function handleExportCard(character: Character) {
   exportingId.value = character.id
@@ -65,9 +85,32 @@ async function handleImportFile(event: Event) {
   input.value = ''
   if (!file) return
 
+  previewing.value = true
+  try {
+    pendingImportFile.value = file
+    pendingImportPreview.value = await previewCharacterCard(file)
+    relationshipWizardVisible.value = true
+  } catch (error) {
+    pendingImportFile.value = null
+    notification.error({
+      message: t('admin.page.characters.importCardError'),
+      description: error instanceof Error ? error.message : String(error),
+    })
+  } finally {
+    previewing.value = false
+  }
+}
+
+async function confirmImportCard(
+  initialRelationship: InitialRelationshipPayload | null,
+) {
+  if (!pendingImportFile.value) return
   importing.value = true
   try {
-    const { character, landed_arc_template_ids } = await importCharacterCard(file)
+    const { character, landed_arc_template_ids } = await importCharacterCard(
+      pendingImportFile.value,
+      { initialRelationship },
+    )
     await pickerRef.value?.refresh()
     notification.success({
       message: t('admin.page.characters.importCardSuccess', { name: character.name }),
@@ -77,6 +120,7 @@ async function handleImportFile(event: Event) {
           })
         : undefined,
     })
+    resetRelationshipWizard()
   } catch (error) {
     notification.error({
       message: t('admin.page.characters.importCardError'),
@@ -85,6 +129,24 @@ async function handleImportFile(event: Event) {
   } finally {
     importing.value = false
   }
+}
+
+// Loading-gated close — bound to the modal's @close so an in-flight import
+// can't be dismissed out from under itself. The success path below must
+// NOT go through this: `importing` is still true there (finally hasn't run
+// yet), so a guarded close would silently no-op and leave the wizard stuck
+// open with stale pending state — see resetRelationshipWizard().
+function closeRelationshipWizard() {
+  if (importing.value) return
+  resetRelationshipWizard()
+}
+
+// Unguarded reset — the success path calls this directly (not the guarded
+// close above) because it runs while `importing` is still true.
+function resetRelationshipWizard() {
+  relationshipWizardVisible.value = false
+  pendingImportFile.value = null
+  pendingImportPreview.value = null
 }
 
 function openCreateModal() {
@@ -155,7 +217,7 @@ async function handleBackupImported(_char: Character) {
         <UiButton variant="primary" @click="openCreateModal">
           {{ t('admin.page.characters.createAction') }}
         </UiButton>
-        <UiButton variant="secondary" :loading="importing" @click="triggerImport">
+        <UiButton variant="secondary" :loading="previewing" @click="triggerImport">
           {{ t('admin.page.characters.importCardAction') }}
         </UiButton>
       </div>
@@ -219,6 +281,16 @@ async function handleBackupImported(_char: Character) {
       v-if="createModalOpen"
       @close="closeCreateModal"
       @created="handleCharacterCreated"
+    />
+
+    <InitialRelationshipWizardModal
+      :visible="relationshipWizardVisible"
+      :card-name="relationshipWizardCardName"
+      :card="pendingImportPreview"
+      :suggested-known-context="pendingImportPreview?.suggested_known_context ?? ''"
+      :loading="importing"
+      @close="closeRelationshipWizard"
+      @confirm="confirmImportCard"
     />
 
     <Teleport to="body">
@@ -316,7 +388,6 @@ async function handleBackupImported(_char: Character) {
   padding: 24px;
   background: rgba(0, 0, 0, 0.62);
   backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
 }
 .characters-admin__backup-modal {
   width: min(560px, calc(100vw - 32px));

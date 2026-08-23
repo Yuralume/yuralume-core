@@ -261,6 +261,14 @@ class StorySceneOpeningContext:
     material: StorySceneMaterial
     today: date
     operator_primary_language: str = "zh-TW"
+    player_persona_note: str = ""
+    """What the player declared about themselves for this pair.
+
+    Not to be confused with ``material.operator_note``, which is this
+    *scene's* staging note about where the player stands in it. That one
+    is authored per beat and changes every scene; this one is the
+    player's standing account of who they are, and it outlives every
+    scene. Empty leaves the opening prompt byte-identical."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +377,14 @@ class StorySceneClosingContext:
     player_lines: tuple[str, ...] = ()
     today: date | None = None
     operator_primary_language: str = "zh-TW"
+    player_persona_note: str = ""
+    """The player's standing declaration about themselves — the same
+    staging the opening was written from, so the wrap-up describes the
+    same person.
+
+    It authorises nothing about *actions*: the 「不得虛構玩家的行動」 red
+    line still answers only to ``player_lines``. Declaring you are a
+    detective does not put you at the crime scene."""
 
 
 @dataclass(frozen=True, slots=True)

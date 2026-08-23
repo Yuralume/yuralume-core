@@ -11,6 +11,15 @@ export const ARC_DISCOVERY_STUDIO_COACHMARK_KEY =
 export const STUDIO_EXIT_HUB_COACHMARK_KEY =
   'yuralume.studio.exitHubCoachmark.dismissed'
 
+/**
+ * One-shot coachmark shown the first time someone lands on `/studio`
+ * (BD12). It points at the "how the studio works" guide, so it is spent
+ * either way: reading the guide answers it, and closing it says no. Like
+ * the two keys above it is user-wide — the studio is not per-character.
+ */
+export const STUDIO_GUIDE_COACHMARK_KEY =
+  'yuralume.studio.guideCoachmark.dismissed'
+
 export interface ArcDiscoveryCharacterState {
   id: string | null | undefined
   arc_template_id?: string | null
@@ -84,6 +93,29 @@ export function rememberStudioCoachmarkDismissed(
   if (!storage) return false
   try {
     storage.setItem(ARC_DISCOVERY_STUDIO_COACHMARK_KEY, '1')
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function isStudioGuideCoachmarkDismissed(
+  storage: ArcDiscoveryStorage | null | undefined,
+): boolean {
+  if (!storage) return false
+  try {
+    return storage.getItem(STUDIO_GUIDE_COACHMARK_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function rememberStudioGuideCoachmarkDismissed(
+  storage: ArcDiscoveryStorage | null | undefined,
+): boolean {
+  if (!storage) return false
+  try {
+    storage.setItem(STUDIO_GUIDE_COACHMARK_KEY, '1')
     return true
   } catch {
     return false

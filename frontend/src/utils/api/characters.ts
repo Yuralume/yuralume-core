@@ -71,6 +71,9 @@ export interface CharacterCreationIntakeQuestion {
   field: string
   question: string
   suggestions: string[]
+  // False for advisory-only nudges (e.g. proactive cadence hint) that are
+  // worth asking but do not withhold can_create.
+  blocking: boolean
 }
 
 export interface CharacterCreationIntakeWarning {

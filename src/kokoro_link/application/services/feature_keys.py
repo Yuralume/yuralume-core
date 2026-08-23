@@ -170,6 +170,18 @@ FEATURE_IMAGE_FEED = "image_feed"
 """Image profile routing for LumeGram feed post images."""
 
 
+FEATURE_BRANCHING_DRAMA_SCENE = "branching_drama_scene"
+"""Image profile routing for 分歧劇場 node scene illustrations.
+
+Distinct from :data:`FEATURE_BRANCHING_DRAMA` — that one picks the *LLM*
+that writes the branching tree; this one picks which image backend draws
+the still that sits above each beat. Its own key because the surface's
+economics are unlike the other image keys: a drama pre-renders a whole
+layer of nodes at once, most of which the player will never walk through,
+so operators want to route it independently (or, hosted, cap how deep the
+prefetch goes) without touching portraits or feed art."""
+
+
 FEATURE_VIDEO_FEED = "video_feed"
 """Video profile routing for LumeGram feed post short clips.
 
@@ -369,6 +381,19 @@ advice the owner acts on in the admin console, and a failed call degrades
 to "needs manual review", never to "assume it's fine". Routed on its own
 key so the owner can pin a careful, low-hallucination model to a job whose
 false negatives are published to strangers."""
+
+
+FEATURE_SHOWCASE_IMAGE_REVIEW = "showcase_image_review"
+"""Public-showcase image-consistency pre-review.
+
+Ops-time sibling of ``showcase_review``: where that key reads a post's
+*text*, this one looks at the post's generated image next to the
+character's portrait, appearance sheet and the images of neighbouring
+posts, and reports when generation drifted into "someone else" (hair
+colour/length, eye colour, species, signature features). Advisory in
+Core — the Cloud control plane decides what a flag blocks. On its own
+key because it must resolve to a vision-capable model, which the text
+reviewer's route has no reason to be."""
 
 
 FEATURE_SHOWCASE_TRANSLATE = "showcase_translate"
@@ -621,6 +646,7 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_ARC_TEMPLATE_TRANSLATE,
     FEATURE_STORY_SEED_TRANSLATE,
     FEATURE_SHOWCASE_REVIEW,
+    FEATURE_SHOWCASE_IMAGE_REVIEW,
     FEATURE_SHOWCASE_TRANSLATE,
     FEATURE_OFFICIAL_CARD_TRANSLATE,
     FEATURE_SILLYTAVERN_NORMALIZE,
@@ -650,6 +676,7 @@ IMAGE_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_IMAGE_CHAT_TOOL,
     FEATURE_IMAGE_PORTRAIT,
     FEATURE_IMAGE_FEED,
+    FEATURE_BRANCHING_DRAMA_SCENE,
 )
 """Feature keys understood by the image-profile picker (global + per-
 character). Kept separate from ``GLOBAL_FEATURE_KEYS`` because image
@@ -753,6 +780,7 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_IMAGE_CHAT_TOOL: "生圖：聊天工具",
     FEATURE_IMAGE_PORTRAIT: "生圖：角色頭像",
     FEATURE_IMAGE_FEED: "生圖：動態貼文",
+    FEATURE_BRANCHING_DRAMA_SCENE: "生圖：分歧劇場場景圖",
     FEATURE_VIDEO_FEED: "短影片：動態貼文",
 }
 
@@ -868,6 +896,7 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
     FEATURE_GROUP_MULTIMODAL_PERCEPTION: (
         FEATURE_IMAGE_RECOGNITION,
         FEATURE_VIDEO_STORYBOARD,
+        FEATURE_SHOWCASE_IMAGE_REVIEW,
     ),
     FEATURE_GROUP_HIGH_REASONING_GATES: (
         FEATURE_PROACTIVE_INTENTION,

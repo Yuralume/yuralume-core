@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuth } from '@/composables/useAuth'
-import { useLocale } from '@/composables/useLocale'
-import { formatDateTime } from '@/i18n/formatters'
 import type { OperatorProfile } from '@/types/operator'
 import {
   getOperatorProfile,
@@ -25,7 +23,6 @@ import WebNotificationSetting from './WebNotificationSetting.vue'
 
 const { t } = useI18n()
 const router = useRouter()
-const { locale } = useLocale()
 const {
   authEnabled,
   currentUser,
@@ -43,20 +40,7 @@ const displayNameLocked = ref(false)
 const displayNameAliases = ref<string[]>([])
 const displayNameSaving = ref(false)
 const displayNameFeedback = ref<string | null>(null)
-const currentStatusDraft = ref('')
-const currentStatusSetAt = ref<string | null>(null)
-const currentStatusSaving = ref(false)
-const currentStatusLoading = ref(false)
-const currentStatusFeedback = ref<string | null>(null)
-
-const currentStatusSetAtLabel = computed(() => {
-  if (!currentStatusSetAt.value || !currentUser.value?.timezone_id) return null
-  return formatDateTime(
-    currentStatusSetAt.value,
-    locale.value,
-    currentUser.value.timezone_id,
-  )
-})
+const profileLoading = ref(false)
 
 function applyOperatorProfile(profile: OperatorProfile) {
   operatorProfile.value = profile
@@ -65,23 +49,28 @@ function applyOperatorProfile(profile: OperatorProfile) {
   }
   displayNameLocked.value = profile.display_name_locked
   displayNameAliases.value = profile.aliases ?? []
-  currentStatusDraft.value = profile.current_status ?? ''
-  currentStatusSetAt.value = profile.current_status_set_at ?? null
 }
 
 async function loadOperatorProfile() {
   if (!currentUser.value) return
-  currentStatusLoading.value = true
-  currentStatusFeedback.value = null
+  profileLoading.value = true
+  displayNameFeedback.value = null
   try {
     const profile = await getOperatorProfile()
     applyOperatorProfile(profile)
   } catch (err) {
-    currentStatusFeedback.value = err instanceof Error
-      ? t('common.errorWithDetail', { message: t('playerSidebar.currentStatus.loadFailed'), detail: err.message })
-      : t('playerSidebar.currentStatus.loadFailed')
+    // Player-visible failure feedback. Reuses the display-name field's
+    // feedback slot (rather than growing a second one) — PP1 tore out the
+    // retired current-status field's `currentStatusFeedback` and, with it,
+    // the only player-visible surface a load failure had; this was a
+    // regression, not a cleanup. `displayName.loadFailed` already existed
+    // in all three locale catalogs, unused, for exactly this.
+    displayNameFeedback.value = err instanceof Error
+      ? t('common.errorWithDetail', { message: t('playerSidebar.displayName.loadFailed'), detail: err.message })
+      : t('playerSidebar.displayName.loadFailed')
+    console.error('Failed to load operator profile', err)
   } finally {
-    currentStatusLoading.value = false
+    profileLoading.value = false
   }
 }
 
@@ -105,35 +94,6 @@ async function saveDisplayName() {
   } finally {
     displayNameSaving.value = false
   }
-}
-
-async function saveCurrentStatus() {
-  if (!currentUser.value) return
-  currentStatusSaving.value = true
-  currentStatusFeedback.value = null
-  try {
-    const profile = await updateOperatorProfile({
-      current_status: currentStatusDraft.value.trim() || null,
-    })
-    applyOperatorProfile(profile)
-    window.dispatchEvent(new CustomEvent('kokoro:operator-profile-updated', {
-      detail: profile,
-    }))
-    currentStatusFeedback.value = profile.current_status
-      ? t('playerSidebar.currentStatus.saved')
-      : t('playerSidebar.currentStatus.cleared')
-  } catch (err) {
-    currentStatusFeedback.value = err instanceof Error
-      ? t('common.errorWithDetail', { message: t('playerSidebar.currentStatus.saveFailed'), detail: err.message })
-      : t('playerSidebar.currentStatus.saveFailed')
-  } finally {
-    currentStatusSaving.value = false
-  }
-}
-
-async function clearCurrentStatus() {
-  currentStatusDraft.value = ''
-  await saveCurrentStatus()
 }
 
 function handleOperatorProfileUpdated(event: Event) {
@@ -211,14 +171,14 @@ defineExpose({ flashWebNotification, flashAdminEntry })
         class="field-input"
         maxlength="80"
         :placeholder="t('playerSidebar.displayName.placeholder')"
-        :disabled="displayNameSaving || currentStatusLoading"
+        :disabled="displayNameSaving || profileLoading"
       />
       <div class="display-name-actions">
         <UiButton
           variant="primary"
           size="sm"
           :loading="displayNameSaving"
-          :disabled="currentStatusLoading || !displayNameDraft.trim()"
+          :disabled="profileLoading || !displayNameDraft.trim()"
           @click="saveDisplayName"
         >
           {{ displayNameSaving ? t('playerSidebar.displayName.saving') : t('playerSidebar.displayName.save') }}
@@ -251,52 +211,8 @@ defineExpose({ flashWebNotification, flashAdminEntry })
          self-host 分支與 G2 之前逐字相同（唯讀時區＋手填座標）。 -->
     <PlayerPlaceLocaleSettings
       :profile="operatorProfile"
-      :disabled="currentStatusLoading"
+      :disabled="profileLoading"
     />
-    <div class="current-status-field">
-      <label class="field-label" for="operator-current-status">
-        {{ t('playerSidebar.currentStatus.label') }}
-      </label>
-      <textarea
-        id="operator-current-status"
-        v-model="currentStatusDraft"
-        class="field-textarea current-status-input"
-        :placeholder="t('playerSidebar.currentStatus.placeholder')"
-        :disabled="currentStatusSaving || currentStatusLoading"
-        rows="2"
-      />
-      <div class="current-status-actions">
-        <UiButton
-          variant="primary"
-          size="sm"
-          :loading="currentStatusSaving"
-          :disabled="currentStatusLoading"
-          @click="saveCurrentStatus"
-        >
-          {{ currentStatusSaving ? t('playerSidebar.currentStatus.saving') : t('playerSidebar.currentStatus.save') }}
-        </UiButton>
-        <UiButton
-          variant="ghost"
-          size="sm"
-          :disabled="currentStatusSaving || currentStatusLoading || !currentStatusDraft.trim()"
-          @click="clearCurrentStatus"
-        >
-          {{ t('playerSidebar.currentStatus.clear') }}
-        </UiButton>
-      </div>
-      <p class="current-status-hint">
-        <span v-if="currentStatusSetAtLabel">
-          {{ t('playerSidebar.currentStatus.setAt', { time: currentStatusSetAtLabel }) }}
-        </span>
-        <span v-else>{{ t('playerSidebar.currentStatus.hint') }}</span>
-      </p>
-      <p
-        v-if="currentStatusFeedback"
-        class="current-status-feedback"
-      >
-        {{ currentStatusFeedback }}
-      </p>
-    </div>
   </section>
 
   <!--
@@ -435,36 +351,6 @@ defineExpose({ flashWebNotification, flashAdminEntry })
 }
 .display-name-aliases__label {
   color: var(--color-text-secondary);
-}
-
-.current-status-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--color-border);
-}
-
-.current-status-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.current-status-input {
-  min-height: 58px;
-}
-
-.current-status-hint,
-.current-status-feedback {
-  margin: 0;
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.current-status-feedback {
-  color: #7dc49a;
 }
 
 .settings-group {

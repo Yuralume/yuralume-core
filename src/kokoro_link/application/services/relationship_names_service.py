@@ -15,6 +15,13 @@ three things, in one logical operation:
 
 History is never rewritten: old memories keep the old name; the alias
 bridge + rename-log acknowledgement carry the continuity.
+
+:meth:`RelationshipNamesService.update_seed` widens the same edit to the
+rest of the seed (backs ``PATCH /characters/{id}/initial-relationship``).
+It deliberately *delegates* the two address fields to ``update_names``
+rather than writing them itself, so the wider surface cannot become a
+back door that changes a name without the rename-log event and persona
+reconcile that a rename owes the character.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from kokoro_link.contracts.initial_relationship import (
     CharacterOperatorRelationshipSeedRepositoryPort,
 )
 from kokoro_link.domain.entities.character_operator_relationship_seed import (
+    SCHEDULE_INVOLVEMENT_POLICIES,
     CharacterOperatorRelationshipSeed,
 )
 from kokoro_link.domain.value_objects.address_change_event import (
@@ -65,6 +73,99 @@ class RelationshipNamesService:
         if seed is None:
             return "", ""
         return seed.user_address_name, seed.character_address_name
+
+    async def get_seed(
+        self, *, character_id: str, operator_id: str,
+    ) -> CharacterOperatorRelationshipSeed | None:
+        """Return the whole seed for the pair, or ``None`` when unset."""
+        return await self._seeds.get(character_id, operator_id)
+
+    async def update_seed(
+        self,
+        *,
+        character_id: str,
+        operator_id: str,
+        relationship_label: str | None = None,
+        known_context: str | None = None,
+        living_arrangement: str | None = None,
+        user_address_name: str | None = None,
+        character_address_name: str | None = None,
+        tone_distance: str | None = None,
+        familiarity_boundary: str | None = None,
+        schedule_involvement_policy: str | None = None,
+        proactive_permission: bool | None = None,
+        proactive_cadence_hint: str | None = None,
+        user_profile_notes: str | None = None,
+        source: str = SOURCE_PLAYER_EDIT,
+        now: datetime | None = None,
+    ) -> CharacterOperatorRelationshipSeed:
+        """Apply a partial edit across the *whole* relationship seed.
+
+        Same tri-state contract as :meth:`update_names`, extended to every
+        editable field: ``None`` leaves the value untouched, a provided
+        value sets it (an empty string clears a text field; an empty
+        ``schedule_involvement_policy`` reverts to ``none``).
+        ``confirmed_by_user`` is deliberately not editable here — it
+        records that the player confirmed the seed at creation time, not
+        something a later edit may re-assert.
+
+        The two address names are **not** written directly: they are
+        delegated to :meth:`update_names` so the rename-log event and the
+        learned-persona reconcile can never be bypassed by editing the
+        names through the wider surface. Upsert semantics are inherited
+        too — editing a pair that has no seed row yet creates one.
+        """
+        # Validate before any write so an illegal policy can't leave a
+        # half-applied edit behind (the address delegation commits first).
+        policy: str | None = None
+        if schedule_involvement_policy is not None:
+            policy = (schedule_involvement_policy or "none").strip().lower()
+            if policy not in SCHEDULE_INVOLVEMENT_POLICIES:
+                raise ValueError(
+                    "RelationshipSeed.schedule_involvement_policy must be one "
+                    f"of {sorted(SCHEDULE_INVOLVEMENT_POLICIES)}, got "
+                    f"{schedule_involvement_policy!r}",
+                )
+        when = now or datetime.now(timezone.utc)
+        seed = await self.update_names(
+            character_id=character_id,
+            operator_id=operator_id,
+            user_address_name=user_address_name,
+            character_address_name=character_address_name,
+            source=source,
+            now=when,
+        )
+
+        changes: dict[str, object] = {}
+        for field, value in (
+            ("relationship_label", relationship_label),
+            ("known_context", known_context),
+            ("living_arrangement", living_arrangement),
+            ("tone_distance", tone_distance),
+            ("familiarity_boundary", familiarity_boundary),
+            ("proactive_cadence_hint", proactive_cadence_hint),
+            ("user_profile_notes", user_profile_notes),
+        ):
+            if value is not None and value.strip() != getattr(seed, field):
+                changes[field] = value
+        if policy is not None and policy != seed.schedule_involvement_policy:
+            changes["schedule_involvement_policy"] = policy
+        if (
+            proactive_permission is not None
+            and proactive_permission != seed.proactive_permission
+        ):
+            changes["proactive_permission"] = proactive_permission
+        if not changes:
+            return seed
+
+        updated = replace(
+            seed,
+            created_at=seed.created_at or when,
+            updated_at=when,
+            **changes,  # type: ignore[arg-type]
+        )
+        await self._seeds.save(updated)
+        return updated
 
     async def update_names(
         self,

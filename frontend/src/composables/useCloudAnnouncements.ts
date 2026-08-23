@@ -24,6 +24,7 @@
 
 import { computed, ref } from 'vue'
 
+import { isCloudDeployment } from '@/composables/deploymentMode'
 import {
   fetchCloudAnnouncements,
   type CloudAnnouncementsSnapshot,
@@ -39,6 +40,10 @@ let inFlight: Promise<void> | null = null
 let generation = 0
 
 async function load(options: { refresh?: boolean } = {}): Promise<void> {
+  // No board on self-host, and the route is not mounted there either. The dot
+  // guards its own mount, but the gate belongs here so a future caller cannot
+  // reopen the hole by forgetting to.
+  if (!isCloudDeployment()) return
   if (!supported.value) return
   if (inFlight) return inFlight
   const issuedAt = generation

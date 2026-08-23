@@ -83,6 +83,7 @@ class PromptContextBuilderPort(Protocol):
         presence_frame: PresenceFrame | None = None,
         operator: OperatorProfile | None = None,
         operator_persona_lines: list[str] | None = None,
+        player_persona_note: str | None = None,
         peer_roster_lines: list[str] | None = None,
         initial_relationship_lines: list[str] | None = None,
         persona_curiosity_plan: PersonaCuriosityPlan | None = None,
@@ -92,7 +93,6 @@ class PromptContextBuilderPort(Protocol):
         world_event_recall: tuple[str, ...] | None = None,
         upcoming_day_schedules: list[DailySchedule] | None = None,
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
-        include_operator_status: bool = True,
         stage_nudge: bool = False,
     ) -> str:
         """Build prompt context for model generation.
@@ -165,11 +165,12 @@ class PromptContextBuilderPort(Protocol):
         builder appends a "remote future is vague" guard so the model
         admits it hasn't decided.
 
-        ``include_operator_status`` gates the operator's self-reported
-        "current status" only. ``operator`` itself still drives the
-        identity / language blocks either way. Callers must pass ``False``
-        whenever the turn may have been typed by someone other than the
-        profile's owner — an external channel with an open or multi-entry
-        sender allowlist — otherwise the owner's whereabouts are handed to
-        the model as if they were the current sender's.
+        ``player_persona_note`` is what the player *declared* about
+        themselves for this relationship (identity / world premise), as
+        opposed to ``operator_persona_lines`` which is what the character
+        *inferred* from talking to them. The builder renders it as its own
+        adjacent block with a performance-authorization rail; ``None`` or
+        empty leaves the prompt byte-identical. Callers must apply the same
+        gate they apply to the operator persona — a channel that may carry
+        someone other than the account owner is not the owner's stage.
         """

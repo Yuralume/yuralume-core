@@ -74,6 +74,9 @@ from kokoro_link.api.routes.internal_cloud_official_cards import (
 from kokoro_link.api.routes.internal_cloud_showcase import (
     router as internal_cloud_showcase_router,
 )
+from kokoro_link.api.routes.internal_cloud_stats import (
+    router as internal_cloud_stats_router,
+)
 from kokoro_link.api.routes.internal_drain import (
     router as internal_drain_router,
 )
@@ -95,8 +98,14 @@ from kokoro_link.api.routes.operator_persona import (
 from kokoro_link.api.routes.pending_follow_ups import (
     router as pending_follow_ups_router,
 )
+from kokoro_link.api.routes.player_persona_note import (
+    router as player_persona_note_router,
+)
 from kokoro_link.api.routes.relationship_names import (
     router as relationship_names_router,
+)
+from kokoro_link.api.routes.initial_relationship import (
+    router as initial_relationship_router,
 )
 from kokoro_link.api.routes.proactive import router as proactive_router
 from kokoro_link.api.routes.push import router as push_router
@@ -600,6 +609,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(operator_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(operator_persona_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(relationship_names_router, prefix="/api/v1", dependencies=_auth_dep)
+    app.include_router(
+        initial_relationship_router, prefix="/api/v1", dependencies=_auth_dep,
+    )
+    app.include_router(
+        player_persona_note_router, prefix="/api/v1", dependencies=_auth_dep,
+    )
     app.include_router(pending_follow_ups_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(proactive_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(push_router, prefix="/api/v1", dependencies=_auth_dep)
@@ -668,6 +683,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     if matrix.serve_cloud_internal_routes:
         app.include_router(internal_cloud_router, prefix="/api/internal/v1")
         app.include_router(internal_cloud_showcase_router, prefix="/api/internal/v1")
+        app.include_router(internal_cloud_stats_router, prefix="/api/internal/v1")
         app.include_router(
             internal_cloud_official_cards_router, prefix="/api/internal/v1",
         )

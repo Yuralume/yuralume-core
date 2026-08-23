@@ -184,6 +184,17 @@ class KindSpec:
     #: atomic two-character pair lease. Mutually exclusive with
     #: ``character_scoped`` for the reconciler's diff logic.
     pair_scoped: bool = False
+    #: NF4 dormancy exemption. ``background_dormancy_days`` stops EVERY chain of
+    #: a dormant character — including the ``KnobGate.NONE`` ones, because "cheap
+    #: enough not to down-shift" is not the same claim as "worth running for a
+    #: character nobody has spoken to in a week". The single exemption criterion
+    #: is **"finishes an in-progress, player-visible operation"**: work the player
+    #: already started and is owed the end of, which by construction only costs a
+    #: provider call when such an operation actually exists (and its existence is
+    #: itself evidence the player is around). Everything else — every chain that
+    #: would spend money on its own initiative with nobody watching — is exactly
+    #: what dormancy exists to stop, and stays covered.
+    dormancy_exempt: bool = False
 
 
 #: The full character-scoped kind registry. Every entry is chained (self-continuing)
@@ -254,6 +265,15 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         handler="feed_comment_reply",
         knob_gate=KnobGate.NONE,
         event_driven=True,
+        # NF4 dormancy exemption: the thing this chain finishes is a comment the
+        # PLAYER wrote on a post and is waiting for an answer to. Leaving it
+        # unanswered until they happen to open the chat is a visible break in
+        # something already in flight. Feed comments do not advance the
+        # foreground-interaction anchor, so a returning player who only comments
+        # would otherwise still read as dormant. The recheck is an indexed read
+        # when nothing is pending — the model only runs when a real comment is
+        # waiting, which is itself proof the player came back.
+        dormancy_exempt=True,
     ),
     PROACTIVE_EVALUATE_KIND: KindSpec(
         kind=PROACTIVE_EVALUATE_KIND,
@@ -304,6 +324,12 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         # account stretch that window would leave 起幕 blocked for the one
         # player most likely to come back and press it.
         knob_gate=KnobGate.NONE,
+        # NF4 dormancy exemption, for the same promise one step further: an
+        # open scene is a player-visible operation the player PAID to start.
+        # Stopping this chain would leave that scene open forever — no wrap-up,
+        # no canon summary, and 起幕 permanently blocked behind it — which is
+        # exactly the state a returning player would come back to.
+        dormancy_exempt=True,
     ),
     CHARACTER_UPKEEP_KIND: KindSpec(
         kind=CHARACTER_UPKEEP_KIND,

@@ -243,6 +243,11 @@ async def test_round_trip_preserves_a_layer_and_resets_runtime() -> None:
     assert object_key is not None
     assert await storage.get_bytes(object_key=object_key) == _PNG
 
+    # Initial rapport matches manual character creation (owner-decided
+    # IR5), not the CharacterStatePayload zero default.
+    assert char.state.affection == 50
+    assert char.state.trust == 50
+
 
 @pytest.mark.asyncio
 async def test_import_can_seed_importer_confirmed_initial_relationship() -> None:

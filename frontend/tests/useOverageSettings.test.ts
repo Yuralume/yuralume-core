@@ -6,6 +6,7 @@ import {
 } from '@/utils/api/overageSettings'
 import { notifyIdentityChanged } from '@/utils/identityLifecycle'
 import { useOverageSettings } from '@/composables/useOverageSettings'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 vi.mock('@/utils/api/overageSettings', () => ({
   fetchOverageSettings: vi.fn(),
@@ -37,6 +38,7 @@ function settings(overrides: Partial<{
 beforeEach(() => {
   vi.clearAllMocks()
   useOverageSettings().reset()
+  setDeploymentMode('cloud')
 })
 
 describe('useOverageSettings', () => {
@@ -134,5 +136,29 @@ describe('useOverageSettings', () => {
     await pending
 
     expect(overage.settings.value).toBeNull()
+  })
+})
+
+describe('useOverageSettings deployment gating', () => {
+  it('asks nothing on self-host — there is no quota to overrun', async () => {
+    setDeploymentMode('self_host')
+    const overage = useOverageSettings()
+
+    await overage.ensureLoaded()
+
+    expect(mockedFetch).not.toHaveBeenCalled()
+    expect(overage.ready.value).toBe(false)
+  })
+
+  it('does not latch self-host: a late cloud probe still loads', async () => {
+    setDeploymentMode('self_host')
+    const overage = useOverageSettings()
+    await overage.ensureLoaded()
+
+    setDeploymentMode('cloud')
+    mockedFetch.mockResolvedValueOnce({ kind: 'ok', settings: settings() })
+    await overage.ensureLoaded()
+
+    expect(overage.ready.value).toBe(true)
   })
 })

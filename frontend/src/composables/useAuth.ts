@@ -27,6 +27,11 @@ import {
   setupInitialAdmin as apiSetup,
 } from '@/utils/api/auth'
 import type { AuthUser, BuildInfo } from '@/utils/api/auth'
+import {
+  deploymentMode,
+  isCloudDeployment,
+  setDeploymentMode,
+} from '@/composables/deploymentMode'
 import { useLocale } from '@/composables/useLocale'
 import { useTimezone } from '@/composables/useTimezone'
 import { notifyIdentityChanged } from '@/utils/identityLifecycle'
@@ -36,7 +41,9 @@ const TOKEN_KEY = 'kokoro_auth_token'
 // Singleton state (module-level refs).
 const authEnabled = ref<boolean | null>(null) // null = not yet probed
 const needsSetup = ref<boolean>(false)
-const mode = ref<'self_host' | 'cloud'>('self_host')
+// The deployment mode lives in `@/composables/deploymentMode` — the cloud-only
+// clients must read it without importing this module (see that file). `useAuth`
+// is still the only writer, and still publishes it as `mode` / `cloudMode`.
 const buildInfo = ref<BuildInfo | null>(null)
 // Mirror of backend KOKORO_DEBUG_UI_ENABLED. Drives whether the SPA
 // renders developer-facing admin panels — observability, experiments,
@@ -108,7 +115,7 @@ async function bootstrapAuth(): Promise<void> {
     const config = await getAuthConfig()
     authEnabled.value = config.auth_enabled
     needsSetup.value = config.needs_setup
-    mode.value = config.mode === 'cloud' ? 'cloud' : 'self_host'
+    setDeploymentMode(config.mode === 'cloud' ? 'cloud' : 'self_host')
     buildInfo.value = config.build_info ?? null
     debugUiEnabled.value = config.debug_ui_enabled === true
     portalUrl.value = (config.portal_url ?? '').trim() || null
@@ -158,7 +165,7 @@ async function loginWithCloudSession(payload: {
   persistToken(res.token)
   currentUser.value = res.user
   needsSetup.value = false
-  mode.value = 'cloud'
+  setDeploymentMode('cloud')
   applyUserRuntimePreferences(res.user)
 }
 
@@ -226,8 +233,8 @@ export function useAuth() {
     authEnabled: computed(() => authEnabled.value === true),
     authProbed: computed(() => authEnabled.value !== null),
     needsSetup: computed(() => needsSetup.value),
-    mode: computed(() => mode.value),
-    cloudMode: computed(() => mode.value === 'cloud'),
+    mode: deploymentMode,
+    cloudMode: computed(() => isCloudDeployment()),
     buildInfo: computed(() => buildInfo.value),
     debugUiEnabled: computed(() => debugUiEnabled.value),
     portalUrl: computed(() => portalUrl.value),
@@ -243,12 +250,12 @@ export function useAuth() {
      * flag could never block a self-host operator.
      */
     needsLocaleConfirmation: computed(
-      () => mode.value === 'cloud'
+      () => isCloudDeployment()
         && currentUser.value?.needs_locale_confirmation === true,
     ),
     /** Hosted-only relocation suggestion; never an applied fact. */
     locationHint: computed(
-      () => (mode.value === 'cloud'
+      () => (isCloudDeployment()
         ? currentUser.value?.location_hint ?? null
         : null),
     ),

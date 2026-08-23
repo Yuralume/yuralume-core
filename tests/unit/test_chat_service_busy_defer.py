@@ -41,11 +41,15 @@ from kokoro_link.domain.entities.operator_persona import (
     OperatorPersona,
 )
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
+from kokoro_link.domain.entities.player_persona_note import PlayerPersonaNote
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
 from kokoro_link.domain.value_objects.familiarity import Familiarity
 from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.proactive_outcome import ProactiveOutcome
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
+from kokoro_link.infrastructure.busy.llm_decider import (
+    _build_prompt as build_busy_decider_prompt,
+)
 from kokoro_link.infrastructure.llm.fake import FakeChatModel
 from kokoro_link.infrastructure.llm.registry import InMemoryChatModelRegistry
 from kokoro_link.infrastructure.memory.in_memory import InMemoryMemoryRepository
@@ -53,6 +57,9 @@ from kokoro_link.infrastructure.post_turn.null_processor import (
     NullPostTurnProcessor,
 )
 from kokoro_link.infrastructure.prompt.default import DefaultPromptContextBuilder
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    PLAYER_PERSONA_NOTE_HEADER,
+)
 from kokoro_link.infrastructure.repositories.in_memory_characters import (
     InMemoryCharacterRepository,
 )
@@ -61,6 +68,9 @@ from kokoro_link.infrastructure.repositories.in_memory_conversations import (
 )
 from kokoro_link.infrastructure.repositories.in_memory_pending_follow_ups import (
     InMemoryPendingFollowUpRepository,
+)
+from kokoro_link.infrastructure.repositories.in_memory_player_persona_notes import (
+    InMemoryPlayerPersonaNoteRepository,
 )
 from kokoro_link.infrastructure.repositories.in_memory_proactive_attempts import (
     InMemoryProactiveAttemptRepository,
@@ -224,6 +234,7 @@ def _build_chat_service(
     operator_persona_service=None,
     relationship_seed_repository=None,
     release_enqueuer=None,
+    player_persona_note_repository=None,
 ):
     character_repository = InMemoryCharacterRepository()
     conversation_repository = InMemoryConversationRepository()
@@ -254,6 +265,7 @@ def _build_chat_service(
         operator_persona_service=operator_persona_service,
         relationship_seed_repository=relationship_seed_repository,
         journal_repository=journal_repository,
+        player_persona_note_repository=player_persona_note_repository,
     )
     if release_enqueuer is not None:
         chat_service.set_pending_follow_up_release_enqueuer(release_enqueuer)
@@ -825,3 +837,149 @@ async def test_scheduled_promise_write_point_enqueues_release_job() -> None:
     row = enqueuer.rows[0]
     assert row.is_scheduled_promise is True
     assert row.promise_intent == "叫使用者起床"
+
+
+# ── the *decision* is player-facing too (計畫 §3.2) ────────────────────
+
+
+_PLAYER_NOTE = "我是隱瞞身分的超能力者，白天在同一間事務所上班。"
+
+
+class _FixedOperatorProfileService:
+    """Always the same owner, whatever ``user_id`` the character carries.
+
+    The note is stored per ``(character_id, operator_id)``, so the test
+    needs the id the chat path will resolve — pinning it here is simpler
+    than reaching into the character's default ``user_id``.
+    """
+
+    OPERATOR_ID = "owner-1"
+
+    async def get_current(self) -> OperatorProfile:
+        return OperatorProfile(
+            id=self.OPERATOR_ID, display_name="Alex", timezone_id="Asia/Taipei",
+        )
+
+    async def get_for_user(self, user_id: str) -> OperatorProfile:
+        return await self.get_current()
+
+
+async def _run_busy_turn(
+    *,
+    note: str | None,
+    operator_persona_enabled: bool = True,
+) -> _ScriptedDecider:
+    """One busy turn that reaches the decider; returns what it was given."""
+    activity = _busy_activity()
+    decider = _ScriptedDecider([BusyDecision()])  # IMMEDIATE — prompt only
+    notes = InMemoryPlayerPersonaNoteRepository()
+    chat, character_service, _ = _build_chat_service(
+        decider=decider,
+        schedule_service=_StubScheduleService(current_activity=activity),
+        pending_repo=InMemoryPendingFollowUpRepository(),
+        operator_profile_service=_FixedOperatorProfileService(),
+        player_persona_note_repository=notes,
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Airi", personality=[], interests=[]),
+    )
+    if note:
+        await notes.upsert(
+            PlayerPersonaNote.create(
+                character_id=created.id,
+                operator_id=_FixedOperatorProfileService.OPERATOR_ID,
+                note=note,
+            ),
+        )
+
+    await chat.send_message(
+        SendChatMessageRequest(
+            character_id=created.id,
+            message="在忙嗎？",
+            operator_persona_enabled=operator_persona_enabled,
+        ),
+    )
+
+    assert decider.calls, "the decider was never consulted"
+    return decider
+
+
+def _decider_prompt(decider: _ScriptedDecider) -> str:
+    """The prompt the decider would actually build from what it was handed.
+
+    Asserting on the rendered prompt rather than on the argument tuple is
+    the point: the argument is only a leak-free way in if the renderer
+    still puts it in front of the model.
+    """
+    call = decider.calls[0]
+    return build_busy_decider_prompt(
+        character=_bare_character(),
+        user_message=call["user_message"],
+        current_activity=call["current_activity"],
+        recent_dialogue_summary=None,
+        recent_proactive_attempts=(),
+        relationship_context_lines=tuple(call["relationship_context_lines"]),
+        interaction_context_lines=tuple(call["interaction_context_lines"]),
+        now=datetime.now(timezone.utc),
+        local_tz=timezone.utc,
+    )
+
+
+def _bare_character():
+    from kokoro_link.domain.entities.character import Character
+    from kokoro_link.domain.value_objects.character_state import CharacterState
+
+    return Character.create(
+        name="Airi",
+        summary="",
+        personality=[],
+        interests=[],
+        speaking_style="",
+        boundaries=[],
+        state=CharacterState(
+            emotion="平靜", affection=50, fatigue=0, trust=50, energy=100,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_busy_decision_prompt_carries_the_player_declaration() -> None:
+    """§3.2 promised the note to the busy-defer *decision*, not only the
+    compose that follows it.
+
+    The decision is the one that picks the ack the player reads, and the
+    one that judges whether this player is worth interrupting an activity
+    for. Making that call without the player's declared identity judges a
+    stranger — and left the two halves of the same feature reading two
+    different players.
+    """
+    decider = await _run_busy_turn(note=_PLAYER_NOTE)
+
+    prompt = _decider_prompt(decider)
+    assert PLAYER_PERSONA_NOTE_HEADER in prompt
+    assert _PLAYER_NOTE in prompt
+
+
+@pytest.mark.asyncio
+async def test_busy_decision_prompt_is_traceless_without_a_declaration() -> None:
+    decider = await _run_busy_turn(note=None)
+
+    prompt = _decider_prompt(decider)
+    assert PLAYER_PERSONA_NOTE_HEADER not in prompt
+
+
+@pytest.mark.asyncio
+async def test_busy_decision_prompt_obeys_the_operator_persona_gate() -> None:
+    """Same flag, same answer as the main chat prompt.
+
+    A turn typed by someone who is not the account owner must not have the
+    owner's declared setting staged as the current speaker's — the decision
+    prompt is no more exempt from that than the reply prompt is.
+    """
+    decider = await _run_busy_turn(
+        note=_PLAYER_NOTE, operator_persona_enabled=False,
+    )
+
+    prompt = _decider_prompt(decider)
+    assert PLAYER_PERSONA_NOTE_HEADER not in prompt
+    assert _PLAYER_NOTE not in prompt

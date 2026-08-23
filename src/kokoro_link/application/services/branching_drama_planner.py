@@ -25,10 +25,15 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.domain.entities.branching_drama import (
+    DEFAULT_OPERATOR_POSITION,
     TONE_DARK,
     TONE_NEUTRAL,
     TONE_SUNNY,
     VALID_TONES,
+)
+from kokoro_link.infrastructure.prompt.drama_operator_position_lines import (
+    STAGE_PLANNER,
+    render_drama_operator_position_block,
 )
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
@@ -66,6 +71,8 @@ class BranchingDramaPlanner:
         briefs: Sequence[CharacterBrief],
         total_segments: int,
         operator_primary_language: str = "zh-TW",
+        operator_position: str = DEFAULT_OPERATOR_POSITION,
+        operator_note: str | None = None,
     ) -> tuple[str, NodeOutline]:
         """Returns (drama_title, root_outline)."""
         if await self._resolver.is_fake():
@@ -79,6 +86,8 @@ class BranchingDramaPlanner:
             briefs=briefs,
             total_segments=total_segments,
             operator_primary_language=operator_primary_language,
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
         try:
             raw = await self._resolver.generate(system)
@@ -110,6 +119,8 @@ class BranchingDramaPlanner:
         depth: int,
         total_segments: int,
         operator_primary_language: str = "zh-TW",
+        operator_position: str = DEFAULT_OPERATOR_POSITION,
+        operator_note: str | None = None,
     ) -> dict[str, NodeOutline]:
         """Returns {tone: NodeOutline} for dark/sunny/neutral."""
         is_ending = depth == total_segments - 1
@@ -128,6 +139,8 @@ class BranchingDramaPlanner:
             total_segments=total_segments,
             is_ending=is_ending,
             operator_primary_language=operator_primary_language,
+            operator_position=operator_position,
+            operator_note=operator_note,
         )
         try:
             raw = await self._resolver.generate(system)
@@ -162,6 +175,8 @@ def _build_root_prompt(
     briefs: Sequence[CharacterBrief],
     total_segments: int,
     operator_primary_language: str = "zh-TW",
+    operator_position: str = DEFAULT_OPERATOR_POSITION,
+    operator_note: str | None = None,
 ) -> str:
     body = get_default_loader().render(
         "branching/planner_root",
@@ -170,8 +185,12 @@ def _build_root_prompt(
         brief_block="\n\n".join(b.text for b in briefs),
         char_ids=", ".join(b.character_id for b in briefs),
     )
-    language_hint = render_operator_language_hint(operator_primary_language)
-    return f"{language_hint}\n\n{body}" if language_hint else body
+    return _with_prompt_preamble(
+        body,
+        operator_primary_language=operator_primary_language,
+        operator_position=operator_position,
+        operator_note=operator_note,
+    )
 
 
 def _build_children_prompt(
@@ -184,6 +203,8 @@ def _build_children_prompt(
     total_segments: int,
     is_ending: bool,
     operator_primary_language: str = "zh-TW",
+    operator_position: str = DEFAULT_OPERATOR_POSITION,
+    operator_note: str | None = None,
 ) -> str:
     ending_note = (
         "*** 這是最終段落，三種取向都必須推進到結局收束。 ***"
@@ -200,8 +221,41 @@ def _build_children_prompt(
         path_context=path_context or "（這是從開場直接推進的第一次分歧）",
         char_ids=", ".join(b.character_id for b in briefs),
     )
-    language_hint = render_operator_language_hint(operator_primary_language)
-    return f"{language_hint}\n\n{body}" if language_hint else body
+    return _with_prompt_preamble(
+        body,
+        operator_primary_language=operator_primary_language,
+        operator_position=operator_position,
+        operator_note=operator_note,
+    )
+
+
+def _with_prompt_preamble(
+    body: str,
+    *,
+    operator_primary_language: str,
+    operator_position: str,
+    operator_note: str | None,
+) -> str:
+    """Prefix a rendered planner template with its code-side preambles.
+
+    Both preambles go *before* the template, not after: the shipped
+    templates end with their 輸出規則 block, and anything appended past
+    that competes with the JSON contract the parser depends on. The
+    prompt pack itself is frozen, so conditional guidance has nowhere
+    else to live (same lever as ``_STAGE_PRESENCE_GUIDANCE``).
+    """
+    parts = [
+        part
+        for part in (
+            render_operator_language_hint(operator_primary_language),
+            render_drama_operator_position_block(
+                operator_position, operator_note, stage=STAGE_PLANNER,
+            ),
+            body,
+        )
+        if part
+    ]
+    return "\n\n".join(parts)
 
 
 # ── parsers ───────────────────────────────────────────────────────────

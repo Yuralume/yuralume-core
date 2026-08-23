@@ -157,6 +157,32 @@ def test_candidates_carry_the_source_hash_the_control_plane_stores(
     assert len(candidate["source_hash"]) == 64
 
 
+def test_review_reports_text_and_image_verdicts(monkeypatch) -> None:
+    """Each review row carries both advisory verdicts. The test deployment
+    runs the fake model, so nothing actually looked at the post — and both
+    verdicts must say so rather than answer "pass"."""
+    client = _client(monkeypatch)
+    character_id = _seed(client)
+
+    response = client.post(
+        f"{_BASE}/review",
+        json={
+            "tenant_id": _TENANT,
+            "character_id": character_id,
+            "post_ids": [f"post-{_TENANT}"],
+        },
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200
+    review = response.json()["reviews"][0]
+    assert review["post_id"] == f"post-{_TENANT}"
+    assert {"verdict", "reasons", "rewrite", "image_verdict", "image_reasons"} <= set(review)
+    assert review["verdict"] == "needs_manual_review"
+    assert review["image_verdict"] == "needs_manual_review"
+    assert review["image_reasons"]
+
+
 def test_another_tenants_character_is_404(monkeypatch) -> None:
     client = _client(monkeypatch)
     character_id = _seed(client, tenant=_OTHER_TENANT)

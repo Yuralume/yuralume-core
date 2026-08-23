@@ -144,6 +144,23 @@ class CharacterRepositoryPort(Protocol):
         own targeted operations so an unrelated aggregate write cannot
         resurrect a consumed claim or clobber a lock."""
 
+    async def touch_last_active(self, character_id: str, now: datetime) -> bool:
+        """Advance ``CharacterState.last_active_at`` to ``now``. Monotonic.
+
+        The foreground-interaction anchor every "is this player still here"
+        question reads (dormancy, idle down-shift, freeze reaping, feed
+        silence). Chat has always written it as part of its whole-aggregate
+        turn save; every *other* paid foreground surface (起幕, 分歧劇場 …)
+        holds an entity that was loaded before a long model call, so a
+        targeted single-column UPDATE is the only honest way for them to move
+        it: an aggregate ``save()`` from those paths would write back state
+        that a concurrent chat turn has since advanced.
+
+        Never moves the anchor backwards — a slow action that started before
+        a chat turn must not un-do that turn's newer anchor. Returns whether a
+        row was actually updated (``False`` for an unknown character *and* for
+        an already-newer anchor)."""
+
     async def delete(self, character_id: str) -> bool:
         """Remove the character. Returns True when a row was removed."""
 

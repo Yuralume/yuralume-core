@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchCloudAnnouncements } from '@/utils/api/cloudAnnouncements'
 import { useCloudAnnouncements } from '@/composables/useCloudAnnouncements'
 import { notifyIdentityChanged } from '@/utils/identityLifecycle'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 vi.mock('@/utils/api/cloudAnnouncements', () => ({
   fetchCloudAnnouncements: vi.fn(),
@@ -22,6 +23,7 @@ function snapshot(unreadCount = 1) {
 beforeEach(() => {
   vi.clearAllMocks()
   useCloudAnnouncements().reset()
+  setDeploymentMode('cloud')
 })
 
 afterEach(() => {
@@ -114,5 +116,31 @@ describe('useCloudAnnouncements', () => {
     notifyIdentityChanged()
 
     expect(announcements.hasUnread.value).toBe(false)
+  })
+})
+
+describe('useCloudAnnouncements deployment gating', () => {
+  it('asks nothing on self-host — there is no board and no route', async () => {
+    setDeploymentMode('self_host')
+    const announcements = useCloudAnnouncements()
+
+    await announcements.ensureLoaded()
+    announcements.refreshOnReturn()
+    await Promise.resolve()
+
+    expect(mockedFetch).not.toHaveBeenCalled()
+    expect(announcements.hasUnread.value).toBe(false)
+  })
+
+  it('does not latch self-host: a late cloud probe still loads', async () => {
+    setDeploymentMode('self_host')
+    const announcements = useCloudAnnouncements()
+    await announcements.ensureLoaded()
+
+    setDeploymentMode('cloud')
+    mockedFetch.mockResolvedValueOnce({ kind: 'ok', snapshot: snapshot(2) })
+    await announcements.ensureLoaded()
+
+    expect(announcements.unreadCount.value).toBe(2)
   })
 })

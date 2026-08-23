@@ -101,6 +101,9 @@ from kokoro_link.infrastructure.prompt.memory_lines import (
     format_memory_line,
     memory_time_tag,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompt.register_blocks import (
     render_diversity_evidence_block,
     render_turn_register_block,
@@ -331,6 +334,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         presence_frame: "PresenceFrame | None" = None,
         operator: "OperatorProfile | None" = None,
         operator_persona_lines: "list[str] | None" = None,
+        player_persona_note: str | None = None,
         peer_roster_lines: "list[str] | None" = None,
         initial_relationship_lines: "list[str] | None" = None,
         persona_curiosity_plan: PersonaCuriosityPlan | None = None,
@@ -351,7 +355,6 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         resolved_player_address: "ResolvedAddress | None" = None,
         resolved_character_address: "ResolvedAddress | None" = None,
         address_change_lines: "list[str] | None" = None,
-        include_operator_status: bool = True,
         stage_nudge: bool = False,
     ) -> str:
         # ``vision_markers`` carries the cross-turn image inventory:
@@ -488,6 +491,13 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         # rules — keeps the prompt builder a pure formatter and the
         # service free to evolve its rendering policy.
         operator_persona_block: list[str] = list(operator_persona_lines or [])
+        # Adjacent to the inferred portrait but never merged into it: one
+        # block is what the player said is true, the other is what the
+        # character worked out. Collapsing them would invite the model to
+        # treat a declaration as a guess it may doubt.
+        player_persona_note_block = render_player_persona_note_lines(
+            player_persona_note,
+        )
         peer_roster_block: list[str] = list(peer_roster_lines or [])
         initial_relationship_block: list[str] = list(initial_relationship_lines or [])
         relationship_anchor_block = _render_relationship_anchor_block(
@@ -527,16 +537,6 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
         presence_frame_block = _render_presence_frame_block(
             presence_frame_model,
             operator_language=getattr(operator, "primary_language", None),
-            operator=operator,
-            # The identity / language blocks above read ``operator``
-            # unconditionally — pre-existing behaviour on shared channels,
-            # left alone. The *status* is different: it is a first-person
-            # claim about what the person on the other end is doing right
-            # now, so it may only be rendered when the caller knows that
-            # person is the account owner.
-            include_operator_status=include_operator_status,
-            now=ref_now,
-            local_tz=local_tz,
         )
         # SN1: rendered next to the latest-user-message line rather than up
         # here with the presence frame — it is a statement about *this*
@@ -647,6 +647,7 @@ class DefaultPromptContextBuilder(PromptContextBuilderPort):
                 *operator_language_block,
                 *operator_block,
                 *address_change_block,
+                *player_persona_note_block,
                 *operator_persona_block,
                 *peer_roster_block,
                 *presence_frame_block,
@@ -880,16 +881,6 @@ with you", which would put the character in a room the frame says it is
 not in.
 """
 
-_OPERATOR_STATUS_FRESHNESS_LINE = (
-    "- 這是他自述的近況，不是硬性事實，也沒有固定有效期限："
-    "請依內容語意與設定時間距今多久，自行判斷它現在還算不算數；"
-    "明顯過期就只當一段舊近況參考，不要拿它否定他這一輪說的話。"
-)
-
-_OPERATOR_STATUS_CLIP = 200
-"""Prompt-budget guard for a free-text field with no length limit."""
-
-
 def _render_latest_user_message_line(
     *,
     stage_nudge: bool,
@@ -934,11 +925,6 @@ def _render_stage_nudge_block(
 def _render_presence_frame_block(
     presence_frame: "PresenceFrame | None",
     operator_language: str | None = None,
-    *,
-    operator: "OperatorProfile | None" = None,
-    include_operator_status: bool = True,
-    now: datetime | None = None,
-    local_tz: tzinfo = timezone.utc,
 ) -> list[str]:
     frame = presence_frame or PresenceFrame.web_stage()
     uses_texting_style = _presence_frame_uses_texting_style(frame)
@@ -954,14 +940,6 @@ def _render_presence_frame_block(
     lines = [
         "互動語境：",
         f"- 當前介面：{channel_label}（{frame.surface.value} / {frame.channel.value}）。",
-        # D4: the operator's self-reported situation is context for both
-        # branches — on the stage it explains why they showed up, on the
-        # phone it explains why they are only texting. Withheld entirely
-        # when the turn may not come from the profile's owner.
-        *(
-            _render_operator_status_lines(operator, now=now, local_tz=local_tz)
-            if include_operator_status else []
-        ),
     ]
     if uses_texting_style:
         lines.append(
@@ -994,53 +972,6 @@ def _render_presence_frame_block(
             "- 本回合仍以文字為主要輸入；同場感只表示互動框架，不能憑空補完現實細節。",
         )
     return lines
-
-
-def _render_operator_status_lines(
-    operator: "OperatorProfile | None",
-    *,
-    now: datetime | None,
-    local_tz: tzinfo,
-) -> list[str]:
-    """Hand the operator's self-reported "current status" to the model.
-
-    D4 of the judge retirement: this field used to feed only the
-    stage-access judge. It is plain narrative context now — both
-    timestamps are handed over so the model can weigh freshness
-    semantically. Deliberately **no TTL and no code-side expiry**: a stale
-    status is still shown with its age rather than silently dropped, since
-    "出差到下週" set nine days ago may still be true and only the model can
-    tell. No status = no line at all, so an unset field leaves no trace.
-    """
-    if operator is None:
-        return []
-    status = _clip(operator.current_status or "", _OPERATOR_STATUS_CLIP)
-    if not status:
-        return []
-    set_at = operator.current_status_set_at
-    if set_at is None:
-        when = "未記錄設定時間"
-    else:
-        when = f"設定於 {_format_status_time(set_at, local_tz)}"
-    if now is not None:
-        when = f"{when}，現在是 {_format_status_time(now, local_tz)}"
-    return [
-        f"- 玩家自己填的「目前狀態」：{status}（{when}）。",
-        _OPERATOR_STATUS_FRESHNESS_LINE,
-    ]
-
-
-def _format_status_time(value: datetime, local_tz: tzinfo) -> str:
-    """Full date, year included.
-
-    A month/day stamp renders a status set one year ago identically to one
-    set minutes ago ("07/30 21:40" both times), and the freshness line asks
-    the model to weigh exactly that distance — so the year has to be on the
-    wire or the instruction is unanswerable. There is no TTL to lean on:
-    a stale status is deliberately still shown (see
-    ``_render_operator_status_lines``), which makes the timestamp the only
-    signal of its age."""
-    return to_timezone(value, local_tz).strftime("%Y-%m-%d %H:%M")
 
 
 def _presence_frame_uses_texting_style(frame: PresenceFrame) -> bool:

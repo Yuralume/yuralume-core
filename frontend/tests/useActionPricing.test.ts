@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { fetchCloudPricing } from '@/utils/api/cloudPricing'
 import type { TierPricing } from '@/utils/api/cloudPricing'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 import {
   ACTION_CHAT,
   ACTION_IMAGE_PORTRAIT,
@@ -39,6 +40,7 @@ function ok(tiers: TierPricing[], stale = false) {
 beforeEach(() => {
   vi.clearAllMocks()
   useActionPricing().reset()
+  setDeploymentMode('cloud')
 })
 
 describe('resolveActionPrice', () => {
@@ -188,5 +190,30 @@ describe('affordability pre-check', () => {
 
     expect(pricing.shortfallFor(ACTION_CHAT, { total: 0, known: true, stale: true }))
       .toBeNull()
+  })
+})
+
+describe('useActionPricing deployment gating', () => {
+  it('asks nothing on self-host — nothing there is priced in credits', async () => {
+    setDeploymentMode('self_host')
+    const pricing = useActionPricing()
+
+    await pricing.ensureLoaded()
+    await pricing.refresh()
+
+    expect(mockedFetch).not.toHaveBeenCalled()
+    expect(pricing.priceOf(ACTION_CHAT)).toBeNull()
+  })
+
+  it('does not latch self-host: a late cloud probe still loads', async () => {
+    setDeploymentMode('self_host')
+    const pricing = useActionPricing()
+    await pricing.ensureLoaded()
+
+    setDeploymentMode('cloud')
+    mockedFetch.mockResolvedValueOnce(ok([tier('t', 'action_fixed', [[ACTION_CHAT, 4]])]))
+    await pricing.ensureLoaded()
+
+    expect(pricing.priceOf(ACTION_CHAT)?.price_cr).toBe(4)
   })
 })

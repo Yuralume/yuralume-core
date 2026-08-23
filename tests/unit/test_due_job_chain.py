@@ -352,3 +352,85 @@ async def test_scene_timeout_chain_jumps_to_a_live_scenes_deadline() -> None:
 
 async def _resolved(value):  # noqa: ANN001, ANN202
     return value
+
+
+# --- NF4: dormancy in the handler pre-flight ------------------------------- #
+#
+# The chain advance already computed ``None`` for a dormant character, so the
+# chain stopped — but only AFTER the step ran. That ordering is what an owner
+# switching the knob on actually experiences: every job already scheduled for
+# every long-absent character fires once more first, composing real pictures
+# and pushing real messages, before anything stops.
+
+_DORMANT_TIER = AccountRuntimeProfile(name="free", background_dormancy_days=7)
+
+
+async def test_scheduled_job_runs_no_step_once_dormancy_applies() -> None:
+    """The owner flips the knob; the jobs seeded under the old policy are
+    still queued and come due. They must break their chains without running."""
+    ownership = InMemoryRuntimeOwnership()
+    await ownership.flip("distributed", 0, now=BASE)
+    char = _FakeCharacter()  # never interacted
+    queue, _, reconciler, _ = await _harness([char], ownership=ownership)
+    seeded = await reconciler.run_once(now=BASE)
+    assert seeded.reseeded == len(character_chain_kinds())  # knob still NULL
+
+    # …the knob is set. The already-queued jobs come due against a handler
+    # whose calculator now sees the dormant policy.
+    _, dormant_handler, _, executor = await _harness(
+        [char], ownership=ownership, profile=_DORMANT_TIER,
+    )
+    claimed = await queue.claim("w1", now=BASE, limit=100, lease_seconds=60)
+    for job in claimed:
+        result = await dormant_handler.handle(
+            char, job.kind, now=BASE, logical_slot=str(job.due_at.timestamp()),
+            last_due=job.due_at,
+        )
+        if kind_spec(job.kind).dormancy_exempt:
+            assert result.executed is True, job.kind
+        else:
+            assert result.executed is False, job.kind
+            assert result.chain_stopped is True, job.kind
+
+    # Only the exempt kinds' steps ran — nothing was composed or dispatched
+    # for the absent player.
+    assert {kind for kind, _ in executor.calls} == {
+        kind for kind in character_chain_kinds()
+        if kind_spec(kind).dormancy_exempt
+    }
+
+
+async def test_dormant_character_step_and_chain_both_stop() -> None:
+    queue, handler, _, executor = await _harness(
+        [_FakeCharacter()], profile=_DORMANT_TIER,
+    )
+    result = await handler.handle(
+        _FakeCharacter(), FEED_COMPOSE_KIND, now=BASE, logical_slot="b",
+    )
+    assert result.executed is False
+    assert result.chain_stopped is True
+    assert executor.calls == []
+    assert await queue.active_chain_keys() == set()
+
+
+async def test_active_character_is_untouched_by_the_pre_flight() -> None:
+    queue, handler, _, executor = await _harness(
+        [_FakeCharacter()], profile=_DORMANT_TIER,
+    )
+    active = _FakeCharacter(state=_State(last_active_at=BASE))
+    result = await handler.handle(
+        active, FEED_COMPOSE_KIND, now=BASE, logical_slot="b",
+    )
+    assert result.executed is True
+    assert executor.calls == [("feed_compose", "c1")]
+    assert (FEED_COMPOSE_KIND, "c1") in await queue.active_chain_keys()
+
+
+async def test_pre_flight_is_inert_without_the_knob() -> None:
+    """self-host red line: a never-interacted character still runs everything."""
+    _, handler, _, executor = await _harness([_FakeCharacter()])
+    result = await handler.handle(
+        _FakeCharacter(), FEED_COMPOSE_KIND, now=BASE, logical_slot="b",
+    )
+    assert result.executed is True
+    assert executor.calls == [("feed_compose", "c1")]

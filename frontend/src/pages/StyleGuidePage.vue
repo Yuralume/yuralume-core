@@ -9,7 +9,10 @@ import {
   UiCard,
   UiSection,
   UiBadge,
+  UiProgressRing,
+  UiLightbox,
 } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
 import CharacterRelationshipMood from '@/components/CharacterRelationshipMood.vue'
 import CharacterCardFace from '@/components/CharacterCardFace.vue'
 import CharacterCardGalleryModal from '@/components/CharacterCardGalleryModal.vue'
@@ -27,6 +30,19 @@ const options = computed(() => [
   { value: 'b', label: t('styleGuide.options.b') },
   { value: 'c', label: t('styleGuide.options.c'), disabled: true },
 ])
+
+/**
+ * UiLightbox demo. The URLs are bundled build assets rather than object-storage
+ * keys, so `?v=full` simply 404s back to the same file — enough to exercise the
+ * chrome (counter, arrows, caption, open-original) without a live character.
+ */
+const lightboxOpen = ref(false)
+const lightboxIndex = ref(0)
+const lightboxItems: LightboxItem[] = [
+  { url: '/logo-mark.png', caption: 'logo-mark.png — square mark' },
+  { url: '/favicon.png', caption: 'favicon.png — 192x192' },
+  { url: '/LumeGramLogo.png', caption: 'LumeGramLogo.png' },
+]
 
 const loadingDemo = ref(false)
 function toggleLoading() {
@@ -215,6 +231,30 @@ const galleryCards: CharacterCardPreview[] = [
         <UiBadge variant="warning">Warning</UiBadge>
         <UiBadge variant="danger">Danger</UiBadge>
       </div>
+    </UiSection>
+
+    <UiSection title="UiProgressRing">
+      <div class="row">
+        <UiProgressRing :ratio="0" />
+        <UiProgressRing :ratio="0.32" />
+        <UiProgressRing :ratio="1" />
+        <UiProgressRing :ratio="0.68" :size="48" :thickness="5">
+          <span style="font-size: 11px;">68%</span>
+        </UiProgressRing>
+      </div>
+    </UiSection>
+
+    <UiSection
+      title="UiLightbox"
+      description="the one way to view an image large: arrows / swipe / Esc / back button, one mounted image, fixed open-original link"
+    >
+      <UiButton variant="primary" @click="lightboxOpen = true">Open lightbox</UiButton>
+      <UiLightbox
+        v-model:index="lightboxIndex"
+        :visible="lightboxOpen"
+        :items="lightboxItems"
+        @close="lightboxOpen = false"
+      />
     </UiSection>
 
     <UiSection title="CharacterRelationshipMood" :description="t('styleGuide.relationshipMood.description')">

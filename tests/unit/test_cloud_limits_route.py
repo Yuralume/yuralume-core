@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from kokoro_link.api.dependencies import get_current_user
 from kokoro_link.api.routes.cloud_limits import router as cloud_limits_router
 from kokoro_link.application.services.player_runtime_limits import (
+    BackgroundPolicySnapshot,
     PlayerRuntimeLimitsSnapshot,
     QuotaUsage,
 )
@@ -49,6 +50,7 @@ def _snapshot(
     character_daily_creates: QuotaUsage | None = QuotaUsage(limit=1, used=0),
     story_scenes_daily: QuotaUsage | None = QuotaUsage(limit=5, used=1),
     session_message_limit: int | None = 80,
+    dormancy_days: int | None = None,
 ) -> PlayerRuntimeLimitsSnapshot:
     return PlayerRuntimeLimitsSnapshot(
         character_slots=character_slots,
@@ -58,6 +60,7 @@ def _snapshot(
         album_generation_enabled=True,
         tts_enabled=True,
         video_generation_enabled=True,
+        background=BackgroundPolicySnapshot(dormancy_days=dormancy_days),
     )
 
 
@@ -107,8 +110,30 @@ def test_returns_the_full_shape_for_a_cloud_operator() -> None:
         "album_generation_enabled": True,
         "tts_enabled": True,
         "video_generation_enabled": True,
+        "background": {"dormancy_days": None},
     }
     assert service.calls == ["cloud:acct-1"]
+
+
+def test_background_dormancy_days_is_reported_when_the_tier_sets_it() -> None:
+    """NF4, display-only: the SPA needs the window in order to warn *before*
+    the character goes quiet, which is the whole point of this route."""
+    client = _client(service=_StubLimitsService(_snapshot(dormancy_days=3)))
+
+    response = client.get("/api/v1/cloud/runtime-limits")
+
+    assert response.status_code == 200
+    assert response.json()["background"] == {"dormancy_days": 3}
+
+
+def test_no_dormancy_serializes_as_null_not_zero() -> None:
+    """Same "``None`` means never" convention the quotas use: a tier without
+    the knob must not read as "goes dormant immediately"."""
+    client = _client(service=_StubLimitsService(_snapshot(dormancy_days=None)))
+
+    body = client.get("/api/v1/cloud/runtime-limits").json()
+
+    assert body["background"]["dormancy_days"] is None
 
 
 def test_unlimited_quotas_serialize_as_null() -> None:

@@ -11,7 +11,9 @@ envelope to the Cloud Channel Hub, and the pre-send ledger retry worker
 """
 
 from kokoro_link.application.services.proactive_delivery.eligible_binding import (
+    ResolvedProactiveSink,
     find_eligible_proactive_binding,
+    list_eligible_proactive_bindings,
 )
 from kokoro_link.application.services.proactive_delivery.hosted_adapter import (
     HostedChannelProactiveDeliveryAdapter,
@@ -30,6 +32,8 @@ __all__ = [
     "HostedChannelProactiveDeliveryAdapter",
     "LocalMessagingProactiveDeliveryAdapter",
     "ProactiveDeliveryRetryWorker",
+    "ResolvedProactiveSink",
     "build_hosted_delivery_identity_resolver",
     "find_eligible_proactive_binding",
+    "list_eligible_proactive_bindings",
 ]

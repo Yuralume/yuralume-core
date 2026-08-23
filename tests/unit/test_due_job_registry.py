@@ -22,6 +22,7 @@ from kokoro_link.contracts.due_jobs import (
     PROACTIVE_EVALUATE_KIND,
     SCHEDULE_MAINTENANCE_KIND,
     SCHEDULE_WEATHER_VET_KIND,
+    SOCIAL_KIND_REGISTRY,
     STORY_SCENE_TIMEOUT_KIND,
     character_chain_kinds,
     is_character_chain_kind,
@@ -107,6 +108,33 @@ def test_every_kind_is_chained_and_character_scoped() -> None:
         assert spec.chained is True
         assert spec.character_scoped is True
         assert spec.handler  # non-empty handler binding
+
+
+def test_dormancy_exemption_is_the_short_argued_list() -> None:
+    """NF4. Dormancy stops every chain of a character nobody has spoken to;
+    the only survivors are the two that *finish something the player started*
+    — an open 起幕 scene's wrap-up, and the answer to a comment they wrote.
+    Both are un-gated by design, and both are an indexed read when there is
+    nothing in flight, so the exemption never spends on an absent player.
+
+    Everything else — proactive, feed, beats, schedule, goal review, upkeep —
+    would spend on its own initiative with nobody watching, which is precisely
+    what the knob exists to stop. Adding a name here needs that argument."""
+    exempt = {
+        kind for kind, spec in CHARACTER_KIND_REGISTRY.items()
+        if spec.dormancy_exempt
+    }
+    assert exempt == {STORY_SCENE_TIMEOUT_KIND, FEED_COMMENT_REPLY_KIND}
+    for kind in exempt:
+        assert kind_spec(kind).knob_gate is KnobGate.NONE
+
+
+def test_social_chains_are_never_dormancy_exempt() -> None:
+    """Encounters, dreams and peer consolidation are background by every
+    definition: nothing is in flight for the player, so an away account must
+    not keep paying for them."""
+    for spec in SOCIAL_KIND_REGISTRY.values():
+        assert spec.dormancy_exempt is False
 
 
 def test_unknown_kind_returns_none() -> None:

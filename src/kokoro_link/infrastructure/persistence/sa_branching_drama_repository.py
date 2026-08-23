@@ -14,11 +14,13 @@ from kokoro_link.contracts.branching_drama import (
     BranchingDramaRepositoryPort,
 )
 from kokoro_link.domain.entities.branching_drama import (
+    DEFAULT_OPERATOR_POSITION,
     BranchingDrama,
     DramaNode,
     DramaSession,
     DramaSessionTurn,
     Exchange,
+    read_stored_visual_style,
 )
 from kokoro_link.infrastructure.persistence.branching_drama_models import (
     BranchingDramaNodeRow,
@@ -229,6 +231,9 @@ def _drama_to_row(d: BranchingDrama) -> BranchingDramaRow:
     row.status = d.status
     row.error_message = d.error_message
     row.error_code = d.error_code
+    row.operator_position = d.operator_position
+    row.operator_note = d.operator_note
+    row.visual_style = d.visual_style
     row.created_at = d.created_at
     row.updated_at = d.updated_at
     return row
@@ -245,6 +250,17 @@ def _row_to_drama(r: BranchingDramaRow) -> BranchingDrama:
         status=r.status,
         error_message=r.error_message,
         error_code=r.error_code,
+        # A pre-BD2 row has no position; the default is what it always
+        # played as, so read it back rather than inventing an "unjudged"
+        # fourth state the prompt stages have no framing for.
+        operator_position=r.operator_position or DEFAULT_OPERATOR_POSITION,
+        operator_note=r.operator_note,
+        # No default substituted on purpose (BD10): ``NULL`` means the row
+        # predates the column, and the scene-prompt builder answers that
+        # with the legacy ``characters[0]`` resolution. Reading it back as
+        # ``anime`` would repaint every existing realistic drama. Read
+        # leniently so one odd stored value cannot 500 the whole list.
+        visual_style=read_stored_visual_style(r.visual_style),
         created_at=r.created_at,
         updated_at=r.updated_at,
     )

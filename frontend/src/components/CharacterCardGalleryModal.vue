@@ -125,6 +125,15 @@ function handleTranslateChange(event: Event) {
   emit('translate-change', input.checked)
 }
 
+/**
+ * bubble 階段的 `window` 監聽（`addEventListener` 預設）。
+ *
+ * LB7：卡面（`CharacterCardFace`）會在這個 modal（z-index 910）之上再開一層
+ * 放大浮窗（`UiLightbox`，z-index 1500）。浮窗開著時 Esc／←→ 到不了這裡——
+ * 浮窗以 **capture 階段**掛在 `window` 上並對這些鍵 `stopPropagation()`，
+ * 攔截責任在浮窗自己。**不要在這裡補讓位守衛**（本檔曾有一條訂閱卡面
+ * `zoom-open-change` 的手寫讓位，已隨責任收回 primitive 一併移除）。
+ */
 function handleWindowKeydown(event: KeyboardEvent) {
   if (!props.visible) return
   if (event.key === 'Escape') {
@@ -348,7 +357,6 @@ function handleWindowKeydown(event: KeyboardEvent) {
     max(24px, var(--safe-area-left));
   background: rgba(0, 0, 0, 0.62);
   backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
 }
 
 .character-card-gallery {

@@ -183,6 +183,9 @@ from kokoro_link.contracts.operator_address_preference import (
 from kokoro_link.contracts.address_change_log import (
     AddressChangeLogRepositoryPort,
 )
+from kokoro_link.contracts.player_persona_note import (
+    PlayerPersonaNoteRepositoryPort,
+)
 from kokoro_link.application.services.relationship_names_service import (
     RelationshipNamesService,
 )
@@ -338,6 +341,9 @@ from kokoro_link.infrastructure.prompt.initial_relationship import (
 )
 from kokoro_link.infrastructure.prompt.address_change import (
     render_address_change_lines,
+)
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
 )
 from kokoro_link.domain.services.address_resolver import (
     resolve_character_address,
@@ -957,6 +963,9 @@ class ChatService:
         emotion_aggregator: EmotionAggregatorPort | None = None,
         self_reflection_repository: "SelfReflectionRepositoryPort | None" = None,
         address_preference_repository: "OperatorAddressPreferenceRepositoryPort | None" = None,
+        player_persona_note_repository: (
+            "PlayerPersonaNoteRepositoryPort | None"
+        ) = None,
         address_change_log_repository: "AddressChangeLogRepositoryPort | None" = None,
         relationship_names_service: "RelationshipNamesService | None" = None,
         experiment_overlay_service: "ExperimentOverlayService | None" = None,
@@ -1088,6 +1097,7 @@ class ChatService:
         )
         self._self_reflection_repository = self_reflection_repository
         self._address_preference_repository = address_preference_repository
+        self._player_persona_note_repository = player_persona_note_repository
         self._address_change_log_repository = address_change_log_repository
         self._relationship_names_service = relationship_names_service
         self._experiment_overlay_service = experiment_overlay_service
@@ -2766,6 +2776,11 @@ class ChatService:
             character.id, operator,
         )
         operator_persona_lines = self._render_operator_persona_lines(operator_persona)
+        player_persona_note = await self._load_player_persona_note(
+            character.id,
+            operator,
+            enabled=payload.operator_persona_enabled,
+        )
         peer_roster_lines = await self._load_peer_roster_lines(character.id)
         initial_relationship_lines = await self._load_initial_relationship_lines(
             character.id, operator,
@@ -2874,6 +2889,7 @@ class ChatService:
                 phrase_habit_lines=phrase_habit_lines,
                 operator=operator,
                 operator_persona_lines=operator_persona_lines,
+                player_persona_note=player_persona_note,
                 peer_roster_lines=peer_roster_lines,
                 initial_relationship_lines=initial_relationship_lines,
                 persona_curiosity_plan=persona_curiosity_plan,
@@ -2895,7 +2911,6 @@ class ChatService:
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
-                include_operator_status=payload.operator_persona_enabled,
                 stage_nudge=nudge.enabled,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
@@ -3496,6 +3511,22 @@ class ChatService:
                     operator,
                     relationship_context_lines=relationship_context_lines,
                 ),
+            ) + tuple(
+                # The *decision* is a player-facing act too: it picks the
+                # brief ack the player reads, and it decides whether the
+                # player is worth interrupting an activity for. Judging
+                # that without the player's declared identity is judging a
+                # stranger — the compose half already receives the note, so
+                # withholding it here left the two halves reading different
+                # players. ``operator`` is already ``None`` whenever the
+                # caller's ``operator_persona_enabled`` is off (both chat
+                # entry points gate the argument), so the same flag that
+                # silences the owner's persona silences this.
+                render_player_persona_note_lines(
+                    await self._load_player_persona_note(
+                        character.id, operator, enabled=operator is not None,
+                    ),
+                ),
             )
             decision = await self._busy_reply_decider.decide(
                 character=character,
@@ -4038,6 +4069,11 @@ class ChatService:
             if operator_persona_enabled else None
         )
         operator_persona_lines = self._render_operator_persona_lines(operator_persona)
+        player_persona_note = await self._load_player_persona_note(
+            character.id,
+            operator,
+            enabled=operator_persona_enabled,
+        )
         peer_roster_lines = await self._load_peer_roster_lines(character.id)
         initial_relationship_lines = await self._load_initial_relationship_lines(
             character.id, operator,
@@ -4146,6 +4182,7 @@ class ChatService:
                     phrase_habit_lines=phrase_habit_lines,
                     operator=operator,
                     operator_persona_lines=operator_persona_lines,
+                    player_persona_note=player_persona_note,
                     peer_roster_lines=peer_roster_lines,
                     initial_relationship_lines=initial_relationship_lines,
                     persona_curiosity_plan=persona_curiosity_plan,
@@ -4167,7 +4204,6 @@ class ChatService:
                     turn_register_profile=register_profile,
                     reply_diversity_evidence=diversity_evidence,
                     retry_directive=retry_directive,
-                    include_operator_status=operator_persona_enabled,
                     stage_nudge=stage_nudge,
                 )
                 prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
@@ -4385,6 +4421,7 @@ class ChatService:
                 phrase_habit_lines=phrase_habit_lines,
                 operator=operator,
                 operator_persona_lines=operator_persona_lines,
+                player_persona_note=player_persona_note,
                 peer_roster_lines=peer_roster_lines,
                 initial_relationship_lines=initial_relationship_lines,
                 persona_curiosity_plan=persona_curiosity_plan,
@@ -4405,7 +4442,6 @@ class ChatService:
                 material_digest=material_digest,
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
-                include_operator_status=operator_persona_enabled,
                 stage_nudge=stage_nudge,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
@@ -4723,6 +4759,7 @@ class ChatService:
                 phrase_habit_lines=phrase_habit_lines,
                 operator=operator,
                 operator_persona_lines=operator_persona_lines,
+                player_persona_note=player_persona_note,
                 peer_roster_lines=peer_roster_lines,
                 initial_relationship_lines=initial_relationship_lines,
                 persona_curiosity_plan=persona_curiosity_plan,
@@ -4744,7 +4781,6 @@ class ChatService:
                 turn_register_profile=register_profile,
                 reply_diversity_evidence=diversity_evidence,
                 retry_directive=retry_directive,
-                include_operator_status=operator_persona_enabled,
                 stage_nudge=stage_nudge,
             )
             prompt_pack_hash = _last_prompt_pack_hash(self._prompt_context_builder)
@@ -5659,6 +5695,39 @@ class ChatService:
             )
             return []
 
+    async def _load_player_persona_note(
+        self,
+        character_id: str,
+        operator: "OperatorProfile | None",
+        *,
+        enabled: bool,
+    ) -> str:
+        """The player's declared identity / world premise for this pair.
+
+        Gated on the same flag as the operator persona: both are claims
+        about *the account owner*, so a channel that may carry someone
+        else must not have the owner's declared setting staged as the
+        current speaker's. Failure-soft — the declaration is staging, not
+        a reason to lose the turn.
+        """
+        if (
+            not enabled
+            or self._player_persona_note_repository is None
+            or operator is None
+        ):
+            return ""
+        try:
+            row = await self._player_persona_note_repository.get(
+                character_id=character_id,
+                operator_id=operator.id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "player persona note load failed; continuing without it",
+            )
+            return ""
+        return row.note if row is not None else ""
+
     async def _load_peer_roster_lines(self, character_id: str) -> list[str]:
         if self._character_social_knowledge_service is None:
             return []
@@ -6381,6 +6450,16 @@ class ChatService:
                 self._post_turn_processor.process, "resolved_player_address",
             ):
                 kwargs["resolved_player_address"] = resolved_player_address
+            # PP3 — handed to the extractor so it does NOT re-mine facts the
+            # declaration already supplies on every turn. Same gate as the
+            # reply prompts: text about the account owner is not staged for
+            # a turn that may have come from somebody else.
+            if _accepts_keyword(
+                self._post_turn_processor.process, "player_persona_note",
+            ):
+                kwargs["player_persona_note"] = await self._load_player_persona_note(
+                    character.id, operator, enabled=persona_enabled,
+                )
             result = await self._post_turn_processor.process(**kwargs)
         except Exception as exc:
             _LOGGER.exception("Post-turn processing crashed")

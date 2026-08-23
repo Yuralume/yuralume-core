@@ -13,12 +13,15 @@
  * image would have a box to fall back on, because the box is in the markup.
  */
 
+import { readFileSync } from 'node:fs'
+
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSSRApp, ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createI18n } from 'vue-i18n'
 
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
+import { chatImageLightboxItems } from '@/utils/chatImageLightbox'
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -110,12 +113,6 @@ describe('a picture in a chat bubble', () => {
     expect(await renderOneImage()).toContain('bubble-image')
   })
 
-  it('still opens the original in a new tab', async () => {
-    const html = await renderOneImage()
-    expect(html).toContain(`href="${IMAGE_URL}"`)
-    expect(html).toContain('rel="noopener"')
-  })
-
   it('carries the caption as alt text, and a default when there is none', async () => {
     const captioned = await renderBubble([
       { kind: 'image', url: IMAGE_URL, mime_type: 'image/png', caption: '傍晚的天空' },
@@ -130,12 +127,100 @@ describe('a picture in a chat bubble', () => {
     ])
     expect(html).toContain('bubble-file')
     expect(html).not.toContain('bubble-image')
+    // A file attachment is a download, not something to look at: it keeps the
+    // new tab the pictures just gave up (LB3).
+    expect(html).toContain('href="/v1/public/a.txt"')
+    expect(html).toContain('target="_blank"')
   })
 
   it('renders no picture markup at all when there is nothing attached', async () => {
     const html = await renderBubble([])
     expect(html).not.toContain('bubble-images')
     expect(html).toContain('你看，這是今天的天空。')
+  })
+})
+
+// ----------------------------------------------------------------------
+// LB3 — the picture opens the lightbox instead of a new tab
+// ----------------------------------------------------------------------
+
+const bubbleSource = readFileSync(
+  new URL('../src/components/ChatBubble.vue', import.meta.url),
+  'utf8',
+)
+
+describe('a chat picture opens the lightbox', () => {
+  it('is a button, not a link to somewhere else', async () => {
+    const html = await renderOneImage()
+    expect(html).toContain('class="bubble-image-link"')
+    expect(html).toContain('type="button"')
+    // The old path opened the file itself in a new tab; "open the original"
+    // now lives inside the lightbox (and goes through `safeMediaHref()` there,
+    // which this anchor never did).
+    expect(html).not.toContain(`href="${IMAGE_URL}"`)
+  })
+
+  it('renders no overlay markup while it is closed', async () => {
+    // The point of `v-if="visible"`: a closed lightbox holds no element, so it
+    // holds no decoded bitmap either.
+    expect(await renderOneImage()).not.toContain('ui-lightbox')
+  })
+})
+
+describe('what reaches the lightbox is the original URL', () => {
+  // This is the trap of the ticket. The thumbnail's own `src` goes through
+  // `imageSrcFor()`, which returns '' once the strip scrolls out of view
+  // (IV5-C release). Feeding that display value to the lightbox would make a
+  // picture scrolled far enough away open blank — and the SSR harness has no
+  // `IntersectionObserver`, so a release never happens here and every other
+  // assertion in this file would stay green.
+
+  it('maps attachments to their untouched url and caption', () => {
+    expect(chatImageLightboxItems([
+      { kind: 'image', url: IMAGE_URL, mime_type: 'image/png', caption: '傍晚的天空' },
+    ])).toEqual([{ url: IMAGE_URL, caption: '傍晚的天空' }])
+  })
+
+  it('keeps only the pictures, in the order the thumbnails are in', () => {
+    // The thumbnail `v-for` runs over the image attachments, so the index the
+    // click hands over only means anything if this filter matches it.
+    expect(chatImageLightboxItems([
+      { kind: 'image', url: '/a.png', mime_type: 'image/png', caption: null },
+      { kind: 'file', url: '/b.txt', mime_type: 'text/plain', caption: null },
+      { kind: 'image', url: '/c.png', mime_type: 'image/png', caption: null },
+    ]).map(item => item.url)).toEqual(['/a.png', '/c.png'])
+  })
+
+  it('survives a message with no attachments at all', () => {
+    expect(chatImageLightboxItems(undefined)).toEqual([])
+    expect(chatImageLightboxItems([])).toEqual([])
+  })
+
+  it('is what the bubble actually hands the lightbox', () => {
+    // Read from source: the collection is built from the attachments, never
+    // from the released display src.
+    // `\r?` throughout: the checkout is CRLF on Windows and a bare `\n` in the
+    // pattern silently matches nothing, turning this gate green-by-absence.
+    const itemsComputed = bubbleSource.match(
+      /const lightboxItems = computed[\s\S]*?\r?\n\)/,
+    )?.[0] ?? ''
+    expect(itemsComputed).not.toBe('')
+    expect(itemsComputed).toContain('chatImageLightboxItems(imageAttachments.value)')
+    expect(itemsComputed).not.toContain('imageSrcFor')
+    expect(bubbleSource).toContain(':items="lightboxItems"')
+  })
+
+  it('opens at the picture that was clicked', () => {
+    expect(bubbleSource).toContain('@click="openZoom(imageIdx)"')
+    expect(bubbleSource).toContain('v-model:index="zoomIndex"')
+  })
+
+  it('closes the overlay when the attachment list is replaced', () => {
+    // The index points into the previous list; leaving it open turns into
+    // "the same slot, a different picture" the moment a new one lands.
+    expect(bubbleSource).toMatch(
+      /watch\(\s*\(\) => imageAttachments\.value\.map[\s\S]{0,200}zoomOpen\.value = false/,
+    )
   })
 })
 

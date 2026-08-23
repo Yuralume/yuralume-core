@@ -16,7 +16,9 @@ import { revealDelaysFor, splitAssistantBubbles } from '@/utils/chatSegments'
 import { clampSeedPrompt, composeMomentSeed } from '@/utils/fusionSeed'
 import { stashStudioSeed } from '@/utils/studioSeedTransfer'
 import { isTTSPlaybackEligible } from '@/utils/ttsAvailability'
-import { UiImage } from '@/components/ui'
+import { UiImage, UiLightbox } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
+import { chatImageLightboxItems } from '@/utils/chatImageLightbox'
 import { observeOffscreenRelease } from '@/utils/offscreenImageObserver'
 import {
   type ImageBox,
@@ -103,6 +105,39 @@ function rememberImageBox(url: string, event: Event) {
   const box = usableImageBox(el.offsetWidth, el.offsetHeight)
   if (box) imageBoxes.value = { ...imageBoxes.value, [url]: box }
 }
+
+// --- 放大檢視（LB3）
+/**
+ * 集合＝**同一則訊息**的圖片附件，不跨訊息收整個對話。
+ *
+ * 取的是 `imageAttachments`（原始 `att.url`），不是 `imageSrcFor()` 的顯示值
+ * ——後者在圖片捲出視窗時是空字串，餵給浮窗就會變成「捲遠一點再點開是一片
+ * 空白」。這條判斷刻意住在 `chatImageLightboxItems()` 裡：它的輸入型別身上
+ * 只有原始 URL，釋放後的空字串沒有路徑進得來（見該檔檔頭）。
+ */
+const zoomOpen = ref(false)
+const zoomIndex = ref(0)
+
+const lightboxItems = computed<LightboxItem[]>(() =>
+  chatImageLightboxItems(imageAttachments.value),
+)
+
+function openZoom(at: number) {
+  zoomIndex.value = at
+  zoomOpen.value = true
+}
+
+/**
+ * 附件清單換掉就關窗。索引指的是舊那份清單，留著會在新清單落地的瞬間變成
+ * 「同一格位置的另一張圖」。串流中的訊息會補上附件，所以這不是假想情境。
+ */
+watch(
+  () => imageAttachments.value.map(att => att.url).join('\n'),
+  () => {
+    zoomOpen.value = false
+    zoomIndex.value = 0
+  },
+)
 
 // The strip is behind `v-if` (it only renders once the text has finished
 // revealing), so the element arrives after mount and can go away again —
@@ -494,15 +529,22 @@ watch(
       ref="bubbleImagesEl"
       class="bubble-images"
     >
-      <!-- The href stays the original: "open in a new tab" means the full
-           picture, not the size the thread happened to display. -->
-      <a
-        v-for="att in imageAttachments"
+      <!-- 原本是 `target="_blank"` 的 anchor（LB3 改成就地放大的浮窗）。同一則
+           訊息的圖是一組，左右鍵在它們之間走，手機返回鍵關窗而不是離開 app。
+           仍是按鈕不是連結——它不導向任何地方；「看原檔／另存」由浮窗保留。
+
+           順帶收掉一個既有的不一致：這裡的 href 從來沒過 `safeMediaHref()`
+           （AlbumPanel 與 FeedCard 都有過）。改走浮窗之後「開原圖」是浮窗出的，
+           那條護欄自然生效——`.lumebackup` 還原落地的 `javascript:` 之類 scheme
+           不再有機會在聊天串裡變成一顆可點的連結。 -->
+      <button
+        v-for="(att, imageIdx) in imageAttachments"
         :key="att.url"
-        :href="att.url"
-        target="_blank"
-        rel="noopener"
+        type="button"
         class="bubble-image-link"
+        :title="t('common.actions.zoom')"
+        :aria-label="t('common.actions.zoomAria', { name: att.caption || t('chat.bubble.imageAlt') })"
+        @click="openZoom(imageIdx)"
       >
         <UiImage
           :src="imageSrcFor(att.url)"
@@ -515,7 +557,7 @@ watch(
           @load="rememberImageBox(att.url, $event)"
         />
         <span v-if="att.caption" class="bubble-image-caption">{{ att.caption }}</span>
-      </a>
+      </button>
     </div>
 
     <div v-if="otherAttachments.length && allBubblesVisible" class="bubble-files">
@@ -530,6 +572,14 @@ watch(
         📎 {{ att.caption ?? att.url.split('/').pop() }}
       </a>
     </div>
+
+    <!-- 檔案附件（上面那條）維持開新分頁：那是下載，不是看圖。 -->
+    <UiLightbox
+      v-model:index="zoomIndex"
+      :visible="zoomOpen"
+      :items="lightboxItems"
+      @close="zoomOpen = false"
+    />
   </div>
 </template>
 
@@ -752,12 +802,29 @@ watch(
   gap: 6px;
 }
 
+/* LB3：這是 <button>（就地開浮窗），不再是連結。UA 的按鈕預設值會給它灰底、
+   邊框、padding，還會把圖說置中——全部歸零，讓換成按鈕前後畫出來的東西一樣。
+   保底行為（釋放後用實測 box 當佔位）靠的就是版面不動。 */
 .bubble-image-link {
   display: flex;
   flex-direction: column;
   gap: 4px;
   text-decoration: none;
   color: inherit;
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  text-align: left;
+  cursor: zoom-in;
+}
+
+.bubble-image-link:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: 10px;
 }
 
 .bubble-image {

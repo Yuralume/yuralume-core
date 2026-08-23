@@ -68,6 +68,7 @@ from kokoro_link.application.dto.character_backup.persona import (
     OperatorAddressPreferenceBackupRecord,
     OperatorProfileFieldBackupRecord,
     PersonaCuriosityAttemptBackupRecord,
+    PlayerPersonaNoteBackupRecord,
 )
 from kokoro_link.application.dto.character_backup.registry import (
     BACKUP_TABLE_RULES_BY_NAME,
@@ -160,6 +161,7 @@ __all__ = [
     "OperatorProfileFieldBackupRecord",
     "PendingFollowUpBackupRecord",
     "PersonaCuriosityAttemptBackupRecord",
+    "PlayerPersonaNoteBackupRecord",
     "PolicyOverride",
     "PolicySource",
     "ResetFlag",

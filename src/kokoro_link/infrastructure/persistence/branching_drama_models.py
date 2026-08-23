@@ -45,6 +45,30 @@ class BranchingDramaRow(Base):
     )
     """Gateway refusal code behind a ``failed`` status (U4b) — see
     ``FusionStoryRow.error_code``. ``NULL`` for ordinary crashes."""
+    operator_position: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+    )
+    """Where the player stands in this drama (BD2). Nullable with no
+    server default and no backfill: ``NULL`` is what every pre-BD2 row
+    says, and the mapper reads it back as
+    ``DEFAULT_OPERATOR_POSITION`` so those dramas keep playing exactly
+    as they did. No index — only ever read with the drama row."""
+    operator_note: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+    )
+    """Optional free-text 「你在劇中演誰」 (BD2). In-story staging only."""
+    visual_style: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+    )
+    """The look every scene image of this drama is drawn in (BD10).
+
+    Nullable with no server default and no backfill — but unlike
+    ``operator_position`` the ``NULL`` here is *load-bearing*: the mapper
+    does **not** substitute a default, because a pre-BD10 drama was styled
+    off its first character and reading it back as ``anime`` would silently
+    repaint half the existing realistic ones. ``NULL`` routes the scene
+    prompt to that legacy per-character resolution instead. No index —
+    only ever read with the drama row."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )

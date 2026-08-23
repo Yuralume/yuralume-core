@@ -79,9 +79,12 @@ vi.mock('@/utils/api/ttsAssets', () => ({
   listTTSAssets: vi.fn(async () => ({ voice_presets: [] })),
 }))
 
-vi.mock('@/utils/api/relationshipNames', () => ({
-  getRelationshipNames: vi.fn(async () => ({})),
-  updateRelationshipNames: vi.fn(),
+// InitialRelationshipSettingsEditor (mounted unconditionally by
+// CharacterSettingsSection since IR2) fires the same kind of immediate
+// watch-driven GET the moment it is set up.
+vi.mock('@/utils/api/initialRelationship', () => ({
+  getInitialRelationship: vi.fn(async () => ({ has_seed: false })),
+  updateInitialRelationship: vi.fn(),
 }))
 
 // StoryArcPanel (mounted unconditionally by admin/CharacterCardEditor —

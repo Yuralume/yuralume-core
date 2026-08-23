@@ -8,8 +8,9 @@ import ChannelBindingsPanel from './ChannelBindingsPanel.vue'
 import CharacterBackupPanel from './CharacterBackupPanel.vue'
 import CharacterEditPanel from './CharacterEditPanel.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
+import InitialRelationshipSettingsEditor from './InitialRelationshipSettingsEditor.vue'
+import PlayerPersonaNoteSetting from './PlayerPersonaNoteSetting.vue'
 import ProactiveMessageSetting from './ProactiveMessageSetting.vue'
-import RelationshipNamesEditor from './RelationshipNamesEditor.vue'
 import SimpleVoicePicker from './SimpleVoicePicker.vue'
 import DispositionAdminEditor from './admin/DispositionAdminEditor.vue'
 
@@ -67,11 +68,22 @@ defineExpose({
   />
 
   <CollapsibleSection
-    :title="t('playerSidebar.relationshipNames.title')"
-    :hint="t('playerSidebar.relationshipNames.sectionHint')"
+    :title="t('playerSidebar.relationshipSeed.title')"
+    :hint="t('playerSidebar.relationshipSeed.sectionHint')"
     :default-open="false"
   >
-    <RelationshipNamesEditor :key="`${character.id}:rel-names`" :character="character" />
+    <InitialRelationshipSettingsEditor :key="`${character.id}:rel-seed`" :character="character" />
+  </CollapsibleSection>
+
+  <CollapsibleSection
+    :title="t('playerPersonaNote.sectionTitle')"
+    :hint="t('playerPersonaNote.sectionHint', { name: character.name })"
+    :default-open="false"
+  >
+    <PlayerPersonaNoteSetting
+      :key="`${character.id}:player-persona-note`"
+      :character="character"
+    />
   </CollapsibleSection>
 
   <CollapsibleSection

@@ -19,6 +19,9 @@ from kokoro_link.application.services.chat_turn_lease import (
     ConversationBusyError,
     release_turn_lease,
 )
+from kokoro_link.application.services.character_activity_anchor import (
+    CharacterActivityAnchor,
+)
 from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_scene_material import (
     PendingBeatSceneMaterialProvider,
@@ -65,6 +68,9 @@ from tests.unit._runtime_profiles import (
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.infrastructure.repositories.in_memory_background_jobs import (
     InMemoryBackgroundCoordinatorLease,
+)
+from kokoro_link.infrastructure.repositories.in_memory_characters import (
+    InMemoryCharacterRepository,
 )
 from kokoro_link.infrastructure.repositories.in_memory_conversations import (
     InMemoryConversationRepository,
@@ -217,8 +223,13 @@ class _Fixture:
         turn_lease: ChatTurnLease | None = None,
         retry_policy: BeatRetryPolicy | None = None,
         quota_guard=None,  # noqa: ANN001
+        characters=None,  # noqa: ANN001 - CharacterRepositoryPort | None
     ) -> None:
         self.arcs_repo = InMemoryStoryArcRepository()
+        # NF4: the foreground-interaction anchor. Wired only when a test
+        # supplies a character repository, so every other test in this file
+        # exercises the same path it always did.
+        self.characters = characters
         self.arc = arc
         self.conversations = InMemoryConversationRepository()
         self.sessions = InMemoryStorySceneSessionRepository()
@@ -240,6 +251,10 @@ class _Fixture:
             story_arc_service=self.arc_service,
             turn_lease=turn_lease,
             quota_guard=quota_guard,
+            activity_anchor=(
+                CharacterActivityAnchor(characters)
+                if characters is not None else None
+            ),
         )
 
     async def setup(self) -> None:
@@ -665,3 +680,54 @@ async def test_quota_guard_refusal_blocks_before_the_opener_is_called() -> None:
     assert await fx.sessions.get_open_for_character("c1") is None
     arc = await fx.arcs_repo.get_active_for_character("c1")
     assert arc.beats[0].play_attempt_count == 0
+
+
+# ── NF4: 起幕 is a foreground interaction ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_opening_a_scene_moves_the_foreground_anchor() -> None:
+    """A player who only presses 起幕 is still a player who is here.
+
+    Before this the anchor was written only at the end of a chat turn, so
+    somebody playing exclusively through scenes read as "never interacted"
+    — permanently dormant under a tier with ``background_dormancy_days``,
+    and silent to the idle down-shift and the freeze reaper as well.
+    """
+    characters = InMemoryCharacterRepository()
+    character = _character()
+    await characters.save(character)
+    fx = await _fixture(
+        arc=_arc(), opener=_StubOpener(_DRAFT), characters=characters,
+    )
+    assert (await characters.get("c1")).state.last_active_at is None
+
+    await fx.service.open_scene(character, now=NOW)
+
+    assert (await characters.get("c1")).state.last_active_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_a_refused_opening_does_not_move_the_anchor() -> None:
+    """The anchor records interactions that happened. A refusal — here the
+    daily ceiling — delivered nothing and is not one."""
+    characters = InMemoryCharacterRepository()
+    character = _character()
+    await characters.save(character)
+
+    from kokoro_link.application.services.story_scene_quota import (
+        StorySceneDailyLimitReached,
+    )
+
+    class _Refusing:
+        async def check(self, character, *, now=None):  # noqa: ANN001
+            raise StorySceneDailyLimitReached(limit=1, used=1)
+
+    fx = await _fixture(
+        arc=_arc(), opener=_StubOpener(_DRAFT), characters=characters,
+        quota_guard=_Refusing(),
+    )
+    with pytest.raises(StorySceneDailyLimitReached):
+        await fx.service.open_scene(character, now=NOW)
+
+    assert (await characters.get("c1")).state.last_active_at is None

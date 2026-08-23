@@ -179,7 +179,12 @@ class CharacterCardProfile(BaseModel):
         importer's storage) and ``arc_template_id`` is the resolved
         local id of the bundled template (after any collision remap).
         Every B / C layer field is left at its default → the imported
-        character starts from zero on the importer's deployment."""
+        character starts from zero on the importer's deployment, except
+        ``initial_state``: affection/trust start at 50 (the same opening
+        rapport a player gets creating a character from scratch in
+        ``CharacterCreateModal.vue``) rather than the payload's own
+        zero default, which stays 0 for every other consumer of
+        :class:`CharacterStatePayload`."""
         return CreateCharacterRequest(
             name=self.name,
             summary=self.summary,
@@ -201,7 +206,7 @@ class CharacterCardProfile(BaseModel):
             date_of_birth=self.date_of_birth,
             image_urls=list(image_urls),
             allowed_tools=list(self.allowed_tools),
-            initial_state=CharacterStatePayload(),
+            initial_state=CharacterStatePayload(affection=50, trust=50),
             proactive_enabled=self.proactive_enabled,
             proactive_daily_limit=self.proactive_daily_limit,
             proactive_cooldown_minutes=self.proactive_cooldown_minutes,

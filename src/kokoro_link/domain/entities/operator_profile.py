@@ -19,7 +19,6 @@ Why an entity at all (vs. a couple of preference rows)?
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 from typing import Final
 
 from kokoro_link.domain.value_objects.actor import Actor
@@ -75,7 +74,7 @@ UNSET: Final = _Unset()
 """Sentinel for tri-state profile updates.
 
 ``None`` is a meaningful value for some mutable profile fields (for
-example clearing ``current_status``), so callers that want "leave this
+example clearing ``location_label``), so callers that want "leave this
 field untouched" use this sentinel instead.
 """
 
@@ -104,8 +103,6 @@ class OperatorProfile:
     display_name_locked: bool = False
     primary_language: str = DEFAULT_PRIMARY_LANGUAGE
     timezone_id: str = DEFAULT_OPERATOR_TIMEZONE
-    current_status: str | None = None
-    current_status_set_at: datetime | None = None
     country_code: str | None = None
     latitude: float | None = None
     longitude: float | None = None
@@ -145,16 +142,6 @@ class OperatorProfile:
             self, "timezone_id",
             normalise_timezone_id(self.timezone_id),
         )
-        if self.current_status is not None:
-            status = self.current_status.strip()
-            object.__setattr__(self, "current_status", status or None)
-        if self.current_status is None:
-            object.__setattr__(self, "current_status_set_at", None)
-        elif self.current_status_set_at is not None:
-            set_at = self.current_status_set_at
-            if set_at.tzinfo is None:
-                set_at = set_at.replace(tzinfo=timezone.utc)
-            object.__setattr__(self, "current_status_set_at", set_at)
         object.__setattr__(
             self, "country_code", _normalise_country_code(self.country_code),
         )
@@ -229,8 +216,6 @@ class OperatorProfile:
         password_hash: str | None = None,
         is_admin: bool | None = None,
         display_name_locked: bool | None = None,
-        current_status: str | None | _Unset = UNSET,
-        current_status_set_at: datetime | None = None,
         country_code: str | None | _Unset = UNSET,
         latitude: float | None | _Unset = UNSET,
         longitude: float | None | _Unset = UNSET,
@@ -251,10 +236,7 @@ class OperatorProfile:
         password_hash after they're set, so we don't bother with
         sentinel tri-state.
 
-        ``current_status`` uses ``UNSET`` for "leave alone" so
-        explicit ``None`` can clear both status text and set-at time.
-
-        Location fields use the same sentinel because they are mutable:
+        Location fields use ``UNSET`` for "leave alone" because they are mutable:
         omitting them leaves the current geographic fact unchanged,
         while explicit ``None`` clears the per-operator override so
         external fact providers can fall back to deployment defaults.
@@ -277,16 +259,6 @@ class OperatorProfile:
             next_aliases = self.aliases
         else:
             next_aliases = tuple(aliases)
-        next_current_status = self.current_status
-        next_current_status_set_at = self.current_status_set_at
-        if current_status is not UNSET:
-            status = current_status.strip() if isinstance(current_status, str) else ""
-            if status:
-                next_current_status = status
-                next_current_status_set_at = current_status_set_at
-            else:
-                next_current_status = None
-                next_current_status_set_at = None
         return replace(
             self,
             display_name=self.display_name if display_name is None else display_name,
@@ -302,8 +274,6 @@ class OperatorProfile:
                 if display_name_locked is None
                 else display_name_locked
             ),
-            current_status=next_current_status,
-            current_status_set_at=next_current_status_set_at,
             country_code=(
                 self.country_code if country_code is UNSET else country_code
             ),

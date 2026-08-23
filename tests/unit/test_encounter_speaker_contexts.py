@@ -380,6 +380,59 @@ async def test_transcript_prompt_carries_beats_register_and_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_encounter_prompts_never_carry_the_player_persona_note() -> None:
+    """An encounter is two characters talking to *each other*.
+
+    The player's declared persona note is a performance authorisation for
+    the surfaces that speak **to the player** — chat, the busy-defer ack
+    and its follow-up, proactive pushes, 起幕, comment replies. This one has
+    no player in the room: the owner is a third party being talked about,
+    and their declared identity is not part of what the peer character
+    knows. Nothing in the encounter path fetches the note today, and the
+    counterpart guard in ``test_player_persona_note_seams.py`` pins every
+    surface that *should* carry it — this is the other half, so that the
+    block cannot be pasted in here "for consistency" without a red light.
+
+    Both encounter prompts are checked because they assemble from
+    different sources: the beats planner from the speaker contexts, the
+    transcript from those plus the profile blocks.
+    """
+    from kokoro_link.application.services.character_encounter_service import (
+        EncounterBeat,
+    )
+    from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+        PLAYER_PERSONA_NOTE_HEADER,
+    )
+
+    provider = _ScriptedProvider('{"beats": [{"topic": "河堤拍照"}]}')
+    runner = _runner(
+        provider=provider,
+        encounter_repository=_FakeEncounterRepo([_completed_encounter()]),
+        social_knowledge_service=_FakeSocialKnowledge(),
+        life_context_builder=_FakeLifeBuilder({
+            "a": _life("主人最近在準備搬家"), "b": _life(),
+        }),
+    )
+    char_a, char_b = _char("a"), _char("b")
+    encounter = _encounter_ns()
+    contexts = await runner._speaker_contexts(
+        char_a, char_b, now=_NOW, encounter=encounter,
+    )
+    await runner._plan_topic_beats(
+        encounter, char_a, char_b, speaker_contexts=contexts,
+    )
+    await runner._generate_transcript(
+        encounter, char_a, char_b,
+        speaker_contexts=contexts,
+        beats=(EncounterBeat(topic="河堤拍照", carrier="a"),),
+    )
+
+    assert provider.model.prompts, "no prompt was produced — guard is vacuous"
+    for prompt in provider.model.prompts:
+        assert PLAYER_PERSONA_NOTE_HEADER not in prompt
+
+
+@pytest.mark.asyncio
 async def test_register_profile_anchors_on_meetup_situation() -> None:
     class _RecordingProfiler:
         def __init__(self) -> None:

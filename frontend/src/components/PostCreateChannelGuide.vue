@@ -154,7 +154,6 @@ function dismiss() {
   padding: 24px;
   background: rgba(0, 0, 0, 0.58);
   backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
 }
 
 .post-create-channel-guide {

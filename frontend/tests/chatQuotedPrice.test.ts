@@ -10,6 +10,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 vi.mock('@/utils/authedFetch', () => ({ authedFetch: vi.fn() }))
 vi.mock('@/utils/api/cloudPricing', () => ({ fetchCloudPricing: vi.fn() }))
@@ -28,6 +29,7 @@ const REQUEST = { character_id: 'char-1', message: 'hello' }
 beforeEach(() => {
   vi.clearAllMocks()
   useActionPricing().reset()
+  setDeploymentMode('cloud')
 })
 
 async function seedPrices(chatCr: number, imageCr: number): Promise<void> {

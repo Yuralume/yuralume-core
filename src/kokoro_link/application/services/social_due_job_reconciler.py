@@ -34,6 +34,9 @@ from kokoro_link.application.services.due_job_reconciler import (
     _DEFAULT_RESEED_JITTER_SECONDS,
     _stable_reseed_jitter,
 )
+from kokoro_link.application.services.account_runtime_profile_cache import (
+    ProfileResolutionScope,
+)
 from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.background_jobs import (
     BackgroundJobQueuePort,
@@ -122,11 +125,15 @@ class SocialDueJobReconciler:
             return SocialReconcileResult()
 
         tenant_cache: dict[str, str | None] = {}
+        # One profile resolution per operator for the whole pass — characters
+        # and pairs share it, since a pair's two sides are always the same
+        # operator's. See :meth:`NextDueCalculator.new_profile_scope`.
+        profile_scope = self._calculator.new_profile_scope()
         char_result = await self._reconcile_characters(
-            resolved, epoch, active_pairs, tenant_cache,
+            resolved, epoch, active_pairs, tenant_cache, profile_scope,
         )
         pair_result = await self._reconcile_pairs(
-            resolved, epoch, active_pairs, tenant_cache,
+            resolved, epoch, active_pairs, tenant_cache, profile_scope,
         )
         return SocialReconcileResult(
             character_reseeded=char_result[0],
@@ -143,6 +150,7 @@ class SocialDueJobReconciler:
         epoch: int,
         active_pairs: set[tuple[str, str]],
         tenant_cache: dict[str, str | None],
+        profile_scope: ProfileResolutionScope,
     ) -> tuple[int, int, int, int]:
         try:
             characters = await self._characters.list_active()
@@ -159,6 +167,7 @@ class SocialDueJobReconciler:
                 seeded = await self._reseed(
                     character, kind, character.id, now, epoch, tenant_cache,
                     payload={"character_id": character.id, "reseeded": True},
+                    profile_scope=profile_scope,
                 )
                 if seeded is True:
                     reseeded += 1
@@ -174,6 +183,7 @@ class SocialDueJobReconciler:
         epoch: int,
         active_pairs: set[tuple[str, str]],
         tenant_cache: dict[str, str | None],
+        profile_scope: ProfileResolutionScope,
     ) -> tuple[int, int, int, int]:
         try:
             relationships = await self._relationships.list_enabled()
@@ -200,6 +210,17 @@ class SocialDueJobReconciler:
                         "relationship_id": relationship.id,
                         "reseeded": True,
                     },
+                    profile_scope=profile_scope,
+                    # The pair's OTHER side. ``char_a`` is only the canonical
+                    # -low id, not "the character this chain is for": asking
+                    # the calculator about it alone would make the pair's stop
+                    # conditions depend on id ordering — a chain kept alive by
+                    # an active char_a for a char_b nobody has ever spoken to,
+                    # and the mirror image stopping a pair whose active side
+                    # happens to sort second. Every other stop here (missing /
+                    # cross-operator / frozen / locked) is already "either
+                    # side"; dormancy joins them.
+                    co_characters=(char_b,) if char_b is not None else (),
                 )
                 if seeded is True:
                     reseeded += 1
@@ -245,6 +266,8 @@ class SocialDueJobReconciler:
         tenant_cache: dict[str, str | None],
         *,
         payload: dict[str, object],
+        profile_scope: ProfileResolutionScope | None = None,
+        co_characters: tuple[Character, ...] = (),
     ) -> bool | None:
         """Reseed one chain. ``True`` seeded, ``False`` lost the race / covered,
         ``None`` intentionally stopped (calculator returned ``None``)."""
@@ -253,6 +276,7 @@ class SocialDueJobReconciler:
         )
         next_due = await self._calculator.compute(
             character, kind, now=now, explicit_next_due=reseed_due, scope_id=scope_id,
+            co_characters=co_characters, profile_scope=profile_scope,
         )
         if next_due is None:
             return None

@@ -177,7 +177,6 @@ onBeforeUnmount(() => {
   z-index: 400;
   background: rgba(0, 0, 0, 0.65);
   backdrop-filter: blur(8px) saturate(1.1);
-  -webkit-backdrop-filter: blur(8px) saturate(1.1);
   display: flex;
   align-items: stretch;
   justify-content: center;

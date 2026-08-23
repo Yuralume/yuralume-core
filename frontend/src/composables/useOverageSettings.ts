@@ -14,6 +14,7 @@
 
 import { computed, ref } from 'vue'
 
+import { isCloudDeployment } from '@/composables/deploymentMode'
 import {
   fetchOverageSettings,
   updateOverageSettings,
@@ -32,6 +33,10 @@ let inFlight: Promise<void> | null = null
 let generation = 0
 
 async function load(): Promise<void> {
+  // There is no quota to overrun on self-host, so there is nothing to consent
+  // to and no route to read. Only the read is gated — `setSwitch()` is a
+  // deliberate player action and must keep failing loudly if it ever runs.
+  if (!isCloudDeployment()) return
   if (!supported.value) return
   if (inFlight) return inFlight
   const issuedAt = generation

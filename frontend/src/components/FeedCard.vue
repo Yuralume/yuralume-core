@@ -10,7 +10,8 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import { UiImage } from '@/components/ui'
+import { UiImage, UiLightbox } from '@/components/ui'
+import type { LightboxItem } from '@/components/ui'
 import type {
   FeedComment,
   FeedPost,
@@ -27,7 +28,11 @@ import { useAuth } from '@/composables/useAuth'
 import { useLocale } from '@/composables/useLocale'
 import { useTimezone } from '@/composables/useTimezone'
 import { formatDate, formatRelativeTime } from '@/i18n/formatters'
-import { safeMediaHref } from '@/utils/safeMediaUrl'
+
+// 浮窗底下的圖說長度上限——貼文本文可以很長，塞整篇進浮窗底部只會蓋住圖片。
+// 40（alt 用的長度）是給無障礙工具聽的摘要，圖說是給看得到畫面的人讀的，
+// 值得留寬一點，但仍要有上限。
+const FEED_LIGHTBOX_CAPTION_MAX = 200
 
 const LOCAL_AUTHOR_ID = 'local'
 const { timeZone } = useTimezone()
@@ -75,6 +80,39 @@ function openProfile() {
 const liked = ref(props.post.liked)
 const likes = ref(props.post.reactions.likes)
 const pending = ref(false)
+
+// ---------------------------------------------------------------- 放大檢視
+// LB4：貼文圖從「開新分頁」改成浮窗放大。集合固定只有一張（這則貼文自己的
+// 圖），不像相簿（LB2）會非同步成長，所以不用接 hasMore / loadMore。
+const zoomOpen = ref(false)
+const zoomIndex = ref(0)
+
+const imageZoomLabel = computed(() =>
+  props.post.content_text.slice(0, 40) || t('lightbox.label'),
+)
+
+// 浮窗裡要看到完整原比例——貼文縮圖井是裁過的 1:1 方形，但原圖不一定是方的，
+// 所以這裡刻意不帶 aspectRatio：UiLightbox 用 object-fit: contain 顯示，
+// 留白給元件自己的預設佔位比例，不強迫成方形。
+const lightboxItems = computed<LightboxItem[]>(() => {
+  const url = props.post.image_url
+  if (!url) return []
+  return [{
+    url,
+    caption: truncateCaption(props.post.content_text),
+    alt: props.post.content_text.slice(0, 40),
+  }]
+})
+
+function truncateCaption(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed.length <= FEED_LIGHTBOX_CAPTION_MAX) return trimmed
+  return `${trimmed.slice(0, FEED_LIGHTBOX_CAPTION_MAX)}…`
+}
+
+function openImageZoom() {
+  zoomOpen.value = true
+}
 
 // comment state — lazy: nothing fetched until expanded once.
 const showComments = ref(false)
@@ -318,12 +356,13 @@ function formatRelative(iso: string): string {
         preload="metadata"
       />
     </div>
-    <a
+    <button
       v-else-if="post.image_url"
-      :href="safeMediaHref(post.image_url)"
-      target="_blank"
-      rel="noopener noreferrer"
-      class="feed-card-image-link"
+      type="button"
+      class="feed-card-image-button"
+      :title="imageZoomLabel"
+      :aria-label="imageZoomLabel"
+      @click="openImageZoom"
     >
       <!-- The post picture fills a 1:1 well that is as wide as the
            LumeGram frame: `.kg-frame` caps at 480px and `.kg-body` takes
@@ -331,7 +370,11 @@ function formatRelative(iso: string): string {
            viewport minus the same 28px once the frame goes full-bleed at
            520px. Stating it is the whole point — an absent `sizes` means
            `100vw`, which would pull w768 for a 452px well on every
-           desktop card. -->
+           desktop card.
+
+           LB4: click opens `UiLightbox` at full, uncropped aspect instead
+           of a new tab — this well only exists to make the feed grid
+           tidy. -->
       <UiImage
         variant="content"
         :src="post.image_url"
@@ -339,7 +382,7 @@ function formatRelative(iso: string): string {
         sizes="(max-width: 520px) calc(100vw - 28px), 452px"
         aspect-ratio="1 / 1"
       />
-    </a>
+    </button>
     <div class="feed-card-body">
       <div class="feed-card-meta">
         <span class="feed-card-kind">{{ kindLabel }}</span>
@@ -433,6 +476,16 @@ function formatRelative(iso: string): string {
         </ul>
       </section>
     </div>
+
+    <!-- 「開原圖／另存」浮窗自己保留（右上角工具列），這裡只負責開關與集合。 -->
+    <UiLightbox
+      v-if="post.image_url"
+      v-model:index="zoomIndex"
+      :visible="zoomOpen"
+      :items="lightboxItems"
+      :label="imageZoomLabel"
+      @close="zoomOpen = false"
+    />
   </article>
 </template>
 
@@ -521,12 +574,22 @@ function formatRelative(iso: string): string {
   text-overflow: ellipsis;
 }
 
-.feed-card-image-link {
+/* 從 <a target="_blank"> 換成 <button>（LB4）——按鈕自帶的邊框／底色／
+   padding 要清掉，否則貼文圖的方形井會多出一圈系統樣式。 */
+.feed-card-image-button {
   display: block;
   width: 100%;
+  padding: 0;
+  border: none;
   background: var(--color-surface);
   aspect-ratio: 1 / 1;
   overflow: hidden;
+  cursor: zoom-in;
+}
+
+.feed-card-image-button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
 }
 
 .feed-card-video-wrap {
@@ -547,7 +610,7 @@ function formatRelative(iso: string): string {
   background: #000;
 }
 
-.feed-card-image-link img {
+.feed-card-image-button img {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -555,7 +618,7 @@ function formatRelative(iso: string): string {
   transition: transform 0.2s;
 }
 
-.feed-card-image-link:hover img {
+.feed-card-image-button:hover img {
   transform: scale(1.02);
 }
 

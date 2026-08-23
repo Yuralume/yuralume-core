@@ -38,6 +38,19 @@ class InMemoryCharacterRepository(CharacterRepositoryPort):
         self._consolidation_claims[character_id] = now
         return True
 
+    async def touch_last_active(self, character_id: str, now: datetime) -> bool:
+        """Single-process twin of the targeted, monotonic anchor UPDATE."""
+        character = self._characters.get(character_id)
+        if character is None:
+            return False
+        current = character.state.last_active_at
+        if current is not None and current >= now:
+            return False
+        self._characters[character_id] = character.with_state(
+            character.state.with_active_now(now),
+        )
+        return True
+
     async def list(self) -> list[Character]:
         return list(self._characters.values())
 

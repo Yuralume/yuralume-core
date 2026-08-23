@@ -34,6 +34,9 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompts import get_default_loader
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,6 +116,14 @@ def _build_prompt(payload: FeedCommentReplyInput) -> str:
         if payload.busy_hint else
         "當下沒有特別的疲勞或情緒線索，照角色平常的語氣回。"
     )
+    # The declaration rides the one free-standing context slot the shipped
+    # template already has, appended after the state clause rather than
+    # folded into the persona block — the persona block is who the
+    # *character* is, and merging the two is exactly how a model starts
+    # answering as the player.
+    note_lines = render_player_persona_note_lines(payload.player_persona_note)
+    if note_lines:
+        busy_clause = "\n".join([busy_clause, *note_lines])
     body = get_default_loader().render(
         "feed/comment_reply",
         max_reply_chars=_MAX_REPLY_CHARS,

@@ -79,8 +79,6 @@ function profileFixture(overrides: Partial<OperatorProfile> = {}): OperatorProfi
     timezone_id: 'Asia/Taipei',
     has_real_name: true,
     display_name_locked: false,
-    current_status: null,
-    current_status_set_at: null,
     country_code: 'TW',
     latitude: 25.05,
     longitude: 121.53,

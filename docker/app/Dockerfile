@@ -22,6 +22,10 @@ FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim@sha256:fb576a1ff0c6b967e8b46669
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG YURALUME_BUILD_TAG=
 ARG YURALUME_BUILD_SHA=
 ARG YURALUME_BUILD_TIME=

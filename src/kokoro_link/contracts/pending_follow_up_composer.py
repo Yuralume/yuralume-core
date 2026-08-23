@@ -67,6 +67,14 @@ class PendingFollowUpComposeInput:
     """Prompt-ready lines from OperatorPersonaService for this
     character/operator pair. Empty when persona is disabled or not yet
     learned."""
+    player_persona_note: str = ""
+    """What the player declared about themselves for this pair — a
+    performance authorization, not something the character inferred.
+
+    Empty leaves the prompt byte-identical. The dispatcher blanks it
+    whenever the release would reach an external sink that could carry
+    more than the account owner, because this reply is fanned out through
+    the very same proactive delivery path."""
     operator_primary_language: str = "zh-TW"
     """BCP 47 tag of the character owner's pinned content language
     (FRONTEND_I18N_PLAN). Lets the deferred reply land in the same

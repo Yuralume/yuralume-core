@@ -39,6 +39,9 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.operator_scene_position import (
     render_opener_operator_position_block,
 )
+from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
+    render_player_persona_note_lines,
+)
 from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
@@ -200,11 +203,30 @@ def _build_prompt(
         material_scene_characters=scene_characters,
         companion_block=_companion_block(context),
         material_dramatic_question=material.dramatic_question or _UNSPECIFIED,
-        operator_position_block=render_opener_operator_position_block(
-            material.operator_position, material.operator_note,
+        operator_position_block=_operator_block_with_persona_note(
+            render_opener_operator_position_block(
+                material.operator_position, material.operator_note,
+            ),
+            context.player_persona_note,
         ),
     )
     return f"{language_hint}\n\n{body}" if language_hint else body
+
+
+def _operator_block_with_persona_note(position_block: str, note: str) -> str:
+    """Both things the prompt knows about the player, in one slot.
+
+    Kept as two visibly separate blocks: the position note is this
+    scene's staging, the persona note is the player's standing account of
+    themselves, and a model that merged them would start writing the
+    declaration as if it were tonight's beat. They share the template
+    placeholder only because the shipped prompt template is not this
+    seam's to change — the separation is in the text, not the slot.
+    """
+    note_lines = render_player_persona_note_lines(note)
+    if not note_lines:
+        return position_block
+    return "\n".join([position_block, *note_lines])
 
 
 def _companion_block(context: StorySceneOpeningContext) -> str:

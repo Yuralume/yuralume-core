@@ -6,7 +6,10 @@ ceilings does this account have, and how much is spent" — the numbers the
 hosted services already enforce (character slots, daily character creates,
 daily 起幕 openings, per-session message cap, and the three capability
 switches), so the SPA can warn *before* the player presses a button instead
-of only reporting the refusal afterwards.
+of only reporting the refusal afterwards. NF4 adds the one entry that is not
+a ceiling at all — ``background.dormancy_days``, the window after which the
+characters stop running in the background — for the same reason: better said
+in advance than discovered as an unexplained silence.
 
 **Advisory only.** Nothing here grants or denies anything; the guards in
 ``character_service`` / ``story_scene_quota`` / the media services remain the
@@ -52,6 +55,16 @@ class QuotaUsageResponse(BaseModel):
     limit: int
 
 
+class BackgroundPolicyResponse(BaseModel):
+    """How this account's background scheduling behaves when the player is
+    away (NF4). Display-only, like everything else on this route: the
+    scheduler decides, this only reports what it was told."""
+
+    dormancy_days: int | None
+    """Days without a foreground interaction after which the characters stop
+    scheduling background work. ``null`` = never."""
+
+
 class CloudRuntimeLimitsResponse(BaseModel):
     """A ``null`` quota means this tier does not cap that item at all."""
 
@@ -62,6 +75,9 @@ class CloudRuntimeLimitsResponse(BaseModel):
     album_generation_enabled: bool
     tts_enabled: bool
     video_generation_enabled: bool
+    # Additive (NF4). Existing fields keep their names, types and meanings;
+    # a client that has never heard of dormancy parses this body unchanged.
+    background: BackgroundPolicyResponse
 
 
 @router.get("/runtime-limits", response_model=CloudRuntimeLimitsResponse)
@@ -113,6 +129,9 @@ def _to_response(
         album_generation_enabled=snapshot.album_generation_enabled,
         tts_enabled=snapshot.tts_enabled,
         video_generation_enabled=snapshot.video_generation_enabled,
+        background=BackgroundPolicyResponse(
+            dormancy_days=snapshot.background.dormancy_days,
+        ),
     )
 
 

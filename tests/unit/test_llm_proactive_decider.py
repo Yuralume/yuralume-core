@@ -775,3 +775,30 @@ async def test_instructions_carry_the_memory_time_anchor_rule() -> None:
 
     assert "回憶的時間別亂編" in prompt
     assert "錨點" in prompt
+
+
+@pytest.mark.asyncio
+async def test_instructions_separate_own_story_from_user_reality() -> None:
+    """A player said he had a contract to sign; the arc turned it into a
+    meeting with an invented agent at an invented company and the decider
+    referenced it as shared knowledge. The instructions must state that the
+    character's own story material is news to the user, that the user's real
+    life has exactly one source (what he said), and that no detail may be
+    invented for it — while still allowing quoting what he actually said."""
+    model = _StubModel('{"should_send": false, "reason": "ok"}')
+    decider = LLMProactiveDecider(model=model)
+    await decider.decide(_context())
+    prompt = model.captured_prompt or ""
+
+    # The two material blocks that carry the character's own world.
+    assert "你目前在進行的故事線" in prompt
+    assert "今天你身上發生的小事" in prompt
+    # First mention must be introduced, not name-dropped.
+    assert "沒聽過" in prompt
+    assert "你也知道那個" in prompt
+    # The user's reality has a single source of truth.
+    assert "只能引用他真的說出口的部分" in prompt
+    # No invented details attached to the user's real-life affairs.
+    assert "公司名" in prompt
+    # …and the legitimate quote-back hook survives the rule.
+    assert "你之前不是說有個工作要簽約" in prompt

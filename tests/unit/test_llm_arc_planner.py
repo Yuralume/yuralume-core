@@ -546,6 +546,61 @@ async def test_dialogue_block_is_continuity_background_not_material() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_block_forbids_reskinning_the_players_real_life() -> None:
+    # FB1 — the anti-stagnation demand above ("one event the chat never
+    # mentioned") had an escape route: re-skin whatever the player said
+    # about their own life into the character's plot and invent the
+    # missing specifics. The red line bounds the *domain* the external
+    # event may come from; it must not cancel the demand itself.
+    fake = _FakeModel(_one_beat_payload())
+    planner = LLMStoryArcPlanner(model=fake)
+    await planner.plan_arc(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+        recent_dialogue_summary="他說最近有個工作要簽約。",
+    )
+    prompt = fake.last_prompt
+    assert prompt is not None
+    # (1) the player's own affairs are out of scope as subject matter,
+    # and the external event's domain is the character's world.
+    assert "使用者本人的現實事務" in prompt
+    assert "不是這條 arc 的題材" in prompt
+    assert "必須發生在角色自己的" in prompt
+    # (2) no adaptation / re-skinning / mirroring of what they said.
+    assert "改編、換皮、平移或鏡像" in prompt
+    # (3) reference only what was actually said — no invented specifics.
+    assert "只能按上面脈絡裡他實際說過的內容引用" in prompt
+    assert "不得替它補上他沒說過的人名、公司、機構、職稱、地點、日期或進度" in prompt
+    # The anti-stagnation demand survives intact.
+    assert "至少要引入一個近期對話裡完全沒出現過的外部事件" in prompt
+
+
+@pytest.mark.asyncio
+async def test_empty_dialogue_summary_renders_no_red_line_at_all() -> None:
+    # The red line lives inside the optional block: no summary means no
+    # block, so an arc planned without recent chat context must be
+    # byte-identical to one that never had the argument.
+    common = dict(
+        character=_character(),
+        start_date=date(2026, 5, 1),
+        duration_days=21,
+        beat_count_hint=3,
+        hint=None,
+        today=date(2026, 4, 28),
+    )
+    legacy = _build_prompt(**common)
+    blank = _build_prompt(**common, recent_dialogue_summary="   ")
+    assert blank == legacy
+    assert "近期對話脈絡（" not in blank
+    assert "使用者本人的現實事務" not in blank
+    assert "改編、換皮、平移或鏡像" not in blank
+    assert "${" not in blank
+    assert "\n\n\n" not in blank
+
+
+@pytest.mark.asyncio
 async def test_empty_seed_and_history_render_exactly_like_before() -> None:
     # Excision test: with no candidates and no history the prompt must
     # carry no heading, no orphan blank-line pile, and no unrendered

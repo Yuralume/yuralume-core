@@ -53,8 +53,6 @@ class SAOperatorProfileRepository(OperatorProfileRepositoryPort):
                     is_admin=profile.is_admin,
                     primary_language=profile.primary_language,
                     timezone_id=profile.timezone_id,
-                    current_status=profile.current_status,
-                    current_status_set_at=profile.current_status_set_at,
                     country_code=profile.country_code,
                     latitude=profile.latitude,
                     longitude=profile.longitude,
@@ -80,8 +78,6 @@ class SAOperatorProfileRepository(OperatorProfileRepositoryPort):
                 # timezone_id is the same pinned identity setting:
                 # normal profile saves must not reinterpret historical
                 # civil dates/times by overwriting an existing row.
-                existing.current_status = profile.current_status
-                existing.current_status_set_at = profile.current_status_set_at
                 existing.country_code = profile.country_code
                 existing.latitude = profile.latitude
                 existing.longitude = profile.longitude
@@ -369,8 +365,6 @@ def _row_to_entity(row: OperatorProfileRow) -> OperatorProfile:
         is_admin=bool(row.is_admin),
         primary_language=row.primary_language or "zh-TW",
         timezone_id=getattr(row, "timezone_id", None) or "UTC",
-        current_status=getattr(row, "current_status", None),
-        current_status_set_at=getattr(row, "current_status_set_at", None),
         country_code=getattr(row, "country_code", None),
         latitude=getattr(row, "latitude", None),
         longitude=getattr(row, "longitude", None),

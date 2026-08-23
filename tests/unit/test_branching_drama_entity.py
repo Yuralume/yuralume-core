@@ -6,6 +6,7 @@ import pytest
 
 from kokoro_link.domain.entities.branching_drama import (
     DEFAULT_TOTAL_SEGMENTS,
+    MAX_TOTAL_SEGMENTS,
     SESSION_ENDED,
     SESSION_PLAYING,
     SEGMENTS_WARNING_THRESHOLD,
@@ -46,6 +47,59 @@ class TestBranchingDrama:
                 character_ids=[], prompt="test",
             )
 
+    def test_create_pending_accepts_max_total_segments(self):
+        # BD4: the ceiling itself must still succeed — off-by-one errors
+        # in a `>` vs `>=` check would reject the legal boundary.
+        drama = BranchingDrama.create_pending(
+            character_ids=["a", "b"],
+            prompt="test",
+            total_segments=MAX_TOTAL_SEGMENTS,
+        )
+        assert drama.total_segments == MAX_TOTAL_SEGMENTS
+
+    def test_create_pending_rejects_over_max_total_segments(self):
+        # BD4: total_segments has a hard ceiling — the tree's node count
+        # is 3^N, so one turn past the cap is already unbounded fan-out.
+        with pytest.raises(ValueError, match="total_segments"):
+            BranchingDrama.create_pending(
+                character_ids=["a", "b"],
+                prompt="test",
+                total_segments=MAX_TOTAL_SEGMENTS + 1,
+            )
+
+    def test_constructor_tolerates_over_max_total_segments(self):
+        # FX3: the constructor is also the *read* path — every repository
+        # mapper builds an entity from a row — and the create form allowed
+        # 15 before BD4 lowered the cap to 12. Enforcing the ceiling here
+        # would not stop those dramas, it would take the whole list down
+        # with them (``list_recent`` maps before anything can filter), and
+        # the delete endpoint that is the only way to remove them shares
+        # that path. So a stored over-cap drama constructs.
+        drama = BranchingDrama(
+            id="d1",
+            character_ids=("a",),
+            prompt="test",
+            title="t",
+            total_segments=MAX_TOTAL_SEGMENTS + 3,
+            status=STATUS_GENERATING_OUTLINES,
+        )
+
+        assert drama.total_segments == MAX_TOTAL_SEGMENTS + 3
+
+    def test_constructor_still_rejects_an_unplayably_shallow_tree(self):
+        # The floor is not policy: ``total_segments - 1`` is the ending
+        # layer's index all through the service, so a 1-segment tree has no
+        # beat to end on. No writer has ever produced one.
+        with pytest.raises(ValueError, match="total_segments"):
+            BranchingDrama(
+                id="d1",
+                character_ids=("a",),
+                prompt="test",
+                title="t",
+                total_segments=1,
+                status=STATUS_GENERATING_OUTLINES,
+            )
+
     def test_expected_node_count(self):
         drama = BranchingDrama.create_pending(
             character_ids=["a", "b"],
@@ -54,6 +108,28 @@ class TestBranchingDrama:
         )
         # (3^6 - 1) / 2 = 364
         assert drama.expected_node_count() == 364
+
+    def test_initial_node_target_is_prefetch_layers_not_full_tree(self):
+        drama = BranchingDrama.create_pending(
+            character_ids=["a", "b"],
+            prompt="test",
+            total_segments=6,
+        )
+        # root + 3 tonal children = the two layers _generate_tree actually
+        # produces synchronously (OUTLINE_PREFETCH_DEPTH=2); nowhere near
+        # the 364-node full-tree total from expected_node_count().
+        assert drama.initial_node_target() == 4
+        assert drama.initial_node_target() < drama.expected_node_count()
+
+    def test_initial_node_target_bounded_by_small_tree(self):
+        # A 2-segment tree's full size already equals what the prefetch
+        # loop would produce for a deeper tree, so the two must agree.
+        drama = BranchingDrama.create_pending(
+            character_ids=["a", "b"],
+            prompt="test",
+            total_segments=2,
+        )
+        assert drama.initial_node_target() == drama.expected_node_count() == 4
 
     def test_status_transitions(self):
         drama = BranchingDrama.create_pending(
@@ -187,3 +263,34 @@ class TestDramaSession:
         ended = session.end()
         assert ended.status == SESSION_ENDED
         assert ended.is_ended
+
+
+class TestCreateBranchingDramaRequestTotalSegments:
+    """BD4 — the DTO's edge must agree with the entity's edge, or a
+    request that clears validation still blows up inside the domain."""
+
+    def test_accepts_max_total_segments(self):
+        from kokoro_link.application.dto.branching_drama import (
+            CreateBranchingDramaRequest,
+        )
+
+        request = CreateBranchingDramaRequest(
+            character_ids=["a", "b"],
+            prompt="test",
+            total_segments=MAX_TOTAL_SEGMENTS,
+        )
+        assert request.total_segments == MAX_TOTAL_SEGMENTS
+
+    def test_rejects_over_max_total_segments(self):
+        import pydantic
+
+        from kokoro_link.application.dto.branching_drama import (
+            CreateBranchingDramaRequest,
+        )
+
+        with pytest.raises(pydantic.ValidationError):
+            CreateBranchingDramaRequest(
+                character_ids=["a", "b"],
+                prompt="test",
+                total_segments=MAX_TOTAL_SEGMENTS + 1,
+            )

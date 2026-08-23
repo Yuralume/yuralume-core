@@ -124,10 +124,29 @@ const completedFiles = [
   'src/pages/CloudCallbackPage.vue',
   'src/pages/BranchingDramaPage.vue',
   'src/pages/FusionStoryPage.vue',
+  // Creator Studio shell + its newcomer explanation (plan BD, ticket BD12).
+  'src/pages/StudioPage.vue',
+  'src/components/studio/StudioGuideModal.vue',
+  'src/components/studio/StudioTabCard.vue',
   'src/pages/MemoirPage.vue',
   'src/components/ChatBubble.vue',
   'src/components/ChatFirstTurnGuide.vue',
   'src/components/ChatPanel.vue',
+  // Player-facing "how to play" guide (plan PG, ticket PG1) — the chat
+  // header entry, its one-shot coachmark, and the chaptered overview modal.
+  'src/components/playerGuide/PlayerGuideEntry.vue',
+  'src/components/playerGuide/PlayerGuideModal.vue',
+  'src/components/playerGuide/PlayerGuideChapterSection.vue',
+  'src/utils/playerGuide.ts',
+  // Player persona note (plan PP, ticket PP4) — one modal shared by the
+  // chat header chip, the first-visit prompt, and the per-character
+  // settings tab.
+  'src/components/PlayerPersonaNoteChip.vue',
+  'src/components/PlayerPersonaNoteModal.vue',
+  'src/components/PlayerPersonaNoteSetting.vue',
+  'src/composables/usePlayerPersonaNote.ts',
+  'src/utils/api/playerPersonaNote.ts',
+  'src/utils/playerPersonaNote.ts',
   // Story scene ("Start a Scene") player surface — plan SC, ticket SC2.
   'src/components/SceneFrame.vue',
   'src/components/StorySceneChips.vue',

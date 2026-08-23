@@ -13,6 +13,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 vi.mock('axios', () => ({
   default: { post: vi.fn(), get: vi.fn() },
@@ -35,6 +36,7 @@ const mockedPricing = vi.mocked(fetchCloudPricing)
 beforeEach(() => {
   vi.clearAllMocks()
   useActionPricing().reset()
+  setDeploymentMode('cloud')
   mockedPost.mockResolvedValue({ data: {} } as never)
 })
 

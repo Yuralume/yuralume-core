@@ -18,6 +18,7 @@ import type { MessagingPlatform } from '@/types/messaging'
 import { resolveWebPushNudge } from '@/utils/webPushNudge'
 import { UiBadge, UiImage } from '@/components/ui'
 import SidebarBrand from './SidebarBrand.vue'
+import BackgroundDormancyAdvisory from './BackgroundDormancyAdvisory.vue'
 import CharacterLimitAdvisory from './CharacterLimitAdvisory.vue'
 import CloudCreditsBadge from './CloudCreditsBadge.vue'
 import CloudNoticeDot from './CloudNoticeDot.vue'
@@ -325,6 +326,11 @@ function sidebarTabLabel(tab: (typeof SIDEBAR_TABS)[number]): string {
     <!-- 未讀公告紅點：同樣僅 hosted（cloud）模式，且只在真的有未讀時出現。
          公告內文一律留在 Portal，這裡只負責「有新的東西」這一個提示。 -->
     <CloudNoticeDot />
+
+    <!-- 背景休眠事前提示（NF5）：僅在 hosted 快照明確給出 dormancy_days
+         時才渲染，self-host／self-host 快照缺席時零輸出，絕不 disable
+         任何東西——純粹的行銷面事前告知。 -->
+    <BackgroundDormancyAdvisory />
 
     <!-- 頁籤 -->
     <div class="tabs" role="tablist" :aria-label="t('playerSidebar.tabs.ariaLabel')">

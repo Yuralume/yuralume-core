@@ -28,10 +28,19 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from kokoro_link.application.services.feature_keys import (
+    FEATURE_SHOWCASE_IMAGE_REVIEW,
     FEATURE_SHOWCASE_REVIEW,
     FEATURE_SHOWCASE_TRANSLATE,
 )
 from kokoro_link.application.services.model_resolver import ModelResolver
+from kokoro_link.application.services.showcase.image_review import (
+    MAX_REFERENCE_IMAGES,
+    ShowcaseImageReview,
+    ShowcaseImageReviewer,
+)
+from kokoro_link.application.services.vision_media import (
+    to_vision_url_with_storage,
+)
 from kokoro_link.application.services.showcase.filters import (
     FilterOutcome,
     PublicActivity,
@@ -114,6 +123,20 @@ class SnapshotContext:
 
 
 @dataclass(frozen=True, slots=True)
+class PostReviewReport:
+    """One review batch's advisory verdicts.
+
+    ``text`` is the de-identification review; ``images`` (keyed by post
+    id) is the image-consistency review. Kept side by side rather than
+    merged into one record because the two steps fail independently — a
+    vision route that is down must not take the text verdicts with it.
+    """
+
+    text: ReviewSummary
+    images: Mapping[str, ShowcaseImageReview]
+
+
+@dataclass(frozen=True, slots=True)
 class TranslationRequest:
     """One text to render into ``locales``.
 
@@ -143,6 +166,8 @@ class ShowcaseService:
         memory_repository=None,  # noqa: ANN001
         story_arc_repository=None,  # noqa: ANN001
         active_llm_provider=None,  # noqa: ANN001 — ActiveLLMProviderPort
+        object_storage=None,  # noqa: ANN001 — ObjectStoragePort
+        public_base_url: str = "",
     ) -> None:
         self._characters = character_service
         self._operators = operator_profile_repository
@@ -151,6 +176,8 @@ class ShowcaseService:
         self._memories = memory_repository
         self._arcs = story_arc_repository
         self._provider = active_llm_provider
+        self._object_storage = object_storage
+        self._public_base_url = (public_base_url or "").rstrip("/")
 
     # ----- characters -------------------------------------------------
 
@@ -209,8 +236,8 @@ class ShowcaseService:
         character_id: str,
         post_ids: Sequence[str],
         limit: int = DEFAULT_POST_LIMIT,
-    ) -> ReviewSummary:
-        """Advisory pre-review for the requested posts.
+    ) -> PostReviewReport:
+        """Advisory pre-review (text + image) for the requested posts.
 
         Ids that are not (or no longer) publishable candidates are simply
         absent from the result: the caller asked about posts, and a post
@@ -226,12 +253,56 @@ class ShowcaseService:
             if candidate.id in wanted
         ]
         if not selected:
-            return ReviewSummary()
+            return PostReviewReport(text=ReviewSummary(), images={})
         character = await self._require_character(tenant_id, character_id)
         reviewer = ShowcaseReviewer(self._resolver(FEATURE_SHOWCASE_REVIEW))
-        return await review_candidates(
+        summary = await review_candidates(
             selected, reviewer=reviewer, character=character,
         )
+        images = await self._review_images(
+            bundle.outcome.candidates, selected, character=character,
+        )
+        return PostReviewReport(text=summary, images=images)
+
+    async def _review_images(
+        self,
+        candidates: Sequence[ShowcaseCandidate],
+        selected: Sequence[ShowcaseCandidate],
+        *,
+        character: Character,
+    ) -> dict[str, ShowcaseImageReview]:
+        """Image-consistency verdicts for ``selected``, sequential like the
+        text pass and for the same reason (nobody is waiting; bursts only
+        buy rate limits)."""
+        reviewer = ShowcaseImageReviewer(
+            self._resolver(FEATURE_SHOWCASE_IMAGE_REVIEW),
+            media=self._vision_media_resolver(),
+        )
+        selected_ids = {candidate.id for candidate in selected}
+        images: dict[str, ShowcaseImageReview] = {}
+        for candidate in selected:
+            references = _reference_image_urls(
+                candidate,
+                candidates,
+                selected_ids=selected_ids,
+                character=character,
+            )
+            images[candidate.id] = await reviewer.review(
+                candidate, character=character, reference_urls=references,
+            )
+        return images
+
+    def _vision_media_resolver(self):  # noqa: ANN202 — image_review.MediaResolver
+        async def resolve(url: str, prefer_public: bool) -> str | None:
+            return await to_vision_url_with_storage(
+                url,
+                uploads_dir=None,
+                public_base_url=self._public_base_url,
+                object_storage=self._object_storage,
+                prefer_public_image_urls=prefer_public,
+            )
+
+        return resolve
 
     # ----- publish ----------------------------------------------------
 
@@ -490,7 +561,44 @@ def build_showcase_service(container) -> ShowcaseService:  # noqa: ANN001
         memory_repository=getattr(container, "memory_repository", None),
         story_arc_repository=getattr(container, "story_arc_repository", None),
         active_llm_provider=getattr(container, "active_llm_provider", None),
+        object_storage=getattr(container, "object_storage", None),
+        public_base_url=getattr(
+            getattr(container, "app_settings", None), "public_base_url", "",
+        )
+        or "",
     )
+
+
+def _reference_image_urls(
+    candidate: ShowcaseCandidate,
+    candidates: Sequence[ShowcaseCandidate],
+    *,
+    selected_ids: set[str],
+    character: Character | None,
+) -> tuple[str, ...]:
+    """What "the character's existing look" means for one review.
+
+    Portrait first — it is the owner-blessed reference — then the images
+    of the nearest *older* posts that are not part of this review batch.
+    In-batch neighbours are excluded on purpose: they are exactly as
+    unvetted as the post under review, and a batch that drifted together
+    must not vouch for itself.
+    """
+    references: list[str] = []
+    if character is not None and character.image_urls:
+        references.append(character.image_urls[0])
+    seen_self = False
+    for other in candidates:  # repository order: newest first
+        if len(references) >= MAX_REFERENCE_IMAGES:
+            break
+        if other.id == candidate.id:
+            seen_self = True
+            continue
+        if not seen_self or other.id in selected_ids:
+            continue
+        if (other.image_url or "").strip():
+            references.append(other.image_url)
+    return tuple(references[:MAX_REFERENCE_IMAGES])
 
 
 def _clean_locales(locales: Sequence[str]) -> tuple[str, ...]:
@@ -529,6 +637,7 @@ def format_exclusions(excluded: Mapping[str, int]) -> str:
 __all__ = [
     "DEFAULT_POST_LIMIT",
     "CandidateBundle",
+    "PostReviewReport",
     "ShowcaseCandidate",
     "ShowcaseCharacterSummary",
     "ShowcaseError",

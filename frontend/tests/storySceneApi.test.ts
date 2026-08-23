@@ -20,6 +20,7 @@ import { isSceneNarration, sceneHeadingIndex } from '@/utils/sceneMessages'
 import { messages as zhTW } from '@/i18n/locales/zh-TW'
 import { messages as enUS } from '@/i18n/locales/en-US'
 import { messages as jaJP } from '@/i18n/locales/ja-JP'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 /**
  * The story-scene transport (plan SC, ticket SC2) against the SC1-A contract.
@@ -92,6 +93,7 @@ const SESSION = {
 beforeEach(() => {
   vi.clearAllMocks()
   useActionPricing().reset()
+  setDeploymentMode('cloud')
 })
 
 describe('openStoryScene', () => {

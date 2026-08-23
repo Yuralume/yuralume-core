@@ -1074,6 +1074,9 @@ function cancel() {
               class="field-input"
               :placeholder="t('characterCreate.initialRelationship.proactiveCadencePlaceholder')"
             />
+            <div v-if="initialRelationship.proactive_permission" class="field-hint">
+              {{ t('characterCreate.initialRelationship.proactiveCadenceHint') }}
+            </div>
             <div v-if="intakeQuestionsFor('proactive_cadence_hint').length" class="intake-field-questions">
               <div
                 v-for="question in intakeQuestionsFor('proactive_cadence_hint')"

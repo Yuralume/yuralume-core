@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import axios from 'axios'
-import {
-  getRelationshipNames,
-  updateRelationshipNames,
-} from '@/utils/api/relationshipNames'
 import { setPersonaField } from '@/utils/api/operatorPersona'
 
 vi.mock('axios', () => {
@@ -22,49 +18,13 @@ beforeEach(() => {
   vi.clearAllMocks()
 })
 
-describe('relationship names API', () => {
-  it('loads current names for a character', async () => {
-    const data = {
-      character_id: 'c1',
-      operator_id: 'op1',
-      user_address_name: '阿丹',
-      character_address_name: '美緒姐',
-    }
-    mockedAxios.get.mockResolvedValueOnce({ data })
-
-    await expect(getRelationshipNames('c1')).resolves.toEqual(data)
-    expect(mockedAxios.get).toHaveBeenCalledWith(
-      '/api/v1/characters/c1/relationship-names',
-    )
-  })
-
-  it('PATCHes only the provided names', async () => {
-    const data = {
-      character_id: 'c1',
-      operator_id: 'op1',
-      user_address_name: '阿丹',
-      character_address_name: '',
-    }
-    mockedAxios.patch.mockResolvedValueOnce({ data })
-
-    await expect(
-      updateRelationshipNames('c1', { user_address_name: '阿丹' }),
-    ).resolves.toEqual(data)
-    expect(mockedAxios.patch).toHaveBeenCalledWith(
-      '/api/v1/characters/c1/relationship-names',
-      { user_address_name: '阿丹' },
-    )
-  })
-
-  it('encodes the character id in the path', async () => {
-    mockedAxios.get.mockResolvedValueOnce({ data: {} })
-    await getRelationshipNames('a/b')
-    expect(mockedAxios.get).toHaveBeenCalledWith(
-      '/api/v1/characters/a%2Fb/relationship-names',
-    )
-  })
-})
-
+// The dedicated `/relationship-names` API wrapper (and its
+// `RelationshipNamesEditor` consumer) was retired in IR2 — the two address
+// name fields moved into `InitialRelationshipSettingsEditor`, which PATCHes
+// them through `/initial-relationship` in the same call as the rest of the
+// seed (see `tests/initialRelationshipApi.test.ts`). The backend route
+// itself stays (IR1's docstring keeps it for other callers); this file just
+// no longer exercises the now-unused frontend wrapper.
 describe('persona field correction API', () => {
   it('PUTs an explicit name/nickname correction', async () => {
     const field = {

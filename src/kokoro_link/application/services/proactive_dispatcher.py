@@ -84,8 +84,13 @@ from kokoro_link.application.services.proactive_event_bus import (
     ProactiveEvent,
     ProactiveEventBus,
 )
+from kokoro_link.application.services.persona_disclosure_gate import (
+    persona_safe_for_account,
+)
 from kokoro_link.application.services.proactive_delivery.eligible_binding import (
+    ResolvedProactiveSink,
     find_eligible_proactive_binding,
+    list_eligible_proactive_bindings,
 )
 from kokoro_link.application.services.proactive_delivery.line_conversation_recorder import (  # noqa: E501
     HostedLineConversationRecorder,
@@ -178,6 +183,9 @@ if TYPE_CHECKING:
     )
     from kokoro_link.contracts.operator_address_preference import (
         OperatorAddressPreferenceRepositoryPort,
+    )
+    from kokoro_link.contracts.player_persona_note import (
+        PlayerPersonaNoteRepositoryPort,
     )
     from kokoro_link.application.services.event_seed_dispenser import (
         EventSeedDispenser,
@@ -279,6 +287,9 @@ class ProactiveDispatcher:
         weather_context_port: "WeatherContextPort | None" = None,
         schedule_service: "ScheduleService | None" = None,
         operator_persona_service=None,  # noqa: ANN001 - optional app service
+        player_persona_note_repository: (
+            "PlayerPersonaNoteRepositoryPort | None"
+        ) = None,
         relationship_seed_repository: (
             CharacterOperatorRelationshipSeedRepositoryPort | None
         ) = None,
@@ -340,6 +351,7 @@ class ProactiveDispatcher:
         self._weather_context_port = weather_context_port
         self._schedule_service = schedule_service
         self._operator_persona_service = operator_persona_service
+        self._player_persona_note_repository = player_persona_note_repository
         self._relationship_seed_repository = relationship_seed_repository
         self._persona_curiosity_service = persona_curiosity_service
         self._persona_curiosity_planner = persona_curiosity_planner
@@ -653,6 +665,11 @@ class ProactiveDispatcher:
         operator_persona_lines = await self._load_operator_persona_lines(
             character,
         )
+        # ``account`` is the external sink resolved above — the gate has
+        # to see it, so this load cannot move earlier than the binding.
+        player_persona_note = await self._load_player_persona_note(
+            character, account,
+        )
         # HUMANIZATION_ROADMAP §3.4 — surface still-active deferred motives
         # so the intention judge can re-evaluate timing on a re-tick. The
         # alarms that bought this tick were already spent above, so the
@@ -721,6 +738,7 @@ class ProactiveDispatcher:
             weather_context=weather_context,
             upcoming_day_schedules=tuple(upcoming_day_schedules),
             operator_persona_lines=tuple(operator_persona_lines),
+            player_persona_note=player_persona_note,
             initial_relationship_lines=tuple(initial_relationship_lines),
             persona_curiosity_plan=persona_curiosity_plan,
             deferred_intents=deferred_intents,
@@ -1156,6 +1174,45 @@ class ProactiveDispatcher:
             binding_repository=self._bindings,
             character_id=character_id,
         )
+
+    async def _resolve_pre_composed_sink(
+        self, character_id: str, target: ResolvedProactiveSink | None,
+    ) -> tuple[ChannelBinding, MessagingAccount] | None:
+        """Where a pre-composed message may actually go.
+
+        Unpinned (``target is None``) this is the plain resolution every
+        caller without a gate of its own gets — unchanged.
+
+        Pinned, it costs the same one listing but asks a different question:
+        not "which binding wins now" but "is the binding the gate authorised
+        still eligible" — see
+        :meth:`ResolvedProactiveSink.confirm_against`. Both ways of losing
+        the pin (another binding overtook it, the owner switched it off)
+        collapse to ``None`` here, which is the fail-safe branch: the message
+        falls back to web / hosted rather than landing on an endpoint no gate
+        ever looked at.
+        """
+        if target is None:
+            return await self._find_eligible_binding(character_id)
+        if target.eligible is None:
+            # The gate resolved "nowhere external". Re-deriving one now would
+            # deliver to a sink it never saw.
+            return None
+        confirmed = target.confirm_against(
+            await list_eligible_proactive_bindings(
+                account_repository=self._accounts,
+                binding_repository=self._bindings,
+                character_id=character_id,
+            ),
+        )
+        if confirmed is None:
+            _LOGGER.info(
+                "pre-composed: pinned binding is no longer eligible "
+                "character=%s binding=%s — skipping the external sink",
+                character_id,
+                target.binding.id if target.binding else None,
+            )
+        return confirmed
 
     async def _deliver_external(
         self,
@@ -1649,6 +1706,87 @@ class ProactiveDispatcher:
             return timezone_for_id(getattr(operator, "timezone_id", None))
         except Exception:  # pragma: no cover - defensive
             return default
+
+    async def _load_player_persona_note(
+        self,
+        character: Character,
+        account: "MessagingAccount | None",
+    ) -> str:
+        """The player's declared identity / world premise, if it may be said here.
+
+        One compose is fanned out to web, the local binding and the
+        hosted channel at once, so the note has to be decided against the
+        *least private* sink rather than per delivery. When an external
+        binding exists, the account behind it therefore governs: a group
+        or open-allowlist account (the same shape that already suppresses
+        persona learning inbound) blanks the note for every sink on this
+        tick, including the owner's own web session. Losing staging on a
+        browser tab is a far cheaper mistake than reading the owner's
+        declared setting aloud to a group chat.
+        """
+        if self._player_persona_note_repository is None:
+            return ""
+        if account is not None and not persona_safe_for_account(account):
+            return ""
+        operator_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        try:
+            row = await self._player_persona_note_repository.get(
+                character_id=character.id,
+                operator_id=operator_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive: player persona note load failed character=%s",
+                character.id,
+            )
+            return ""
+        return row.note if row is not None else ""
+
+    async def resolve_proactive_sink(
+        self, character_id: str,
+    ) -> ResolvedProactiveSink | None:
+        """Resolve — ONCE — the external sink a pre-composed send may use.
+
+        The repository-touching half of the disclosure gate, kept separate so
+        a caller that composes for tens of seconds before delivering can hold
+        on to the answer and hand it back to :meth:`deliver_pre_composed` as
+        an explicit target. Asking twice is the defect this exists to prevent:
+        the gate would authorise the owner's own DM and the send would land on
+        whichever binding was touched most recently by the time the composer
+        finished. There is deliberately no convenience form that resolves and
+        discards in one call — that shape is exactly the unpinned re-query
+        the release path used to leak through.
+
+        ``None`` means the lookup itself failed — no sink, no verdict. The
+        caller must treat it as "cannot disclose", not as "web only"; that
+        distinction is why this returns an optional rather than raising.
+        """
+        try:
+            eligible = await self._find_eligible_binding(character_id)
+        except Exception:
+            _LOGGER.exception(
+                "proactive: disclosure gate lookup failed character=%s",
+                character_id,
+            )
+            return None
+        return ResolvedProactiveSink.of(eligible)
+
+    @staticmethod
+    def persona_disclosure_allowed_for(
+        sink: ResolvedProactiveSink | None,
+    ) -> bool:
+        """The verdict for an already-resolved sink.
+
+        Pure, so the gate and the send provably read the same snapshot rather
+        than two lookups that merely tend to agree. ``None`` (unresolved) is
+        fail-closed for the same reason a raising lookup is."""
+        if sink is None:
+            return False
+        if sink.account is None:
+            # Nowhere external at all — only the owner's own session can
+            # hear this, so the declaration is theirs to hear.
+            return True
+        return persona_safe_for_account(sink.account)
 
     async def _load_operator_persona_lines(self, character: Character) -> list[str]:
         service = self._operator_persona_service
@@ -2268,6 +2406,7 @@ The invitation this dispatcher
         trigger: ProactiveTrigger,
         reason: str = "",
         attachments: tuple[OutboundAttachment, ...] = (),
+        target: ResolvedProactiveSink | None = None,
         now: datetime | None = None,
     ) -> ProactiveAttempt:
         """Fan out a message whose text was decided elsewhere.
@@ -2278,6 +2417,16 @@ The invitation this dispatcher
         the same web + binding fan-out as the standard evaluate path,
         and writes a ``proactive_attempt`` row so the dispatch shows up
         in the audit log.
+
+        ``target`` is the L12 pin, extended to this path: the caller's own
+        gate already resolved a :class:`ResolvedProactiveSink` and decided
+        what the message may say from it (whether it carries the owner's
+        declared identity), so the send has to land on THAT sink — including
+        when the sink is empty, which means the gate cleared the text for a
+        web-only character and no binding that surfaced during the compose
+        window was ever gated. Passing it is what makes the two agree; the
+        default ``None`` keeps every caller that has no gate of its own
+        resolving here exactly as before.
 
         Failure semantics mirror ``evaluate``: a partial fan-out (web
         succeeds, TG fails) still counts as SENT — the user got the
@@ -2316,12 +2465,21 @@ The invitation this dispatcher
                 now=when,
             )
 
-        eligible = await self._find_eligible_binding(character_id)
+        eligible = await self._resolve_pre_composed_sink(character_id, target)
+        # The gate authorised ONE external endpoint and it is gone. Reaching
+        # for the hosted channel now would substitute a sink the gate never
+        # saw — the same defect as re-resolving a local binding, one door
+        # along. Web (below) still gets the message.
+        pin_withdrawn = (
+            eligible is None
+            and target is not None
+            and target.eligible is not None
+        )
         web_enabled = bool(character.accepts_web_proactive)
         # Same LH4 Core-C hosted dual-path as ``evaluate``: no local binding but
         # a resolvable, channel-eligible cloud identity is a valid hosted sink.
         hosted_target: tuple[str, str] | None = None
-        if eligible is None:
+        if eligible is None and not pin_withdrawn:
             hosted_target = await self._resolve_hosted_target(character_id)
         if eligible is None and hosted_target is None and not web_enabled:
             return await self._log(
@@ -2776,12 +2934,20 @@ def _requires_user_started_interaction(trigger: ProactiveTrigger) -> bool:
 def _seed_allows_pre_message_proactive(
     seed: CharacterOperatorRelationshipSeed | None,
 ) -> bool:
+    """IR4: gate on explicit operator permission alone.
+
+    ``proactive_cadence_hint`` used to be co-required, which meant a
+    player who checked "can find me first" but left the frequency hint
+    blank got permanently gated — nothing in creation UI ever said the
+    checkbox alone wasn't enough. The cadence hint is now purely
+    advisory: when present it still renders into the prompt (see
+    ``render_initial_relationship_seed_lines``) so the character has a
+    frequency/timing steer; when absent the character judges cadence on
+    its own, same as any other unset relationship-seed field.
+    """
     if seed is None:
         return False
-    return bool(
-        seed.proactive_permission
-        and seed.proactive_cadence_hint.strip()
-    )
+    return bool(seed.proactive_permission)
 
 
 def _proactive_event_valence(outcome: ProactiveOutcome) -> float:

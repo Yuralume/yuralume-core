@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ref, type Ref } from 'vue'
+
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 import type {
   RuntimeLimitsResult,
@@ -17,23 +18,13 @@ import type {
  *      every consumer's `v-if` collapses.
  */
 
-// Auth is a module-scope singleton and starts at `self_host` until the config
-// probe lands; a hoisted handle lets each test pick the deployment mode
-// before the composable reads it. A real ref, not a `{ value }` stand-in —
-// the composable derives a `computed` from it, and a plain object would cache
-// the first reading forever instead of tracking the probe.
-const holder = vi.hoisted(() => ({ cloudMode: null as Ref<boolean> | null }))
-
-vi.mock('@/composables/useAuth', () => ({
-  useAuth: () => ({ cloudMode: holder.cloudMode }),
-}))
-
+// The deployment mode is a module-scope ref of its own (see
+// `@/composables/deploymentMode`), which is what lets each test pick the shape
+// of the deployment before the composable reads it — and, because it really is
+// a ref, lets the `supported` computed re-evaluate when a late probe flips it.
 vi.mock('@/utils/api/cloudLimits', () => ({
   fetchRuntimeLimits: vi.fn(),
 }))
-
-const cloudMode = ref(true)
-holder.cloudMode = cloudMode
 
 const { fetchRuntimeLimits } = await import('@/utils/api/cloudLimits')
 const { notifyIdentityChanged } = await import('@/utils/identityLifecycle')
@@ -54,6 +45,7 @@ function snapshot(
       album_generation_enabled: true,
       tts_enabled: true,
       video_generation_enabled: true,
+      background: null,
       ...overrides,
     },
   }
@@ -61,7 +53,7 @@ function snapshot(
 
 beforeEach(() => {
   vi.clearAllMocks()
-  cloudMode.value = true
+  setDeploymentMode('cloud')
   useRuntimeLimits().reset()
 })
 
@@ -323,9 +315,77 @@ describe('useRuntimeLimits feature switches', () => {
   })
 })
 
+describe('useRuntimeLimits background dormancy (NF4/NF5)', () => {
+  it('says nothing before anything is loaded', () => {
+    expect(useRuntimeLimits().backgroundDormancyDays.value).toBeNull()
+  })
+
+  it('reports the dormancy window once a snapshot names one', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce(snapshot({
+      background: { dormancyDays: 14 },
+    }))
+
+    await limits.ensureLoaded()
+
+    expect(limits.backgroundDormancyDays.value).toBe(14)
+  })
+
+  it('stays null when the tier never goes dormant', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce(snapshot({
+      background: { dormancyDays: null },
+    }))
+
+    await limits.ensureLoaded()
+
+    expect(limits.backgroundDormancyDays.value).toBeNull()
+  })
+
+  it('stays null when the payload carried no background object at all', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce(snapshot({ background: null }))
+
+    await limits.ensureLoaded()
+
+    expect(limits.backgroundDormancyDays.value).toBeNull()
+  })
+
+  it('claims nothing when the read degrades', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce({ kind: 'degraded' })
+
+    await limits.ensureLoaded()
+
+    expect(limits.backgroundDormancyDays.value).toBeNull()
+  })
+
+  it('goes quiet on self-host (unsupported)', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce({ kind: 'unsupported' })
+
+    await limits.ensureLoaded()
+
+    expect(limits.backgroundDormancyDays.value).toBeNull()
+  })
+
+  it('hides again if the deployment stops reporting as cloud', async () => {
+    const limits = useRuntimeLimits()
+    mockedFetch.mockResolvedValueOnce(snapshot({
+      background: { dormancyDays: 7 },
+    }))
+    await limits.ensureLoaded()
+    expect(limits.backgroundDormancyDays.value).toBe(7)
+
+    setDeploymentMode('self_host')
+
+    expect(limits.backgroundDormancyDays.value).toBeNull()
+  })
+})
+
 describe('useRuntimeLimits deployment gating', () => {
   it('issues no request at all on self-host', async () => {
-    cloudMode.value = false
+    setDeploymentMode('self_host')
     const limits = useRuntimeLimits()
 
     await limits.ensureLoaded()
@@ -340,11 +400,11 @@ describe('useRuntimeLimits deployment gating', () => {
     // `useAuth` starts at `self_host` and flips only once the config probe
     // resolves; a component mounting first must not disable hosted hints
     // for the rest of the page's life.
-    cloudMode.value = false
+    setDeploymentMode('self_host')
     const limits = useRuntimeLimits()
     await limits.ensureLoaded()
 
-    cloudMode.value = true
+    setDeploymentMode('cloud')
     mockedFetch.mockResolvedValueOnce(snapshot({
       character_slots: { used: 2, limit: 3 },
     }))
@@ -360,7 +420,7 @@ describe('useRuntimeLimits deployment gating', () => {
     }))
     await limits.ensureLoaded()
 
-    cloudMode.value = false
+    setDeploymentMode('self_host')
 
     expect(limits.supported.value).toBe(false)
     expect(limits.characterSlots.value).toBeNull()

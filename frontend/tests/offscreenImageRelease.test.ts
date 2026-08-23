@@ -204,9 +204,14 @@ describe('chat bubble picture wiring', () => {
     expect(bubble).toMatch(/\.bubble-image \{[^}]*height: auto;/)
   })
 
-  it('still links the original, not the variant', () => {
-    // "Open in a new tab" means the full picture.
-    expect(bubble).toContain(':href="att.url"')
+  it('still hands the original on, not the released display src', () => {
+    // The picture no longer links anywhere: clicking opens the lightbox, which
+    // carries "open the original" itself (LB3). What matters here is unchanged
+    // — the *original* URL is what leaves this component, because the display
+    // src is empty for exactly as long as the release is in effect. Feed that
+    // to the overlay and a picture scrolled far enough away opens blank.
+    expect(bubble).toContain('chatImageLightboxItems(imageAttachments.value)')
+    expect(bubble).not.toContain(':items="imageSrcFor')
   })
 })
 

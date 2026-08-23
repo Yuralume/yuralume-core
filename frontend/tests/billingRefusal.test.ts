@@ -12,12 +12,13 @@
 import { readFileSync } from 'node:fs'
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { setDeploymentMode } from '@/composables/deploymentMode'
 
 vi.mock('@/utils/api/cloudPricing', () => ({ fetchCloudPricing: vi.fn() }))
 
 const { fetchCloudPricing } = await import('@/utils/api/cloudPricing')
 const { useActionPricing } = await import('@/composables/useActionPricing')
-const { billingRefusalKind, refreshQuotedPrices }
+const { billingRefusalKind, isRetryableConflict, refreshQuotedPrices }
   = await import('@/utils/api/billingRefusal')
 const { InsufficientCreditsError }
   = await import('@/utils/api/insufficientCredits')
@@ -47,6 +48,7 @@ function snapshot(priceCr: number) {
 beforeEach(() => {
   vi.clearAllMocks()
   useActionPricing().reset()
+  setDeploymentMode('cloud')
 })
 
 describe('billingRefusalKind', () => {
@@ -68,6 +70,38 @@ describe('billingRefusalKind', () => {
     expect(billingRefusalKind(new Error('gpu on fire'))).toBeNull()
     expect(billingRefusalKind(null)).toBeNull()
     expect(billingRefusalKind({ response: { status: 402 } })).toBeNull()
+  })
+})
+
+describe('isRetryableConflict', () => {
+  function statusError(statusCode: number): Error {
+    return Object.assign(new Error(`status ${statusCode}`), { statusCode })
+  }
+
+  it('retries the transient 409 — "someone is already generating this"', () => {
+    // `BranchingGenerationInProgress` / `SceneRegenerationInProgress`: a plain
+    // string detail, and waiting is exactly what clears it.
+    expect(isRetryableConflict(statusError(409))).toBe(true)
+  })
+
+  it('never retries a moved price, which shares the 409', () => {
+    // The bug this exists to stop: `price_changed` also carries `statusCode
+    // 409`, so a bare status check sat on it for the full 60s retry window —
+    // a minute of fake "still generating…" and then the refusal thrown at the
+    // player as a fatal error that booted them out of the VN.
+    expect(isRetryableConflict(new PriceChangedError({ currentPriceCr: 8 })))
+      .toBe(false)
+  })
+
+  it('never retries an empty wallet', () => {
+    expect(isRetryableConflict(new InsufficientCreditsError())).toBe(false)
+  })
+
+  it('leaves every other failure to the caller', () => {
+    expect(isRetryableConflict(statusError(500))).toBe(false)
+    expect(isRetryableConflict(statusError(404))).toBe(false)
+    expect(isRetryableConflict(new Error('offline'))).toBe(false)
+    expect(isRetryableConflict(null)).toBe(false)
   })
 })
 
@@ -125,6 +159,9 @@ const PRICED_SURFACES = [
   'components/fusion-story/FusionStoryViewer.vue',
   'pages/FusionStoryPage.vue',
   'pages/BranchingDramaPage.vue',
+  // FX2: start / talk / advance answer a 402 in place too, instead of
+  // emitting `error` and booting the player out of the playthrough.
+  'components/branching-drama/BranchingDramaPlayer.vue',
 ]
 
 function source(file: string): string {
@@ -139,6 +176,15 @@ describe('insufficient-credits surface parity', () => {
       "from '@/components/InsufficientCreditsNotice.vue'",
     )
     expect(src).toContain('<InsufficientCreditsNotice')
+  })
+
+  it('retries the drama advance on the shape, never on the bare status', () => {
+    // The FX2 regression in concrete form: `isRetryable: (e) => status === 409`
+    // swallowed `price_changed` into a 60-second "still generating…".
+    const src = source('components/branching-drama/BranchingDramaPlayer.vue')
+
+    expect(src).toContain('isRetryable: isRetryableConflict')
+    expect(src).not.toContain('apiStatusErrorStatus')
   })
 
   it('does not leave the draft refusal in a plain error line', () => {

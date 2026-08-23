@@ -297,7 +297,15 @@ async def test_pre_message_proactive_seed_permission_uses_character_owner() -> N
 
 
 @pytest.mark.asyncio
-async def test_pre_message_proactive_permission_without_cadence_still_waits() -> None:
+async def test_pre_message_proactive_permission_without_cadence_now_sends() -> None:
+    """IR4: cadence hint is advisory only — permission alone unblocks.
+
+    Before IR4 this was the trap: creation UI let an operator check "can
+    find me first" without ever saying the frequency hint was secretly
+    co-required, so the character stayed silent forever with no signal
+    anywhere that anything was still missing. The gate now tracks
+    ``proactive_permission`` alone.
+    """
     harness = build_messaging_harness()
     character = await _enable_character(
         harness, idle_minutes=None, accepts_web_proactive=True,
@@ -309,6 +317,47 @@ async def test_pre_message_proactive_permission_without_cadence_still_waits() ->
             operator_id=DEFAULT_OPERATOR_ID,
             relationship_label="朋友",
             proactive_permission=True,
+        ),
+    )
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _ = _make_dispatcher(
+        harness,
+        decider=decider,
+        relationship_seed_repository=relationship_repo,
+    )
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=datetime(2026, 4, 18, 14, 30, tzinfo=timezone.utc),
+    )
+
+    relationship_lines = "\n".join(decider.calls[0].initial_relationship_lines)
+    assert attempt.outcome == ProactiveOutcome.SENT
+    assert len(decider.calls) == 1
+    assert "朋友" in relationship_lines
+    # Permission line still renders; the now-optional cadence line does not
+    # (render_initial_relationship_seed_lines skips it when blank), so the
+    # character sees no fabricated frequency and has to judge it itself.
+    assert "主動訊息授權" in relationship_lines
+    assert "主動訊息頻率或時機" not in relationship_lines
+
+
+@pytest.mark.asyncio
+async def test_pre_message_proactive_without_permission_still_waits_even_with_cadence() -> None:
+    """A filled-in cadence hint never substitutes for the permission flag."""
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    relationship_repo = InMemoryCharacterOperatorRelationshipSeedRepository()
+    await relationship_repo.save(
+        CharacterOperatorRelationshipSeed(
+            character_id=character.id,
+            operator_id=DEFAULT_OPERATOR_ID,
+            relationship_label="朋友",
+            proactive_permission=False,
+            proactive_cadence_hint="一天最多一次",
         ),
     )
     decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))

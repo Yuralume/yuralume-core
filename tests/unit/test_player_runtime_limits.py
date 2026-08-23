@@ -513,3 +513,28 @@ async def test_snapshot_counts_through_the_real_in_memory_repositories() -> None
     assert snapshot.character_slots == QuotaUsage(limit=3, used=2)
     assert snapshot.character_daily_creates == QuotaUsage(limit=1, used=1)
     assert snapshot.story_scenes_daily == QuotaUsage(limit=5, used=1)
+
+
+# --- NF4 background policy (display-only, no counter to fail soft) ----------
+
+
+async def test_background_dormancy_days_is_carried_from_the_profile() -> None:
+    """The one field here that is not a ceiling: it says what happens when the
+    player stops playing, so the SPA can warn before the character goes quiet
+    instead of leaving them to notice the silence."""
+    profile = AccountRuntimeProfile(name="free", background_dormancy_days=3)
+    service, _chars, _usage, _sessions = _service(profile)
+
+    snapshot = await service.snapshot_for_operator(OPERATOR, now=NOW)
+
+    assert snapshot.background.dormancy_days == 3
+
+
+async def test_permissive_profile_reports_no_dormancy() -> None:
+    """self-host and any tier without the knob: "never", spelled ``None`` —
+    the same convention as every unlimited quota on this snapshot."""
+    service, _chars, _usage, _sessions = _service(DEFAULT_ACCOUNT_RUNTIME_PROFILE)
+
+    snapshot = await service.snapshot_for_operator(OPERATOR, now=NOW)
+
+    assert snapshot.background.dormancy_days is None

@@ -170,14 +170,21 @@ class StudioJobRecoveryService:
     async def _supersede(self, job: StudioGenerationJob) -> None:
         """Fail a duplicate row — via its owning service when money rides on it.
 
-        A superseded row is not just bookkeeping: a fusion row carries the ids
-        of the action charge its (losing) replica raised, and only the newest
-        row per target is re-driven. Marking it failed here without telling the
-        service would drop that reservation on the floor — the one path where a
-        player pays for a run nothing will ever finish.
+        A superseded row is not just bookkeeping: a fusion **or branching** row
+        carries the ids of the action charge its (losing) replica raised, and
+        only the newest row per target is re-driven. Marking it failed here
+        without telling the service would drop that reservation on the floor —
+        the one path where a player pays for a run nothing will ever finish.
+
+        The plain ``save`` below is therefore the *no owning service* fallback
+        only: a kind with no handler, or a service this deployment did not
+        wire. Any kind whose rows can carry a charge must be dispatched above.
         """
         if job.kind in FUSION_JOB_KINDS and self._fusion is not None:
             await self._fusion.supersede_job(job)
+            return
+        if job.kind in BRANCHING_JOB_KINDS and self._branching is not None:
+            await self._branching.supersede_job(job)
             return
         await self._jobs.save(job.with_status(
             JOB_STATUS_FAILED,

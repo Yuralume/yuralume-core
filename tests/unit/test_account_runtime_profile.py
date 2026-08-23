@@ -213,6 +213,39 @@ def test_parser_rejects_frequency_knobs_above_contract_maximum(caplog) -> None:
     assert "ignoring invalid idle_downshift_days=3651" in caplog.text
 
 
+def test_parser_reads_background_dormancy_days() -> None:
+    # NF4: same bounds and nullability as idle_downshift_days (1..3650, NULL
+    # = off) — a different question, an identical contract shape.
+    assert AccountRuntimeProfile.from_control_plane_payload(
+        "free", {"background_dormancy_days": 3},
+    ).background_dormancy_days == 3
+    assert AccountRuntimeProfile.from_control_plane_payload(
+        "free", {"background_dormancy_days": None},
+    ).background_dormancy_days is None
+
+
+def test_parser_dormancy_days_defaults_to_never_when_absent() -> None:
+    """The self-host red line at its source: a payload that never mentions the
+    knob (and the ``{}`` every un-migrated tier sends) resolves to "never
+    dormant", not to some default window."""
+    assert AccountRuntimeProfile.from_control_plane_payload(
+        "plus", {},
+    ).background_dormancy_days is None
+    assert DEFAULT_ACCOUNT_RUNTIME_PROFILE.background_dormancy_days is None
+
+
+def test_parser_rejects_out_of_range_and_mistyped_dormancy_days(caplog) -> None:
+    """Fail-open per knob, in the direction that keeps characters alive: a
+    malformed value falls back to "never dormant" rather than silencing a
+    paying tenant's whole background stack."""
+    for bad in (0, -1, 3651, "7", True):
+        profile = AccountRuntimeProfile.from_control_plane_payload(
+            "free", {"background_dormancy_days": bad},
+        )
+        assert profile.background_dormancy_days is None, bad
+    assert "ignoring invalid background_dormancy_days" in caplog.text
+
+
 def test_effective_multipliers_apply_idle_factor_and_clamp(caplog) -> None:
     profile = AccountRuntimeProfile(
         name="plus",
