@@ -608,6 +608,7 @@ export const messages: MessageSchema = {
   },
   chat: {
     priceChanged: '蛍火の価格が更新されました。今回は消費されていません——もう一度送信してください。',
+    conversationBusy: 'キャラクターがまだ前のメッセージに返信中です——このターンが終わってからもう一度送信してください。',
     header: {
       noCharacter: '左側でキャラクターを作成または選択してチャットを開始してください',
       talkingTo: '{name} と会話中',
@@ -648,13 +649,19 @@ export const messages: MessageSchema = {
       loadOlder: '以前のメッセージを読み込む',
       loadingOlder: '以前のメッセージを読み込み中…',
       scrollToLatest: '最新のメッセージへ移動',
-      streamingHint: 'ツールを使用している可能性があります（画像生成は 30〜60 秒かかることがあります）',
+    },
+    toolActivity: {
+      generateImage: '絵を描いている…',
+      webSearch: '調べものをしている…',
+      webFetch: 'ページを読んでいる…',
+      generic: '何かしている…',
     },
     onboarding: {
       title: 'まず {name} に一言かけてみましょう',
       stageHint: '同じ場にいるときのように話しかけます。{name} は今の予定や状況に沿って自然に応じます。',
       dmHint: 'スマホモードは {name} にメッセージを送る形式です。近況を聞きたい時や、会えるか分からない時に向いています。',
       lifeHint: '数ターン話すと、「{name} の生活」と「思い出とアルバム」に日常が少しずつ蓄積されます。',
+      nudgeOption: '何を話せばいいか分からない？{name}に先に話してもらう',
       startersAria: '最初のメッセージ',
       starters: {
         stageGreeting: '{name}、今日はどんな一日だった？',
@@ -718,6 +725,8 @@ export const messages: MessageSchema = {
       title: '{name}に先に話してもらう',
       placeholder: '今の場面を補足（空欄でも可）。例：ドアを開けて入ってくる',
       confirm: '話す',
+      tip: 'このボタンで{name}が先に話しかけてくれます。使いたいときはいつでもここに。',
+      tipDismiss: '分かりました',
     },
     actions: {
       undo: '直前のターンを取り消す',
@@ -896,11 +905,11 @@ export const messages: MessageSchema = {
           schedule: 'キャラクターには毎日の予定があります。通勤、仕事、食事、睡眠。今何をしているか聞けば、その時の予定に沿って答えます。あなたが一日チャットを開かなくても、過ぎた出来事は記憶になります。「生活」のページで、その子の一日を普通の言葉で調整できます。',
           busyDefer: '本当に手が離せない時間帯には、あとでちゃんと返すと先に伝えて、後から本当に返してくれます。待っているあいだにもう一度送ると、保留していた返信を取り消してそのまま答えます。放置されることはありません。答えるために調べたり何かしたりする必要があった場合は、返す前に実際にそれをしてから報告します。',
           promise: '「明日 7 時に起こして」と頼めば覚えておいて、その時間に自分からメッセージを送ります。「あとで調べておく」「写真を送る」といった約束も同じで、その時間になったら実際に調べたり撮ったりしてから結果を送ります。見つからなければ正直にそう言い、それらしい答えを作ることはありません。',
-          proactive: 'あなたが何も言っていないときでも、キャラクターから話しかけてくることがあります。オフにもできますし、設定で「静か／ほどほど／にぎやか」を選んで頻度を変えられます。実際に送るかどうかは、その時の生活と最近の会話にもよります。「にぎやか」にしても 1 日何通と決まるわけではありません。作成時に設定した許可や頻度の目安も、キャラクター設定の「関係設定」で改めて調整できます。',
+          proactive: 'あなたが何も言っていないときでも、キャラクターから話しかけてくることがあります。オフにもできますし、設定で「静か／ほどほど／にぎやか」を選んで頻度を変えられます。実際に送るかどうかは、その時の生活と最近の会話にもよります。「にぎやか」にしても 1 日何通と決まるわけではありません。作成画面の「先に話しかけてもいい」は既定でオンになっていて、その場で外せます。オンのままでもすぐには来ません——作成後しばらく間をおいてから、相手が自分でタイミングを選びます。この許可も頻度の目安も、あとからキャラクター設定の「関係設定」で調整できます。',
           noReply: '返事をしない日が続いても、同じメッセージを毎日送り直したりはしません。人と同じように態度が少しずつ変わります。気にかけ、すねて、そっとしておく、という順です。',
           drift: 'しばらく放っておくと、戻ってきたときの口調が性格によって変わります。拗ねる子は拗ねますし、淡白な子は本当に何とも思っていないかもしれません。',
           encounter: 'キャラクター同士も自分たちで会います。双方の予定と関係から会う機会が組まれ、短い会話として演じられます。そのあとの会話で、昨日誰に会ったかを自分から話すこともあります。',
-          world: '現実の時間の中で生きています。今日雨が降るか、連休の何日目かを知っていますし、最近のニュースにも自然に触れます。話に出たニュースを掘り下げて聞けば、記憶頼りで適当に答えるのではなく、元の記事を読んでから答えます。この層には「キャラクターが普段関心を寄せること」で外の話題を有効にしておく必要があります。',
+          world: '現実の時間の中で生きています。今日雨が降るか、連休の何日目かを知っていますし、最近のニュースにも自然に触れます。話に出たニュースを掘り下げて聞けば、記憶頼りで適当に答えるのではなく、元の記事を読んでから答えます。現代設定のキャラクターはこの層が最初からオンになっており、ファンタジー／学園設定などは初期状態でオフです——どちらも「キャラクターが普段関心を寄せること」でいつでも切り替えられます。',
         },
       },
       lumegram: {
@@ -962,6 +971,7 @@ export const messages: MessageSchema = {
         lead: 'キャラクターはあなたのもので、持ち出せます。人に渡すのと自分で引っ越すのは別のファイルなので、取り違えないでください。',
         items: {
           card: '「.lumecard」は共有用です。人格設定、外見、ステージ画像、あなたが書いたストーリーシリーズを持っていきますが、記憶・会話・二人の関係は入りません。受け取った人には新しいキャラクターとして入り、知らない相手から始まります。',
+          identityCard: '「プレイヤー身分カード」が保存するのはキャラクター本体ではなく、キャラクター作成時に決める「二人の関係」一式です——呼び方、距離感、向こうから話しかけていいか、あなたの人物設定など。キャラクター作成ウィザードでカードを選んで読み込めば、これらの項目を一度に埋められます。読み込んだ後も各項目は自由に書き換えられ、どう変えてもカード本体には書き戻りません——カードはその瞬間のスナップショットで、後から作るキャラクターにつられて変わることはありません。ウィザードでは今埋めたばかりの内容を新しいカードとして保存することもでき、次のキャラクター作成でそのまま読み込めます。既存のキャラクターも、設定ページからいまの関係設定を新しいカードとして保存でき、次のキャラクターに使い回せます。保存したカードはすべて設定の「個人」タブの「プレイヤー身分カード」でまとめて管理します——改名・削除・全項目のプレビューができますが、初版はその場での編集にはまだ対応していません。同じ名前だと上書きするか確認され、保存できる枚数には上限があるので、いっぱいになったら 1 枚削除してから保存してください。',
           backup: '「.lumebackup」は引っ越し用です。会話も記憶もスケジュールも物語の流れも、アルバムや LumeGram のメディアも丸ごと 1 つの暗号化ファイルにまとめます。自分の別の環境（セルフホストとクラウド、どちらの向きでも）へ持っていけますし、そのまま保管しておくこともできます。クラウド版では書き出せる回数がキャラクターごとではなくアカウント単位で数えられます。短いあいだに続けて書き出すと一時的に断られるので、少し時間をおいてからもう一度お試しください。',
           backupSelfHost: '「.lumebackup」は引っ越し用です。会話も記憶もスケジュールも物語の流れも、アルバムや LumeGram のメディアも丸ごと 1 つの暗号化ファイルにまとめます。自分の別の環境（セルフホストとクラウド、どちらの向きでも）へ持っていけますし、そのまま保管しておくこともできます。',
           password: 'バックアップを書き出すとき、そのファイル専用のパスワードを自分で決めます。このパスワードは必ず覚えておいてください。忘れるとバックアップファイルは二度と復号できなくなり、当方でも復旧できません。',
@@ -2751,6 +2761,8 @@ export const messages: MessageSchema = {
         sharedAllowed: '私が明確に許可した共通の日常なら組み込める',
       },
       proactivePermission: '作成後、あなたが先に話しかける前でも相手から連絡できる',
+      proactivePermissionHint: '既定でオンです。不要ならチェックを外してください。作成直後にすぐ連絡が来ることはありません——しばらく間をおいてから、相手が自分でタイミングを選びます（深夜は避けます）。ウェブ上のメッセージはサイトに戻らないと見えないので、公式 LINE を連携すると実際に届くようになります。',
+      proactiveCadenceLabel: '連絡の頻度の目安',
       proactiveCadencePlaceholder: '例：一日に最多一回、大事なことを思いついた時だけ',
       proactiveCadenceHint: '任意項目。空欄なら頻度やタイミングは相手が自分で判断します',
       profileInterests: '相手が知ってもよい興味',
@@ -2812,6 +2824,72 @@ export const messages: MessageSchema = {
       label: 'あなたの設定',
       filledHint: '{name}にあなたが何者かを伝えています。クリックして変更できます。',
       emptyHint: '{name}にあなたが何者かを伝えましょう。',
+    },
+  },
+  identityCard: {
+    picker: {
+      label: 'プレイヤーカードから読み込む',
+      placeholder: '読み込まずに空欄から始める',
+      hint: '保存済みのプレイヤーカードを選ぶと、下の項目がまとめて埋まります。読み込んだあとも各項目は自由に直せますし、直してもカード自体は変わりません。',
+    },
+    personaNote: {
+      label: 'あなたの設定（任意）',
+      placeholder: '例：他人の感情の色が見える能力者。それを知っているのはあなただけ。',
+      hint: '{name}にあなたが何者かを伝えましょう。素性でも経歴でも世界観の設定でも構いません。空のままでも大丈夫で、あとからいつでも書けます。',
+    },
+    save: {
+      checkbox: '今回入力した内容をプレイヤーカードとして保存する',
+      nameLabel: 'プレイヤーカードの名前',
+      namePlaceholder: '例：会社員のわたし',
+      hint: '次にキャラクターを作るとき、この一式をそのまま読み込めます。{max}文字まで。同じ名前がある場合は上書きするか確認します。',
+    },
+    overwrite: {
+      title: '既存のプレイヤーカードを上書きしますか？',
+      content: '「{name}」という名前のプレイヤーカードがすでにあります。上書きすると今回入力した内容に置き換わります。そのカードから作成済みのキャラクターには影響しません。',
+      ok: '上書きする',
+    },
+    followUp: {
+      cardSaved: 'プレイヤーカードを保存しました',
+      personaNoteFailed: 'あなたの設定を保存できませんでした',
+      cardSaveFailed: 'プレイヤーカードを保存できませんでした',
+      bothFailed: 'あなたの設定とプレイヤーカードのどちらも保存できませんでした',
+      characterStillCreated: 'キャラクターの作成は完了しています。この手順だけが未完了なので、そのまま再試行できます。',
+      limitReached: 'プレイヤーカードは上限の{limit}枚に達しています。設定でいずれか1枚を削除してから保存してください。',
+    },
+    saveFromCharacter: {
+      action: '今の設定をプレイヤーカードとして保存する',
+      hint: '「{name}」の現在の関係設定と設定をプレイヤーカードとして保存します。次にキャラクターを作るときそのまま読み込めます。使われるのは今すでに保存されている内容で、まだ保存していない編集は含まれません。',
+      loadFailed: '今の設定を読み込めませんでした。後でもう一度お試しください。',
+      empty: 'このキャラクターにはまだ保存できる設定がありません。上で関係設定かあなたの設定を入力してから、プレイヤーカードとして保存してください。',
+    },
+    manage: {
+      title: 'プレイヤーカード',
+      hint: 'キャラクター作成ウィザードやキャラクターの設定ページで保存した関係・設定の一式です。ここでは名前の変更、削除、全項目のプレビューができます——このバージョンではまだ内容の編集はできません。',
+      loading: '読み込み中…',
+      loadFailed: 'プレイヤーカードの一覧を読み込めませんでした。後でもう一度お試しください。',
+      empty: 'まだプレイヤーカードがありません。キャラクター作成ウィザードやキャラクターの設定ページから最初の1枚を保存できます。',
+      count: '{count} / {limit} 枚',
+      limitNote: '上限に達しています。追加するには、下でいずれか1枚を削除してください。',
+      updatedAtLabel: '更新：{time}',
+      previewAction: 'プレビュー',
+      renameAction: '名前を変更',
+      rename: {
+        namePlaceholder: 'プレイヤーカードの名前',
+        hint: '{max}文字まで。',
+        conflict: '同じ名前のプレイヤーカードが既にあります。別の名前にしてください。',
+        failed: '名前を変更できませんでした。後でもう一度お試しください。',
+        saved: '名前を変更しました',
+      },
+      delete: {
+        confirmTitle: 'このプレイヤーカードを削除しますか？',
+        confirmContent: '「{name}」を削除しても、そのカードから作成済みのキャラクターには影響しません。カード自体が消えるだけです。',
+        done: 'プレイヤーカードを削除しました',
+        failed: '削除できませんでした。後でもう一度お試しください。',
+      },
+      preview: {
+        enabled: '許可あり',
+        disabled: '許可なし',
+      },
     },
   },
   characterBackup: {
@@ -3134,6 +3212,7 @@ export const messages: MessageSchema = {
       arc_template_translate: 'アークテンプレートの翻訳',
       story_seed_translate: 'ストーリーシードの翻訳',
       showcase_review: '公開ショーケースの事前審査',
+      showcase_image_review: '公開ショーケース画像の一貫性事前審査',
       showcase_translate: '公開ショーケースの翻訳',
       official_card_translate: '公式カードの事前翻訳',
       sillytavern_normalize: 'SillyTavern カード取り込みの正規化',
@@ -3149,11 +3228,15 @@ export const messages: MessageSchema = {
       persona_projection: 'オペレーターペルソナ：プレイヤー向けの投影',
       persona_curiosity: 'オペレーターペルソナ：自然な探索の計画',
       address_preference_observer: '語用観察：呼び方 / 語体の好み',
+      relationship_coherence: '関係の呼称一貫性セルフヒール',
       experiment_analysis: 'A/B 実験：手動分析レポート',
       character_encounter_plan: 'キャラクター交流：自然な出会いの計画',
+      character_encounter_beats: 'キャラクター交流：話題ビートの計画',
       character_encounter_dialogue: 'キャラクター交流：短い対話',
       character_encounter_reflect: 'キャラクター交流：記憶の振り返り',
       peer_knowledge_consolidate: 'キャラクター間の社会的知識の整理',
+      outcome_claim_judge: '送信成果申告の一貫性チェック',
+      player_knowledge_disclosure: 'プッシュ通知後の開示判定（プレイヤー知識台帳）',
     },
     reasoning: {
       title: '推論設定',
@@ -3162,7 +3245,7 @@ export const messages: MessageSchema = {
       disableLabel: '推論（thinking）を無効化',
       effortLabel: '推論強度（OpenAI 互換系、値域はプロバイダ依存）',
       effortPlaceholder: 'low / medium / high など',
-      budgetLabel: 'Thinking 予算トークン（Anthropic）',
+      budgetLabel: 'Thinking 予算トークン（Anthropic／OpenRouter 接続のみ有効、それ以外では無視されます）',
       budgetPlaceholder: '4096 など',
     },
     vision: {
@@ -3291,6 +3374,12 @@ export const messages: MessageSchema = {
       configured: '設定済み',
       unconfigured: '未設定',
     },
+    options: {
+      imageGenerationOff: '画像生成を無効にする',
+    },
+    hints: {
+      imageDisabled: '無効を選択中：NSFW モードの間、画像生成は通常の画像 profile へ切り替わらず、すぐに「現在利用できません」と応答します。',
+    },
     empty: {
       providers: '利用可能な provider がありません',
       models: '利用可能な model がありません',
@@ -3305,7 +3394,7 @@ export const messages: MessageSchema = {
     errors: {
       loadFailed: 'NSFW mode ルーティング先の読み込みに失敗しました',
       modelsLoadFailed: 'モデル一覧の読み込みに失敗しました',
-      targetRequired: '先に LLM provider、model、画像 profile を選択してください。',
+      targetRequired: '先に LLM provider、model、画像 profile（または画像生成の無効化）を選択してください。',
       saveFailed: 'NSFW mode ルーティング先の保存に失敗しました',
     },
   },
@@ -4500,6 +4589,8 @@ export const messages: MessageSchema = {
       brand: '管理コンソール',
       warn: '技術管理エリア',
       warnHint: 'この区画は技術管理用インターフェースで、変更するとキャラクターの記憶がドリフトする恐れがあります。',
+      toggleNav: 'ナビゲーションメニューの開閉',
+      backToOverview: '概要',
     },
     home: {
       title: '管理ホーム',
@@ -4839,7 +4930,7 @@ export const messages: MessageSchema = {
         reasoning_effort: { label: 'Reasoning effort（プロバイダー固有の値、空欄で既定）', placeholder: '例：low / medium / high' },
         extra_request_params: { label: '追加 request パラメータ（純粋な JSON オブジェクト、request payload にマージ）', placeholder: '詳細設定：各プロバイダーの文書に従って入力、例：{\'{\'}"top_k": 40{\'}\'}' },
         strip_think_tags: { label: '返信から <think>...</think> タグを除去' },
-        thinking_budget_tokens: { label: 'Thinking budget tokens（空欄＝extended thinking を無効）', placeholder: '例：4096' },
+        thinking_budget_tokens: { label: 'Thinking budget tokens', placeholder: '例：4096' },
         server: { label: 'ComfyUI server URL', placeholder: 'http://127.0.0.1:8188' },
         checkpoint: { label: 'Checkpoint（モデルファイル）', placeholder: 'waiNSFWIllustrious_v140.safetensors' },
         workflow_file: { label: 'Workflow JSON パス（空欄＝組み込み既定）', placeholder: '/path/to/workflow_api.json' },
@@ -4848,6 +4939,26 @@ export const messages: MessageSchema = {
           label: '接続スラッグ（同じ provider の 1 つ目は空欄でOK）',
           placeholder: '例：relay-b',
           hint: '同じ provider の接続を複数併用する場合にのみ入力します——例えば中継業者の API キーごとに使えるモデルが違うケースです。スラッグは model セレクターに表示される id の一部になる（custom_openai_compatible__relay-b）ため、短い半角英数字にし、保存後の変更は避けてください。古い id を指している設定は既定値に戻ります。',
+        },
+        // 名前を共有しつつ意味が provider ごとに異なるフィールドキー用の
+        // per-preset 上書き（詳細は catalogLabels.ts の
+        // providerFieldLabel / providerFieldHint を参照）。管理画面が
+        // 接続の preset id を渡したとき、ここのサブキーが上の共通エント
+        // リより優先されます。
+        anthropic: {
+          thinking_budget_tokens: {
+            hint: '空欄にすると extended thinking を無効化します（このパラメータ自体を送信しないため、モデルは一切思考しません）。',
+          },
+        },
+        openrouter: {
+          thinking_budget_tokens: {
+            hint: 'reasoning.max_tokens として送信されます。「推論強度（Reasoning effort）」とは併用できず、両方入力した場合はこちらの予算が優先されます。空欄の場合はこのパラメータ自体を送信しません＝上流モデルの既定挙動に従うという意味で、thinking を無効化するわけではありません。',
+          },
+        },
+        custom_openai_compatible: {
+          disable_reasoning: {
+            hint: 'このチェックボックスは vLLM／llama.cpp 流の chat_template_kwargs（enable_thinking: false）を送信します。この接続が実際には OpenRouter のようなアグリゲーター向けの場合、多くはこの指定が効きません——代わりに「追加 request パラメータ」でそのアグリゲーターが解釈する reasoning オブジェクトを直接入力するか、専用の OpenRouter 接続タイプに切り替えてください。',
+          },
         },
       },
       runtimeIdHint: 'この接続が model セレクターに表示される id',

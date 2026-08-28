@@ -13,9 +13,7 @@ failed" as a dead end — the operator can still edit it.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -51,6 +49,7 @@ from kokoro_link.infrastructure.story.date_context import (
     format_absolute_day,
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +61,6 @@ _CANONICAL_SCENE_TYPES = (
     SCENE_ENCOUNTER, SCENE_REVELATION, SCENE_CONFLICT,
     SCENE_RESOLUTION, SCENE_INTERLUDE,
 )
-_FENCE_RE = re.compile(r"```(?:\w+)?\n?")
 _MAX_BEATS = 7
 _MIN_BEATS = 3
 # Cap scene_characters per beat — keeps prompts predictable; if a
@@ -509,18 +507,10 @@ def _parse_plan(
     provenance; it is the *only* field whose absence or malformation is
     not allowed to matter — see ``_coerce_seed_ids``.
     """
-    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
-    # Find the outermost JSON object.
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    blob = text[start : end + 1]
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    log_parse_outcome(_LOGGER, outcome, site="story.arc_planner")
+    data = outcome.value
+    if data is None:
         return None
     beats = data.get("beats")
     if not isinstance(beats, list) or not beats:

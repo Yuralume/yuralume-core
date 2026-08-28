@@ -8,6 +8,8 @@ relevant prompt section, so the system keeps working end-to-end.
 
 from __future__ import annotations
 
+from datetime import datetime, tzinfo
+
 from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import Message
@@ -15,6 +17,11 @@ from kokoro_link.domain.entities.conversation import Message
 
 class NullDialogueSummarizer(DialogueSummarizerPort):
     async def summarize(
-        self, *, character: Character, messages: list[Message],
+        self,
+        *,
+        character: Character,
+        messages: list[Message],
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
     ) -> str:
         return ""

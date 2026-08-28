@@ -11,6 +11,8 @@ from tests.unit._runtime_profiles import (
     RESTRICTIVE_ACCOUNT_RUNTIME_PROFILE,
 )
 from kokoro_link.domain.entities.arc_series import ArcSeries
+from kokoro_link.domain.entities.character import Character
+from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.entities.arc_template import (
     ARC_TEMPLATE_SCOPE_CHARACTER_BOUND,
     ArcTemplate,
@@ -94,6 +96,77 @@ async def test_create_and_update_character() -> None:
     assert updated is not None
     assert updated.interests == ["music", "news"]
     assert updated.speaking_style == "playful"
+
+
+@pytest.mark.asyncio
+async def test_create_character_world_awareness_defaults_by_frame() -> None:
+    """TR1: omitted ``world_awareness_enabled`` resolves from ``world_frame``.
+
+    Modern (the creation UI's own default) turns RSS world-events on;
+    fantasy/school/custom keep the historical opt-in-off bubble.
+    """
+    service = CharacterService(InMemoryCharacterRepository())
+
+    modern = await service.create_character(
+        CreateCharacterRequest(name="Airi", world_frame="modern"),
+    )
+    assert modern.world_awareness_enabled is True
+
+    for frame in ("fantasy", "school", "custom"):
+        created = await service.create_character(
+            CreateCharacterRequest(name=f"Char-{frame}", world_frame=frame),
+        )
+        assert created.world_awareness_enabled is False, frame
+
+
+@pytest.mark.asyncio
+async def test_create_character_explicit_world_awareness_wins_over_frame() -> None:
+    """An explicit client value always beats the frame-based default —
+    both directions: opting a fantasy character in, and opting a modern
+    one out (e.g. an installed character card's own authored choice)."""
+    service = CharacterService(InMemoryCharacterRepository())
+
+    opted_in_fantasy = await service.create_character(
+        CreateCharacterRequest(
+            name="Fantasy-opt-in",
+            world_frame="fantasy",
+            world_awareness_enabled=True,
+        ),
+    )
+    assert opted_in_fantasy.world_awareness_enabled is True
+
+    opted_out_modern = await service.create_character(
+        CreateCharacterRequest(
+            name="Modern-opt-out",
+            world_frame="modern",
+            world_awareness_enabled=False,
+        ),
+    )
+    assert opted_out_modern.world_awareness_enabled is False
+
+
+def test_character_entity_direct_construction_still_defaults_off() -> None:
+    """TR1 scope guard: the entity's own default is untouched — existing
+    characters (loaded from storage) and any direct ``Character.create``
+    caller that doesn't pass ``world_awareness_enabled`` still get the
+    historical always-off default, frame notwithstanding. Only the
+    service's *creation-request* resolution point is frame-aware."""
+    default_state = CharacterState(
+        emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
+    )
+    modern = Character.create(
+        name="Airi", summary="", user_id="op",
+        personality=[], interests=[], speaking_style="natural", boundaries=[],
+        state=default_state, world_frame="modern",
+    )
+    assert modern.world_awareness_enabled is False
+
+    fantasy = Character.create(
+        name="Rin", summary="", user_id="op",
+        personality=[], interests=[], speaking_style="natural", boundaries=[],
+        state=default_state, world_frame="fantasy",
+    )
+    assert fantasy.world_awareness_enabled is False
 
 
 @pytest.mark.asyncio

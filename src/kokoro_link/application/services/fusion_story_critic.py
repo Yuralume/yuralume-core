@@ -47,6 +47,11 @@ from kokoro_link.domain.value_objects.fusion_critique import (
 )
 from kokoro_link.domain.value_objects.fusion_outline import FusionOutline
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -217,18 +222,50 @@ def _render_findings(
     return "\n".join(parts)
 
 
-def _parse_critique(
-    raw: str, *, paragraph_count: int,
-) -> FusionStoryCritique | None:
-    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly: does the first-``{`` to
+    last-``}`` slice parse as JSON at all — no balance-awareness, no
+    repair. When it does, old already succeeded with exactly this
+    value, so the shared scanner (anchored at the same ``{``) recovers
+    it identically. Used only as a gate; see ``_parse_critique``.
+    """
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:
-        return None
+        return False
     try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        # RecursionError, not just a decode error: a model stuck in a
+        # repetition loop emits thousands of nested openers, and
+        # ``json.loads`` blows its C-stack guard on those. See
+        # ``llm_output.extract.MAX_NESTING_DEPTH``.
+        return False
+    return True
+
+
+def _parse_critique(
+    raw: str, *, paragraph_count: int,
+) -> FusionStoryCritique | None:
+    # DH2-services: fence-stripping is folded into the shared scanner
+    # (fence-agnostic by construction) and truncation repair is on —
+    # this prompt unconditionally asks for the JSON envelope. Branch
+    # selection still mirrors the old crude slice exactly (see the
+    # helper above) so a genuinely array-shaped reply is not misread as
+    # its first nested object.
+    #
+    # FX1/DH-2: the array half of that guard is now structural. It used
+    # to read "the whole reply parses and isn't a dict", which needed
+    # the *entire* string to decode — so a model that closed its array
+    # and then wrote one more sentence (``[…]\n以上，有需要再跟我說！``)
+    # switched the guard off completely, and the object extractor handed
+    # back the array's first element as if it were the critique.
+    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
         return None
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="fusion_story.critic")
+    data = outcome.value
     if not isinstance(data, dict):
         return None
     severity = _coerce_severity(data.get("severity"))

@@ -65,10 +65,17 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.outcome_claim_honesty import (
+    append_honesty_correction,
+)
+from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+    render_schedule_activity_knowledge_line,
+)
 from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
     render_player_persona_note_lines,
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
+    format_hours_days_label,
     render_current_time_fact_lines,
 )
 from kokoro_link.infrastructure.prompt.tool_outcomes_block import (
@@ -251,7 +258,10 @@ def _build_prompt(payload: PendingFollowUpComposeInput) -> str:
     )
     if language_hint:
         body = f"{language_hint}\n\n{body}"
-    return body
+    # HV1: only ever non-empty on a re-compose the honesty gate ordered
+    # (see the scheduled-promise composer for why it is appended in code
+    # rather than added as a template placeholder).
+    return append_honesty_correction(body, payload.honesty_correction)
 
 
 def _tools_block(payload: PendingFollowUpComposeInput) -> str:
@@ -321,12 +331,14 @@ def _schedule_block(payload: PendingFollowUpComposeInput) -> list[str]:
     lines.extend(
         render_current_time_fact_lines(payload.now, payload.local_tz, heading=None),
     )
+    has_activity = False
     if payload.just_finished_activity is not None:
         activity = payload.just_finished_activity
         loc = f"（{activity.location}）" if activity.location else ""
         lines.append(
             f"- 剛結束：{activity.category} — {activity.description}{loc}",
         )
+        has_activity = True
     if payload.current_activity is not None:
         activity = payload.current_activity
         loc = f"（{activity.location}）" if activity.location else ""
@@ -334,8 +346,13 @@ def _schedule_block(payload: PendingFollowUpComposeInput) -> list[str]:
             f"- 現在進行：{activity.category} — {activity.description}{loc}"
             f"（busy_score={activity.busy_score:.2f}）",
         )
-    if len(lines) == 1:
+        has_activity = True
+    if not has_activity:
         lines.append("- 你目前剛好有空，可以好好回覆對方。")
+    else:
+        # KB9: an activity description can name a companion or place from
+        # material the player never read (see player_knowledge_lines).
+        lines.append(render_schedule_activity_knowledge_line())
     return lines
 
 
@@ -388,15 +405,15 @@ def _should_use_safe_summary(
 
 
 def _humanize_minutes(minutes: float) -> str:
+    """Duration reading (no 「前」 suffix), truncated below 1 hour. The
+    >=1-hour tail is identical to every other elapsed-ago formatter, so it
+    delegates to the shared
+    :func:`~kokoro_link.infrastructure.prompt.timing_utils.format_hours_days_label`."""
     if minutes < 1:
         return "不到 1 分鐘"
     if minutes < 60:
         return f"約 {int(minutes)} 分鐘"
-    hours = minutes / 60.0
-    if hours < 24:
-        return f"約 {hours:.1f} 小時"
-    days = hours / 24.0
-    return f"約 {days:.1f} 天"
+    return format_hours_days_label(minutes / 60.0, prefix="約 ")
 
 
 # ----------------------------------------------------------------------

@@ -12,6 +12,7 @@ import {
 import { UiButton } from '@/components/ui'
 import ChatAssistSetting from './ChatAssistSetting.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
+import IdentityCardManagerPanel from './IdentityCardManagerPanel.vue'
 import NsfwModeSetting from './NsfwModeSetting.vue'
 import PlayerPasswordPanel from './PlayerPasswordPanel.vue'
 import PlayerPlaceLocaleSettings from './PlayerPlaceLocaleSettings.vue'
@@ -226,6 +227,17 @@ defineExpose({ flashWebNotification, flashAdminEntry })
     :default-open="false"
   >
     <PlayerPasswordPanel :show-title="false" />
+  </CollapsibleSection>
+
+  <!-- IC3：身分卡是 operator 層級（跨角色）的資料，管理面因此掛在個人設定
+       分頁，不是角色分頁——精靈側的建立與這裡的改名/刪除/預覽共用同一份
+       清單事實來源（`usePlayerIdentityCards`）。 -->
+  <CollapsibleSection
+    :title="t('identityCard.manage.title')"
+    :hint="t('identityCard.manage.hint')"
+    :default-open="false"
+  >
+    <IdentityCardManagerPanel />
   </CollapsibleSection>
 
   <section class="settings-group">

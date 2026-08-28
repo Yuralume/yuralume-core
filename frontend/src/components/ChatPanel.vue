@@ -12,10 +12,14 @@ import {
   ChatRuntimeLimitError,
   ChatStreamProtocolError,
   getLatestConversation,
+  isChatStreamAbortedError,
+  sendChatMessage,
   sendChatMessageStream,
   uploadChatAttachments,
   undoLastTurn,
 } from '@/utils/api/chat'
+import { ChatTurnGuard, type ChatTurnTicket } from '@/utils/chatTurnGuard'
+import { nextActiveTool, toolActivityDisplay } from '@/utils/toolActivity'
 import {
   prependOlderMessages,
   restoredScrollTop,
@@ -24,6 +28,7 @@ import {
 } from '@/utils/chatHistoryScroll'
 import { isInsufficientCreditsError } from '@/utils/api/insufficientCredits'
 import { isPriceChangedError } from '@/utils/api/priceChanged'
+import { isConversationBusyError } from '@/utils/api/conversationBusy'
 import { billingRefusalKind, refreshQuotedPrices } from '@/utils/api/billingRefusal'
 import { creditAmountText } from '@/utils/creditsFormat'
 import { composerHeightFor } from '@/utils/composerAutoResize'
@@ -38,6 +43,7 @@ import SceneFrame from '@/components/SceneFrame.vue'
 import StorySceneChips from '@/components/StorySceneChips.vue'
 import StorySceneControl from '@/components/StorySceneControl.vue'
 import StageNudgeControl from '@/components/StageNudgeControl.vue'
+import StageNudgeTipHint from '@/components/StageNudgeTipHint.vue'
 import ActionPriceHint from '@/components/ActionPriceHint.vue'
 import PlayerGuideEntry from '@/components/playerGuide/PlayerGuideEntry.vue'
 import PlayerPersonaNoteChip from '@/components/PlayerPersonaNoteChip.vue'
@@ -83,6 +89,11 @@ import {
   rememberPlayerPersonaNoteDismissed,
   shouldPromptPlayerPersonaNote,
 } from '@/utils/playerPersonaNote'
+import {
+  isStageNudgeTipDismissed,
+  rememberStageNudgeTipDismissed,
+  shouldShowStageNudgeTip,
+} from '@/utils/stageNudgeTip'
 
 const { t, locale } = useI18n()
 const { timeZone } = useTimezone()
@@ -177,6 +188,16 @@ const emit = defineEmits<{
   // duplicating the user's bubble when the watcher fires back into
   // localMessages mid-send.
   conversationIdLearned: [convId: string]
+  /**
+   * "I can no longer compute the thread; please reload it from the server."
+   *
+   * Raised by the undo path when the parent reseeded `messages` while the
+   * undo was in flight: the local trim is an index arithmetic on the array
+   * the undo was decided against, and against a reseeded array it would
+   * delete live messages instead. There is no correct local answer at that
+   * point — only the server has one.
+   */
+  conversationReloadRequested: []
   toggleStageLayout: []
 }>()
 
@@ -196,6 +217,15 @@ const olderHasMore = ref(false)
 const olderCursor = ref<number | null>(null)
 const loadingOlder = ref(false)
 const streamingText = ref('')
+/** Which tool the character is running right now (SSE tool_activity
+ * frames), or null. Drives the typing indicator's icon + diegetic
+ * line; transitions live in utils/toolActivity (pure, unit-tested). */
+const activeToolName = ref<string | null>(null)
+const activeToolDisplay = computed(() =>
+  activeToolName.value === null
+    ? null
+    : toolActivityDisplay(activeToolName.value),
+)
 const ttsAvailable = ref(false)
 /**
  * Whether a bubble may offer to be read aloud.
@@ -245,6 +275,18 @@ const playerPersonaNoteDismissed = ref(false)
 const playerPersonaNoteFilled = computed(
   () => playerPersonaNoteText.value.trim().length > 0,
 )
+
+// --- 首輪示意 tip（TR4）------------------------------------------------
+// 指向輸入列「讓角色先開口」圖示按鈕（StageNudgeControl）的一次性提示。
+// 顯示條件全在 `shouldShowStageNudgeTip`（純函式，單獨掛測試）；這裡只持
+// 有「這台裝置上，玩家對這個角色關掉過沒」。
+/** 這台裝置上，玩家對這個角色已經看過並關掉過這顆 tip。 */
+const stageNudgeTipDismissed = ref(false)
+
+function dismissStageNudgeTip() {
+  rememberStageNudgeTipDismissed(getSafeLocalStorage(), props.character?.id ?? null)
+  stageNudgeTipDismissed.value = true
+}
 
 // --- Story scene ("Start a Scene") -----------------------------------
 // Declared here, above the character watcher, because that watcher runs
@@ -299,6 +341,97 @@ function releaseSendingLock(lockId: number) {
   sending.value = false
 }
 
+/**
+ * Drop the lock whoever holds it — the abandoning paths only.
+ *
+ * `releaseSendingLock` is deliberately id-checked so a late turn cannot
+ * unlock a newer one; that same check would leave the composer disabled for
+ * ever when the turn holding the lock is disowned rather than finished.
+ */
+function abandonSendingLock() {
+  activeSendingLockId = null
+  sending.value = false
+}
+
+/**
+ * Which character the turn in flight belongs to, and the handle that cancels
+ * it. See `utils/chatTurnGuard` — the panel outlives any one character, so a
+ * turn has to be able to prove it still belongs to what is on screen.
+ */
+const turnGuard = new ChatTurnGuard()
+
+/** Everything one send has to carry through its awaits. */
+interface ChatTurnHandle {
+  /** Keeps the composer disabled for exactly this turn. */
+  lockId: number
+  /**
+   * Proves the turn still belongs to the character on screen. Also the
+   * snapshot of *which* character composed it (`ticket.characterId`).
+   */
+  ticket: ChatTurnTicket
+  /**
+   * The thread this turn was composed against, snapshotted at the press.
+   *
+   * Only read when the turn is sent after the reader has already walked away
+   * — `props.conversationId` is then somebody else's thread, and the send
+   * has to name the one the player was actually typing into.
+   */
+  conversationId: string | null
+}
+
+/**
+ * Claim the composer and stamp the turn, in that order and in one place.
+ *
+ * Taken at the top of a send — before the attachment upload, not after —
+ * so the whole send path, awaits included, is covered by the same stamp,
+ * and so a turn that outlives the screen still knows where it belongs.
+ */
+function beginChatTurn(characterId: string): ChatTurnHandle {
+  return {
+    lockId: beginSendingLock(),
+    ticket: turnGuard.begin(characterId),
+    conversationId: props.conversationId,
+  }
+}
+
+/**
+ * Walk away from the turn in flight and reset everything it owns on screen.
+ *
+ * Called when the character changes and when the panel unmounts. Abandoning
+ * loses nothing: the server finishes the turn and stores it as an ordinary
+ * message, so reopening that character reads the reply back from the
+ * database. What it does prevent is the previous character's stream
+ * animating into the new one's thread, its reply and state being grafted on
+ * top, and its failures being reported as the new character's.
+ */
+function abandonInFlightTurn(nextCharacterId: string | null) {
+  turnGuard.interrupt(nextCharacterId)
+  streamingText.value = ''
+  activeToolName.value = null
+  abandonSendingLock()
+  // The undo is a second in-flight request with its own lock, and it holds
+  // three buttons hostage (undo, open-a-scene, load-older). Disowning it the
+  // same way keeps the new character's controls usable — its own late reply
+  // is refused by the snapshot check in `handleUndoLastTurn`.
+  abandonUndoRequest()
+  // The typewriter reveal is pinned to an index in a thread that is no
+  // longer on screen; releasing it also unblocks `historyReflowBlocked`.
+  revealingMessageIndex.value = null
+  if (pendingRevealResolve) {
+    pendingRevealResolve()
+    pendingRevealResolve = null
+  }
+  pendingFirstRevealRelease = null
+  // The refusal cards are answers about *this* conversation — "this thread
+  // hit its message cap", "that upload failed", "the turn you just tried
+  // costs more than you hold". Carried over they become a false accusation
+  // pinned above a thread that was never refused anything.
+  sessionMessageCapReached.value = false
+  creditsExhausted.value = false
+  creditsRequiredCr.value = null
+  uploadError.value = null
+}
+
 type ChatInteractionMode = 'stage' | 'dm'
 // Both surfaces are the player's to pick, with no gate in between (plan
 // SA, D1): switching is local state only — no request, no wait, no charge.
@@ -326,6 +459,16 @@ const chatAssistHintVisible = computed(() => shouldShowChatAssistHint({
   inputEmpty: inputText.value.trim() === '',
   discovered: chatAssistDiscovered.value,
   dismissed: chatAssistHintDismissed.value,
+}))
+
+const stageNudgeTipVisible = computed(() => shouldShowStageNudgeTip({
+  mode: interactionMode.value,
+  loadingHistory: props.loadingHistory ?? false,
+  historyFailed: props.historyFailed ?? false,
+  messageCount: localMessages.value.length,
+  noteLoaded: playerPersonaNoteLoaded.value,
+  personaNoteModalOpen: playerPersonaNoteOpen.value,
+  dismissed: stageNudgeTipDismissed.value,
 }))
 
 const modeStatusLabel = computed(() => (
@@ -478,6 +621,10 @@ async function handleStorySceneOpen() {
     }
     return
   }
+  // Same rule as a chat turn (see `runChatTurn`): the opening belongs to the
+  // character it was pressed for, and the reader may have moved on while it
+  // was being written. The scene is on the server either way.
+  if (props.character?.id !== character.id) return
   if (!response) {
     // "You are out for today" makes the count beside the button stale by
     // definition — the server counted more openings than this tab knew
@@ -521,6 +668,9 @@ async function handleStorySceneEnd() {
     okText: t('chat.storyScene.endConfirmAction'),
   })) return
   const response = await endStoryScene(character.id)
+  // Same rule as the opening above: the send-off belongs to the thread it
+  // was asked for, not to whichever one is on screen when it comes back.
+  if (props.character?.id !== character.id) return
   if (!response) return
   if (response.closing_narration) {
     closingNarrationIndex.value = localMessages.value.length
@@ -780,8 +930,43 @@ function onPaste(event: ClipboardEvent) {
 // TurnJournal snapshot on the server, then asks the parent to
 // refetch so the visual state matches.
 const undoing = ref(false)
+/**
+ * Which undo request owns `undoing`, so a disowned one cannot unlock (or
+ * re-lock) the screen it no longer belongs to. Same shape as the sending
+ * lock and `chatAssistRequestSeq`, and for the same reason: this request
+ * outlives the character it was started for.
+ */
+let undoRequestSeq = 0
+
+/** Stop waiting on the undo in flight — the abandoning paths only. */
+function abandonUndoRequest() {
+  undoRequestSeq += 1
+  undoing.value = false
+}
+
+/**
+ * Is the undo begun against `character` / `conversationId` still an undo of
+ * what the reader is looking at?
+ *
+ * Three awaits sit between the press and the last write (the confirm dialog,
+ * the undo call, the character refetch), and every write below is expressed
+ * relative to "the thread on screen" — a trim counted back from its end, a
+ * character pushed into the parent. Aimed at the wrong thread they delete
+ * and overwrite live data, which is the one failure an undo must not have.
+ */
+function undoTargetOnScreen(character: Character, conversationId: string): boolean {
+  return (
+    props.character?.id === character.id
+    && props.conversationId === conversationId
+  )
+}
+
 async function handleUndoLastTurn() {
-  if (!props.character || !props.conversationId || undoing.value || sending.value) return
+  // Snapshotted before the first await: every check and every write below is
+  // against *this* thread, never against whatever is on screen by then.
+  const character = props.character
+  const conversationId = props.conversationId
+  if (!character || !conversationId || undoing.value || sending.value) return
   if (localMessages.value.length < 2) {
     notification.info({
       message: t('chat.actions.undoNoneTitle'),
@@ -795,29 +980,57 @@ async function handleUndoLastTurn() {
     content: t('chat.actions.undoConfirm', { name: characterDisplayName.value }),
     okText: t('chat.actions.undoConfirmAction'),
   })) return
+  // The dialog is an await like any other — it can be sitting open while the
+  // reader taps the next character in the sidebar and only then confirms.
+  if (!undoTargetOnScreen(character, conversationId)) return
+  const seq = ++undoRequestSeq
   undoing.value = true
   try {
-    const summary = await undoLastTurn(props.conversationId)
+    // The array this trim will be counted against. `slice(0, -n)` is index
+    // arithmetic on *this* array; if the parent reseeds `messages` while the
+    // request is in flight (a proactive push arriving is the ordinary way),
+    // the last n entries are no longer the n this undo reversed and cutting
+    // them would delete live messages. Identity, not length: a reseed can
+    // land on the same count.
+    const threadBefore = props.messages
+    const summary = await undoLastTurn(conversationId)
+    if (!undoTargetOnScreen(character, conversationId)) return
+    const reseeded = props.messages !== threadBefore
     // Strip the last two bubbles locally so the UI reacts instantly;
-    // parent will re-sync from the server right after.
-    const trimmed = localMessages.value.slice(0, -summary.reverted_messages)
-    localMessages.value = trimmed
+    // parent will re-sync from the server right after. The count guard is
+    // not defensive noise: `slice(0, -0)` is `slice(0, 0)`, so a server that
+    // reports nothing reverted would silently empty the whole thread.
+    const trimmed = reseeded || summary.reverted_messages <= 0
+      ? null
+      : localMessages.value.slice(0, -summary.reverted_messages)
+    if (trimmed) localMessages.value = trimmed
     notification.success({
       message: t('chat.actions.undoSuccessTitle'),
       duration: 2.5,
     })
     // Fetch the rolled-back character from the server so emotion /
     // affection badges reflect the restore, then push everything
-    // upstream as one update. Falling back to the stale props
+    // upstream as one update. Falling back to the stale snapshot
     // character keeps the UX usable if the character refetch fails.
     let freshChar: Character
     try {
-      freshChar = await getCharacter(props.character.id)
+      freshChar = await getCharacter(character.id)
     } catch {
-      freshChar = props.character
+      freshChar = character
     }
-    emit('conversationUpdate', props.conversationId, trimmed, freshChar)
+    if (!undoTargetOnScreen(character, conversationId)) return
+    emit(
+      'conversationUpdate',
+      conversationId,
+      trimmed ?? [...localMessages.value],
+      freshChar,
+    )
+    // Nothing local can reconstruct the post-undo thread from a reseeded
+    // one — the reload the parent just did may even predate the deletion
+    // committing. Ask for the server's copy instead of guessing.
+    if (reseeded) emit('conversationReloadRequested')
   } catch (error) {
+    if (!undoTargetOnScreen(character, conversationId)) return
     const msg = error instanceof Error ? error.message : String(error)
     notification.error({
       message: t('chat.actions.undoFailedTitle'),
@@ -825,27 +1038,46 @@ async function handleUndoLastTurn() {
       duration: 4,
     })
   } finally {
-    undoing.value = false
+    // Id-checked for the same reason the sending lock is: this request may
+    // have been disowned by a character switch, and a newer undo — or the
+    // new character's idle state — is not ours to unlock.
+    if (seq === undoRequestSeq) undoing.value = false
   }
 }
 
 // Refresh the current-activity badge every 60s so it stays in sync as
 // the character moves between scheduled blocks.
 let activityTimer: ReturnType<typeof setInterval> | null = null
+/**
+ * Which activity request the badge belongs to.
+ *
+ * The schedule planner has a fast path (milliseconds) and a slow one
+ * (seconds, when it has to re-plan), so "the previous character's snapshot
+ * arrives after the new character's" is an ordinary second-long window, not
+ * a freak race — and the badge it lands in is the header of whoever is on
+ * screen. Same seq + id pair as `loadChatAssistSuggestions`.
+ */
+let currentActivityRequestSeq = 0
 
 async function refreshCurrentActivity() {
-  if (!props.character) {
+  const characterId = props.character?.id
+  if (!characterId) {
     currentActivity.value = null
     return
   }
+  const seq = ++currentActivityRequestSeq
   currentActivityLoading.value = true
   try {
-    const snapshot = await getCurrentActivity(props.character.id)
+    const snapshot = await getCurrentActivity(characterId)
+    if (seq !== currentActivityRequestSeq || props.character?.id !== characterId) return
     currentActivity.value = snapshot.current
   } catch {
+    if (seq !== currentActivityRequestSeq || props.character?.id !== characterId) return
     currentActivity.value = null
   } finally {
-    currentActivityLoading.value = false
+    if (seq === currentActivityRequestSeq) {
+      currentActivityLoading.value = false
+    }
   }
 }
 
@@ -877,6 +1109,10 @@ watch(() => props.historyPage, (page) => {
 }, { immediate: true })
 
 watch(() => props.character?.id ?? null, (characterId) => {
+  // First, before anything else in here: the previous character's turn may
+  // still be streaming, and every line below assumes the panel now belongs
+  // to `characterId`.
+  abandonInFlightTurn(characterId)
   focusInput()
   chatAssistRequestSeq += 1
   chatAssistOpen.value = false
@@ -894,6 +1130,10 @@ watch(() => props.character?.id ?? null, (characterId) => {
     characterId,
   )
   void loadPlayerPersonaNote(characterId)
+  stageNudgeTipDismissed.value = isStageNudgeTipDismissed(
+    getSafeLocalStorage(),
+    characterId,
+  )
   if (activityTimer) {
     clearInterval(activityTimer)
     activityTimer = null
@@ -942,14 +1182,23 @@ watch(
 
 onUnmounted(() => {
   if (activityTimer) clearInterval(activityTimer)
+  // Leaving the page cancels the stream too. Without this the fetch closure
+  // keeps reading — and writing into refs of a component nobody can see —
+  // for as long as the reply takes.
+  abandonInFlightTurn(null)
+})
+
+function waitForMessageReveal(index: number, onFirstReveal: () => void): Promise<void> {
+  // There is one reveal slot and a second turn may legitimately claim it
+  // while the first is still parked on it (the composer unlocks on the
+  // first bubble, so the reader can send again mid-reveal). Overwriting the
+  // resolver without settling it would strand the previous turn's `await`
+  // for the life of the panel — with its `finally` never running, so its
+  // ticket never settles and its lock is never accounted for.
   if (pendingRevealResolve) {
     pendingRevealResolve()
     pendingRevealResolve = null
   }
-  pendingFirstRevealRelease = null
-})
-
-function waitForMessageReveal(index: number, onFirstReveal: () => void): Promise<void> {
   revealingMessageIndex.value = index
   pendingFirstRevealRelease = onFirstReveal
   return new Promise(resolve => {
@@ -1017,20 +1266,25 @@ function refuseIfInsufficientCredits(): boolean {
  * carries `stage_nudge`, what — if anything — renders optimistically), which
  * the caller decides before handing off here.
  *
- * `sendingLockId` is already-acquired by the caller (not begun in here):
+ * `turn.lockId` is already-acquired by the caller (not begun in here):
  * `handleSend`'s lock has to span its upload phase too, which happens
- * before this function is ever called.
+ * before this function is ever called. `turn.ticket` is stamped just as
+ * early, and every await below re-checks it: a turn that outlives the
+ * character it was composed for is dropped on the floor rather than written
+ * into whoever is on screen now (see `utils/chatTurnGuard`).
  */
 async function runChatTurn(
   request: SendChatMessageRequest,
   optimisticMessage: ChatMessage | null,
-  sendingLockId: number,
+  turn: ChatTurnHandle,
 ): Promise<void> {
+  const { lockId: sendingLockId, ticket } = turn
   if (optimisticMessage) {
     // Immediate optimistic bubble so the user sees their turn land.
     localMessages.value.push(optimisticMessage)
   }
   streamingText.value = ''
+  activeToolName.value = null
   await scrollToBottom()
 
   // Captured from the stream's first SSE event. If the request later
@@ -1042,12 +1296,15 @@ async function runChatTurn(
     const reply = await sendChatMessageStream(
       request,
       (token: string) => {
+        // The abort normally gets here first; this is the tick it loses.
+        if (!turnGuard.isCurrent(ticket)) return
         if (!isDmSend) {
           streamingText.value += token
         }
         scrollToBottom()
       },
       (convId: string) => {
+        if (!turnGuard.isCurrent(ticket)) return
         liveConversationId = convId
         // Stash the id in the parent WITHOUT touching ``messages``.
         // A full conversationUpdate here would reassign props.messages,
@@ -1056,7 +1313,18 @@ async function runChatTurn(
         // visible duplicate once we append the assistant reply.
         emit('conversationIdLearned', convId)
       },
+      (activity) => {
+        if (!turnGuard.isCurrent(ticket)) return
+        activeToolName.value = nextActiveTool(activeToolName.value, activity)
+      },
+      { signal: ticket.signal },
     )
+
+    // The reply resolved after the reader moved on (the race the abort did
+    // not win). Nothing is lost: the turn landed server-side and reopening
+    // that character reads it back — whereas writing it here would graft the
+    // previous character's reply and state onto the current one.
+    if (!turnGuard.isCurrent(ticket)) return
 
     // 串流結束後把 streaming bubble 換成正式訊息；忙碌延遲的追加訊息
     // 可能只有 user message，沒有 immediate assistant reply。
@@ -1076,6 +1344,10 @@ async function runChatTurn(
         await revealPromise
       }
     }
+
+    // The reveal above can take seconds, which is plenty of time to switch
+    // away — and everything below writes into the thread and the character.
+    if (!turnGuard.isCurrent(ticket)) return
 
     // SC1-D: the turn that answers the scene's dramatic question says so on
     // its own reply, so the closed session and its send-off arrive with the
@@ -1097,8 +1369,13 @@ async function runChatTurn(
     }
     emit('conversationUpdate', reply.conversation_id, [...localMessages.value], updatedChar)
     // Suggested actions ride the ordinary reply and only mean anything inside
-    // a scene, which is exactly what the setter enforces.
-    setStorySceneChips(reply.suggested_actions ?? [])
+    // a scene, which is exactly what the setter enforces. Skipped once a
+    // newer turn has begun — the chips are a single slot showing "what you
+    // may do next", and this turn's answer to that is already stale (see
+    // `ownsScreen`; the thread writes above deliberately stay on `isCurrent`).
+    if (turnGuard.ownsScreen(ticket)) {
+      setStorySceneChips(reply.suggested_actions ?? [])
+    }
     // The fallback for a backend that predates those fields: the scene may
     // still have closed server-side with nothing on the reply to say so.
     if (!sceneClosed && storySceneActive.value && props.character) {
@@ -1114,6 +1391,12 @@ async function runChatTurn(
       loadNsfwMode()
     }
   } catch (err) {
+    // Two ways to arrive here without anything having gone wrong: the reader
+    // walked away (abort — expected, and `abandonInFlightTurn` already reset
+    // everything this turn owned), or the failure belongs to a character
+    // nobody is looking at. Either way this turn has no screen to report to,
+    // and an error bubble would be posted into somebody else's thread.
+    if (isChatStreamAbortedError(err) || !turnGuard.isCurrent(ticket)) return
     streamingText.value = ''
     revealingMessageIndex.value = null
     if (pendingRevealResolve) {
@@ -1135,6 +1418,16 @@ async function runChatTurn(
         role: 'assistant',
         content: t('chat.priceChanged'),
       })
+    } else if (isConversationBusyError(err)) {
+      // The character is still answering the previous message — a 409, and
+      // an ordinary one now that walking away leaves the server finishing
+      // that turn on its own. Same treatment as a moved price: a plain line
+      // saying what to do (wait, then send again), never a stack of
+      // "Chat request failed: 409".
+      localMessages.value.push({
+        role: 'assistant',
+        content: t('chat.conversationBusy'),
+      })
     } else if (cloudMode.value && isSessionMessageCapError(err)) {
       sessionMessageCapReached.value = true
     } else {
@@ -1150,9 +1443,24 @@ async function runChatTurn(
       emit('conversationUpdate', liveConversationId, [...localMessages.value], props.character)
     }
   } finally {
-    releaseSendingLock(sendingLockId)
-    await scrollToBottom()
-    focusInput()
+    turnGuard.settle(ticket)
+    // An abandoned turn must not settle the composer either: the lock, the
+    // indicator and the scroll position now belong to the character on
+    // screen, and `abandonInFlightTurn` already put them where they should
+    // be. Scrolling a thread the reader is calmly reading back to the
+    // bottom is the visible half of that.
+    //
+    // `ownsScreen`, not `isCurrent`: the multi-bubble reveal hands the
+    // composer back before this turn is finished, so the reader can start a
+    // *newer* turn on the same character — and everything in here is
+    // single-slot screen state that newer turn now owns. Clearing its tool
+    // indicator from the previous turn's `finally` is the reported symptom.
+    if (turnGuard.ownsScreen(ticket)) {
+      activeToolName.value = null
+      releaseSendingLock(sendingLockId)
+      await scrollToBottom()
+      focusInput()
+    }
   }
 }
 
@@ -1179,7 +1487,7 @@ async function handleSend() {
   // The chips belonged to the previous turn; leaving them up through the send
   // would invite a second press on an action the scene has already moved past.
   setStorySceneChips([])
-  const sendingLockId = beginSendingLock()
+  const turn = beginChatTurn(props.character.id)
 
   // Upload first so the assistant turn has real URLs to reference.
   let uploadedUrls: string[] = []
@@ -1187,25 +1495,48 @@ async function handleSend() {
     try {
       uploadedUrls = await uploadChatAttachments(toUpload.map(s => s.file))
     } catch (err) {
-      uploadError.value = err instanceof Error ? err.message : t('chat.errors.uploadFailed')
-      releaseSendingLock(sendingLockId)
+      // A failure that belongs to a character the reader has left is not
+      // theirs to see — and the lock they are holding is not ours to drop.
+      if (turnGuard.isCurrent(turn.ticket)) {
+        uploadError.value = err instanceof Error ? err.message : t('chat.errors.uploadFailed')
+        releaseSendingLock(turn.lockId)
+      }
+      turnGuard.settle(turn.ticket)
       return
     }
   }
 
-  // Clear the staged preview once the bytes are on the server; the
-  // chat bubble below uses the persisted URL from this point on.
+  // Clear the staged preview once the bytes are on the server; the chat
+  // bubble below uses the persisted URL from this point on. Only the items
+  // this turn actually uploaded: whatever was staged while the bytes were
+  // going up is still the composer's, and after a character switch it is
+  // not even the same character's.
   for (const item of toUpload) URL.revokeObjectURL(item.preview)
-  stagedAttachments.value = []
+  stagedAttachments.value = stagedAttachments.value.filter(
+    item => !toUpload.includes(item),
+  )
+
+  const request: SendChatMessageRequest = {
+    character_id: turn.ticket.characterId,
+    conversation_id: turn.conversationId,
+    message: userText,
+    attachment_urls: uploadedUrls,
+    presence_frame: currentPresenceFrame(uploadedUrls.length > 0),
+  }
+
+  // Switched characters while the bytes were going up: this turn is for a
+  // thread nobody is looking at. Send it anyway.
+  if (!turnGuard.isCurrent(turn.ticket)) {
+    turnGuard.settle(turn.ticket)
+    dispatchAbandonedTurn(request)
+    return
+  }
 
   await runChatTurn(
-    {
-      character_id: props.character.id,
-      conversation_id: props.conversationId,
-      message: userText,
-      attachment_urls: uploadedUrls,
-      presence_frame: currentPresenceFrame(uploadedUrls.length > 0),
-    },
+    // Still on screen, so the live thread id wins over the snapshot: the
+    // parent can have learned or reseeded the conversation while the bytes
+    // were going up. The snapshot exists for the send that lost its screen.
+    { ...request, conversation_id: props.conversationId },
     {
       role: 'user',
       content: userText,
@@ -1216,8 +1547,33 @@ async function handleSend() {
         caption: null,
       })),
     },
-    sendingLockId,
+    turn,
   )
+}
+
+/**
+ * Send a turn whose composer is already gone, and render none of it.
+ *
+ * The upload is the one await in the send path that happens *before* the
+ * request exists, so it is the one place where walking away could throw the
+ * message itself away — the text was cleared from the box the moment send was
+ * pressed, the previews were revoked, and the server never heard about any of
+ * it. That is not what abandoning means anywhere else here: every other
+ * abandoned turn is already on the wire, the server finishes it, and the
+ * player finds the reply waiting when they come back.
+ *
+ * So the send goes out against the snapshot the press was composed with, and
+ * nothing else does. Deliberately not `runChatTurn`: there is no optimistic
+ * bubble to place, no stream worth reading, no state to settle and no screen
+ * to report to — the reply lands in the database and the thread reads it back
+ * on reopen, exactly like every other abandoned turn. A failure is the same
+ * kind of silent as a stream that broke after the reader left: the console
+ * keeps it for diagnosis, the player is not told about a thread they closed.
+ */
+function dispatchAbandonedTurn(request: SendChatMessageRequest): void {
+  void sendChatMessage(request).catch((error: unknown) => {
+    console.warn('[chat] abandoned turn failed to send', error)
+  })
 }
 
 /**
@@ -1242,7 +1598,7 @@ async function handleStageNudgeSubmit(rawText: string) {
   creditsRequiredCr.value = null
   sessionMessageCapReached.value = false
   setStorySceneChips([])
-  const sendingLockId = beginSendingLock()
+  const turn = beginChatTurn(props.character.id)
 
   await runChatTurn(
     {
@@ -1256,7 +1612,7 @@ async function handleStageNudgeSubmit(rawText: string) {
       stage_nudge: true,
     },
     optimisticMessage,
-    sendingLockId,
+    turn,
   )
 }
 
@@ -1655,6 +2011,7 @@ onUnmounted(() => {
           :mode="interactionMode"
           :context="emptyMessage"
           @select-starter="useStarterMessage"
+          @request-nudge="handleStageNudgeSubmit('')"
         />
 
         <template v-for="(msg, i) in localMessages" :key="i">
@@ -1687,13 +2044,16 @@ onUnmounted(() => {
           :tts-available="ttsUsable"
           @insufficient-credits="creditsExhausted = true"
         />
-        <!-- 首 token 到達前的 typing indicator -->
+        <!-- 首 token 到達前的 typing indicator。工具真的在跑時（SSE
+             tool_activity frame）升級成圖示＋演出式文案；沒有工具的輪
+             次就只有點點——不再對每個開了工具的角色恆掛「可能要等
+             30–60 秒」的猜測。 -->
         <div v-else-if="sending && !revealInProgress" class="typing-indicator">
           <span class="dot" /><span class="dot" /><span class="dot" />
-          <span
-            v-if="character && character.allowed_tools && character.allowed_tools.length > 0"
-            class="tool-wait-hint"
-          >{{ t('chat.history.streamingHint') }}</span>
+          <span v-if="activeToolDisplay" class="tool-activity" role="status">
+            <span class="tool-activity__icon" aria-hidden="true">{{ activeToolDisplay.icon }}</span>
+            {{ t(activeToolDisplay.labelKey) }}
+          </span>
         </div>
 
         <!-- 螢火不足：取代泛用錯誤氣泡，直接給承諾文案與加值入口。
@@ -1845,6 +2205,13 @@ onUnmounted(() => {
           </div>
           <span v-if="uploadError" class="upload-error">{{ uploadError }}</span>
         </div>
+        <!-- 首輪一次性提示：指向下面輸入列上的示意圖示按鈕（plan TR4，
+             D-TR4-2：PP 首開彈窗先，關掉後才輪到這顆）。 -->
+        <StageNudgeTipHint
+          :visible="stageNudgeTipVisible"
+          :character-name="characterDisplayName"
+          @dismiss="dismissStageNudgeTip"
+        />
         <div class="input-row">
           <div class="input-actions" v-click-outside="closeActionMenu">
             <button
@@ -2399,10 +2766,30 @@ onUnmounted(() => {
   max-width: 90%;
 }
 
-.tool-wait-hint {
+.tool-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   color: var(--color-text-secondary);
   margin-left: 4px;
+}
+
+.tool-activity__icon {
+  font-size: 13px;
+  line-height: 1;
+  animation: tool-activity-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes tool-activity-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.95); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-activity__icon {
+    animation: none;
+  }
 }
 
 .dot {

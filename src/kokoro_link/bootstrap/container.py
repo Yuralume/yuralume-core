@@ -34,6 +34,13 @@ if TYPE_CHECKING:
     from kokoro_link.application.services.external_chat_turn_service import (
         ExternalChatTurnService,
     )
+    from kokoro_link.application.services.line_reactivation import (
+        LineReactivationCampaignService,
+        LineReactivationCandidateService,
+    )
+    from kokoro_link.contracts.line_reactivation import (
+        LineReactivationCampaignRepositoryPort,
+    )
 
 _LOGGER = logging.getLogger(__name__)
 from kokoro_link.contracts.due_jobs import DEFAULT_CAPABILITY_CAPS
@@ -132,6 +139,8 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_GOAL_REVIEW,
     FEATURE_MEMORY_CONSOLIDATE,
     FEATURE_NOVELTY_GATE,
+    FEATURE_OUTCOME_CLAIM_JUDGE,
+    FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE,
     FEATURE_PERSONA_CURIOSITY,
     FEATURE_POST_TURN,
     FEATURE_PROACTIVE_INTENTION,
@@ -206,6 +215,7 @@ from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.application.services.chat_turn_lease import ChatTurnLease
 from kokoro_link.application.services.drain_state import DrainState
 from kokoro_link.application.services.turn_undo_service import TurnUndoService
+from kokoro_link.application.services.undone_turn_gate import UndoneTurnGate
 from kokoro_link.infrastructure.prompt.llm_material_digester import (
     LLMPromptMaterialDigester,
 )
@@ -522,10 +532,24 @@ from kokoro_link.application.services.schedule_weather_drift_service import (
 )
 from kokoro_link.application.services.state_tracker import StateChangeTracker
 from kokoro_link.application.services.composer_tool_loop import ComposerToolLoop
+from kokoro_link.application.services.chat_outcome_claim_auditor import (
+    ChatOutcomeClaimAuditor,
+)
+from kokoro_link.application.services.outcome_claim_guard import (
+    OutcomeClaimGuard,
+)
+from kokoro_link.application.services.output_quality import (
+    OutputQualityCounters,
+    OutputQualityOrchestrator,
+)
+from kokoro_link.application.services.memory_disclosure_service import (
+    MemoryDisclosureService,
+)
 from kokoro_link.application.services.tool_orchestrator import ToolOrchestrator
 from kokoro_link.application.services.notification_service import NotificationService
 from kokoro_link.bootstrap.settings import (
     AppSettings,
+    DialogueCheckpointSettings,
     TTSSettings,
     UserTimezoneSettings,
 )
@@ -554,6 +578,9 @@ from kokoro_link.contracts.character_draft import (
     CompanionDraftGeneratorPort,
 )
 from kokoro_link.contracts.clock import ClockPort
+from kokoro_link.contracts.dialogue_checkpoint import (
+    DialogueCheckpointRepositoryPort,
+)
 from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
 from kokoro_link.contracts.embedder import EmbedderPort
 from kokoro_link.contracts.goal_repository import GoalRepositoryPort
@@ -661,6 +688,7 @@ from kokoro_link.contracts.schedule_planner import SchedulePlannerPort
 from kokoro_link.contracts.schedule_repository import ScheduleRepositoryPort
 from kokoro_link.contracts.state_history import StateHistoryRepositoryPort
 from kokoro_link.contracts.turn_journal import TurnJournalRepositoryPort
+from kokoro_link.contracts.undone_turn import UndoneTurnRepositoryPort
 from kokoro_link.contracts.behavioral_pattern import (
     BehavioralPatternRepositoryPort,
 )
@@ -699,6 +727,12 @@ from kokoro_link.contracts.player_persona_note import (
 )
 from kokoro_link.application.services.player_persona_note_service import (
     PlayerPersonaNoteService,
+)
+from kokoro_link.contracts.player_identity_card import (
+    PlayerIdentityCardRepositoryPort,
+)
+from kokoro_link.application.services.player_identity_card_service import (
+    PlayerIdentityCardService,
 )
 from kokoro_link.contracts.address_change_log import (
     AddressChangeLogRepositoryPort,
@@ -834,6 +868,12 @@ from kokoro_link.infrastructure.repositories.in_memory_character_encounters impo
 from kokoro_link.infrastructure.repositories.in_memory_character_encounter_intents import (
     InMemoryCharacterEncounterIntentRepository,
 )
+from kokoro_link.infrastructure.repositories.in_memory_prompt_material_digests import (
+    InMemoryPromptMaterialDigestRepository,
+)
+from kokoro_link.infrastructure.repositories.in_memory_dialogue_checkpoints import (
+    InMemoryDialogueCheckpointRepository,
+)
 from kokoro_link.infrastructure.repositories.in_memory_arc_templates import (
     InMemoryArcTemplateRepository,
 )
@@ -852,6 +892,9 @@ from kokoro_link.infrastructure.repositories.in_memory_schedules import InMemory
 from kokoro_link.infrastructure.repositories.in_memory_state_history import InMemoryStateHistoryRepository
 from kokoro_link.infrastructure.repositories.in_memory_turn_journals import (
     InMemoryTurnJournalRepository,
+)
+from kokoro_link.infrastructure.repositories.in_memory_undone_turns import (
+    InMemoryUndoneTurnRepository,
 )
 from kokoro_link.infrastructure.repositories.in_memory_preferences import (
     InMemoryPreferencesRepository,
@@ -886,7 +929,12 @@ from kokoro_link.infrastructure.schedule.llm_aftermath import (
 )
 from kokoro_link.infrastructure.schedule.llm_weather_drift import (
     LLMScheduleWeatherDriftJudge,
-    NullScheduleWeatherDriftJudge,
+)
+from kokoro_link.infrastructure.honesty.llm_outcome_claim_judge import (
+    LLMOutcomeClaimJudge,
+)
+from kokoro_link.infrastructure.knowledge.llm_disclosure_judge import (
+    LLMDisclosureJudge,
 )
 from kokoro_link.infrastructure.state.llm_idle_drift import (
     LLMIdleDriftJudge,
@@ -1120,6 +1168,10 @@ class ServiceContainer:
     character_runtime_initializer: "CharacterRuntimeInitializer | None" = None
     chat_assist_service: ChatAssistService | None = None
     turn_journal_repository: TurnJournalRepositoryPort | None = None
+    undone_turn_repository: UndoneTurnRepositoryPort | None = None
+    """TU1 — the undo tombstone store. Exposed on the container because
+    its second consumer is the post-turn gate, which is reached from the
+    background paths rather than from ``TurnUndoService``."""
     turn_undo_service: TurnUndoService | None = None
     messaging_dispatcher: MessagingDispatcher | None = None
     telegram_polling_service: TelegramPollingService | None = None
@@ -1202,6 +1254,22 @@ class ServiceContainer:
     # Player-authorised quota overage (AP4). Always wired; the settings routes
     # that read it still 404 outside cloud mode.
     quota_overage_service: "QuotaOverageService | None" = None
+    # HV1/HV2 outbound honesty gate. Held on the container only so the
+    # internal metrics scrape can read its counters — the gate itself is
+    # reached through the promise tool loop and the proactive dispatcher,
+    # never from a route. One instance for both, so the counters describe
+    # the deployment rather than one seam of it. ``None`` on a deployment
+    # with no LLM provider wired, where nothing composes.
+    outcome_claim_guard: "OutcomeClaimGuard | None" = None
+    # QG0 player-visible output quality gate. Two fields for one seam: the
+    # orchestrator is what the composing services are handed, the counters
+    # are what the internal metrics scrape reads. Held separately because
+    # the route must not have to know how a service is built, and because
+    # the counters are the longer-lived half — one instance per process, so
+    # ``hard_skipped`` stays a number about the deployment rather than
+    # about whichever seam happens to be asking.
+    output_quality_counters: "OutputQualityCounters | None" = None
+    output_quality_orchestrator: "OutputQualityOrchestrator | None" = None
     # Display-only mirror of the runtime ceilings the services already enforce
     # (character slots, daily creates, daily 起幕, session cap, capability
     # flags). Always wired — the profile it reads is permissive in self-host,
@@ -1238,6 +1306,12 @@ class ServiceContainer:
     feed_reaction_service: "FeedReactionService | None" = None
     feed_comment_repository: FeedCommentRepositoryPort | None = None
     feed_comment_service: "FeedCommentService | None" = None
+    #: KB8 disclosure ledger writer. Exposed because the feed's exposure
+    #: endpoint writes ``viewed_at`` through the repository directly and
+    #: then has to translate that read into a disclosure; ``None`` in a
+    #: harness without it simply means the endpoint records the read and
+    #: flips nothing.
+    memory_disclosure_service: "MemoryDisclosureService | None" = None
     feed_composer_service: FeedComposerService | None = None
     #: CV4 deferred video pipeline. Exposed so the CV6 internal trigger (and
     #: any future admin surface) can drive the same object the two carriers do
@@ -1333,6 +1407,10 @@ class ServiceContainer:
     # Player-declared identity / world premise (PP series).
     player_persona_note_repository: "PlayerPersonaNoteRepositoryPort | None" = None
     player_persona_note_service: "PlayerPersonaNoteService | None" = None
+    # 玩家身分卡 — reusable creation templates (IC series). Operator-level:
+    # no character owns one, and none is carried by a character backup.
+    player_identity_card_repository: "PlayerIdentityCardRepositoryPort | None" = None
+    player_identity_card_service: "PlayerIdentityCardService | None" = None
     # Per-pair rename log + names edit.
     address_change_log_repository: "AddressChangeLogRepositoryPort | None" = None
     relationship_names_service: "RelationshipNamesService | None" = None
@@ -1352,6 +1430,22 @@ class ServiceContainer:
     # bare ``ServiceContainer()`` test harnesses. Disposed once in the app
     # lifespan shutdown.
     db_engine: "AsyncEngine | None" = None
+    # LINE 休眠回訪 campaign (LR series). Cloud mode only: the dormancy
+    # window comes from the control plane and the send path is the Hosted
+    # Channel, so a self-host deployment has neither half. ``None`` makes
+    # the internal route answer 503 ``cloud_mode_required``.
+    line_reactivation_candidate_service: (
+        "LineReactivationCandidateService | None"
+    ) = None
+    line_reactivation_campaign_repository: (
+        "LineReactivationCampaignRepositoryPort | None"
+    ) = None
+    # LR T2 — owns the background serial runner, so it is a single
+    # long-lived instance rather than a per-request object: the
+    # in-process "one runner per campaign" guard is state on it.
+    line_reactivation_campaign_service: (
+        "LineReactivationCampaignService | None"
+    ) = None
 
 
 _RepoBundle = tuple[
@@ -1814,6 +1908,94 @@ def _build_dialogue_summarizer(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _DialogueCheckpointWiring:
+    """What DH3 contributes to the container, or four empties.
+
+    Bundled rather than returned as a bare tuple because three of the
+    four go to different consumers (chat prompt, post-turn, turn undo)
+    and a positional tuple would let two of them be swapped silently.
+    """
+
+    repository: "DialogueCheckpointRepositoryPort | None" = None
+    reader: "DialogueCheckpointReader | None" = None
+    updater: "DialogueCheckpointUpdater | None" = None
+    window_limit: int | None = None
+    """``None`` leaves the chat prompt on ``_RECENT_MESSAGE_LIMIT``."""
+
+
+def _build_dialogue_checkpoint(
+    *,
+    settings: DialogueCheckpointSettings,
+    db_session_factory,  # noqa: ANN001 - sessionmaker | None
+    conversation_repository: ConversationRepositoryPort,
+    active_provider: ActiveLLMProviderPort | None,
+) -> _DialogueCheckpointWiring:
+    """Wire the cumulative dialogue checkpoint, or wire nothing (D8).
+
+    Off — the default through the migration period — returns empties, so
+    the chat prompt, the post-turn and the rollback keep their pre-DH3
+    behaviour by having no collaborator to consult rather than by
+    testing a boolean on every turn.
+
+    A ``fake``/unresolvable provider (``active_provider is None``) also
+    returns empties. The merge is the one LLM call whose output is
+    *persisted and compounded*, so a deployment with no real model must
+    not start accumulating a checkpoint it cannot write — an empty
+    summary saved once would then be merged onto forever.
+    """
+    if not settings.enabled or active_provider is None:
+        return _DialogueCheckpointWiring()
+
+    from kokoro_link.application.services.dialogue_checkpoint import (
+        DialogueCheckpointReader,
+        DialogueCheckpointUpdater,
+    )
+    from kokoro_link.application.services.chat_service import (
+        _PROMPT_RAW_RECENT_MESSAGE_LIMIT,
+    )
+    from kokoro_link.infrastructure.dialogue.llm_checkpoint_merger import (
+        LLMDialogueCheckpointMerger,
+    )
+
+    repository: DialogueCheckpointRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_dialogue_checkpoint_repository import (
+            SADialogueCheckpointRepository,
+        )
+        repository = SADialogueCheckpointRepository(db_session_factory)
+    else:
+        repository = InMemoryDialogueCheckpointRepository()
+
+    return _DialogueCheckpointWiring(
+        repository=repository,
+        reader=DialogueCheckpointReader(
+            checkpoints=repository,
+            raw_tail_limit=_PROMPT_RAW_RECENT_MESSAGE_LIMIT,
+            prompt_budget_tokens=settings.prompt_budget_tokens,
+        ),
+        updater=DialogueCheckpointUpdater(
+            checkpoints=repository,
+            merger=LLMDialogueCheckpointMerger(
+                provider=active_provider,
+                # Shares ``dialogue_summary``'s routing rather than
+                # minting a key of its own: a new routable key
+                # regenerates ``contracts/feature-key-manifest.json``
+                # and the Cloud User service's bundled copy, which is a
+                # cross-repo contract change and not DH3's to make.
+                # Splitting the routing is a residual (see the merger's
+                # docstring for why it eventually wants one).
+                feature_key=FEATURE_DIALOGUE_SUMMARY,
+            ),
+            conversations=conversation_repository,
+            window_messages=settings.window_messages,
+            raw_tail_limit=_PROMPT_RAW_RECENT_MESSAGE_LIMIT,
+            backlog_trigger_tokens=settings.backlog_trigger_tokens,
+        ),
+        window_limit=settings.window_messages,
+    )
+
+
 def _build_nsfw_safe_summarizer(
     *,
     active_provider: ActiveLLMProviderPort | None = None,
@@ -2002,6 +2184,8 @@ def _build_character_data_reset(
     conversation_repository: "ConversationRepositoryPort | None",
     state_history_repository: "StateHistoryRepositoryPort | None",
     operator_persona_repository: "OperatorPersonaRepositoryPort | None",
+    dialogue_checkpoint_repository: "DialogueCheckpointRepositoryPort | None"
+    = None,
 ) -> "CharacterResetEraserPort":
     """The one erasure engine behind ``reset_character_data`` (CD3).
 
@@ -2017,6 +2201,16 @@ def _build_character_data_reset(
     deployment does not otherwise use. The repository map is the one
     place that knows which subsystems exist, so it feeds both the
     fallback eraser and the gate.
+
+    ``dialogue_checkpoint_repository`` is passed *beside* the flag map
+    rather than in it: the checkpoint is a second table under the
+    ``CONVERSATIONS`` flag, not the flag's primary table, and it must not
+    become the thing that decides whether that flag is available (a
+    deployment with the checkpoint flag off still clears conversations).
+    Without it the DB-less mode cleared the chat log and left the
+    summary of it behind — the SQL mode has purged both since FX3, and
+    two persistence modes answering "清除對話記錄" differently is the
+    kind of gap only the mode nobody runs in production would show.
     """
     from kokoro_link.application.dto.character_backup.consumer_policies import (
         ResetFlag,
@@ -2040,7 +2234,12 @@ def _build_character_data_reset(
             db_session_factory,
         )
     else:
-        eraser = RepositoryCharacterResetEraser(repositories)
+        eraser = RepositoryCharacterResetEraser(
+            repositories,
+            secondary={
+                ResetFlag.CONVERSATIONS: (dialogue_checkpoint_repository,),
+            },
+        )
     return FlagGatedCharacterResetEraser(
         eraser,
         available_flags=frozenset(
@@ -3190,6 +3389,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     persona_curiosity_service: PersonaCuriosityService | None = None
     persona_curiosity_planner: PersonaCuriosityPlannerPort | None = None
     persona_repository = None  # hoisted so the scheduler can inject it
+    # Hoisted for the same reason: the turn-undo wiring below needs the
+    # repository itself, not the service, and it must read ``None`` on a
+    # deployment where persona is off rather than NameError.
+    persona_curiosity_repository = None
     if app_settings.use_database and app_settings.persona.enabled:
         from kokoro_link.application.services.operator_persona_service import (
             OperatorPersonaService as _OperatorPersonaService,
@@ -3313,6 +3516,17 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         active_provider=active_llm_provider,
     )
     nsfw_safe_summarizer = _build_nsfw_safe_summarizer(
+        active_provider=active_llm_provider,
+    )
+    # DH3 — the cumulative dialogue checkpoint. Everything below is
+    # ``None`` while the flag is off, and that *is* the flag: with no
+    # reader, no updater and no repository in the undo bundle, the chat
+    # service, the post-turn and the rollback all run their pre-DH3 code
+    # with nothing to branch on.
+    dialogue_checkpoint = _build_dialogue_checkpoint(
+        settings=app_settings.dialogue_checkpoint,
+        db_session_factory=db_session_factory,
+        conversation_repository=conversation_repository,
         active_provider=active_llm_provider,
     )
 
@@ -3524,21 +3738,16 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         character_repository=character_repository,
         operator_profile_service=operator_profile_service,
     )
-    # Intra-day weather-drift correction of the planned day. The judge follows
-    # the aftermath shape (Null on the fake provider so a self-host demo never
-    # pays for a verdict), and the service reads weather + operator through the
-    # SAME ports the planner used — comparing the day against a different sky
-    # would be worse than not comparing at all.
-    schedule_weather_drift_judge = (
-        LLMScheduleWeatherDriftJudge(
-            provider=active_llm_provider,
-            feature_key=FEATURE_SCHEDULE_WEATHER_DRIFT,
-        )
-        if (
-            app_settings.cloud.active
-            or app_settings.default_provider_id != _FAKE_PROVIDER_ID
-        )
-        else NullScheduleWeatherDriftJudge()
+    # Intra-day weather-drift correction of the planned day. The judge's own
+    # per-call ``is_fake`` check keeps a fake-provider deployment from ever
+    # paying for a verdict (it returns ``()``, same as the Null judge), so no
+    # static provider check is needed here — providers are DB-backed and
+    # registered after container build. The service reads weather + operator
+    # through the SAME ports the planner used — comparing the day against a
+    # different sky would be worse than not comparing at all.
+    schedule_weather_drift_judge = LLMScheduleWeatherDriftJudge(
+        provider=active_llm_provider,
+        feature_key=FEATURE_SCHEDULE_WEATHER_DRIFT,
     )
     schedule_weather_drift_service = ScheduleWeatherDriftService(
         schedule_repository=schedule_repository,
@@ -3570,33 +3779,63 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         inbox_repository=character_event_inbox_repository,
         world_event_repository=world_event_repository,
     )
+    # Flag-only selection: whether a real model is reachable is a per-call,
+    # DB-backed routing fact, answered inside the adapter via ``is_fake``
+    # (its fake path returns ``None``, same as the Null profiler).
     register_profiler = (
         LLMRegisterProfiler(
             provider=active_llm_provider,
             feature_key=FEATURE_REGISTER_PROFILE,
         )
-        if (
-            app_settings.prompt_quality.register_profile_enabled
-            and (
-                app_settings.cloud.active
-                or app_settings.default_provider_id != _FAKE_PROVIDER_ID
-            )
-        )
+        if app_settings.prompt_quality.register_profile_enabled
         else NullRegisterProfiler()
     )
+    # "Is there a judge behind the gate" is NOT a bootstrap fact: real LLM
+    # providers are DB-backed runtime settings, registered into the mutable
+    # registry by ``runtime_sync`` *after* this container is built (and
+    # re-registered on every admin write). A static
+    # ``default_provider_id != "fake"`` check here silently disabled the
+    # whole quality band on self-hosts whose providers live only in the DB.
+    # The LLM gate answers the question itself, per call, via
+    # ``is_fake(FEATURE_NOVELTY_GATE)`` and returns ``pass_unrouted`` —
+    # which the orchestrator treats exactly like an unwired gate
+    # (pass, uncounted). Only the operator's on/off switch is decided here.
     novelty_gate = (
         LLMNoveltyGate(
             provider=active_llm_provider,
             feature_key=FEATURE_NOVELTY_GATE,
         )
-        if (
-            app_settings.prompt_quality.novelty_gate_enabled
-            and (
-                app_settings.cloud.active
-                or app_settings.default_provider_id != _FAKE_PROVIDER_ID
-            )
-        )
+        if app_settings.prompt_quality.novelty_gate_enabled
         else NullNoveltyGate()
+    )
+    # QG0 — the shared review→regenerate→dispose band, built once and handed
+    # to every composing surface. Built here, next to the gate it wraps and
+    # well above the first consumer (``chat_service``), because *every*
+    # player-visible seam takes it and the alternative is eight construction
+    # orders to keep straight. One instance, therefore one counters set: the
+    # hard-skip rate is a fact about the deployment, and a per-surface
+    # orchestrator would silently split it into eight unreadable ones.
+    output_quality_counters = OutputQualityCounters()
+    output_quality_orchestrator = OutputQualityOrchestrator(
+        # ``None``, not the Null gate, when the operator switched the gate
+        # off. The orchestrator's own contract is that an unwired gate
+        # returns ``pass`` *without counting* — an unwired gate is not a
+        # review that passed. Handing it a ``NullNoveltyGate`` (which passes
+        # everything without a model call) walked straight past that branch
+        # and made a deployment with no judge at all render a full set of
+        # immaculate ``pass`` indicators. The no-judge-route case is handled
+        # dynamically: ``LLMNoveltyGate`` returns ``pass_unrouted`` when the
+        # per-call resolution lands on the fake provider, and the
+        # orchestrator keeps that off the scrape too. The services below
+        # keep the Null instance: their guards are ``is None`` tests and
+        # reading a bare ``None`` there would change what they do, not just
+        # what they report.
+        gate=(
+            novelty_gate
+            if app_settings.prompt_quality.novelty_gate_enabled
+            else None
+        ),
+        counters=output_quality_counters,
     )
     encounter_memory_writer = CharacterEncounterMemoryWriter(
         repository=memory_repository,
@@ -3633,7 +3872,12 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         operator_profile_service=operator_profile_service,
         life_context_builder=encounter_life_context_builder,
         register_profiler=register_profiler,
-        novelty_gate=novelty_gate,
+        reply_quality_gate=novelty_gate,
+        reply_quality_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
+        reply_quality_gate_max_retries=(
+            app_settings.prompt_quality.novelty_gate_max_retries
+        ),
+        output_quality_orchestrator=output_quality_orchestrator,
     )
     character_encounter_service = CharacterEncounterService(
         planner=character_encounter_planner,
@@ -3893,6 +4137,24 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
     player_persona_note_service = PlayerPersonaNoteService(
         player_persona_note_repository,
     )
+    # IC1 — 玩家身分卡. Account-level CRUD with no runtime consumer: nothing
+    # in the turn path reads a card, the creation wizard copies one.
+    from kokoro_link.infrastructure.repositories.in_memory_player_identity_cards import (
+        InMemoryPlayerIdentityCardRepository,
+    )
+    player_identity_card_repository: PlayerIdentityCardRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_player_identity_card_repository import (
+            SAPlayerIdentityCardRepository,
+        )
+        player_identity_card_repository = SAPlayerIdentityCardRepository(
+            db_session_factory,
+        )
+    else:
+        player_identity_card_repository = InMemoryPlayerIdentityCardRepository()
+    player_identity_card_service = PlayerIdentityCardService(
+        player_identity_card_repository,
+    )
     # NF4: the foreground-interaction anchor (``CharacterState.last_active_at``)
     # for the paid foreground surfaces that are not chat — chat writes it as
     # part of its own turn save, everything else needs this targeted, monotonic
@@ -3980,6 +4242,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         action_billing=action_billing_service,
         player_persona_note_repository=player_persona_note_repository,
         activity_anchor=character_activity_anchor,
+        output_quality_orchestrator=output_quality_orchestrator,
+        # QG7b: the knob QG7 could not reach because it does not touch this
+        # file — wired the same way as every other output-quality surface
+        # below (FeedComposerService, ChatService, ...).
+        reply_quality_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
+        reply_quality_gate_max_retries=(
+            app_settings.prompt_quality.novelty_gate_max_retries
+        ),
     )
 
     self_repetition_extractor = LLMSelfRepetitionExtractor(
@@ -4532,20 +4802,34 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         )
         else None
     )
+    # Flag-only selection — same reasoning as the register profiler above:
+    # the adapter's per-call ``is_fake`` path returns ``None`` exactly like
+    # the Null digester, and DB-backed providers arrive after bootstrap.
     prompt_material_digester = (
         LLMPromptMaterialDigester(
             provider=active_llm_provider,
             feature_key=FEATURE_PROMPT_MATERIAL_DIGEST,
         )
-        if (
-            app_settings.prompt_quality.material_digest_enabled
-            and (
-                app_settings.cloud.active
-                or app_settings.default_provider_id != _FAKE_PROVIDER_ID
-            )
-        )
+        if app_settings.prompt_quality.material_digest_enabled
         else NullPromptMaterialDigester()
     )
+    # DIGEST_OFFPATH — where the post-turn leaves the digest for the next
+    # turn to read. A table wherever there is a database, because that is
+    # exactly where the two ends can be different processes: with a
+    # post-turn enqueuer wired the post-turn body runs on a worker while
+    # chat is served from the api replica, and anything process-local
+    # would be written by one and read by neither. Embedded / self-host
+    # has one process and gets the in-memory store, which is the same
+    # object the ChatService would have defaulted to.
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_prompt_material_digest_repository import (
+            SAPromptMaterialDigestRepository,
+        )
+        prompt_material_digest_store = SAPromptMaterialDigestRepository(
+            db_session_factory,
+        )
+    else:
+        prompt_material_digest_store = InMemoryPromptMaterialDigestRepository()
     # GD1-A: built before the chat service so the same instance the internal
     # drain route flips is the one the turn path reads. Wired unconditionally —
     # self-host simply never receives a drain request, so the flag stays False
@@ -4574,6 +4858,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         schedule_memorializer=schedule_memorializer,
         feed_reaction_memorializer=feed_reaction_memorializer,
         dialogue_summarizer=dialogue_summarizer,
+        # DH3 — all three ``None`` unless the checkpoint flag is on.
+        dialogue_checkpoint_reader=dialogue_checkpoint.reader,
+        dialogue_checkpoint_updater=dialogue_checkpoint.updater,
+        dialogue_window_limit=dialogue_checkpoint.window_limit,
         embedder=embedder,
         state_tracker=state_tracker,
         auto_consolidation_trigger=auto_consolidation_trigger,
@@ -4610,11 +4898,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         persona_curiosity_planner=chat_persona_curiosity_planner,
         prompt_material_digester=prompt_material_digester,
         prompt_material_digest_enabled=app_settings.prompt_quality.material_digest_enabled,
+        prompt_material_digest_store=prompt_material_digest_store,
         register_profiler=register_profiler,
         register_profile_enabled=app_settings.prompt_quality.register_profile_enabled,
-        novelty_gate=novelty_gate,
-        novelty_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
-        novelty_gate_max_retries=app_settings.prompt_quality.novelty_gate_max_retries,
+        reply_quality_gate=novelty_gate,
+        reply_quality_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
+        reply_quality_gate_max_retries=(
+            app_settings.prompt_quality.novelty_gate_max_retries
+        ),
+        output_quality_orchestrator=output_quality_orchestrator,
         reply_quality_gate_risk_threshold=(
             app_settings.prompt_quality.reply_quality_gate_risk_threshold
         ),
@@ -4958,6 +5250,31 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             conversation_repository=conversation_repository,
             adapters=messaging_adapters,
         )
+    # HV1/HV2 — the outbound honesty gate. One short model call that asks
+    # whether a composed message claims a completed external action the
+    # round's tools never performed. **One instance, shared by every
+    # outbound seam**: the honesty rate and the judge-outage streak are one
+    # number about one deployment, and a second guard would halve both
+    # without saying so. Built ahead of the proactive dispatcher because
+    # that is now the first consumer; it needs nothing but the provider.
+    outcome_claim_guard = OutcomeClaimGuard(
+        judge=LLMOutcomeClaimJudge(
+            provider=active_llm_provider,
+            feature_key=FEATURE_OUTCOME_CLAIM_JUDGE,
+        ),
+    )
+    # HV4 — the same guard on the one surface that cannot be gated. Chat
+    # streams token by token, so the judge runs *after* delivery and its
+    # only lever is a durable repair follow-up the character comes back to
+    # settle. Wired by setter because ``chat_service`` is built well above
+    # this line; the tombstone gate and the release enqueuer it needs are
+    # handed over per call from the write point's own instances.
+    chat_service.set_outcome_claim_auditor(ChatOutcomeClaimAuditor(
+        guard=outcome_claim_guard,
+        pending_follow_up_repository=pending_follow_up_repository,
+        turn_recorder=turn_recorder,
+        clock=clock,
+    ))
     proactive_dispatcher = ProactiveDispatcher(
         character_repository=character_repository,
         conversation_repository=conversation_repository,
@@ -4974,6 +5291,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         intention_judge=proactive_intention_judge,
         schedule_resolver=_proactive_schedule_resolver,
         memory_repository=memory_repository,
+        # KB8 — runs only after a push has actually been delivered, and
+        # decides nothing about what ships. Its own instance rather than
+        # a shared one: unlike the honesty guard it holds no rate or
+        # outage state, so there is nothing for a second one to halve.
+        disclosure_judge=LLMDisclosureJudge(
+            provider=active_llm_provider,
+            feature_key=FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE,
+        ),
         goal_repository=goal_repository,
         story_event_service=story_event_service,
         story_arc_service=story_arc_service,
@@ -5019,6 +5344,13 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         reply_quality_gate_max_retries=(
             app_settings.prompt_quality.novelty_gate_max_retries
         ),
+        output_quality_orchestrator=output_quality_orchestrator,
+        # HV2: nothing this dispatcher composes reaches a player without a
+        # verdict. The proactive decider writes its message in the same JSON
+        # that orders the tool, so it cannot know whether the tool worked —
+        # which makes the overclaim structural on this surface rather than
+        # an occasional model slip.
+        outcome_claim_guard=outcome_claim_guard,
         subscription_access_guard=subscription_access_guard,
         visible_slot_port=visible_slot_port,
         # SC1-E — a character inside a 起幕 scene does not also message the
@@ -5103,6 +5435,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         reply_quality_gate_max_retries=(
             app_settings.prompt_quality.novelty_gate_max_retries
         ),
+        output_quality_orchestrator=output_quality_orchestrator,
         account_runtime_profile_resolver=account_runtime_profile_resolver,
         account_runtime_usage_repository=account_runtime_usage_repository,
         character_repository=character_repository,
@@ -5148,13 +5481,23 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         feed_video_job_service,
         deferred_pipeline_possible=video_jobs_possible,
     )
+    # KB8 — one ledger writer shared by the feed's three read signals
+    # (the exposure report, a like, a comment). One instance because
+    # "the player has now read this" is one fact about one deployment,
+    # and three writers would be three places to forget a rail.
+    memory_disclosure_service = MemoryDisclosureService(
+        memories=memory_repository,
+        feed_posts=feed_post_repository,
+    )
     feed_reaction_service = FeedReactionService(
         post_repository=feed_post_repository,
         reaction_repository=feed_reaction_repository,
+        disclosure_service=memory_disclosure_service,
     )
     feed_comment_service = FeedCommentService(
         post_repository=feed_post_repository,
         comment_repository=feed_comment_repository,
+        disclosure_service=memory_disclosure_service,
     )
     feed_comment_reply_composer = LLMFeedCommentReplyComposer(
         provider=active_llm_provider,
@@ -5175,6 +5518,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         notification_service=notification_service,
         visible_slot_port=visible_slot_port,
         player_persona_note_repository=player_persona_note_repository,
+        output_quality_orchestrator=output_quality_orchestrator,
+        # RC — the same two knobs every other quality-gated surface reads.
+        # Without them ``KOKORO_NOVELTY_GATE_ENABLED=false`` still reviewed
+        # every reply against a null gate and counted a ``pass`` for it.
+        reply_quality_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
+        reply_quality_gate_max_retries=(
+            app_settings.prompt_quality.novelty_gate_max_retries
+        ),
     )
     # PF1 — the two-pass compose→tool→compose loop shared by every kind of
     # pending follow-up. Same registry / orchestrator / public-URL resolver the
@@ -5193,6 +5544,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         # deferring (distributed) caller is filtered; the embedded release
         # runs its tools inline and is unaffected whatever the env says.
         capability_caps=_capability_caps(),
+        # HV1: nothing this loop composes reaches a player without a verdict.
+        outcome_claim_guard=outcome_claim_guard,
+        output_quality_orchestrator=output_quality_orchestrator,
+        # RC — see the mirror comment on the feed reply service above.
+        reply_quality_gate_enabled=app_settings.prompt_quality.novelty_gate_enabled,
+        reply_quality_gate_max_retries=(
+            app_settings.prompt_quality.novelty_gate_max_retries
+        ),
     )
     pending_follow_up_dispatcher = PendingFollowUpDispatcher(
         repository=pending_follow_up_repository,
@@ -5212,6 +5571,15 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         visible_slot_port=visible_slot_port,
         local_tz=local_tz,
         player_persona_note_repository=player_persona_note_repository,
+        # HV3 — folds the HV1 honesty gate's per-round verdict/block/park
+        # conclusion into a turn record. Shares the same recorder every
+        # other application service uses; ``kind="promise_fulfilment"``
+        # rows appear alongside chat/proactive in the same table.
+        turn_recorder=turn_recorder,
+        # F1 — the same shared guard, for the one counter the dispatcher
+        # owns: a promise given up on after the model re-claimed through
+        # its whole honesty-retry budget. Alert line, never silent.
+        outcome_claim_guard=outcome_claim_guard,
     )
     # P2-B shadow runtime (HOSTED_CORE_SCALING §13 Phase 2). Built ONLY for a
     # scheduler-owning role (all / background) when YURALUME_BACKGROUND_SHADOW=
@@ -5692,6 +6060,26 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             preferences=preferences_repository,
         )
         chat_service.set_tts_pregenerator(tts_pregeneration_service)
+    # TU1 — the undo tombstone store. Built here rather than in the bulk
+    # repository factory because its only consumers are the undo (writer)
+    # and the post-turn gate (reader), and both are wired in this block.
+    undone_turn_repository: UndoneTurnRepositoryPort
+    if db_session_factory is not None:
+        from kokoro_link.infrastructure.persistence.sa_undone_turn_repository import (
+            SaUndoneTurnRepository,
+        )
+        undone_turn_repository = SaUndoneTurnRepository(db_session_factory)
+    else:
+        undone_turn_repository = InMemoryUndoneTurnRepository()
+    # TU2 — the reading half. Wired on every runtime, not only hosted:
+    # embedded runs the post-turn as a fire-and-forget task the undo
+    # cannot wait for, so the race the tombstone closes exists there too.
+    chat_service.set_undone_turn_gate(UndoneTurnGate(undone_turn_repository))
+
+    # Every repository the TU series' rollback steps read is injected
+    # here, in one place. A step whose subsystem is absent on this
+    # deployment receives ``None`` and reports "did nothing"; the wiring
+    # never decides which steps exist.
     turn_undo_service = TurnUndoService(
         journal_repository=turn_journal_repository,
         conversation_repository=conversation_repository,
@@ -5702,6 +6090,26 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         arc_repository=story_arc_repository,
         schedule_repository=schedule_repository,
         operator_persona_repository=persona_repository,
+        undone_turn_repository=undone_turn_repository,
+        emotion_event_repository=emotion_event_repository,
+        pending_follow_up_repository=pending_follow_up_repository,
+        # Hosted only: with no distributed queue there is no release job
+        # to withdraw, because releases run from the in-process tick.
+        follow_up_release_queue=background_job_queue,
+        address_preference_repository=address_preference_repository,
+        address_change_log_repository=address_change_log_repository,
+        relationship_seed_repository=relationship_seed_repository,
+        scene_session_repository=story_scene_session_repository,
+        encounter_intent_repository=character_encounter_intent_repository,
+        persona_curiosity_repository=persona_curiosity_repository,
+        story_event_repository=story_event_repository,
+        # DH3 — ``None`` while the flag is off, which is what keeps the
+        # rollback's step count and query count exactly what they were.
+        dialogue_checkpoint_repository=dialogue_checkpoint.repository,
+        # DIGEST_OFFPATH — the very object the chat service reads its
+        # digest through, so an undo drops the row the reversed turn's
+        # post-turn wrote instead of letting it reach the next prompt.
+        material_digest_cache=chat_service.material_digest_precomputer,
     )
 
     # CD2 — the character-delete boundary engine. Built here (not inside
@@ -5742,6 +6150,10 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
             "character_peer_profile": character_peer_profile_repository,
             "character_encounter": character_encounter_repository,
             "character_encounter_intent": character_encounter_intent_repository,
+            # DH3 — ``None`` while the checkpoint flag is off; the slot
+            # is claimed either way so the boundary statement does not
+            # move with a feature flag.
+            "dialogue_checkpoint": dialogue_checkpoint.repository,
             "pending_follow_up": pending_follow_up_repository,
             "conversation": conversation_repository,
         },
@@ -5755,6 +6167,7 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         conversation_repository=conversation_repository,
         state_history_repository=state_history_repository,
         operator_persona_repository=persona_repository,
+        dialogue_checkpoint_repository=dialogue_checkpoint.repository,
     )
     character_service = CharacterService(
         character_repository,
@@ -5853,6 +6266,60 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
 
         cloud_tenant_tier_sync_service = _CloudTenantTierSyncService(
             operator_profile_repository=operator_profile_repository,
+        )
+    # LINE 休眠回訪 campaign (LR series). Gated on the *same* condition as
+    # the hosted proactive delivery path rather than on ``cloud.active``
+    # alone: this feature is nothing but "pick dormant characters and send
+    # them a hosted proactive message", so wiring it where that path does
+    # not exist would offer the operator a list of characters nothing can
+    # reach. ``proactive_hosted_identity_resolver`` is non-``None`` exactly
+    # when cloud mode, a Channel base URL and a database are all present,
+    # so it doubles as that flag.
+    line_reactivation_campaign_repository = None
+    line_reactivation_candidate_service = None
+    line_reactivation_campaign_service = None
+    if (
+        proactive_hosted_identity_resolver is not None
+        and db_session_factory is not None
+    ):
+        from kokoro_link.application.services.line_reactivation import (
+            LineReactivationCampaignService as _LineReactivationCampaignService,
+        )
+        from kokoro_link.application.services.line_reactivation import (
+            LineReactivationCandidateService as _LineReactivationCandidateService,
+        )
+        from kokoro_link.infrastructure.persistence.sa_line_reactivation_repository import (  # noqa: E501
+            SALineReactivationCampaignRepository as _SALineReactivationRepo,
+        )
+
+        line_reactivation_campaign_repository = _SALineReactivationRepo(
+            db_session_factory,
+        )
+        line_reactivation_candidate_service = _LineReactivationCandidateService(
+            character_repository=character_repository,
+            # The operator rows directly, not through
+            # ``proactive_hosted_identity_resolver``: that resolver is
+            # character-shaped and re-reads a character this listing
+            # already holds. The *rule* it applies is still the shared
+            # one (``cloud_identity_of``), so listing and delivery cannot
+            # disagree about what "has a hosted destination" means.
+            operator_repository=operator_profile_repository,
+            profile_resolver=account_runtime_profile_resolver,
+            external_delivery=proactive_external_delivery,
+            clock=clock,
+        )
+        # D4: the runner's only send verb is the ordinary dispatcher, so
+        # every gate/quota/channel rule a scheduler tick obeys applies to
+        # a recall message unchanged.
+        line_reactivation_campaign_service = _LineReactivationCampaignService(
+            repository=line_reactivation_campaign_repository,
+            dispatcher=proactive_dispatcher,
+            character_repository=character_repository,
+            # D1 is re-asserted per character immediately before its send,
+            # not just when the candidate list was built — the same
+            # resolver the listing uses, so the two answers cannot drift.
+            profile_resolver=account_runtime_profile_resolver,
+            clock=clock,
         )
     character_runtime_initializer = CharacterRuntimeInitializer(
         character_service=character_service,
@@ -6281,6 +6748,11 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         subscription_freeze_service=subscription_freeze_service,
         exclusive_card_freeze_service=exclusive_card_freeze_service,
         cloud_tenant_tier_sync_service=cloud_tenant_tier_sync_service,
+        line_reactivation_candidate_service=line_reactivation_candidate_service,
+        line_reactivation_campaign_repository=(
+            line_reactivation_campaign_repository
+        ),
+        line_reactivation_campaign_service=line_reactivation_campaign_service,
         subscription_access_guard=subscription_access_guard,
         cloud_subscription_repository=cloud_subscription_repository,
         cloud_credit_service=cloud_credit_service,
@@ -6289,6 +6761,9 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         action_billing_service=action_billing_service,
         cloud_tier_pricing_service=cloud_tier_pricing_service,
         quota_overage_service=quota_overage_service,
+        outcome_claim_guard=outcome_claim_guard,
+        output_quality_counters=output_quality_counters,
+        output_quality_orchestrator=output_quality_orchestrator,
         player_runtime_limits_service=player_runtime_limits_service,
         player_locale_service=player_locale_service,
         geocoding_client=geocoding_client,
@@ -6321,12 +6796,14 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         character_runtime_initializer=character_runtime_initializer,
         chat_assist_service=chat_assist_service,
         turn_journal_repository=turn_journal_repository,
+        undone_turn_repository=undone_turn_repository,
         turn_undo_service=turn_undo_service,
         feed_post_repository=feed_post_repository,
         feed_reaction_repository=feed_reaction_repository,
         feed_reaction_service=feed_reaction_service,
         feed_comment_repository=feed_comment_repository,
         feed_comment_service=feed_comment_service,
+        memory_disclosure_service=memory_disclosure_service,
         feed_composer_service=feed_composer_service,
         feed_video_job_service=feed_video_job_service,
         pending_feed_video_repository=pending_feed_video_repository,
@@ -6367,6 +6844,8 @@ def build_container(settings: AppSettings | None = None) -> ServiceContainer:
         relationship_names_service=relationship_names_service,
         player_persona_note_repository=player_persona_note_repository,
         player_persona_note_service=player_persona_note_service,
+        player_identity_card_repository=player_identity_card_repository,
+        player_identity_card_service=player_identity_card_service,
         persona_extraction_service=persona_extraction_service,
         persona_dream_service=persona_dream_service,
         persona_curiosity_service=persona_curiosity_service,

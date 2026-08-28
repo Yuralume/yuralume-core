@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -13,6 +13,7 @@ from kokoro_link.contracts.scheduled_promise_composer import (
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import MessageContentMode
+from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.content_flow import CONTENT_TOLERANCE_COMMUNITY
 from kokoro_link.domain.value_objects.disposition import CharacterDisposition
@@ -127,6 +128,61 @@ def test_prompt_includes_operator_persona_lines() -> None:
     assert "不要把畫像內容硬塞進提醒" in prompt
 
 
+def test_prompt_includes_schedule_activity_knowledge_boundary() -> None:
+    """KB9: an activity description can name a companion/place the player
+    has never heard of — pin the schedule-block rider that covers it."""
+    from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+        render_schedule_activity_knowledge_line,
+    )
+
+    now = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="明天十點叫我起床",
+        scheduled_for=now,
+        current_activity=ScheduleActivity(
+            id="act-1",
+            start_at=now,
+            end_at=now,
+            description="跟阿凱討論山區那次的事",
+            category="social",
+            companion_names=("阿凱",),
+        ),
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=now,
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert render_schedule_activity_knowledge_line() in prompt
+
+
+def test_schedule_block_omits_activity_knowledge_line_when_free() -> None:
+    """No activity in either slot → the placeholder line only, no rider
+    (nothing was rendered that could name someone unheard-of)."""
+    from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+        render_schedule_activity_knowledge_line,
+    )
+
+    now = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="明天十點叫我起床",
+        scheduled_for=now,
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=now,
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert render_schedule_activity_knowledge_line() not in prompt
+
+
 def test_prompt_includes_disposition_and_personality_type_lines() -> None:
     character = Character.create(
         name="Mio",
@@ -205,6 +261,71 @@ def test_prompt_injects_operator_local_current_time() -> None:
     assert "現在時間：2026-06-20 07:30" in prompt
     assert "約定時間：2026-06-20 07:35" in prompt
     assert "清晨" in prompt
+
+
+# --- SP1: promise_made_at anchors "你之前答應的事" ----------------------
+
+
+def test_prompt_omits_promise_made_line_when_promise_made_at_is_none() -> None:
+    """Fail-soft default: rows written before this field existed (or any
+    caller that hasn't been updated) render byte-identical to before."""
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="明天十點叫我起床",
+        scheduled_for=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert "向你提的" not in prompt
+    assert "${" not in prompt
+
+
+def test_prompt_includes_relative_minutes_for_a_recent_promise() -> None:
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="等等叫我起床",
+        promise_made_at=datetime(2026, 5, 18, 9, 30, tzinfo=timezone.utc),
+        scheduled_for=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert "這個承諾是對方在 約 30 分鐘前 向你提的" in prompt
+
+
+def test_prompt_tags_the_civil_day_when_the_promise_crosses_midnight() -> None:
+    """23:50 last night, fulfilled the next morning: duration alone
+    ("約 7 小時前") would still read as the same evening — the civil-day
+    tag is what tells the model it was actually a different calendar
+    day, so a character can say "昨晚" instead of guessing wrong."""
+    payload = ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="明早叫我起床",
+        promise_made_at=datetime(2026, 5, 17, 23, 50, tzinfo=timezone.utc),
+        scheduled_for=datetime(2026, 5, 18, 7, 0, tzinfo=timezone.utc),
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=datetime(2026, 5, 18, 7, 0, tzinfo=timezone.utc),
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert "1 天前" in prompt
+    assert "這個承諾是對方在" in prompt
+    assert "向你提的" in prompt
 
 
 def test_frontier_prompt_omits_nsfw_original_promise_text() -> None:
@@ -619,3 +740,92 @@ async def test_ordinary_messages_still_ship_on_the_second_pass(raw: str) -> None
 
     assert output.tool_calls == ()
     assert output.content_text != ""
+
+
+# --------------------------------------------------------------------- #
+# TC — the promised moment's freshness.
+#
+# The template hard-coded 「（剛到）」 next to the promised time. That is a
+# lie on every late release, and this path has four ways to be late
+# (honesty park +300s, judge outage +900s, quality park +900s, any tick
+# outage or leader handover) — after which the model was shown
+# 「約定時間：…（剛到）」 directly above a 現在時間 line reading two days
+# later. Two contradictory facts, and nothing saying which to believe.
+# --------------------------------------------------------------------- #
+
+_FRESHNESS_NOW = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
+
+
+def _freshness_payload(*, late: timedelta) -> ScheduledPromiseComposeInput:
+    return ScheduledPromiseComposeInput(
+        character=_character(),
+        promise_intent="叫對方起床",
+        promise_text="明天十點叫我起床",
+        scheduled_for=_FRESHNESS_NOW - late,
+        current_activity=None,
+        just_finished_activity=None,
+        recent_dialogue_summary=None,
+        now=_FRESHNESS_NOW,
+    )
+
+
+def _scheduled_line(prompt: str) -> str:
+    """The 約定時間 bullet alone.
+
+    Asserted on in isolation because the discipline lines added beside it
+    *quote* both renderings — a whole-prompt substring check for 「剛到」
+    passes no matter which branch actually ran.
+    """
+    return next(
+        line for line in prompt.splitlines() if line.startswith("- 約定時間：")
+    )
+
+
+def test_promise_prompt_says_just_now_when_the_slot_really_just_came_due() -> None:
+    line = _scheduled_line(
+        _build_prompt(_freshness_payload(late=timedelta(minutes=2))),
+    )
+
+    assert "（剛到）" in line
+    assert "你晚了" not in line
+
+
+def test_promise_prompt_says_just_now_within_ordinary_tick_jitter() -> None:
+    """The dispatcher ticks about every five minutes; a character must not
+    apologise for the scheduler's own granularity."""
+    line = _scheduled_line(
+        _build_prompt(_freshness_payload(late=timedelta(minutes=5))),
+    )
+
+    assert "（剛到）" in line
+
+
+def test_promise_prompt_states_how_late_it_actually_is() -> None:
+    line = _scheduled_line(
+        _build_prompt(_freshness_payload(late=timedelta(days=1, hours=2))),
+    )
+
+    assert "（剛到）" not in line
+    assert "你晚了" in line
+    assert "已經過了 約 1 天" in line
+
+
+def test_promise_prompt_marks_a_quality_park_retry_as_late() -> None:
+    """The 900-second parks (quality, honesty-outage) are the common way
+    this path runs late, and the one that used to read as punctual."""
+    line = _scheduled_line(
+        _build_prompt(_freshness_payload(late=timedelta(seconds=900))),
+    )
+
+    assert "你晚了" in line
+    assert "已經過了 約 15 分鐘" in line
+
+
+def test_promise_prompt_teaches_what_to_do_when_late() -> None:
+    """Stating the fact is half the fix; without the discipline line the
+    model has a number and no instruction — the exact shape of the
+    follow-up composer's own defect."""
+    prompt = _build_prompt(_freshness_payload(late=timedelta(hours=20)))
+
+    assert "時效紀律" in prompt
+    assert "不要假裝準時" in prompt

@@ -225,6 +225,22 @@ class ProactiveContext:
     local_tz: tzinfo = timezone.utc
     """User timezone for civil-date and visible clock rendering. Instants
     remain UTC; this only affects prompt-facing local times."""
+    honesty_correction: str = ""
+    """The instruction a re-decide carries after the outbound honesty gate
+    blocked the previous message (HV2).
+
+    Empty on every ordinary tick — which is what keeps the decider prompt
+    byte-identical for callers that never trip the gate. A field rather
+    than a mutation of ``recent_dialogue_summary`` (the idiom the quality
+    gate reuses) because this text is not dialogue: folding it in there
+    would put a system reprimand where the prompt says the two of them
+    were talking, and the model reads it as something the *player* said.
+
+    Rendered at the very tail of the decider prompt, for the two reasons
+    HV1 gives for the composer's equivalent field: the nearest instruction
+    to the generation point is the one that outranks a whole prompt about
+    being warm and in character, and a per-retry block anywhere earlier
+    would invalidate the cached prefix of every ordinary tick behind it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,12 +333,23 @@ class ProactiveAttemptRepositoryPort(Protocol):
     async def latest_passing_gate_for_character(
         self, character_id: str,
     ) -> ProactiveAttempt | None:
-        """Most recent attempt that got past the cheap gate.
+        """Most recent attempt that should anchor the cooldown.
 
-        This is the anchor for the cooldown: gate-blocked attempts were
-        zero-cost (no LLM call) so they shouldn't reset the clock. If
-        we used "last attempt of any kind" the gate would re-block the
-        next tick and the cooldown would never lapse in practice.
+        Gate-blocked attempts were zero-cost (no LLM call) so they must
+        not reset the clock: with "last attempt of any kind" the gate
+        would re-block the next tick and the cooldown would never lapse
+        in practice.
+
+        The same exclusion covers ``QUALITY_WITHHELD`` for the opposite
+        reason — the budget *was* spent, but the player received nothing,
+        so anchoring on it would let one broken draft silence the whole
+        cooldown window. The authoritative list is
+        ``domain.value_objects.proactive_outcome.NON_COOLDOWN_ANCHOR_OUTCOMES``;
+        implementations must read it rather than re-spell it, or the
+        in-memory and SQL cooldowns drift apart unnoticed.
+
+        A decider's own ``DECIDER_SKIPPED`` still anchors: the character
+        chose silence, and that decision is meant to hold for the window.
         """
         ...
 

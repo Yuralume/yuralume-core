@@ -85,11 +85,16 @@ from kokoro_link.contracts.generation_usage import (
     UsageEventDraft,
     UsageEventRecorderPort,
 )
+from kokoro_link.application.services.output_quality import (
+    OUTCOME_HARD_DEGRADED,
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    length_overrun_lines,
+)
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.novelty_gate import (
     NoveltyGateContext,
     NoveltyGatePort,
-    NoveltyVerdict,
 )
 from kokoro_link.contracts.object_storage import ObjectStoragePort, StoredObject
 from kokoro_link.contracts.register_profile import (
@@ -117,6 +122,7 @@ from kokoro_link.domain.value_objects.feed_source import (
 )
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.domain.value_objects.timezone import timezone_for_id, to_timezone
+from kokoro_link.infrastructure.feed.llm_composer import MAX_BODY_CHARS
 from kokoro_link.infrastructure.localization.fallback_texts import (
     localized_fallback_text,
 )
@@ -160,6 +166,28 @@ character is effectively unavailable: sleep, driving, exam, stage,
 critical meeting, or similarly no-phone slots. The post candidate stays
 unclaimed and can fire on a later tick when the schedule becomes reachable.
 """
+
+_QUALITY_SURFACE = "feed"
+"""Counter / log label for this surface's output-quality outcomes."""
+
+_QUALITY_DEGRADE_AXES = frozenset({"tool_prompt_defect"})
+"""The one hard axis a feed post can survive by dropping something (D1
+exception). A defective ``image_prompt`` costs the post its picture; the
+prose the player came for is untouched, and a text-only post is an
+ordinary shape on this wall. Every other hard axis is *in* the prose, so
+there is nothing to drop and the post is withheld instead."""
+
+_RECENT_SELF_POST_LIMIT = 5
+"""How many published posts the gate sees as this character's own recent
+voice. The novelty axes need real material to compare against — before
+QG2 this surface handed the judge a hard-coded zero and one generic
+sentence, which is a self-repetition check that cannot fire."""
+
+_DIVERSITY_PROMPT_LINE = (
+    "feed composer context snippets 已提供；請判斷貼文是否像套版或重複同一角度。"
+)
+"""Kept alongside the real history as a standing instruction — it says
+what to look for, where ``recent_self_lines`` says what to look at."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,11 +283,19 @@ class _TickOutcome:
     pipeline may come back with a rendered frame and no job (refused
     queue, unsubmittable prompt), and the post it publishes right there
     must reuse those exact bytes rather than render a second picture.
+
+    ``hard_skipped`` is the D1 signal: the output-quality gate hard-failed
+    this candidate (reviewed, regenerated, still failing) rather than the
+    composer simply declining to produce anything. Both read as "no post"
+    to every other field here, but only a plain no-op should send
+    ``_compose_first_viable`` on to the next candidate — a hard failure is
+    a reason to go quiet for the whole tick, not a cue to keep trying.
     """
 
     post: FeedPost | None = None
     deferred: bool = False
     first_frame: "FeedFirstFrame | None" = None
+    hard_skipped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +351,11 @@ class FeedComposerService:
         reply_quality_gate: NoveltyGatePort | None = None,
         reply_quality_gate_enabled: bool = False,
         reply_quality_gate_max_retries: int = 1,
+        # QG2 — the shared review→regenerate→dispose band, which this
+        # surface now runs its composed posts through. ``None`` (self-host,
+        # legacy tests) means no gate at all: the composer's output
+        # publishes exactly as it did before QG.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
         account_runtime_profile_resolver: (
             AccountRuntimeProfileResolverPort | None
         ) = None,
@@ -354,12 +395,17 @@ class FeedComposerService:
         self._notification_service = notification_service
         self._register_profiler = register_profiler
         self._register_profile_enabled = bool(register_profile_enabled)
+        # QG2 moved the judging itself into the orchestrator, which the
+        # container builds around this very gate. The port is still
+        # accepted (one construction signature for every gated surface) and
+        # kept only so a caller can see what this service is gated by.
         self._reply_quality_gate = reply_quality_gate
         self._reply_quality_gate_enabled = bool(reply_quality_gate_enabled)
         self._reply_quality_gate_max_retries = max(
             0,
             int(reply_quality_gate_max_retries),
         )
+        self._output_quality_orchestrator = output_quality_orchestrator
         self._account_runtime_profile_resolver = (
             account_runtime_profile_resolver
             or PermissiveAccountRuntimeProfileResolver()
@@ -479,7 +525,13 @@ class FeedComposerService:
         )
         # Try candidates in priority order so a composer no-op on the
         # top pick doesn't lose the whole tick — second-best still
-        # gets a shot.
+        # gets a shot. A *hard* failure is different (D1): the quality
+        # gate reviewed this candidate, regenerated it, and it still
+        # failed — that is a reason to go quiet for the whole tick, not
+        # a cue to burn another compose + judge pass on the next
+        # candidate. Falling through here would also let a systemic
+        # model-layer problem re-fire the same failure on every
+        # remaining candidate, every tick.
         for candidate in candidates:
             outcome = await self._materialise(
                 character,
@@ -492,6 +544,8 @@ class FeedComposerService:
                 # published one did: its post is queued, and trying the
                 # next candidate would compose a *second* post for the
                 # same slot.
+                return outcome
+            if outcome.hard_skipped:
                 return outcome
         return _TickOutcome()
 
@@ -751,12 +805,26 @@ class FeedComposerService:
         text = (output.content_text or "").strip()
         if not text:
             return _TickOutcome()
-        output = await self._gate_feed_output(
+        gated = await self._gate_feed_output(
             composer_input=composer_input,
             output=output,
             operator=operator,
         )
-        text = (output.content_text or "").strip()
+        if gated is None:
+            # D1 background row: reviewed, regenerated, still hard-failing.
+            # This tick publishes nothing at all, and the quota slot goes
+            # back — same as a plain no-op. What differs is
+            # ``hard_skipped``: it tells ``_compose_first_viable`` to stop
+            # here rather than spend another compose + judge pass on the
+            # next candidate.
+            return _TickOutcome(hard_skipped=True)
+        output = gated
+        # The published cap, applied here and nowhere earlier (D6). By this
+        # point an over-long body has been shown to the judge as evidence
+        # and given its regeneration; a slice that still lands is a last
+        # resort on a draft the gate already accepted, not a silent edit of
+        # the model's first answer.
+        text = (output.content_text or "").strip()[:MAX_BODY_CHARS]
         if not text:
             return _TickOutcome()
         # Late-bind the world-event claim now that we know this candidate
@@ -1083,48 +1151,114 @@ class FeedComposerService:
         composer_input: FeedComposerInput,
         output: FeedComposerOutput,
         operator: OperatorProfile | None,
-    ) -> FeedComposerOutput:
+    ) -> FeedComposerOutput | None:
+        """QG2: review the draft, regenerate once, decide what publishes.
+
+        ``None`` is the D1 background answer — *publish nothing this tick*.
+        It is the whole point of the batch: the 2026-08-26 post shipped
+        because the old shape here could only ever return **something**, so
+        a regenerated draft that was merely non-empty ended the review.
+
+        The one draft that survives a hard failure is the text-only degrade
+        (``_QUALITY_DEGRADE_AXES``): a broken image prompt costs the post
+        its picture, not its existence.
+        """
+        orchestrator = self._output_quality_orchestrator
         if (
-            not self._reply_quality_gate_enabled
-            or self._reply_quality_gate is None
+            orchestrator is None
+            or orchestrator.gate is None
+            or not self._reply_quality_gate_enabled
         ):
+            # Asked before the evidence is gathered, not after: the
+            # register profile is an LLM call and the history window is a
+            # query, and a deployment with the gate switched off must not
+            # pay for either.
             return output
+        character = composer_input.character
         profile = await self._profile_feed_register(composer_input, operator)
+        recent_self_lines = await self._recent_post_bodies(character.id)
         diversity = ReplyDiversityEvidence(
-            assistant_line_count=0,
-            phrase_frequency_lines=(
-                "feed composer context snippets 已提供；請判斷貼文是否像套版或重複同一角度。",
-            ),
+            assistant_line_count=len(recent_self_lines),
+            phrase_frequency_lines=(_DIVERSITY_PROMPT_LINE,),
         )
-        verdict = await self._evaluate_feed_quality_gate(
-            composer_input=composer_input,
-            output=output,
-            operator=operator,
-            register_profile=profile,
-            diversity_evidence=diversity,
+
+        def context_for(draft: FeedComposerOutput) -> NoveltyGateContext:
+            # Rebuilt per draft, not hoisted: the mechanical evidence and
+            # the tool-prompt lines describe *this* draft, and a re-review
+            # that judged the first draft's evidence would be worthless.
+            return self._feed_gate_context(
+                composer_input=composer_input,
+                output=draft,
+                operator=operator,
+                register_profile=profile,
+                diversity_evidence=diversity,
+                recent_self_lines=recent_self_lines,
+            )
+
+        async def regenerate(feedback: str) -> FeedComposerOutput | None:
+            retry_input = replace(
+                composer_input,
+                hint=(
+                    f"{composer_input.hint}\n"
+                    f"上一輪貼文品質問題：{feedback}"
+                ).strip(),
+            )
+            try:
+                retry_output = await self._composer.compose(retry_input)
+            except Exception:
+                _LOGGER.exception(
+                    "feed composer quality retry crashed character=%s",
+                    character.id,
+                )
+                return None
+            # An empty body is the composer's own "I declined"; handing it
+            # back as a candidate would let a blank draft be re-reviewed
+            # and published as an empty post.
+            if not (retry_output.content_text or "").strip():
+                return None
+            return retry_output
+
+        review = await orchestrator.review(
+            output,
+            surface=_QUALITY_SURFACE,
+            context_for=context_for,
+            regenerate=regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=character,
+            max_retries=self._reply_quality_gate_max_retries,
+            enabled=self._reply_quality_gate_enabled,
+            degrade_axes=_QUALITY_DEGRADE_AXES,
         )
-        if (
-            verdict is None
-            or verdict.passes
-            or self._reply_quality_gate_max_retries <= 0
-        ):
-            return output
-        retry_input = replace(
-            composer_input,
-            hint=(
-                f"{composer_input.hint}\n"
-                f"上一輪貼文品質問題：{verdict.feedback}"
-            ).strip(),
-        )
+        if review.outcome == OUTCOME_HARD_DEGRADED and review.final is not None:
+            _LOGGER.warning(
+                "feed: publishing text-only after an unfixable tool prompt "
+                "character=%s", character.id,
+            )
+            return _without_tool_prompts(review.final)
+        return review.final
+
+    async def _recent_post_bodies(self, character_id: str) -> tuple[str, ...]:
+        """This character's own recent post bodies, newest first.
+
+        Fails soft to ``()`` — the gate then sees an empty history, which
+        is honest (no material to compare against) and is also what a brand
+        new character legitimately has.
+        """
         try:
-            retry_output = await self._composer.compose(retry_input)
+            posts = await self._repo.list_for_character(
+                character_id, limit=_RECENT_SELF_POST_LIMIT,
+            )
         except Exception:
             _LOGGER.exception(
-                "feed composer quality retry crashed character=%s",
-                composer_input.character.id,
+                "feed: recent post history lookup failed character=%s",
+                character_id,
             )
-            return output
-        return retry_output if (retry_output.content_text or "").strip() else output
+            return ()
+        return tuple(
+            body
+            for post in posts
+            if (body := (post.content_text or "").strip())
+        )
 
     async def _profile_feed_register(
         self,
@@ -1157,7 +1291,7 @@ class FeedComposerService:
             _LOGGER.exception("feed register profiler failed open")
             return None
 
-    async def _evaluate_feed_quality_gate(
+    def _feed_gate_context(
         self,
         *,
         composer_input: FeedComposerInput,
@@ -1165,11 +1299,11 @@ class FeedComposerService:
         operator: OperatorProfile | None,
         register_profile,
         diversity_evidence: ReplyDiversityEvidence,
-    ) -> NoveltyVerdict | None:
-        if self._reply_quality_gate is None:
-            return None
+        recent_self_lines: tuple[str, ...],
+    ) -> NoveltyGateContext:
+        """Everything the judge sees about one draft post."""
         character = composer_input.character
-        gate_context = NoveltyGateContext(
+        return NoveltyGateContext(
             character_id=character.id,
             operator_id=(
                 getattr(operator, "id", None)
@@ -1179,7 +1313,7 @@ class FeedComposerService:
             known_material=tuple(
                 line for line in composer_input.context_snippets if line.strip()
             ),
-            recent_self_lines=(),
+            recent_self_lines=recent_self_lines,
             self_repetition_hint="",
             latest_user_message=composer_input.hint,
             content_tolerance="frontier",
@@ -1189,15 +1323,12 @@ class FeedComposerService:
                 f"性格：{', '.join(character.personality)}",
                 f"說話風格：{character.speaking_style}",
             ),
+            operator_primary_language=composer_input.operator_primary_language,
+            tool_prompt_lines=_tool_prompt_lines(output),
+            mechanical_evidence_lines=length_overrun_lines(
+                output.content_text, MAX_BODY_CHARS,
+            ),
         )
-        try:
-            return await self._reply_quality_gate.evaluate(
-                gate_context,
-                character=character,
-            )
-        except Exception as exc:
-            _LOGGER.exception("feed reply quality gate failed open")
-            return NoveltyVerdict.pass_open(repr(exc))
 
     async def create_manual_post(
         self,
@@ -2274,6 +2405,24 @@ def _post_to_memory(post: FeedPost, *, language: str = "zh-TW") -> MemoryItem:
         salience=0.5,
         tags=tags,
         created_at=post.created_at,
+        # F3b: left unjudged (""), deliberately — NOT ``disclosed``.
+        # Posting is not reading: this memory is the character's own act
+        # of publishing, which happened the moment the post went live,
+        # while whether the player has actually *seen* it is a separate,
+        # unknown fact. Stamping ``disclosed`` here would assert "the
+        # player now knows this" the instant the post is created, which
+        # is exactly the "told ≠ read" gap the owner's disclosure-ledger
+        # ruling (real read flips the ledger, not the act of sending)
+        # exists to prevent. There is also no view-gate to route this
+        # through: unlike a source memory a post can later be verified
+        # against once the player is shown to have read it (KB8/KB11),
+        # this feed-post memory carries no link back to the post id it
+        # summarises, so there is nothing to flip when a read happens.
+        # "" is the honest value — "not judged", not "not disclosed" —
+        # and it renders exactly as it does today (no frame). If a
+        # future station links this memory to its post's read state,
+        # the link belongs here and the flip can replace this "".
+        player_knowledge="",
     )
 
 
@@ -2290,6 +2439,38 @@ def _operator_language(operator: OperatorProfile | None) -> str:
         return "zh-TW"
     lang = (operator.primary_language or "").strip()
     return lang or "zh-TW"
+
+
+def _tool_prompt_lines(output: FeedComposerOutput) -> tuple[str, ...]:
+    """The draft's tool prompts, each labelled with the field it came from.
+
+    Two jobs at once, which is why they are separated from the prose
+    instead of concatenated with it: the judge can only see
+    ``tool_prompt_defect`` if it is shown the prompts, and it must not read
+    their (legitimately English) tag strings as a language mismatch in a
+    Chinese post.
+    """
+    return tuple(
+        f"{label}: {value}"
+        for label, value in (
+            ("image_prompt", (output.image_prompt or "").strip()),
+            ("video_prompt", (output.video_prompt or "").strip()),
+        )
+        if value
+    )
+
+
+def _without_tool_prompts(output: FeedComposerOutput) -> FeedComposerOutput:
+    """The same post, minus every visual the gate could not fix.
+
+    ``media_kind="none"`` rather than merely blank prompts: it is the
+    composer's own vocabulary for a text-only post, so the render branches
+    downstream take the path they already have instead of each having to
+    notice an empty prompt on its own.
+    """
+    return replace(
+        output, image_prompt="", video_prompt="", media_kind="none",
+    )
 
 
 def _timezone_for_operator(operator: OperatorProfile | None) -> tzinfo:

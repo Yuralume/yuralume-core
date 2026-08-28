@@ -146,3 +146,23 @@ export async function markFeedReactionsSeen(
   )
   return res.data
 }
+
+export interface FeedViewedResult {
+  updated: number
+}
+
+// KB11 read-receipt: batched report of post ids the player has actually
+// looked at (see feedViewTracking.ts / feedViewObserver.ts for the
+// exposure + batching decisions). Idempotent — the server ignores ids
+// already marked viewed, so a retried batch after a network failure is
+// harmless.
+export async function markFeedPostsViewed(
+  characterId: string,
+  postIds: readonly string[],
+): Promise<FeedViewedResult> {
+  const res = await axios.post<FeedViewedResult>(
+    `/api/v1/characters/${characterId}/feed/viewed`,
+    { post_ids: postIds },
+  )
+  return res.data
+}

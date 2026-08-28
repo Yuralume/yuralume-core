@@ -441,3 +441,41 @@ async def test_repair_preserves_vision_on_active_model_when_model_cleared() -> N
         "model_id": None,
         "supports_vision": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_repair_preserves_reasoning_on_active_model_when_model_cleared() -> None:
+    """Route metadata on the primary pick survives a rewrite — same
+    guarantee the mapping-entry repair gives feature/group reasoning."""
+    validator, prefs = _wire()
+    await prefs.set("active_model", {
+        "provider_id": "lmstudio",
+        "model_id": "model-i-unloaded",
+        "reasoning": {"reasoning_effort": "high"},
+    })
+
+    await validator.repair()
+
+    assert await prefs.get("active_model") == {
+        "provider_id": "lmstudio",
+        "model_id": None,
+        "reasoning": {"reasoning_effort": "high"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_repair_preserves_reasoning_on_active_model_provider_reset() -> None:
+    validator, prefs = _wire(default="lmstudio")
+    await prefs.set("active_model", {
+        "provider_id": "openai",
+        "model_id": "gpt-4o",
+        "reasoning": {"disable_reasoning": True},
+    })
+
+    await validator.repair()
+
+    assert await prefs.get("active_model") == {
+        "provider_id": "lmstudio",
+        "model_id": None,
+        "reasoning": {"disable_reasoning": True},
+    }

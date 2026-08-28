@@ -138,6 +138,9 @@ async def test_enqueue_creates_priority_three_post_turn_job() -> None:
         # has none, and the worker must not walk back and adopt the
         # previous turn's line as this turn's input.
         "has_user_message": True,
+        # KB8: ids of the private memories this turn's prompt carried.
+        # Empty here because this fixture's turn injected none.
+        "private_memory_ids": [],
     }
 
 
@@ -145,22 +148,32 @@ async def test_enqueue_payload_carries_no_chat_content() -> None:
     # Payload red line (§3.1 / §11): ids / flags / an enum ONLY — never message text.
     queue, lease, _ = await _leased_queue()
     enqueuer = PostTurnEnqueuer(queue=queue, coordinator_lease=lease)
-    await enqueuer.enqueue(**_enqueue_kwargs(), now=NOW)
+    await enqueuer.enqueue(
+        **_enqueue_kwargs(),
+        private_memory_ids=("mem-1", "mem-2"),
+        now=NOW,
+    )
 
     [job] = await queue.claim("w1", now=NOW, limit=10, lease_seconds=120)
     keys = set(job.payload.keys())
     assert keys == {
         "turn_record_id", "conversation_id", "character_id",
         "assistant_index", "persona_enabled", "content_mode",
-        "has_user_message",
+        "has_user_message", "private_memory_ids",
     }
     # No free-text content field leaked in.
     for forbidden in ("user_text", "assistant_text", "prior_messages", "prompt"):
         assert forbidden not in keys
-    # Every value is an id / flag / enum — no message-length prose.
-    assert all(
-        isinstance(v, (str, int, bool)) for v in job.payload.values()
-    )
+    # Every value is an id / flag / enum, or a list of ids (KB8) — no
+    # message-length prose. The memory ids are references the worker
+    # re-reads rows by, not memory *content*, which is what the rail is
+    # about.
+    for value in job.payload.values():
+        if isinstance(value, list):
+            assert all(isinstance(item, str) for item in value)
+        else:
+            assert isinstance(value, (str, int, bool))
+    assert job.payload["private_memory_ids"] == ["mem-1", "mem-2"]
 
 
 async def test_enqueue_noop_without_leader() -> None:

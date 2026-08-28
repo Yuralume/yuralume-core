@@ -81,6 +81,9 @@ from kokoro_link.domain.value_objects.account_runtime_profile import (
     AccountRuntimeProfile,
 )
 from kokoro_link.domain.value_objects.profile_field import EvidenceRef, ProfileField
+from kokoro_link.domain.value_objects.world_frame import (
+    default_world_awareness_enabled,
+)
 
 if TYPE_CHECKING:
     from kokoro_link.application.services.rest_recovery_refresher import (
@@ -438,6 +441,16 @@ class CharacterService:
         runtime_profile = await self.ensure_character_create_allowed(
             user_id, now=now,
         )
+        # TR1: the creation UI never sends ``world_awareness_enabled`` at
+        # all — it only lets the player pick ``world_frame`` — so an
+        # explicit client value (e.g. from an installed character card)
+        # always wins, and an omitted one resolves by frame instead of
+        # silently falling back to the historical always-off default.
+        world_awareness_enabled = (
+            payload.world_awareness_enabled
+            if payload.world_awareness_enabled is not None
+            else default_world_awareness_enabled(payload.world_frame)
+        )
         character = Character.create(
             name=payload.name,
             summary=payload.summary,
@@ -465,7 +478,7 @@ class CharacterService:
             proactive_daily_limit=payload.proactive_daily_limit,
             proactive_cooldown_minutes=payload.proactive_cooldown_minutes,
             feed_daily_limit=payload.feed_daily_limit,
-            world_awareness_enabled=payload.world_awareness_enabled,
+            world_awareness_enabled=world_awareness_enabled,
             world_topics=tuple(payload.world_topics),
             subscribed_categories=tuple(payload.subscribed_categories),
             excluded_topics=tuple(payload.excluded_topics),

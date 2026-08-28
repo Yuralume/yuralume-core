@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -17,6 +16,7 @@ from kokoro_link.contracts.character_card_translator import (
 )
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -140,26 +140,33 @@ def _profile_payload(profile: CharacterCardProfile) -> dict[str, Any]:
     return payload
 
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
-
-
 def _parse_json_object(raw: str) -> Mapping[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        return {}
-    text = _FENCE_RE.sub("", text).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return {}
-    return data if isinstance(data, Mapping) else {}
+    """Best-effort object extraction; ``{}`` (not ``None``) on any failure.
+
+    The empty-dict sentinel is load-bearing for callers downstream
+    (``merge_translated_profile`` treats a falsy ``parsed`` as "nothing
+    to merge") — it predates the shared layer and stays unchanged here.
+
+    **Truncation repair is off, and this is the canonical reason for the
+    five translator sites that share this shape** (this module,
+    ``character_card/sillytavern_normalizer``, ``memoir/llm_localizer``,
+    ``story/llm_arc_template_translator``,
+    ``story/llm_story_seed_translator``). What repair recovers is *text
+    that stopped mid-sentence*: it closes the dangling string and hands
+    back a value that is a perfectly good ``str``, so every type check
+    downstream passes and the half-summary is merged over the source
+    prose and **persisted** — into a character card, a template, a seed.
+    There is no later step that notices. The pre-migration code returned
+    ``{}`` here and the original text survived; a translation that
+    silently loses its second half is strictly worse than an untranslated
+    one. Same fail-closed call the feed composer, the video storyboard
+    and the proactive decider each made, for the same reason: repair
+    belongs where a partial answer is still an answer, not where it
+    overwrites something correct.
+    """
+    outcome = extract_object_outcome(raw, repair_truncated=False)
+    log_parse_outcome(_LOGGER, outcome, site="character_card.llm_translator")
+    return outcome.value if outcome.value is not None else {}
 
 
 def merge_translated_profile(

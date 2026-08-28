@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
@@ -22,10 +21,10 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
-_FENCE_RE = re.compile(r"```(?:\w+)?\n?")
 _VALID_ACTIONS = {
     "keep_pending",
     "delay_beat",
@@ -126,16 +125,10 @@ def _build_prompt(context: StoryBeatRecheckContext) -> str:
 
 
 def _parse_decision(raw: str) -> StoryBeatRecheckDecision | None:
-    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    log_parse_outcome(_LOGGER, outcome, site="story.beat_rechecker")
+    data = outcome.value
+    if data is None:
         return None
     action = _coerce_str(data.get("action"))
     if action not in _VALID_ACTIONS:

@@ -21,6 +21,10 @@ class DailyScheduleBackupRecord(BackupRecord):
     """Civil date string (``YYYY-MM-DD``) exactly as stored."""
     generated_at: datetime
     is_planned: bool = True
+    manually_adjusted: bool = False
+    """Operator hand-edited this day — exempt from the same-day weather
+    re-plan. Defaulted so backups taken before the column exist restore
+    as untouched."""
     weather_vet_activity_id: str | None = None
     weather_vet_condition: str | None = None
 
@@ -37,6 +41,11 @@ class ScheduleActivityBackupRecord(BackupRecord):
     busy_score: float = _BUSY_SCORE_DEFAULT
     scene_privacy: str | None = None
     meeting_affordance: str | None = None
+    source_beat_id: str | None = None
+    """KB2 beat lineage — carried so a restored day keeps its reserved
+    scene slots out of the memorializer. Defaulted for backups taken
+    before the column existed (their blocks read as ordinary activities,
+    which is what they were)."""
     memorialized: bool = False
     has_memory: bool = False
     companion_names_json: str = "[]"

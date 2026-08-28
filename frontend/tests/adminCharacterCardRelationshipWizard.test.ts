@@ -56,7 +56,11 @@ describe('CharactersAdminPage — 匯入角色卡接上初始關係精靈', () =
 
   it('精靈 confirm 才真的呼叫 importCharacterCard，並把 payload 原樣帶成 initialRelationship', () => {
     const body = functionBody(ADMIN_PAGE, 'async function confirmImportCard', 'function closeRelationshipWizard')
-    expect(body).toContain('async function confirmImportCard(\n  initialRelationship: InitialRelationshipPayload | null,\n)')
+    // IC2 之後多了第二個參數（建角成功才做得到的後續工作）；第一個參數的
+    // 型別與語意一字未改。
+    expect(body).toMatch(
+      /async function confirmImportCard\(\r?\n\s*initialRelationship: InitialRelationshipPayload \| null,\r?\n\s*followUp: CharacterCreationFollowUp,\r?\n\)/,
+    )
     expect(body).toContain('importCharacterCard(')
     expect(body).toContain('pendingImportFile.value,')
     expect(body).toContain('{ initialRelationship },')
@@ -132,7 +136,9 @@ describe('CharacterCardMarketplace — 安裝接上初始關係精靈', () => {
 
   it('精靈 confirm 才真的呼叫 installCharacterCard，並把 payload 原樣帶成 initialRelationship', () => {
     const body = functionBody(MARKETPLACE, 'async function confirmInstall', 'function closeRelationshipWizard')
-    expect(body).toMatch(/async function confirmInstall\(\r?\n\s*initialRelationship: InitialRelationshipPayload \| null,\r?\n\)/)
+    expect(body).toMatch(
+      /async function confirmInstall\(\r?\n\s*initialRelationship: InitialRelationshipPayload \| null,\r?\n\s*followUp: CharacterCreationFollowUp,\r?\n\)/,
+    )
     expect(body).toContain('installCharacterCard(')
     expect(body).toContain('pack.pack_id,')
     expect(body).toContain('translate: translateOnInstall.value,')
@@ -188,10 +194,14 @@ describe('兩個 admin 入口與玩家側共用同一顆 wizard 元件，沒有�
   it('InitialRelationshipWizardModal.vue 沒有為了 admin 被改到破壞玩家側既有欄位', () => {
     // IR3 明確要求盡量不改 wizard 本身；這裡釘住 skip()／confirm() 的既有語意
     // （skip 固定送 null，confirm 送 payload）沒有被動過。
+    //
+    // IC2 在 `confirm` 後面加了第二個參數（建角成功之後才做得到的人設寫入
+    // 與存卡），**第一個參數不動**——這條測試因此改成釘「第一個參數仍是
+    // null／payload.value」，而不是釘整行文字。
     const skipBody = functionBody(WIZARD, 'function skip()', 'function confirm()')
-    expect(skipBody).toContain("emit('confirm', null)")
-    const confirmBody = functionBody(WIZARD, 'function confirm()', 'async function runRelationshipIntake')
-    expect(confirmBody).toContain("emit('confirm', payload.value)")
+    expect(skipBody).toMatch(/emit\('confirm', null[,)]/)
+    const confirmBody = functionBody(WIZARD, 'function confirm()', 'function buildFollowUp')
+    expect(confirmBody).toMatch(/emit\('confirm', payload\.value[,)]/)
   })
 
   it('玩家側三段式的 confirm 呼叫慣例仍在（比對基準，不是 admin 這次改的檔案）', () => {

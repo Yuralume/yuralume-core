@@ -10,11 +10,13 @@ description)``.
 LLM-first: we do not regex / count tokens; the model judges what counts
 as a habit. The Python side only clamps the result count (≤5) and rejects
 empty / overly long strings.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the count clamp and the string-length filter.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Final
 
@@ -22,6 +24,7 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.phrase_habit import PhraseHabitExtractorPort
+from kokoro_link.llm_output import extract_array_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_HABITS: Final = 5
@@ -61,14 +64,13 @@ class LLMPhraseHabitExtractor(PhraseHabitExtractorPort):
             )
             return []
 
-        payload = _extract_json_array(raw)
-        if payload is None:
-            return []
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(parsed, list):
+        # The prompt unconditionally asks for one JSON array (empty when
+        # there's nothing stable to report), so a cut reply is worth
+        # repairing and any non-clean parse is worth a log line.
+        outcome = extract_array_outcome(raw)
+        log_parse_outcome(_LOGGER, outcome, site="behavior.llm_phrase_habit_extractor")
+        parsed = outcome.value
+        if parsed is None:
             return []
 
         out: list[str] = []
@@ -109,31 +111,3 @@ def _build_prompt(*, character_name: str, recent_lines: list[str]) -> str:
         "角色近期回覆樣本：\n"
         f"{sample}"
     )
-
-
-def _extract_json_array(text: str) -> str | None:
-    start = text.find("[")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        ch = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None

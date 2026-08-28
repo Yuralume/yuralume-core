@@ -205,7 +205,7 @@ class OfficialCardTranslator:
             )
             return _all_untranslated(source, translatable, REASON_LLM_FAILED)
 
-        parsed = coerce_json_object(raw)
+        parsed = coerce_json_object(raw, site="official_card_translate")
         if parsed is None:
             _LOGGER.warning(
                 "official card translation to %s returned no JSON object", target,

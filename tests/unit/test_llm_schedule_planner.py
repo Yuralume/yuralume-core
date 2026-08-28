@@ -200,12 +200,20 @@ async def test_accepts_free_form_category() -> None:
 
 
 @pytest.mark.asyncio
-async def test_today_beat_appears_in_prompt() -> None:
-    """When a today_beat is supplied, the planner prompt must contain
-    its location, NPCs and dramatic question — without those signals
-    the LLM has no way to embed the scene into the day."""
+async def test_absent_today_beat_appears_in_prompt() -> None:
+    """A beat the player is *not* in can be staged into today, so the
+    planner prompt must contain its location, NPCs and dramatic question
+    plus the hard "必須反映" directive — without those signals the LLM
+    has no way to embed the scene into the day.
+
+    KB1 pins this shape for ``operator_position == "absent"`` only; the
+    other three positions take the waiting branch below.
+    """
     from datetime import timedelta
-    from kokoro_link.domain.entities.story_arc import StoryArcBeat
+    from kokoro_link.domain.entities.story_arc import (
+        OPERATOR_POSITION_ABSENT,
+        StoryArcBeat,
+    )
 
     captured: dict[str, str] = {}
 
@@ -229,6 +237,7 @@ async def test_today_beat_appears_in_prompt() -> None:
         location="學校公告欄",
         scene_characters=("室友 美咲",),
         dramatic_question="她敢報名試鏡嗎？",
+        operator_position=OPERATOR_POSITION_ABSENT,
     )
     upcoming = StoryArcBeat.create(
         arc_id=arc_id,
@@ -241,12 +250,78 @@ async def test_today_beat_appears_in_prompt() -> None:
         today_beat=beat, upcoming_beats=(upcoming,),
     )
     prompt = captured["prompt"]
-    assert "本日劇情骨架" in prompt
+    assert "本日劇情骨架（**必須**反映在行程中）" in prompt
     assert "公告欄發現試鏡海報" in prompt
     assert "學校公告欄" in prompt
     assert "室友 美咲" in prompt
     assert "她敢報名試鏡嗎？" in prompt
     assert "試鏡前夜" in prompt  # upcoming beat label
+    # KB4 — the scheduled date is stamped by code, not inferred from prose.
+    assert "本場戲排定日＝2026-04-18" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "position",
+    ["central", "present", None],
+    ids=["central", "present", "unjudged"],
+)
+async def test_today_beat_needing_player_is_not_staged(position: str | None) -> None:
+    """KB1 — a beat scheduled today that the player figures in must not
+    be staged as the character's solo day.
+
+    ``central``/``present`` say so outright; ``None`` (unjudged) joins
+    them because staging wrongly writes an experience the player never
+    had into long-term memory via the schedule memorializer, so the
+    unknown case fails safe toward *not* playing. The scene's material
+    is still supplied — the day is meant to be built around it.
+    """
+    from kokoro_link.domain.entities.story_arc import StoryArcBeat
+
+    captured: dict[str, str] = {}
+
+    class _CapturingModel:
+        async def generate(self, prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "[]"
+        def generate_stream(self, prompt: str):  # noqa: ARG002
+            async def _e():
+                if False:
+                    yield ""
+            return _e()
+
+    today = date(2026, 4, 18)
+    beat = StoryArcBeat.create(
+        arc_id="arc-awaiting-player",
+        sequence=1, scheduled_date=today,
+        title="銀環裂開以前", summary="她在林道上等著對方趕來",
+        tension="climax", scene_type="conflict",
+        location="後山林道",
+        scene_characters=("店長 佐倉",),
+        dramatic_question="她願意開口求助嗎？",
+        operator_position=position,
+    )
+    planner = LLMSchedulePlanner(model=_CapturingModel())
+    await planner.plan_day(
+        character=_character(), date_=today, local_tz=UTC,
+        today_beat=beat, upcoming_beats=(),
+    )
+    prompt = captured["prompt"]
+    # No "must be reflected in the schedule" order — that is what turned
+    # a player-centred beat into a solo day.
+    assert "必須**反映在行程中" not in prompt
+    assert "本日劇情骨架（**必須**反映在行程中）" not in prompt
+    # Waiting semantics: prepare, don't play.
+    assert "要等玩家在場才會發生" in prompt
+    assert "不得**把這場戲演出來" in prompt
+    assert "寫成已經發生" in prompt
+    # Material still present so the day can be built around the scene.
+    assert "銀環裂開以前" in prompt
+    assert "後山林道" in prompt
+    assert "店長 佐倉" in prompt
+    assert "她在林道上等著對方趕來" in prompt
+    # KB4 date stamp on this branch too.
+    assert "本場戲排定日＝2026-04-18" in prompt
 
 
 @pytest.mark.asyncio
@@ -295,6 +370,10 @@ async def test_today_beat_in_future_renders_preparation_block() -> None:
     assert "試鏡當天" in prompt
     # Explicit "do NOT play this scene today" guard.
     assert "不要" in prompt
+    # KB4 — the scheduled date is stamped by code so a summary whose prose
+    # still says "今天" (frozen at write time, never rewritten by
+    # delay_beat) cannot be read as the authoritative date.
+    assert "本場戲排定日＝2026-04-21" in prompt
 
 
 @pytest.mark.asyncio

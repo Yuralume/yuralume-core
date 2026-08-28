@@ -14,7 +14,11 @@ from kokoro_link.contracts.memory import (
     ScoredMemory,
     WorldScope,
 )
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_DISCLOSED,
+    PLAYER_KNOWLEDGE_PRIVATE,
+    MemoryItem,
+)
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 
@@ -302,6 +306,28 @@ class InMemoryMemoryRepository(MemoryRepositoryPort):
                 self._by_character[character_id][index] = updated
                 return updated
         return None
+
+    async def mark_disclosed(
+        self, character_id: str, item_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """KB8 flip — see :meth:`MemoryRepositoryPort.mark_disclosed`."""
+        wanted = {item_id for item_id in item_ids if item_id}
+        if not wanted:
+            return ()
+        items = self._by_character.get(character_id)
+        if not items:
+            return ()
+        flipped: list[str] = []
+        for index, item in enumerate(items):
+            if item.id not in wanted:
+                continue
+            if item.player_knowledge != PLAYER_KNOWLEDGE_PRIVATE:
+                continue
+            items[index] = replace(
+                item, player_knowledge=PLAYER_KNOWLEDGE_DISCLOSED,
+            )
+            flipped.append(item.id)
+        return tuple(flipped)
 
     async def touch(self, item_id: str) -> None:
         now = datetime.now(timezone.utc)

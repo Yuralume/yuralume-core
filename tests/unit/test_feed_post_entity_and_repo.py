@@ -106,6 +106,61 @@ def test_with_fields_leaves_image_alone_by_default() -> None:
     assert updated.image_url == "/uploads/feed/c/x.png"
 
 
+# ---------- viewed_at / mark_viewed (KB11) ----------
+
+
+def test_create_defaults_viewed_at_to_none() -> None:
+    post = FeedPost.create(
+        character_id="c",
+        kind=FeedKind.MOOD,
+        content_text="x",
+        source=FeedSource.silence(),
+    )
+    assert post.viewed_at is None
+
+
+def test_mark_viewed_sets_timestamp() -> None:
+    post = FeedPost.create(
+        character_id="c",
+        kind=FeedKind.MOOD,
+        content_text="x",
+        source=FeedSource.silence(),
+    )
+    when = datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc)
+    viewed = post.mark_viewed(when=when)
+    assert viewed.viewed_at == when
+    # original untouched — frozen dataclass, replace() returns a copy.
+    assert post.viewed_at is None
+
+
+def test_mark_viewed_is_idempotent_first_read_wins() -> None:
+    post = FeedPost.create(
+        character_id="c",
+        kind=FeedKind.MOOD,
+        content_text="x",
+        source=FeedSource.silence(),
+    )
+    first = datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    once = post.mark_viewed(when=first)
+    twice = once.mark_viewed(when=later)
+    assert twice.viewed_at == first
+
+
+def test_mark_viewed_defaults_to_now_when_no_timestamp_given() -> None:
+    post = FeedPost.create(
+        character_id="c",
+        kind=FeedKind.MOOD,
+        content_text="x",
+        source=FeedSource.silence(),
+    )
+    before = datetime.now(timezone.utc)
+    viewed = post.mark_viewed()
+    after = datetime.now(timezone.utc)
+    assert viewed.viewed_at is not None
+    assert before <= viewed.viewed_at <= after
+
+
 # ---------- repo ----------
 
 
@@ -310,6 +365,98 @@ async def test_count_since_global_watermark(
     assert await repo.count_since(since=base) == 2
     # since=base+5min → no new posts.
     assert await repo.count_since(since=base + timedelta(minutes=5)) == 0
+
+
+@pytest.mark.asyncio
+async def test_mark_viewed_stamps_unviewed_posts(
+    repo: InMemoryFeedPostRepository,
+) -> None:
+    a = FeedPost.create(
+        character_id="c", kind=FeedKind.MOOD,
+        content_text="a", source=FeedSource.beat("b1"),
+    )
+    b = FeedPost.create(
+        character_id="c", kind=FeedKind.MOOD,
+        content_text="b", source=FeedSource.beat("b2"),
+    )
+    await repo.add(a)
+    await repo.add(b)
+
+    when = datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc)
+    updated = await repo.mark_viewed("c", [a.id, b.id], when=when)
+
+    assert updated == 2
+    stored_a = await repo.get(a.id)
+    stored_b = await repo.get(b.id)
+    assert stored_a.viewed_at == when
+    assert stored_b.viewed_at == when
+
+
+@pytest.mark.asyncio
+async def test_mark_viewed_is_idempotent_across_calls(
+    repo: InMemoryFeedPostRepository,
+) -> None:
+    post = FeedPost.create(
+        character_id="c", kind=FeedKind.MOOD,
+        content_text="a", source=FeedSource.beat("b1"),
+    )
+    await repo.add(post)
+    first = datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+    first_updated = await repo.mark_viewed("c", [post.id], when=first)
+    second_updated = await repo.mark_viewed("c", [post.id], when=later)
+
+    assert first_updated == 1
+    assert second_updated == 0
+    stored = await repo.get(post.id)
+    assert stored.viewed_at == first
+
+
+@pytest.mark.asyncio
+async def test_mark_viewed_ignores_ids_outside_character_scope(
+    repo: InMemoryFeedPostRepository,
+) -> None:
+    mine = FeedPost.create(
+        character_id="c", kind=FeedKind.MOOD,
+        content_text="mine", source=FeedSource.beat("b1"),
+    )
+    other = FeedPost.create(
+        character_id="other", kind=FeedKind.MOOD,
+        content_text="other", source=FeedSource.beat("b2"),
+    )
+    await repo.add(mine)
+    await repo.add(other)
+
+    updated = await repo.mark_viewed("c", [mine.id, other.id])
+
+    assert updated == 1
+    stored_other = await repo.get(other.id)
+    assert stored_other.viewed_at is None
+
+
+@pytest.mark.asyncio
+async def test_mark_viewed_deduplicates_and_ignores_unknown_ids(
+    repo: InMemoryFeedPostRepository,
+) -> None:
+    post = FeedPost.create(
+        character_id="c", kind=FeedKind.MOOD,
+        content_text="a", source=FeedSource.beat("b1"),
+    )
+    await repo.add(post)
+
+    updated = await repo.mark_viewed(
+        "c", [post.id, post.id, "ghost-id"],
+    )
+
+    assert updated == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_viewed_empty_list_is_a_noop(
+    repo: InMemoryFeedPostRepository,
+) -> None:
+    assert await repo.mark_viewed("c", []) == 0
 
 
 @pytest.mark.asyncio

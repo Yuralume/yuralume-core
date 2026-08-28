@@ -143,6 +143,27 @@ class InMemoryFeedPostRepository(FeedPostRepositoryPort):
                     break
         self._by_id[post.id] = post
 
+    async def mark_viewed(
+        self,
+        character_id: str,
+        post_ids: "Iterable[str]",
+        *,
+        when: datetime | None = None,
+    ) -> int:
+        ids = [pid for pid in dict.fromkeys(post_ids) if pid]
+        if not ids:
+            return 0
+        updated = 0
+        for post_id in ids:
+            post = self._by_id.get(post_id)
+            if post is None or post.character_id != character_id:
+                continue
+            if post.viewed_at is not None:
+                continue
+            await self.save(post.mark_viewed(when=when))
+            updated += 1
+        return updated
+
     async def delete(self, post_id: str) -> bool:
         existing = self._by_id.pop(post_id, None)
         if existing is None:

@@ -8,7 +8,6 @@ a bad LLM day doesn't crash the whole gacha cycle.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 
@@ -32,6 +31,7 @@ from kokoro_link.infrastructure.story.beat_operator_position import (
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -138,14 +138,10 @@ class LLMStoryEventExpander(StoryEventExpanderPort):
             # a little flat.
             return await _fallback()
 
-        payload = _extract_json_object(raw)
-        if payload is None:
-            return await _fallback()
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            return await _fallback()
-        if not isinstance(parsed, dict):
+        outcome = extract_object_outcome(raw, repair_truncated=True)
+        log_parse_outcome(_LOGGER, outcome, site="story.expander")
+        parsed = outcome.value
+        if parsed is None:
             return await _fallback()
 
         narrative = _clean_narrative(parsed.get("narrative"))
@@ -392,32 +388,3 @@ def _normalise_tone(value: object) -> str | None:
         # Unknown tone string — drop it rather than propagate garbage.
         return None
     return trimmed
-
-
-def _extract_json_object(text: str) -> str | None:
-    """Return the first balanced ``{...}`` substring, or ``None``."""
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -77,6 +78,9 @@ from kokoro_link.api.routes.internal_cloud_showcase import (
 from kokoro_link.api.routes.internal_cloud_stats import (
     router as internal_cloud_stats_router,
 )
+from kokoro_link.api.routes.line_reactivation import (
+    router as line_reactivation_router,
+)
 from kokoro_link.api.routes.internal_drain import (
     router as internal_drain_router,
 )
@@ -101,6 +105,9 @@ from kokoro_link.api.routes.pending_follow_ups import (
 from kokoro_link.api.routes.player_persona_note import (
     router as player_persona_note_router,
 )
+from kokoro_link.api.routes.player_identity_card import (
+    router as player_identity_card_router,
+)
 from kokoro_link.api.routes.relationship_names import (
     router as relationship_names_router,
 )
@@ -121,6 +128,9 @@ from kokoro_link.api.routes.ui import router as ui_router
 from kokoro_link.api.routes.usage import router as usage_router
 from kokoro_link.api.routes.version import router as version_router
 from kokoro_link.api.routes.world_events import router as world_events_router
+from kokoro_link.application.services.chat_stream_relay import (
+    wait_for_pending_turn_completions,
+)
 from kokoro_link.application.services.drain_state import (
     SERVER_DRAINING_CODE,
     ServerDrainingError,
@@ -149,6 +159,11 @@ FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
 DIST_DIR = FRONTEND_DIR / "dist"
 LEGACY_STATIC_DIR = FRONTEND_DIR / "static"
 _LOGGER = logging.getLogger(__name__)
+# F2 — bound on how long lifespan shutdown waits for ChatService's
+# fire-and-forget background work (post-turn outcome-claim audits, etc.)
+# before abandoning it. A module attribute rather than a literal inline so
+# tests can shrink it instead of a shutdown test taking 10 real seconds.
+CHAT_BACKGROUND_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def _configure_logging() -> None:
@@ -444,6 +459,50 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     await world_event_scheduler.stop()
                 if proactive is not None:
                     await proactive.stop()
+            # Detached chat turns (client disconnected, generation still
+            # running — see ``chat_stream_relay``) first, and *before* the F2
+            # drain below rather than after: finishing a turn is what schedules
+            # the post-turn tails F2 waits for, so the other order would drain
+            # an empty set and then abandon the tasks it was there to catch.
+            #
+            # Belt and braces, not the primary protection: GD's deploy protocol
+            # polls ``active_turns`` to zero before the container is recreated,
+            # and a detached turn is a counted turn. This only matters for a
+            # shutdown that skipped that (self-host Ctrl-C, a crash-adjacent
+            # restart), where it buys an almost-done turn the seconds it needs
+            # to persist instead of dying at loop close.
+            try:
+                await asyncio.wait_for(
+                    wait_for_pending_turn_completions(),
+                    timeout=CHAT_BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    "[lifespan] detached chat turns still running after "
+                    f"{CHAT_BACKGROUND_DRAIN_TIMEOUT_SECONDS}s — abandoning them"
+                )
+            except Exception as exc:  # fail-soft: never mask a clean shutdown
+                print(f"[lifespan] detached chat turn drain failed: {exc!r}")
+            # F2 — drain ChatService's fire-and-forget background work
+            # (post-turn outcome-claim audits, auto-consolidation, …)
+            # before the shared engine's pool goes away below: several of
+            # those tasks write through it. Bounded so a stuck judge call
+            # can never hang shutdown forever; still-running tasks past the
+            # deadline are abandoned (each one's own CancelledError
+            # handling logs the loss — see chat_outcome_claim_auditor.py).
+            try:
+                await asyncio.wait_for(
+                    container.chat_service.wait_for_pending(),
+                    timeout=CHAT_BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    "[lifespan] chat service background drain timed out "
+                    f"after {CHAT_BACKGROUND_DRAIN_TIMEOUT_SECONDS}s — "
+                    "abandoning still-pending tasks"
+                )
+            except Exception as exc:  # fail-soft: never mask a clean shutdown
+                print(f"[lifespan] chat service background drain failed: {exc!r}")
             # HOSTED_CORE_SCALING §9.1 — dispose the single shared async
             # engine (releases its connection pool) once, in every process
             # role. Fail-soft so a dispose error never masks a clean
@@ -615,13 +674,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(
         player_persona_note_router, prefix="/api/v1", dependencies=_auth_dep,
     )
+    app.include_router(
+        player_identity_card_router, prefix="/api/v1", dependencies=_auth_dep,
+    )
     app.include_router(pending_follow_ups_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(proactive_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(push_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(system_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(nsfw_mode_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_providers_router, prefix="/api/v1", dependencies=_auth_dep)
-    app.include_router(admin_app_settings_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(admin_characters_router, prefix="/api/v1", dependencies=_auth_dep)
     # CV6 — admin-only full-chain video test
     # trigger. Not a player-facing surface and not on the public nginx
@@ -669,6 +730,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(branching_drama_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(world_events_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(observability_router, prefix="/api/v1", dependencies=_auth_dep)
+    # Must come *after* observability_router, which owns the static
+    # `/admin/app-settings/{quiet-hours,humanization-flags,
+    # persona-curiosity-flags}` routes. Starlette matches in registration
+    # order, so mounting this router first let its greedy
+    # `/admin/app-settings/{group}` swallow all three and answer
+    # `404 unknown group: quiet-hours` — the same shadowing trap the
+    # arc-template intake router is ordered around above.
+    app.include_router(admin_app_settings_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(usage_router, prefix="/api/v1", dependencies=_auth_dep)
     app.include_router(experiments_router, prefix="/api/v1", dependencies=_auth_dep)
     # Service-to-service Cloud→Core channel. Deliberately NOT behind
@@ -687,6 +756,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         app.include_router(
             internal_cloud_official_cards_router, prefix="/api/internal/v1",
         )
+        # LR series — the dormant-reactivation campaign channel. Mounted
+        # beside its siblings; the route itself answers 503
+        # ``cloud_mode_required`` when the subsystem is unwired, so a
+        # deployment that serves internal routes without the hosted
+        # proactive path says so rather than 404-ing.
+        app.include_router(line_reactivation_router, prefix="/api/internal/v1")
         app.include_router(external_chat_router, prefix="/api/internal/v1")
     app.include_router(ui_router)
     return app

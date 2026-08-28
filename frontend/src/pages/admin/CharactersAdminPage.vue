@@ -26,6 +26,8 @@ import CharacterCardMarketplace from '@/components/admin/CharacterCardMarketplac
 import CharacterCreateModal from '@/components/CharacterCreateModal.vue'
 import AdminCharacterPicker from '@/components/admin/AdminCharacterPicker.vue'
 import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
+import { useCharacterCreationFollowUp } from '@/composables/useCharacterCreationFollowUp'
+import type { CharacterCreationFollowUp } from '@/utils/characterCreationFollowUp'
 import { UiCard, UiBadge, UiButton } from '@/components/ui'
 import {
   downloadCharacterCard,
@@ -35,6 +37,7 @@ import {
 } from '@/utils/api/characters'
 
 const { t } = useI18n()
+const characterCreationFollowUp = useCharacterCreationFollowUp()
 
 const pickerRef = ref<InstanceType<typeof AdminCharacterPicker> | null>(null)
 const createModalOpen = ref(false)
@@ -103,6 +106,7 @@ async function handleImportFile(event: Event) {
 
 async function confirmImportCard(
   initialRelationship: InitialRelationshipPayload | null,
+  followUp: CharacterCreationFollowUp,
 ) {
   if (!pendingImportFile.value) return
   importing.value = true
@@ -111,6 +115,9 @@ async function confirmImportCard(
       pendingImportFile.value,
       { initialRelationship },
     )
+    // 精靈裡填的人設／勾的存卡，只有拿到 character id 之後才做得到（IC2）。
+    // 失敗不回滾角色，composable 會給一則帶重試鍵的提示。
+    await characterCreationFollowUp.run(character.id, followUp)
     await pickerRef.value?.refresh()
     notification.success({
       message: t('admin.page.characters.importCardSuccess', { name: character.name }),

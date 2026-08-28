@@ -43,6 +43,11 @@ class FeedPostResponse(BaseModel):
     video_prompt: str | None = None
     reactions: FeedReactionSummaryResponse
     reactions_seen_at: datetime | None = None
+    viewed_at: datetime | None = None
+    """When the player actually saw this post (KB11 of
+    PLAYER_KNOWLEDGE_BOUNDARY_PLAN). ``None`` means never viewed — the
+    frontend uses this to skip re-observing (and re-reporting) a post
+    it already knows is marked."""
     created_at: datetime
     liked: bool = False
     """Whether the calling user has liked this post. Hydrated by the
@@ -69,6 +74,7 @@ class FeedPostResponse(BaseModel):
                 comments=post.reactions.comments,
             ),
             reactions_seen_at=post.reactions_seen_at,
+            viewed_at=post.viewed_at,
             created_at=post.created_at,
             liked=liked,
         )

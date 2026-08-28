@@ -398,6 +398,13 @@ class ResetTableEffect:
 #: pointer is nulled. None of that is visible at the call site. The FK
 #: verbs quoted below say what the schema agrees should happen to those
 #: rows; the eraser still emits every one of those statements itself.
+#: ``dialogue_checkpoints`` is a different shape again: it has its own
+#: ``character_id`` column (keyed on the operator, not any one
+#: conversation) rather than hanging off a conversation FK, so no cascade
+#: verb reaches it — it is purged only because this flag names it
+#: explicitly. Without that explicit ``PURGE``, "清除對話記錄" left the
+#: accumulated summary behind, and the reader happily re-attached a
+#: summary of messages that no longer existed to the next prompt.
 RESET_FLAG_EFFECTS: Mapping[ResetFlag, tuple[ResetTableEffect, ...]] = (
     MappingProxyType({
         ResetFlag.MEMORIES: (
@@ -451,6 +458,18 @@ RESET_FLAG_EFFECTS: Mapping[ResetFlag, tuple[ResetTableEffect, ...]] = (
                 "conversation_id FK ON DELETE SET NULL：eraser 明發 "
                 "UPDATE … SET conversation_id = NULL——綁定列本身留著，"
                 "只是不再指向任何對話。",
+            ),
+            ResetTableEffect(
+                "dialogue_checkpoints",
+                ResetPolicy.PURGE,
+                "以 (character_id, operator_id) 為鍵的對話累積摘要，"
+                "自己有 character_id 欄（不經 conversation FK cascade）："
+                "清對話記錄卻不清這裡，checkpoint 會指向已被刪除訊息的 "
+                "covers_until_message_key，reader 仍把舊摘要當成角色記得"
+                "的內容掛回 prompt——玩家看到的「清除」是假的。DELETE "
+                "WHERE character_id 明發於 SACharacterResetEraser（同一"
+                "張表在 DELETE 消費者也是 CARRY 分類預設 PURGE，行為"
+                "一致）。",
             ),
         ),
         ResetFlag.STATE_HISTORY: (

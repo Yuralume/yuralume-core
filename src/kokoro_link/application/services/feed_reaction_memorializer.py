@@ -41,7 +41,10 @@ from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.domain.entities.feed_comment import FeedComment
 from kokoro_link.domain.entities.feed_post import FeedPost
 from kokoro_link.domain.entities.feed_reaction import FeedReaction
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.infrastructure.localization.fallback_texts import (
     localized_fallback_text,
@@ -297,6 +300,9 @@ class FeedReactionMemorializer:
             content=content,
             salience=salience,
             tags=tags,
+            # KB6: the memory *is* the player's own like/comment. They
+            # cannot be unaware of an action they performed.
+            player_knowledge=PLAYER_KNOWLEDGE_SHARED,
         )
 
 

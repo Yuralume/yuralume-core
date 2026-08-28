@@ -21,11 +21,17 @@ What pure code does (also enforced here as a guard):
 - Layer-specific confidence caps (Layer 3 ≤ 0.9, infer ≤ 0.6).
 - Reject malformed actions silently — a bad LLM batch should not
   break the next dream pass.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the action-schema validation above. The extraction
+used to have its own non-string-aware brace scanner (a real bug — a
+``}`` inside a quoted string value could truncate the region); the
+shared layer's string-aware scan fixes that as a side effect of the
+migration, not a deliberate change to this module's own logic.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from kokoro_link.application.services.feature_keys import FEATURE_PERSONA_DREAM
@@ -49,6 +55,7 @@ from kokoro_link.domain.value_objects.profile_field import (
     ProfileField,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -215,7 +222,27 @@ def _parse_response(
     valid_field_ids: set[str],
     confirmed_by_id: dict[str, ProfileField],
 ) -> ConsolidationResult:
-    obj = _extract_object(raw)
+    # The prompt unconditionally asks for one JSON object (an empty
+    # ``actions`` list when there's nothing to do), so any non-clean
+    # parse is worth a log line.
+    #
+    # Truncation repair is off all the same, because of what the actions
+    # in that object *do*. ``supersede`` writes ``new_value`` over a
+    # confirmed persona field and ``decay`` rewrites its confidence —
+    # the dream pass is the one place that overwrites facts the operator
+    # already established. A reply cut mid-``new_value`` repairs into an
+    # ordinary string that clears every validation below (non-empty,
+    # right layer, right field_key), and the confirmed value it replaces
+    # is not recoverable.
+    #
+    # The cost of failing closed is bounded and self-healing: the whole
+    # batch is dropped, but nothing in it was applied, the pending
+    # candidates are untouched, and the next dream pass re-asks with the
+    # same input. A half-value written into Layer 1 is not undone by a
+    # later pass.
+    outcome = extract_object_outcome(raw, repair_truncated=False)
+    log_parse_outcome(_LOGGER, outcome, site="persona.llm_consolidator")
+    obj = outcome.value
     if obj is None:
         return ConsolidationResult()
     actions_raw = obj.get("actions")
@@ -500,36 +527,3 @@ def _coerce_confidence(raw: object, layer: int) -> float | None:
     if value > max_conf:
         return max_conf
     return value
-
-
-def _extract_object(raw: str) -> dict | None:
-    if not raw:
-        return None
-    text = raw.strip()
-    if text.startswith("```"):
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1 :]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    end = -1
-    for i, ch in enumerate(text[start:], start=start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-    if end == -1:
-        return None
-    try:
-        obj = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None

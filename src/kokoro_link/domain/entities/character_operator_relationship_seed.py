@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from types import MappingProxyType
 
 
 SCHEDULE_INVOLVEMENT_POLICIES: frozenset[str] = frozenset({
@@ -13,12 +15,56 @@ SCHEDULE_INVOLVEMENT_POLICIES: frozenset[str] = frozenset({
     "shared_allowed",
 })
 
-_MAX_LABEL_CHARS = 80
-_MAX_TEXT_CHARS = 800
-_MAX_NAME_CHARS = 80
-_MAX_TONE_CHARS = 80
-_MAX_CADENCE_CHARS = 160
-_MAX_LIVING_ARRANGEMENT_CHARS = 240
+MAX_LABEL_CHARS = 80
+MAX_TEXT_CHARS = 800
+MAX_NAME_CHARS = 80
+MAX_TONE_CHARS = 80
+MAX_CADENCE_CHARS = 160
+MAX_LIVING_ARRANGEMENT_CHARS = 240
+
+# Internal aliases kept so this module's own call sites read unchanged.
+_MAX_LABEL_CHARS = MAX_LABEL_CHARS
+_MAX_TEXT_CHARS = MAX_TEXT_CHARS
+_MAX_NAME_CHARS = MAX_NAME_CHARS
+_MAX_TONE_CHARS = MAX_TONE_CHARS
+_MAX_CADENCE_CHARS = MAX_CADENCE_CHARS
+_MAX_LIVING_ARRANGEMENT_CHARS = MAX_LIVING_ARRANGEMENT_CHARS
+
+SEED_TEXT_FIELD_MAX_CHARS: Mapping[str, int] = MappingProxyType({
+    "relationship_label": MAX_LABEL_CHARS,
+    "known_context": MAX_TEXT_CHARS,
+    "living_arrangement": MAX_LIVING_ARRANGEMENT_CHARS,
+    "user_address_name": MAX_NAME_CHARS,
+    "character_address_name": MAX_NAME_CHARS,
+    "tone_distance": MAX_TONE_CHARS,
+    "familiarity_boundary": MAX_TEXT_CHARS,
+    "proactive_cadence_hint": MAX_CADENCE_CHARS,
+    "user_profile_notes": MAX_TEXT_CHARS,
+})
+"""Per-field ceiling for every free-text seed field, in one place.
+
+Anything that stores or re-validates a *copy* of the seed (the player
+identity card of the IC series, for one) reads its ceilings from here
+rather than restating the numbers — a limit raised in two files and
+lowered in one is a truncation bug nobody sees until someone's setting
+comes back cut in half."""
+
+SEED_CONTENT_FIELDS: tuple[str, ...] = (
+    "relationship_label",
+    "known_context",
+    "living_arrangement",
+    "user_address_name",
+    "character_address_name",
+    "tone_distance",
+    "familiarity_boundary",
+    "schedule_involvement_policy",
+    "proactive_permission",
+    "proactive_cadence_hint",
+    "user_profile_notes",
+)
+"""The eleven substantive fields the creation wizard asks for, in the
+order it asks them. Excludes the keys, ``confirmed_by_user`` and the
+timestamps — none of which a template of the seed can carry."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +176,17 @@ class CharacterOperatorRelationshipSeed:
         )
 
 
-def _trim(value: object, max_chars: int) -> str:
+def trim_seed_text(value: object, max_chars: int) -> str:
+    """Normalize one free-text seed field: strip, then clip to the cap.
+
+    Clipping rather than rejecting is the seed's long-standing contract —
+    these values arrive from an LLM-assisted intake, and a wizard that
+    refuses to finish because one generated line ran eight characters
+    long is worse than a line that loses its tail. Copies of the seed
+    reuse this so the two can never normalize differently."""
     if not isinstance(value, str):
         return ""
     return value.strip()[:max_chars]
+
+
+_trim = trim_seed_text

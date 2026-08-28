@@ -266,9 +266,20 @@ class Character:
     """When true, the chat prompt includes a ``最近世界上的事`` section
     with a few recent external events ranked against the user's message.
 
-    Defaults off so fantasy / period / purely fictional personas stay in
-    their bubble by default. Modern / curious personas should be toggled
-    on via the settings UI."""
+    The entity default is ``False`` — it is a *fallback for a value the
+    caller never supplied*, not the effective default new characters get.
+    Since TR1 (``TRIAL_INSIGHTS_DEFAULTS_PLAN.md`` §1), character
+    *creation* fills in a missing value itself: ``CharacterService``
+    calls
+    ``domain.value_objects.world_frame.default_world_awareness_enabled(frame)``
+    to decide, so a modern/contemporary ``world_frame`` is born with this
+    ``True`` and a fantasy/school/custom frame is born ``False`` — the
+    entity-level ``False`` here only ever surfaces for a caller that
+    builds a ``Character`` directly without going through that service
+    (tests, scripts) or that explicitly passes ``False``. Existing
+    characters are never backfilled by the frame default; only players
+    (via the settings UI) or an explicit creation payload change this
+    field once a character exists."""
     world_topics: tuple[str, ...] = field(default_factory=tuple)
     """Optional topic filter. Empty = accept any topic. Non-empty
     narrows the selector to events whose ``topic_tags`` intersect this

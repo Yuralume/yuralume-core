@@ -74,6 +74,7 @@ const GLOBAL_FEATURE_KEYS = [
   'arc_template_translate',
   'story_seed_translate',
   'showcase_review',
+  'showcase_image_review',
   'showcase_translate',
   'official_card_translate',
   'sillytavern_normalize',
@@ -89,11 +90,15 @@ const GLOBAL_FEATURE_KEYS = [
   'persona_projection',
   'persona_curiosity',
   'address_preference_observer',
+  'relationship_coherence',
   'experiment_analysis',
   'character_encounter_plan',
+  'character_encounter_beats',
   'character_encounter_dialogue',
   'character_encounter_reflect',
   'peer_knowledge_consolidate',
+  'outcome_claim_judge',
+  'player_knowledge_disclosure',
 ] as const
 
 // Every unique ProviderFieldSpec.key. Labels are always translated;
@@ -319,6 +324,101 @@ describe('providerFieldHint', () => {
       hint: 'backend hint text',
     })
     expect(hint).toBe('backend hint text')
+  })
+})
+
+describe('providerFieldLabel / providerFieldHint per-preset override chain', () => {
+  const t = (key: string, fallback: string) => i18n.global.t(key, fallback)
+
+  // The `thinking_budget_tokens` field key is DELIBERATELY shared
+  // between the anthropic and openrouter presets even though "blank"
+  // means something different on each dialect (off vs. upstream
+  // default) — see catalog.py's openrouter_thinking_budget_tokens spec.
+  // The presetId argument must resolve each connection type's own copy
+  // instead of one bleeding into the other.
+  it('prefers a per-preset label over the shared field-key label', () => {
+    i18n.global.locale.value = 'zh-TW'
+    const field = { key: 'thinking_budget_tokens', label: 'Thinking budget tokens', placeholder: 'e.g. 4096' }
+    const sharedLabel = providerFieldLabel(t, field)
+    const openrouterLabel = providerFieldLabel(t, field, 'openrouter')
+    // No providerFields.openrouter.thinking_budget_tokens.label entry
+    // exists (only the shared label is overridden) — the per-preset
+    // layer for this field is hint-only, so both must currently agree.
+    expect(openrouterLabel).toBe(sharedLabel)
+    expect(openrouterLabel).toBe(
+      nested(zhTW, `${PROVIDER_FIELD_NAMESPACE}.thinking_budget_tokens.label`),
+    )
+  })
+
+  it('falls through to the shared label for a preset with no override', () => {
+    i18n.global.locale.value = 'zh-TW'
+    const field = { key: 'thinking_budget_tokens', label: 'Thinking budget tokens', placeholder: 'e.g. 4096' }
+    expect(providerFieldLabel(t, field, 'mistral')).toBe(
+      nested(zhTW, `${PROVIDER_FIELD_NAMESPACE}.thinking_budget_tokens.label`),
+    )
+  })
+
+  it('resolves different per-preset hints for the same shared field key', () => {
+    i18n.global.locale.value = 'zh-TW'
+    const field = { key: 'thinking_budget_tokens', label: 'Thinking budget tokens', placeholder: 'e.g. 4096' }
+    const anthropicHint = providerFieldHint(t, field, 'anthropic')
+    const openrouterHint = providerFieldHint(t, field, 'openrouter')
+    expect(anthropicHint).toBe(
+      nested(zhTW, `${PROVIDER_FIELD_NAMESPACE}.anthropic.thinking_budget_tokens.hint`),
+    )
+    expect(openrouterHint).toBe(
+      nested(zhTW, `${PROVIDER_FIELD_NAMESPACE}.openrouter.thinking_budget_tokens.hint`),
+    )
+    expect(anthropicHint).not.toBe(openrouterHint)
+    expect(anthropicHint).not.toBe('')
+    expect(openrouterHint).not.toBe('')
+  })
+
+  it('resolves a per-preset hint even when the catalog field carries no hint of its own', () => {
+    i18n.global.locale.value = 'en-US'
+    // The anthropic spec's own English hint (catalog.py) is a
+    // last-resort fallback only — the per-preset i18n entry must win
+    // even though the frontend never sees that backend string equal
+    // the translated hint here.
+    const hint = providerFieldHint(
+      t,
+      { key: 'thinking_budget_tokens', label: 'Thinking budget tokens', placeholder: 'e.g. 4096', hint: '' },
+      'anthropic',
+    )
+    expect(hint).toBe(
+      nested(enUS, `${PROVIDER_FIELD_NAMESPACE}.anthropic.thinking_budget_tokens.hint`),
+    )
+    expect(hint).not.toBe('')
+  })
+
+  it('falls through to the backend hint for a preset+key with no i18n entry at all', () => {
+    const hint = providerFieldHint(
+      t,
+      { key: 'brand_new_field', label: 'X', placeholder: '', hint: 'backend hint text' },
+      'openrouter',
+    )
+    expect(hint).toBe('backend hint text')
+  })
+
+  it('resolves the custom_openai_compatible-scoped disable_reasoning hint', () => {
+    i18n.global.locale.value = 'ja-JP'
+    const hint = providerFieldHint(
+      t,
+      { key: 'disable_reasoning', label: 'Disable reasoning / thinking', placeholder: '' },
+      'custom_openai_compatible',
+    )
+    expect(hint).toBe(
+      nested(jaJP, `${PROVIDER_FIELD_NAMESPACE}.custom_openai_compatible.disable_reasoning.hint`),
+    )
+    expect(hint).not.toBe('')
+    // A different preset sharing the same field key (e.g.
+    // local_openai_compatible) must NOT pick up this scoped hint.
+    const otherPresetHint = providerFieldHint(
+      t,
+      { key: 'disable_reasoning', label: 'Disable reasoning / thinking', placeholder: '' },
+      'local_openai_compatible',
+    )
+    expect(otherPresetHint).toBe('')
   })
 })
 

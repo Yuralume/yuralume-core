@@ -1,70 +1,90 @@
 """TurnUndoService — reverse the last turn of a conversation.
 
-Reads the most recent ``TurnJournal`` for the conversation, then
-reverses each recorded side effect in an order that avoids dangling
-references:
+Reads the most recent ``TurnJournal`` for the conversation, runs every
+registered rollback step against it, then deletes the journal row so the
+same turn cannot be undone twice.
 
-1. Truncate conversation messages back to ``turn_index`` (drops the
-   user + assistant pair that the turn appended).
-2. Delete memory rows added this turn (by id).
-3. Delete ``StateSnapshot`` rows added this turn (by id).
-4. Restore ``Character.state`` from the pre-turn snapshot.
-5. Restore the character's goals list from snapshot (delete-all +
-   bulk-insert).
-6. Restore the active story arc from snapshot (if captured).
-7. Restore today's daily schedule from snapshot (if captured).
-8. Delete the journal row itself.
+The service itself holds no rollback logic. Each subsystem's reversal is
+one :class:`~kokoro_link.application.services.turn_undo.step.UndoStep`
+in its own file under ``turn_undo/steps/``, and
+``turn_undo/registry.py`` owns the order (and the reasoning for it). All
+this module does is: load, build the context, run the list, report.
 
-Fail-soft: each step catches its own exceptions and logs — one
-subsystem refusing to reverse (e.g. a schedule row deleted out from
-under us) shouldn't block the rest of the rollback. The endpoint
-returns a summary so the UI can surface which parts succeeded.
+**Fail-soft is the point of the loop.** Every step runs inside its own
+``try``: one subsystem refusing to reverse — a schedule row deleted out
+from under us, a repository that is unwired on this deployment — must
+not stop the other sixteen. The result summarises what actually
+happened, so the UI can say which parts came back.
 
 Scope caveats (documented, not bugs):
-- Story events (``StoryEvent`` rows) are **not** rolled back — they
-  regenerate daily via ``ensure_today`` and rarely mutate per-turn.
 - Tool invocation audit logs are kept (operators may want to see the
   undone tool call for debugging).
-- External side effects (images written to ``uploads/``, Telegram
-  messages that already went out) are **not** reversed.
+- Turn records and usage / billing events are kept: the upstream call
+  really was made and really was paid for.
+- External side effects (images written to ``uploads/``, Telegram or
+  LINE messages that already went out) are **not** reversed.
+- ``story_events`` rows are reversed selectively, not uniformly: the
+  gacha-rolled daily events (``seed_id`` set) are left alone because
+  they regenerate the next day via ``ensure_today`` and rarely mutate
+  per-turn anyway. Arc-beat realisations (``arc_beat_id`` set) are
+  different — they are one-shot records of a beat having been played,
+  and nothing regenerates them, so ``StoryEventDeleteStep`` does
+  reverse those. (This module used to excuse *all* of ``story_events``
+  on the "regenerates daily" grounds; that was only ever true of the
+  gacha half.)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from kokoro_link.application.services.turn_snapshot_codec import (
-    arc_from_dict, goal_from_dict, schedule_from_dict, state_from_dict,
+from kokoro_link.application.services.material_digest_precompute import (
+    MaterialDigestInvalidator,
 )
+from kokoro_link.application.services.turn_undo import (
+    UNDO_STEPS, UndoContext, UndoDependencies, UndoResult, UndoStep, UndoTally,
+)
+from kokoro_link.contracts.address_change_log import (
+    AddressChangeLogRepositoryPort,
+)
+from kokoro_link.contracts.background_jobs import BackgroundJobQueuePort
+from kokoro_link.contracts.character_encounter_intent import (
+    CharacterEncounterIntentRepositoryPort,
+)
+from kokoro_link.contracts.dialogue_checkpoint import (
+    DialogueCheckpointRepositoryPort,
+)
+from kokoro_link.contracts.emotion import EmotionEventRepositoryPort
 from kokoro_link.contracts.goal_repository import GoalRepositoryPort
+from kokoro_link.contracts.initial_relationship import (
+    CharacterOperatorRelationshipSeedRepositoryPort,
+)
 from kokoro_link.contracts.memory import MemoryRepositoryPort
+from kokoro_link.contracts.operator_address_preference import (
+    OperatorAddressPreferenceRepositoryPort,
+)
 from kokoro_link.contracts.operator_persona import OperatorPersonaRepositoryPort
+from kokoro_link.contracts.pending_follow_up import (
+    PendingFollowUpRepositoryPort,
+)
+from kokoro_link.contracts.persona_curiosity import (
+    PersonaCuriosityRepositoryPort,
+)
 from kokoro_link.contracts.repositories import (
     CharacterRepositoryPort, ConversationRepositoryPort,
 )
 from kokoro_link.contracts.schedule_repository import ScheduleRepositoryPort
 from kokoro_link.contracts.state_history import StateHistoryRepositoryPort
+from kokoro_link.contracts.story import StoryEventRepositoryPort
 from kokoro_link.contracts.story_arc import StoryArcRepositoryPort
+from kokoro_link.contracts.story_scene import StorySceneSessionRepositoryPort
 from kokoro_link.contracts.turn_journal import TurnJournalRepositoryPort
-from kokoro_link.domain.entities.conversation import Conversation
-from kokoro_link.domain.entities.turn_journal import TurnJournal
+from kokoro_link.contracts.undone_turn import UndoneTurnRepositoryPort
 
 _LOGGER = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True, slots=True)
-class UndoResult:
-    conversation_id: str
-    turn_index: int
-    reverted_messages: int
-    deleted_memories: int
-    deleted_state_snapshots: int
-    rejected_persona_fields: int
-    restored_goals: bool
-    restored_arc: bool
-    restored_schedule: bool
-    restored_character_state: bool
+__all__ = ["NoJournalError", "TurnUndoService", "UndoResult"]
 
 
 class NoJournalError(Exception):
@@ -72,6 +92,11 @@ class NoJournalError(Exception):
 
 
 class TurnUndoService:
+    """Orchestrates the rollback. Every keyword is a repository a step
+    may need; all but the first four are optional because the subsystem
+    behind them is absent on some deployments, and the step that reads
+    one reports "did nothing" rather than failing the undo."""
+
     def __init__(
         self,
         *,
@@ -83,17 +108,64 @@ class TurnUndoService:
         goal_repository: GoalRepositoryPort | None = None,
         arc_repository: StoryArcRepositoryPort | None = None,
         schedule_repository: ScheduleRepositoryPort | None = None,
-        operator_persona_repository: OperatorPersonaRepositoryPort | None = None,
+        operator_persona_repository: (
+            OperatorPersonaRepositoryPort | None
+        ) = None,
+        undone_turn_repository: UndoneTurnRepositoryPort | None = None,
+        emotion_event_repository: EmotionEventRepositoryPort | None = None,
+        pending_follow_up_repository: (
+            PendingFollowUpRepositoryPort | None
+        ) = None,
+        follow_up_release_queue: BackgroundJobQueuePort | None = None,
+        address_preference_repository: (
+            OperatorAddressPreferenceRepositoryPort | None
+        ) = None,
+        address_change_log_repository: (
+            AddressChangeLogRepositoryPort | None
+        ) = None,
+        relationship_seed_repository: (
+            CharacterOperatorRelationshipSeedRepositoryPort | None
+        ) = None,
+        scene_session_repository: StorySceneSessionRepositoryPort | None = None,
+        encounter_intent_repository: (
+            CharacterEncounterIntentRepositoryPort | None
+        ) = None,
+        persona_curiosity_repository: (
+            PersonaCuriosityRepositoryPort | None
+        ) = None,
+        story_event_repository: StoryEventRepositoryPort | None = None,
+        dialogue_checkpoint_repository: (
+            DialogueCheckpointRepositoryPort | None
+        ) = None,
+        material_digest_cache: MaterialDigestInvalidator | None = None,
+        steps: tuple[UndoStep, ...] = UNDO_STEPS,
     ) -> None:
         self._journals = journal_repository
-        self._conversations = conversation_repository
-        self._characters = character_repository
-        self._memories = memory_repository
-        self._state_history = state_history_repository
-        self._goals = goal_repository
-        self._arcs = arc_repository
-        self._schedules = schedule_repository
-        self._operator_persona = operator_persona_repository
+        self._steps = steps
+        self._deps = UndoDependencies(
+            journals=journal_repository,
+            conversations=conversation_repository,
+            characters=character_repository,
+            memories=memory_repository,
+            state_history=state_history_repository,
+            goals=goal_repository,
+            arcs=arc_repository,
+            schedules=schedule_repository,
+            operator_persona=operator_persona_repository,
+            undone_turns=undone_turn_repository,
+            emotion_events=emotion_event_repository,
+            pending_follow_ups=pending_follow_up_repository,
+            follow_up_release_queue=follow_up_release_queue,
+            address_preferences=address_preference_repository,
+            address_change_log=address_change_log_repository,
+            relationship_seeds=relationship_seed_repository,
+            scene_sessions=scene_session_repository,
+            encounter_intents=encounter_intent_repository,
+            persona_curiosity=persona_curiosity_repository,
+            story_events=story_event_repository,
+            dialogue_checkpoints=dialogue_checkpoint_repository,
+            material_digest_cache=material_digest_cache,
+        )
 
     async def undo_last_turn(self, conversation_id: str) -> UndoResult:
         journal = await self._journals.get_latest(conversation_id)
@@ -102,163 +174,30 @@ class TurnUndoService:
                 f"No undoable turns recorded for conversation {conversation_id}",
             )
 
-        reverted_messages = await self._truncate_conversation(
-            conversation_id, journal.turn_index,
+        context = UndoContext(
+            journal=journal,
+            deps=self._deps,
+            # One clock read for the whole rollback: two steps stamping
+            # a timestamp must not disagree about when the undo was.
+            now=datetime.now(timezone.utc),
         )
-        deleted_memories = await self._delete_memories(
-            conversation_id, journal.turn_started_at,
-        )
-        deleted_state_snapshots = await self._delete_state_snapshots(
-            journal.character_id, journal.turn_started_at,
-        )
-        rejected_persona_fields = await self._reject_persona_fields(
-            conversation_id, journal.turn_started_at,
-        )
-        restored_state = await self._restore_character_state(journal)
-        restored_goals = await self._restore_goals(journal)
-        restored_arc = await self._restore_arc(journal)
-        restored_schedule = await self._restore_schedule(journal)
+        tally = UndoTally()
+        for step in self._steps:
+            try:
+                await step.apply(context, tally)
+            except Exception:
+                _LOGGER.exception(
+                    "Undo: step %s failed for conversation %s",
+                    step.name, conversation_id,
+                )
 
         try:
             await self._journals.delete(journal.id)
         except Exception:
             _LOGGER.exception("Undo: failed to delete journal %s", journal.id)
 
-        return UndoResult(
+        return UndoResult.from_tally(
             conversation_id=conversation_id,
             turn_index=journal.turn_index,
-            reverted_messages=reverted_messages,
-            deleted_memories=deleted_memories,
-            deleted_state_snapshots=deleted_state_snapshots,
-            rejected_persona_fields=rejected_persona_fields,
-            restored_goals=restored_goals,
-            restored_arc=restored_arc,
-            restored_schedule=restored_schedule,
-            restored_character_state=restored_state,
+            tally=tally,
         )
-
-    async def _truncate_conversation(
-        self, conversation_id: str, turn_index: int,
-    ) -> int:
-        try:
-            conv = await self._conversations.get(conversation_id)
-        except Exception:
-            _LOGGER.exception("Undo: conversation get failed")
-            return 0
-        if conv is None:
-            return 0
-        if turn_index >= len(conv.messages):
-            return 0
-        dropped = len(conv.messages) - turn_index
-        truncated = Conversation(
-            id=conv.id,
-            character_id=conv.character_id,
-            messages=list(conv.messages[:turn_index]),
-            source=conv.source,
-            # Carry the loaded optimistic-concurrency version + read boundary
-            # (B3) so the repo can tell a genuine concurrent append from the
-            # tail this undo is deliberately dropping.
-            version=conv.version,
-            loaded_message_count=conv.loaded_message_count,
-        )
-        try:
-            # B3: an undo is an authoritative truncation — it must not merge the
-            # tail it is removing back, even if a concurrent append bumped the
-            # version in between. ``truncation=True`` applies the replace verbatim.
-            await self._conversations.save(truncated, truncation=True)
-        except Exception:
-            _LOGGER.exception("Undo: conversation save failed")
-            return 0
-        return dropped
-
-    async def _delete_memories(
-        self, conversation_id: str, since,
-    ) -> int:
-        try:
-            return await self._memories.delete_created_since(
-                conversation_id, since,
-            )
-        except Exception:
-            _LOGGER.exception("Undo: memory delete failed")
-            return 0
-
-    async def _delete_state_snapshots(
-        self, character_id: str, since,
-    ) -> int:
-        if self._state_history is None:
-            return 0
-        try:
-            return await self._state_history.delete_created_since(
-                character_id, since,
-            )
-        except Exception:
-            _LOGGER.exception("Undo: state_history delete failed")
-            return 0
-
-    async def _reject_persona_fields(self, conversation_id: str, since) -> int:
-        if self._operator_persona is None:
-            return 0
-        try:
-            return await self._operator_persona.reject_evidence_since(
-                conversation_id=conversation_id,
-                since=since,
-            )
-        except Exception:
-            _LOGGER.exception("Undo: operator persona reject failed")
-            return 0
-
-    async def _restore_character_state(self, journal: TurnJournal) -> bool:
-        if not journal.prev_character_state:
-            return False
-        try:
-            character = await self._characters.get(journal.character_id)
-            if character is None:
-                return False
-            restored_state = state_from_dict(journal.prev_character_state)
-            await self._characters.save(character.with_state(restored_state))
-            return True
-        except Exception:
-            _LOGGER.exception("Undo: character state restore failed")
-            return False
-
-    async def _restore_goals(self, journal: TurnJournal) -> bool:
-        if self._goals is None:
-            return False
-        try:
-            await self._goals.delete_for_character(journal.character_id)
-            if journal.prev_goals:
-                restored = [goal_from_dict(g) for g in journal.prev_goals]
-                await self._goals.add_many(restored)
-            return True
-        except Exception:
-            _LOGGER.exception("Undo: goal restore failed")
-            return False
-
-    async def _restore_arc(self, journal: TurnJournal) -> bool:
-        if self._arcs is None:
-            return False
-        if journal.prev_active_arc is None:
-            # Either no arc existed pre-turn (nothing to restore) or
-            # the arc got deleted mid-turn — we don't reverse either
-            # case because distinguishing them reliably requires
-            # recording deletions too, and the scope here is ``undo
-            # the typical post-turn mutation``.
-            return False
-        try:
-            restored = arc_from_dict(journal.prev_active_arc)
-            await self._arcs.save(restored)
-            return True
-        except Exception:
-            _LOGGER.exception("Undo: arc restore failed")
-            return False
-
-    async def _restore_schedule(self, journal: TurnJournal) -> bool:
-        if self._schedules is None or journal.prev_daily_schedule is None:
-            return False
-        try:
-            restored = schedule_from_dict(journal.prev_daily_schedule)
-            await self._schedules.save(restored)
-            return True
-        except Exception:
-            _LOGGER.exception("Undo: schedule restore failed")
-            return False

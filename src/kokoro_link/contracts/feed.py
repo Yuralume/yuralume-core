@@ -115,6 +115,36 @@ class FeedPostRepositoryPort(ABC):
     async def save(self, post: FeedPost) -> None: ...
 
     @abstractmethod
+    async def mark_viewed(
+        self,
+        character_id: str,
+        post_ids: Iterable[str],
+        *,
+        when: datetime | None = None,
+    ) -> int:
+        """Idempotently stamp ``viewed_at`` on ``post_ids`` (KB11).
+
+        Scoped to ``character_id`` so a caller can only mark posts
+        belonging to the character they already hold ownership of —
+        the route resolves ``character_id`` via the same ownership
+        dependency every other feed endpoint uses, and this method
+        trusts that resolution rather than re-deriving it.
+
+        First read wins: a post that already carries a ``viewed_at``
+        is left untouched, whether the duplicate comes from a replayed
+        batch, a like/comment landing after the exposure event, or the
+        exposure event landing after the like/comment. Ids that don't
+        exist or don't belong to ``character_id`` are silently
+        ignored — this is a best-effort ledger, not a validating
+        write, so a stale id in a batched frontend report can't turn
+        an otherwise-successful call into an error.
+
+        Returns the number of posts whose watermark was newly set —
+        the caller uses this only for observability, never as a
+        correctness signal (0 is the steady-state response for a
+        replayed batch)."""
+
+    @abstractmethod
     async def delete(self, post_id: str) -> bool: ...
 
     @abstractmethod

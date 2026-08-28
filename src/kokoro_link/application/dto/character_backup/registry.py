@@ -56,6 +56,7 @@ from kokoro_link.application.dto.character_backup.character import (
 from kokoro_link.application.dto.character_backup.conversation import (
     ConversationBackupRecord,
     DeferredIntentBackupRecord,
+    DialogueCheckpointBackupRecord,
     MessageBackupRecord,
     PendingFollowUpBackupRecord,
     TurnJournalBackupRecord,
@@ -209,6 +210,19 @@ CHARACTER_BACKUP_TABLE_RULES: tuple[BackupTableRule, ...] = (
         ),
         dto=MessageBackupRecord,
         parent_table="conversations",
+    ),
+    BackupTableRule(
+        table="dialogue_checkpoints",
+        classification=BackupClassification.CARRY,
+        reason=(
+            "對話累積摘要（DH3）：角色對「載入視窗以外的整段關係」的"
+            "唯一記憶。訊息本身有帶走，但那段的**摘要**無法從一個已"
+            "經回溯不到那麼遠的視窗重算——不帶等於還原出一個忘記了"
+            "這段關係的角色，而且救不回來。"
+            "covers_until_message_key 是訊息的內容指紋不是 row id，"
+            "匯入重發 id 之後仍指向同一則訊息。"
+        ),
+        dto=DialogueCheckpointBackupRecord,
     ),
     BackupTableRule(
         table="turn_journals",
@@ -484,6 +498,23 @@ CHARACTER_BACKUP_TABLE_RULES: tuple[BackupTableRule, ...] = (
         ),
     ),
     BackupTableRule(
+        table="prompt_material_digests",
+        classification=_RUNTIME,
+        reason=(
+            "上一回合 post-turn 蒸給下一回合讀的素材摘要"
+            "（DIGEST_OFFPATH）：每個欄位都是從 emotion_events／"
+            "self_reflections／story_events／story_arcs／feed_posts 重"
+            "算得出來的衍生值，而那些來源表本身就在 CARRY 清單裡——"
+            "還原完第一次 post-turn 就會重新蒸一份。**帶著它反而更"
+            "糟**：匯出當下的摘要會以「現況」的語氣掛回還原後的 "
+            "prompt，而它描述的是另一個時間點的素材；讀取端的 24h "
+            "上限也只是把這個錯誤限縮成一天，不是消掉。與 "
+            "dialogue_checkpoints（CARRY）的差別正在這裡：那份摘要"
+            "涵蓋的是視窗外、已經重算不回來的對話，這份沒有任何一"
+            "個位元是重算不回來的。"
+        ),
+    ),
+    BackupTableRule(
         table="background_visible_slots",
         classification=_RUNTIME,
         reason="tick 去重 claim ledger，純 runtime。",
@@ -517,6 +548,18 @@ CHARACTER_BACKUP_TABLE_RULES: tuple[BackupTableRule, ...] = (
         table="external_proactive_events",
         classification=_RUNTIME,
         reason="外部主動送信 pre-send ledger，runtime 時態。",
+    ),
+    BackupTableRule(
+        table="line_reactivation_campaign_items",
+        classification=_RUNTIME,
+        reason=(
+            "LINE 休眠回訪 campaign 的逐角色 outcome（LR 系列）：這是"
+            "**營運者做過什麼**的稽核列，不是角色的資料。它掛在一個備"
+            "份不帶走的 campaign 上，把它還原到另一個部署等於宣稱那邊"
+            "發生過一次從未發生的後台操作。"
+            "（父表 `line_reactivation_campaigns` 沒有任何 character 欄，"
+            "本來就不在本 registry 的掃描範圍內。）"
+        ),
     ),
     BackupTableRule(
         table="cloud_subscription_states",

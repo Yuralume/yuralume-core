@@ -171,7 +171,7 @@ class _StubSummarizer:
         self._summary = summary
         self.calls = 0
 
-    async def summarize(self, *, character, messages):  # noqa: ANN001
+    async def summarize(self, *, character, messages, now=None, local_tz=None):  # noqa: ANN001
         self.calls += 1
         return self._summary
 
@@ -644,7 +644,7 @@ async def test_the_material_keeps_the_memories_with_the_most_pull() -> None:
 async def test_a_broken_summarizer_does_not_cost_the_player_the_scene(
 ) -> None:
     class _ExplodingSummarizer(_StubSummarizer):
-        async def summarize(self, *, character, messages):  # noqa: ANN001
+        async def summarize(self, *, character, messages, now=None, local_tz=None):  # noqa: ANN001
             raise RuntimeError("summarizer is down")
 
     fx, character = await _dormant_side_story_fixture(

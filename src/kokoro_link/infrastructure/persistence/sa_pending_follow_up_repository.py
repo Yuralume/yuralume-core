@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import asc, delete, desc, select
+from sqlalchemy import asc, delete, desc, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from kokoro_link.contracts.pending_follow_up import (
@@ -41,6 +41,30 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
             row = await session.get(PendingFollowUpRow, follow_up_id)
             return _row_to_domain(row) if row else None
 
+    async def coalesce_promise_intent(
+        self,
+        follow_up_id: str,
+        *,
+        expected_intent: str,
+        new_intent: str,
+        now: datetime,
+    ) -> bool:
+        """One conditional UPDATE — see the port for why every predicate
+        is in the statement rather than in a read before it."""
+        async with self._session_factory() as session, session.begin():
+            result = await session.execute(
+                update(PendingFollowUpRow)
+                .where(PendingFollowUpRow.id == follow_up_id)
+                .where(
+                    PendingFollowUpRow.status
+                    == PendingFollowUpStatus.QUEUED.value,
+                )
+                .where(PendingFollowUpRow.scheduled_for > now)
+                .where(PendingFollowUpRow.promise_intent == expected_intent)
+                .values(promise_intent=new_intent, updated_at=now),
+            )
+            return bool(result.rowcount)
+
     async def find_open_for_conversation(
         self, conversation_id: str,
     ) -> PendingFollowUp | None:
@@ -54,6 +78,19 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
             )
             row = (await session.execute(stmt)).scalar_one_or_none()
             return _row_to_domain(row) if row else None
+
+    async def list_open_for_conversation(
+        self, conversation_id: str,
+    ) -> list[PendingFollowUp]:
+        async with self._session_factory() as session:
+            stmt = (
+                select(PendingFollowUpRow)
+                .where(PendingFollowUpRow.conversation_id == conversation_id)
+                .where(PendingFollowUpRow.status.in_(_OPEN_STATUSES))
+                .order_by(asc(PendingFollowUpRow.queued_at))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [_row_to_domain(r) for r in rows]
 
     async def list_due(
         self,
@@ -110,6 +147,48 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
             rows = (await session.execute(stmt)).scalars().all()
             return [_row_to_domain(r) for r in rows]
 
+    async def list_created_since(
+        self, conversation_id: str, since: datetime,
+    ) -> list[PendingFollowUp]:
+        async with self._session_factory() as session:
+            stmt = (
+                select(PendingFollowUpRow)
+                .where(
+                    PendingFollowUpRow.conversation_id == conversation_id,
+                )
+                # Inclusive: the turn stamps the journal's start instant
+                # and the row it defers from one clock read, so ``>`` would
+                # skip the very row turn-undo came for.
+                .where(PendingFollowUpRow.queued_at >= since)
+                .order_by(asc(PendingFollowUpRow.queued_at))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [_row_to_domain(r) for r in rows]
+
+    async def list_created_by_turn(
+        self, conversation_id: str, turn_record_id: str,
+    ) -> list[PendingFollowUp]:
+        async with self._session_factory() as session:
+            stmt = (
+                select(PendingFollowUpRow)
+                .where(
+                    PendingFollowUpRow.conversation_id == conversation_id,
+                )
+                .where(PendingFollowUpRow.turn_record_id == turn_record_id)
+                .order_by(asc(PendingFollowUpRow.queued_at))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [_row_to_domain(r) for r in rows]
+
+    async def delete(self, follow_up_id: str) -> bool:
+        async with self._session_factory() as session, session.begin():
+            result = await session.execute(
+                delete(PendingFollowUpRow).where(
+                    PendingFollowUpRow.id == follow_up_id,
+                ),
+            )
+            return bool(result.rowcount)
+
     async def delete_for_conversation(self, conversation_id: str) -> int:
         async with self._session_factory() as session, session.begin():
             result = await session.execute(
@@ -153,6 +232,8 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
                     last_error=follow_up.last_error,
                     kind=follow_up.kind.value,
                     promise_intent=follow_up.promise_intent,
+                    turn_record_id=follow_up.turn_record_id,
+                    honesty_park_attempts=follow_up.honesty_park_attempts,
                 ))
             else:
                 existing.character_id = follow_up.character_id
@@ -170,6 +251,10 @@ class SaPendingFollowUpRepository(PendingFollowUpRepositoryPort):
                 existing.last_error = follow_up.last_error
                 existing.kind = follow_up.kind.value
                 existing.promise_intent = follow_up.promise_intent
+                existing.turn_record_id = follow_up.turn_record_id
+                existing.honesty_park_attempts = (
+                    follow_up.honesty_park_attempts
+                )
 
 
 def _message_to_payload(message: PendingFollowUpMessage) -> dict:
@@ -234,6 +319,16 @@ def _row_to_domain(row: PendingFollowUpRow) -> PendingFollowUp:
         last_error=row.last_error,
         kind=PendingFollowUpKind(kind_raw),
         promise_intent=getattr(row, "promise_intent", "") or "",
+        # ``getattr`` for the same reason ``kind`` uses it: a row read
+        # through a build that predates migration ``t0h6b3e10045`` has no
+        # such attribute, and "no anchor" is the correct answer there.
+        turn_record_id=getattr(row, "turn_record_id", None) or None,
+        # Same ``getattr`` tolerance as the two above: a row read through a
+        # build predating migration ``w3k9e6h10048`` has no such attribute,
+        # and "no honesty park has happened yet" is the correct reading.
+        honesty_park_attempts=int(
+            getattr(row, "honesty_park_attempts", 0) or 0
+        ),
     )
 
 

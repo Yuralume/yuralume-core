@@ -24,12 +24,15 @@ import {
 } from '@/utils/characterCardSource'
 import { UiCard, UiButton, UiBadge } from '@/components/ui'
 import InitialRelationshipWizardModal from '@/components/InitialRelationshipWizardModal.vue'
+import { useCharacterCreationFollowUp } from '@/composables/useCharacterCreationFollowUp'
+import type { CharacterCreationFollowUp } from '@/utils/characterCreationFollowUp'
 
 const emit = defineEmits<{
   installed: [char: Character]
 }>()
 
 const { t } = useI18n()
+const characterCreationFollowUp = useCharacterCreationFollowUp()
 
 const packs = ref<CharacterCardPackSummary[]>([])
 const loading = ref(true)
@@ -74,6 +77,7 @@ function install(pack: CharacterCardPackSummary) {
 
 async function confirmInstall(
   initialRelationship: InitialRelationshipPayload | null,
+  followUp: CharacterCreationFollowUp,
 ) {
   const pack = pendingPack.value
   if (!pack) return
@@ -86,6 +90,9 @@ async function confirmInstall(
         initialRelationship,
       },
     )
+    // 精靈裡填的人設／勾的存卡，只有拿到 character id 之後才做得到（IC2）。
+    // 失敗不回滾角色，composable 會給一則帶重試鍵的提示。
+    await characterCreationFollowUp.run(character.id, followUp)
     notification.success({
       message: t('admin.page.characters.marketplace.installSuccess', { name: character.name }),
       description: landed_arc_template_ids.length

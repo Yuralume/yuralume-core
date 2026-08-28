@@ -374,3 +374,54 @@ async def test_empty_adjustments_list_short_circuits() -> None:
         date_=date(2026, 4, 18),
     )
     assert updated is None
+
+
+@pytest.mark.asyncio
+async def test_manual_remove_marks_schedule_manually_adjusted() -> None:
+    """The manual routes stamp the day so the same-day weather refresh
+    (``_is_stale_current_day_plan``) can no longer rebuild it and
+    resurrect the deleted activity."""
+    service = _build_service()
+    character = _character()
+    schedule = await _seed_schedule(
+        service, character.id, date_=date(2026, 4, 18),
+        activities=[_activity(9, 12, "morning"), _activity(14, 18, "afternoon")],
+    )
+    target_id = schedule.activities[0].id
+
+    updated = await service.apply_adjustments(
+        character_id=character.id,
+        adjustments=[ScheduleAdjustment(action="remove", activity_id=target_id)],
+        date_=date(2026, 4, 18),
+        manual=True,
+    )
+
+    assert updated is not None
+    assert updated.manually_adjusted is True
+    persisted = await service._repository.get(  # noqa: SLF001 — test seam
+        character.id, date(2026, 4, 18),
+    )
+    assert persisted is not None
+    assert persisted.manually_adjusted is True
+
+
+@pytest.mark.asyncio
+async def test_post_turn_adjustments_leave_manual_flag_unset() -> None:
+    """LLM post-turn adjustments must NOT freeze the day — the weather
+    refresh keeps working for days only the model has touched."""
+    service = _build_service()
+    character = _character()
+    schedule = await _seed_schedule(
+        service, character.id, date_=date(2026, 4, 18),
+        activities=[_activity(9, 12, "morning")],
+    )
+    target_id = schedule.activities[0].id
+
+    updated = await service.apply_adjustments(
+        character_id=character.id,
+        adjustments=[ScheduleAdjustment(action="remove", activity_id=target_id)],
+        date_=date(2026, 4, 18),
+    )
+
+    assert updated is not None
+    assert updated.manually_adjusted is False

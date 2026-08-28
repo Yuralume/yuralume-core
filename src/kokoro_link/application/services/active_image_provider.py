@@ -35,7 +35,10 @@ from typing import Any
 from kokoro_link.contracts.active_image import ActiveImageProviderPort
 from kokoro_link.contracts.image_provider import ImageProviderPort
 from kokoro_link.contracts.repositories import PreferencesRepositoryPort
-from kokoro_link.application.services.nsfw_mode import NsfwModeService
+from kokoro_link.application.services.nsfw_mode import (
+    NsfwModeService,
+    NsfwModeTarget,
+)
 from kokoro_link.application.services.scoped_preferences import (
     get_preference_with_user_fallback,
 )
@@ -95,8 +98,19 @@ class PreferenceBackedActiveImageProvider(ActiveImageProviderPort):
         *,
         character: Character | None = None,
     ) -> str | None:
-        nsfw_profile_id = await self._read_nsfw_profile_id(character=character)
-        if nsfw_profile_id is not None:
+        nsfw_target = await self._read_nsfw_target(character=character)
+        if nsfw_target is not None:
+            nsfw_profile_id = nsfw_target.image_profile_id
+            if nsfw_profile_id is None:
+                # Operator explicitly disabled image generation while the
+                # mode is active — same refuse-fallback contract as a
+                # stale profile (an NSFW prompt must never reach a normal
+                # provider), but it's a deliberate choice, not breakage.
+                _LOGGER.info(
+                    "active image: NSFW mode image generation is disabled "
+                    "by operator; refusing fallback",
+                )
+                return None
             if self._registry.get_profile(nsfw_profile_id) is None:
                 _LOGGER.error(
                     "active image: NSFW mode profile %r is not registered; "
@@ -177,16 +191,13 @@ class PreferenceBackedActiveImageProvider(ActiveImageProviderPort):
             )
             return None
 
-    async def _read_nsfw_profile_id(
+    async def _read_nsfw_target(
         self,
         *,
         character: Character | None,
-    ) -> str | None:
+    ) -> NsfwModeTarget | None:
         if self._nsfw_mode_service is None or character is None:
             return None
-        target = await self._nsfw_mode_service.active_target(
+        return await self._nsfw_mode_service.active_target(
             user_id=getattr(character, "user_id", None),
         )
-        if target is None:
-            return None
-        return target.image_profile_id

@@ -182,7 +182,7 @@ class ShowcaseImageReviewer:
                 post_id=candidate.id,
                 reasons=(f"圖片 LLM 預審失敗：{exc}",),
             )
-        payload = coerce_json_object(raw)
+        payload = coerce_json_object(raw, site="showcase.image_review")
         if payload is None:
             return ShowcaseImageReview(
                 post_id=candidate.id,

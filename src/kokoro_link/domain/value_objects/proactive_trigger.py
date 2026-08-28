@@ -18,6 +18,7 @@ class ProactiveTrigger:
     ARC_BEAT: "ClassVar[ProactiveTrigger]"
     PENDING_FOLLOW_UP: "ClassVar[ProactiveTrigger]"
     SCHEDULED_PROMISE: "ClassVar[ProactiveTrigger]"
+    ADMIN_REACTIVATION: "ClassVar[ProactiveTrigger]"
 
     def __post_init__(self) -> None:
         if not self.value or not self.value.strip():
@@ -53,3 +54,14 @@ ProactiveTrigger.PENDING_FOLLOW_UP = ProactiveTrigger("pending_follow_up")
 # quiet_hours / daily_limit / cooldown / proactive_enabled gates — it's
 # a promise being fulfilled, the user explicitly asked for this push.
 ProactiveTrigger.SCHEDULED_PROMISE = ProactiveTrigger("scheduled_promise")
+# An operator picked this character out of the dormant-reactivation
+# console and pressed send (LR series, plan D3). Distinct from TICK
+# because the rhythm throttles below the gate — min-idle, daily limit,
+# cooldown, low energy, quiet activity — all exist to keep the *scheduler*
+# from pinging someone unprompted, and a human deliberately choosing this
+# character is the opposite situation. Deliberately **not** grouped with
+# the promise-fulfilment triggers: those bypass quiet hours too, and
+# nobody asked for this one, so 03:00 is still 03:00. The four semantic
+# gates (intention judge / decider / quality / honesty) also stay on — a
+# recall message that reads badly is a second injury, not a save.
+ProactiveTrigger.ADMIN_REACTIVATION = ProactiveTrigger("admin_reactivation")

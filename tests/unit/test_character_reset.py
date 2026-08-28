@@ -282,8 +282,8 @@ async def test_reset_route_404_for_unknown_character() -> None:
 # the in-memory repository fallback the tests above exercise. The point
 # of this section is the family CD0 documented but never ran against a
 # real schema: ``conversations=True`` must take turn_journals /
-# pending_follow_ups / story_scene_sessions with it and null out
-# channel_bindings.conversation_id.
+# pending_follow_ups / story_scene_sessions / dialogue_checkpoints with
+# it and null out channel_bindings.conversation_id.
 #
 # **Every case runs twice, with and without ``PRAGMA foreign_keys``.**
 # Production SQLite (self-host) never sets it — ``persistence/engine.py``
@@ -454,6 +454,14 @@ async def _seed_character(conn, character_id: str) -> dict[str, str]:
             created_at=now, updated_at=now,
         ),
     )
+    await conn.execute(
+        insert(t["dialogue_checkpoints"]).values(
+            character_id=character_id, operator_id=OWNER,
+            summary_text="累積摘要", covers_until_message_key="key-0",
+            covers_until_created_at=now, updated_at=now, model="test",
+            stale=False,
+        ),
+    )
     return {
         "conversation_id": conversation_id,
         "account_id": account_id,
@@ -514,7 +522,7 @@ async def test_sa_reset_conversations_cascades_and_reports_conversations_only(
     assert result == (0, 1, 0, 0)
     for table_name in (
         "conversations", "messages", "turn_journals",
-        "pending_follow_ups", "story_scene_sessions",
+        "pending_follow_ups", "story_scene_sessions", "dialogue_checkpoints",
     ):
         assert await sa_world.count(table_name, TARGET_ID) == 0, table_name
 
@@ -567,6 +575,7 @@ async def test_sa_reset_memories_state_history_operator_persona(
     assert await sa_world.count("operator_profile_fields", TARGET_ID) == 0
     # Conversation-family untouched by these three flags.
     assert await sa_world.count("conversations", TARGET_ID) == 1
+    assert await sa_world.count("dialogue_checkpoints", TARGET_ID) == 1
 
 
 @pytest.mark.asyncio
@@ -587,7 +596,7 @@ async def test_sa_reset_never_reaches_the_other_character(sa_world) -> None:
     for table_name in (
         "characters", "conversations", "messages", "turn_journals",
         "pending_follow_ups", "story_scene_sessions", "memory_items",
-        "state_snapshots", "operator_profile_fields",
+        "state_snapshots", "operator_profile_fields", "dialogue_checkpoints",
     ):
         assert await sa_world.count(table_name, OTHER_ID) == 1, table_name
 
@@ -599,6 +608,7 @@ async def test_sa_reset_no_flags_touches_nothing(sa_world) -> None:
     assert result == (0, 0, 0, 0)
     assert await sa_world.count("conversations", TARGET_ID) == 1
     assert await sa_world.count("memory_items", TARGET_ID) == 1
+    assert await sa_world.count("dialogue_checkpoints", TARGET_ID) == 1
 
 
 # ======================================================================
@@ -673,3 +683,151 @@ class _UnusedRepository:
         raise AssertionError(
             "the SQL reset eraser must not delegate to a repository",
         )
+
+
+# ======================================================================
+# The DB-less container mode has to answer "清除對話記錄" the same way.
+#
+# ``dialogue_checkpoints`` is the odd one out among the tables the
+# CONVERSATIONS flag purges: it has its own ``character_id`` column
+# rather than hanging off a conversation FK, so no parent chain reaches
+# it and the policy names it explicitly. The SQL eraser derives that from
+# the registry; the repository fallback has to be *handed* the store, and
+# it was not — so without a database the summary of the cleared chat log
+# survived the clear, and the reader kept attaching it to the prompt.
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_dbless_reset_clears_the_dialogue_checkpoint_too() -> None:
+    from kokoro_link.bootstrap.container import _build_character_data_reset
+    from kokoro_link.application.dto.character_backup.consumer_policies import (
+        ResetFlag,
+    )
+    from kokoro_link.domain.entities.dialogue_checkpoint import (
+        DialogueCheckpoint,
+    )
+    from kokoro_link.infrastructure.repositories.in_memory_dialogue_checkpoints import (
+        InMemoryDialogueCheckpointRepository,
+    )
+
+    checkpoints = InMemoryDialogueCheckpointRepository()
+    await checkpoints.save(
+        DialogueCheckpoint(
+            character_id="char-1",
+            operator_id="op-1",
+            summary_text="她提過週五要去看醫生",
+            covers_until_message_key="k" * 32,
+            covers_until_created_at=datetime(
+                2026, 8, 25, tzinfo=timezone.utc,
+            ),
+            updated_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+        ),
+        expected_message_key=None,
+    )
+
+    class _CountingRepository:
+        async def delete_for_character(self, character_id: str) -> int:
+            return 1
+
+    eraser = _build_character_data_reset(
+        db_session_factory=None,
+        memory_repository=_CountingRepository(),
+        conversation_repository=_CountingRepository(),
+        state_history_repository=_CountingRepository(),
+        operator_persona_repository=_CountingRepository(),
+        dialogue_checkpoint_repository=checkpoints,
+    )
+
+    counts = await eraser.erase("char-1", frozenset({ResetFlag.CONVERSATIONS}))
+
+    assert await checkpoints.list_for_character("char-1") == []
+    # The reported count is still the primary table's, unchanged: the
+    # checkpoint is swept, never counted.
+    assert counts[ResetFlag.CONVERSATIONS] == 1
+
+
+@pytest.mark.asyncio
+async def test_dbless_reset_leaves_the_checkpoint_alone_for_other_flags(
+) -> None:
+    """Only the conversations flag reaches it. Clearing memories must not
+    take the dialogue summary with it — that is a different boundary and
+    the policy says so."""
+    from kokoro_link.bootstrap.container import _build_character_data_reset
+    from kokoro_link.application.dto.character_backup.consumer_policies import (
+        ResetFlag,
+    )
+    from kokoro_link.domain.entities.dialogue_checkpoint import (
+        DialogueCheckpoint,
+    )
+    from kokoro_link.infrastructure.repositories.in_memory_dialogue_checkpoints import (
+        InMemoryDialogueCheckpointRepository,
+    )
+
+    checkpoints = InMemoryDialogueCheckpointRepository()
+    await checkpoints.save(
+        DialogueCheckpoint(
+            character_id="char-1",
+            operator_id="op-1",
+            summary_text="累積摘要",
+            covers_until_message_key="k" * 32,
+            covers_until_created_at=datetime(
+                2026, 8, 25, tzinfo=timezone.utc,
+            ),
+            updated_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+        ),
+        expected_message_key=None,
+    )
+
+    class _CountingRepository:
+        async def delete_for_character(self, character_id: str) -> int:
+            return 1
+
+    eraser = _build_character_data_reset(
+        db_session_factory=None,
+        memory_repository=_CountingRepository(),
+        conversation_repository=_CountingRepository(),
+        state_history_repository=_CountingRepository(),
+        operator_persona_repository=_CountingRepository(),
+        dialogue_checkpoint_repository=checkpoints,
+    )
+
+    await eraser.erase("char-1", frozenset({ResetFlag.MEMORIES}))
+
+    assert len(await checkpoints.list_for_character("char-1")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_deployment_with_the_checkpoint_flag_off_still_resets(
+) -> None:
+    """The checkpoint store is ``None`` while the feature is off, and
+    that must not make the conversations flag unavailable — availability
+    is decided by the flag's *primary* repository, never by an optional
+    second table."""
+    from kokoro_link.bootstrap.container import _build_character_data_reset
+    from kokoro_link.application.dto.character_backup.consumer_policies import (
+        ResetFlag,
+    )
+
+    class _CountingRepository:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def delete_for_character(self, character_id: str) -> int:
+            self.calls += 1
+            return 4
+
+    conversations = _CountingRepository()
+    eraser = _build_character_data_reset(
+        db_session_factory=None,
+        memory_repository=_CountingRepository(),
+        conversation_repository=conversations,
+        state_history_repository=_CountingRepository(),
+        operator_persona_repository=_CountingRepository(),
+        dialogue_checkpoint_repository=None,
+    )
+
+    counts = await eraser.erase("char-1", frozenset({ResetFlag.CONVERSATIONS}))
+
+    assert counts[ResetFlag.CONVERSATIONS] == 4
+    assert conversations.calls == 1

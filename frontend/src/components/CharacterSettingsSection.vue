@@ -8,6 +8,7 @@ import ChannelBindingsPanel from './ChannelBindingsPanel.vue'
 import CharacterBackupPanel from './CharacterBackupPanel.vue'
 import CharacterEditPanel from './CharacterEditPanel.vue'
 import CollapsibleSection from './CollapsibleSection.vue'
+import IdentityCardSaveFromCharacter from './IdentityCardSaveFromCharacter.vue'
 import InitialRelationshipSettingsEditor from './InitialRelationshipSettingsEditor.vue'
 import PlayerPersonaNoteSetting from './PlayerPersonaNoteSetting.vue'
 import ProactiveMessageSetting from './ProactiveMessageSetting.vue'
@@ -85,6 +86,14 @@ defineExpose({
       :character="character"
     />
   </CollapsibleSection>
+
+  <!-- IC3：從既有角色回存的入口。刻意放在關係 seed 與人設兩塊
+       CollapsibleSection 之外、CharacterSettingsSection 自己的層級——存的
+       是這兩塊合起來的整組設定，不屬於其中任一邊。 -->
+  <IdentityCardSaveFromCharacter
+    :key="`${character.id}:identity-card-save`"
+    :character="character"
+  />
 
   <CollapsibleSection
     :title="t('playerSidebar.characters.dispositionSectionTitle')"

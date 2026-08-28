@@ -38,7 +38,6 @@ prose" on the two forced paths.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 
@@ -68,6 +67,7 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -262,14 +262,10 @@ def _operator_block_with_persona_note(position_block: str, note: str) -> str:
 def _parse_draft(
     raw: str, *, context: StorySceneClosingContext,
 ) -> StorySceneClosingDraft | None:
-    payload = _extract_json_object(raw)
-    if payload is None:
-        return None
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    log_parse_outcome(_LOGGER, outcome, site="story.scene_closer")
+    parsed = outcome.value
+    if parsed is None:
         return None
 
     if not _citations_hold(parsed.get("player_actions_referenced"), context):
@@ -352,31 +348,3 @@ def _clean(value: object, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "…"
     return text
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:index + 1]
-    return None

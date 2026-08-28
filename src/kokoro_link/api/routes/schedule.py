@@ -112,6 +112,7 @@ async def add_schedule_activity(
         adjustments=[adjustment],
         date_=target,
         character=character,
+        manual=True,
     )
     if result is None:
         # service rejected the add (e.g. end <= start after tz combine);
@@ -155,6 +156,7 @@ async def update_schedule_activity(
         adjustments=[adjustment],
         date_=target,
         character=character,
+        manual=True,
     )
     if result is None:
         # Nothing changed — either the activity wasn't found / was
@@ -195,6 +197,7 @@ async def delete_schedule_activity(
         adjustments=[adjustment],
         date_=target,
         character=character,
+        manual=True,
     )
     if result is None:
         current = await schedule_service.get_schedule_response(

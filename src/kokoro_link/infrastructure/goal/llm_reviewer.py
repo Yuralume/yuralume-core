@@ -23,7 +23,6 @@ same pair the post-turn writer gets), plus the numeric soft cap.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone, tzinfo
 from typing import Any
@@ -50,6 +49,7 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
     render_date_anchor_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -203,47 +203,15 @@ def _parse_response(
     known_goal_ids: set[str],
     max_new_goals: int,
 ) -> GoalReviewResult:
-    obj = _extract_object(raw)
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="goal.llm_reviewer")
+    obj = outcome.value
     if obj is None:
         return GoalReviewResult()
 
     verdicts = _parse_verdicts(obj.get("verdicts"), known_goal_ids=known_goal_ids)
     new_goals = _parse_new_goals(obj.get("new_goals"), limit=max_new_goals)
     return GoalReviewResult(status_changes=verdicts, new_goals=new_goals)
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _parse_verdicts(raw: Any, *, known_goal_ids: set[str]) -> list[GoalStatusChange]:

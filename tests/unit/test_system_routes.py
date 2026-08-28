@@ -119,6 +119,7 @@ def test_active_model_preference_defaults_to_nulls(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "provider_id": None, "model_id": None, "supports_vision": None,
+        "reasoning": None,
     }
 
 
@@ -136,6 +137,7 @@ def test_active_model_preference_roundtrip(monkeypatch) -> None:
     assert got.status_code == 200
     assert got.json() == {
         "provider_id": "fake", "model_id": "fake", "supports_vision": None,
+        "reasoning": None,
     }
 
 
@@ -152,11 +154,99 @@ def test_active_model_preference_accepts_null_model(monkeypatch) -> None:
     assert put.status_code == 200
     assert put.json() == {
         "provider_id": "lmstudio", "model_id": None, "supports_vision": None,
+        "reasoning": None,
     }
 
     got = client.get("/api/v1/system/preferences/active-model")
     assert got.json() == {
         "provider_id": "lmstudio", "model_id": None, "supports_vision": None,
+        "reasoning": None,
+    }
+
+
+def test_active_model_reasoning_override_roundtrip(monkeypatch) -> None:
+    """The primary pick carries the same optional reasoning posture as
+    feature/group entries — persisted, normalised, and preflighted."""
+    _configure_test_app_env(monkeypatch)
+    app = create_app()
+    calls = _install_reasoning_effort_preflight(app)
+    client = TestClient(app)
+
+    put = client.put(
+        "/api/v1/system/preferences/active-model",
+        json={
+            "provider_id": "fake",
+            "model_id": "fake",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+    assert put.status_code == 200
+    assert put.json()["reasoning"] == {
+        "disable_reasoning": False,
+        "reasoning_effort": "high",
+        "thinking_budget_tokens": None,
+    }
+
+    got = client.get("/api/v1/system/preferences/active-model")
+    assert got.json()["reasoning"] == {
+        "disable_reasoning": False,
+        "reasoning_effort": "high",
+        "thinking_budget_tokens": None,
+    }
+    assert calls == [("high", "fake")]
+
+
+def test_active_model_blank_reasoning_object_treated_as_absent(
+    monkeypatch,
+) -> None:
+    _configure_test_app_env(monkeypatch)
+    client = TestClient(create_app())
+
+    put_response = client.put(
+        "/api/v1/system/preferences/active-model",
+        json={
+            "provider_id": "fake",
+            "model_id": "fake",
+            "reasoning": {
+                "disable_reasoning": False,
+                "reasoning_effort": None,
+                "thinking_budget_tokens": None,
+            },
+        },
+    )
+    assert put_response.status_code == 200
+    assert put_response.json()["reasoning"] is None
+
+    got = client.get("/api/v1/system/preferences/active-model")
+    assert got.json()["reasoning"] is None
+
+
+def test_active_model_reasoning_effort_rejected_before_save(
+    monkeypatch,
+) -> None:
+    """Upstream-rejected effort → 422 and nothing persisted, matching
+    the feature/group preflight contract."""
+    _configure_test_app_env(monkeypatch)
+    app = create_app()
+    calls = _install_reasoning_effort_preflight(app, rejected={"max"})
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/v1/system/preferences/active-model",
+        json={
+            "provider_id": "fake",
+            "model_id": "fake",
+            "reasoning": {"reasoning_effort": "max"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "unsupported reasoning effort" in response.json()["detail"]
+    assert calls == [("max", "fake")]
+    got = client.get("/api/v1/system/preferences/active-model")
+    assert got.json() == {
+        "provider_id": None, "model_id": None, "supports_vision": None,
+        "reasoning": None,
     }
 
 
@@ -238,6 +328,7 @@ def test_feature_model_group_preferences_return_backend_catalogue(
     } in multimodal_group["members"]
     assert body["active_model"] == {
         "provider_id": None, "model_id": None, "supports_vision": None,
+        "reasoning": None,
     }
 
 

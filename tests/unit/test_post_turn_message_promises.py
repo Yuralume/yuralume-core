@@ -287,6 +287,7 @@ async def _extract_and_persist(
         character_id="char-1",
         conversation_id="conv-promise",
         promises=result.message_promises,
+        turn_record_id="turn-1",
     )
     rows = await pending_repo.list_open_for_character("char-1")
     return result.message_promises, rows

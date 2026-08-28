@@ -36,6 +36,21 @@ class CharacterEncounterIntent:
     updated_at: datetime | None = None
     consumed_at: datetime | None = None
     expires_at: datetime | None = None
+    turn_record_id: str | None = None
+    """Id of the ``turn_records`` row for the turn that recorded this
+    agreement — the anchor turn-undo deletes by (TU6).
+
+    The writer (``_persist_peer_meet_intents``) runs in the background
+    post-turn, so "created at or after the turn started" names the wrong
+    turn as easily as the right one. Worse, this table carries no
+    conversation column at all, and a character can be live in a web and
+    a LINE conversation simultaneously — so a character-scoped window let
+    undoing one thread delete a meeting the *other* thread had just
+    agreed to. An id cannot reach across turns or threads.
+
+    ``None`` means no anchor is available (a row written before the
+    column existed, or by a caller with no turn in hand). Undo treats
+    that as "not mine to delete" rather than guessing."""
 
     def __post_init__(self) -> None:
         character_id = self.character_id.strip()
@@ -67,6 +82,8 @@ class CharacterEncounterIntent:
             _as_utc(self.consumed_at) if self.consumed_at else None,
         )
         object.__setattr__(self, "expires_at", expires_at)
+        anchor = (self.turn_record_id or "").strip()
+        object.__setattr__(self, "turn_record_id", anchor or None)
 
     @classmethod
     def create(
@@ -78,6 +95,7 @@ class CharacterEncounterIntent:
         topic: str,
         source: str = "chat_agreement",
         source_text: str = "",
+        turn_record_id: str | None = None,
         now: datetime | None = None,
     ) -> "CharacterEncounterIntent":
         created_at = _as_utc(now or _utcnow())
@@ -91,6 +109,7 @@ class CharacterEncounterIntent:
             source_text=source_text,
             created_at=created_at,
             updated_at=created_at,
+            turn_record_id=turn_record_id,
         )
 
     def mark_consumed(self, *, at: datetime | None = None) -> "CharacterEncounterIntent":

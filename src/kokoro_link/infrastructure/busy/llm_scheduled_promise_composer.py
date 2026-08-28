@@ -64,10 +64,19 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.outcome_claim_honesty import (
+    append_honesty_correction,
+)
+from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+    render_schedule_activity_knowledge_line,
+)
 from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
     render_player_persona_note_lines,
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
+    format_civil_days_ago_label,
+    format_gap_duration_label,
+    format_relative_past_label,
     render_current_time_fact_lines,
 )
 from kokoro_link.infrastructure.prompt.tool_outcomes_block import (
@@ -226,12 +235,15 @@ def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
         f"\n\n對方當初的原話：「{original_text[:200]}」" if original_text else ""
     )
     scheduled_local = to_timezone(payload.scheduled_for, payload.local_tz)
+    promise_made_block = _promise_made_block(payload)
     tools_block = _tools_block(payload)
     body = get_default_loader().render(
         "busy/scheduled_promise_composer",
         promise_intent=payload.promise_intent.strip()[:300],
         scheduled_at_local=scheduled_local.strftime("%Y-%m-%d %H:%M"),
+        scheduled_freshness=_scheduled_freshness(payload),
         original_block=original_block,
+        promise_made_block=promise_made_block,
         persona_block=persona,
         operator_persona_block=operator_block,
         schedule_block=schedule_block,
@@ -248,7 +260,12 @@ def _build_prompt(payload: ScheduledPromiseComposeInput) -> str:
     )
     if language_hint:
         body = f"{language_hint}\n\n{body}"
-    return body
+    # HV1: only ever non-empty on a re-compose the honesty gate ordered.
+    # Appended in code rather than added as a template placeholder — the
+    # shipped template describes the ordinary round, and a slot that is
+    # blank on every call but a retry would have to be kept in sync across
+    # the baseline pack and every tuned overlay for no benefit.
+    return append_honesty_correction(body, payload.honesty_correction)
 
 
 def _tools_block(payload: ScheduledPromiseComposeInput) -> str:
@@ -354,17 +371,92 @@ def _operator_persona_block(lines: tuple[str, ...]) -> list[str]:
     ]
 
 
+_OVERDUE_FLOOR_MINUTES = 10.0
+"""Below this the release is punctual for conversational purposes.
+
+Not a staleness policy — the model still decides what to do about a late
+promise. This only picks which *fact* is true, and it is set by the
+dispatcher's own cadence: the tick runs about every five minutes, so a
+promise due at 07:00 is normally released by 07:05. A floor under that
+would have characters apologising for ordinary scheduling jitter; a
+floor much above it would swallow the 900-second quality / honesty
+parks, which are exactly the delays worth admitting to."""
+
+
+def _scheduled_freshness(payload: ScheduledPromiseComposeInput) -> str:
+    """Say whether the promised moment just arrived, or arrived long ago.
+
+    The template used to hard-code 「（剛到）」 next to the promised time.
+    That string is a lie on every late release, and this path has four
+    ways to be late — honesty park (+300s), judge outage (+900s), quality
+    park (+900s), and any tick outage or leader handover — after which
+    the model was shown 「約定時間：2026-06-19 10:00（剛到）」 directly
+    above a 現在時間 line reading two days later. Two contradictory facts,
+    and nothing telling it which to believe; a promise released a day
+    late was written as if the alarm had just gone off.
+    """
+    late_minutes = (
+        payload.now - payload.scheduled_for
+    ).total_seconds() / 60.0
+    if late_minutes < _OVERDUE_FLOOR_MINUTES:
+        return "（剛到）"
+    return f"（已經過了 {format_gap_duration_label(late_minutes)}，你晚了）"
+
+
+def _promise_made_block(payload: ScheduledPromiseComposeInput) -> str:
+    """Render the "when was this promise made" line, or nothing.
+
+    ``SP1``: without a timing anchor the template's "你之前答應的事"
+    section had no fact to attach to, so the model guessed — a promise
+    made half an hour ago could come out as "昨天". ``promise_made_at``
+    is optional (rows written before this field existed carry ``None``),
+    so this returns an empty string in that case and the ordinary
+    template block renders exactly as before — fail-soft, never a
+    KeyError from a missing substitution.
+    """
+    label = _promise_made_ago_label(payload)
+    if not label:
+        return ""
+    return f"\n- 這個承諾是對方在 {label} 向你提的"
+
+
+def _promise_made_ago_label(payload: ScheduledPromiseComposeInput) -> str:
+    """Combine a duration anchor with a civil-day anchor.
+
+    Duration alone (``約 7 小時前``) is what most promises need. But a
+    promise made late at night and fulfilled the next morning is still
+    "only a few hours ago" by duration while already being "昨天" by the
+    civil calendar the character and player both live in ("昨晚說的明早
+    叫我" must not read as same-day) — so the civil-day tag rides along
+    whenever it disagrees with "today".
+    """
+    if payload.promise_made_at is None:
+        return ""
+    minutes = max(
+        0.0, (payload.now - payload.promise_made_at).total_seconds() / 60.0,
+    )
+    relative = format_relative_past_label(minutes)
+    civil = format_civil_days_ago_label(
+        payload.promise_made_at, payload.now, local_tz=payload.local_tz,
+    )
+    if civil and civil != "今天":
+        return f"{relative}（{civil}）"
+    return relative
+
+
 def _schedule_block(payload: ScheduledPromiseComposeInput) -> list[str]:
     lines = ["活動脈絡："]
     lines.extend(
         render_current_time_fact_lines(payload.now, payload.local_tz, heading=None),
     )
+    has_activity = False
     if payload.just_finished_activity is not None:
         activity = payload.just_finished_activity
         loc = f"（{activity.location}）" if activity.location else ""
         lines.append(
             f"- 剛結束：{activity.category} — {activity.description}{loc}",
         )
+        has_activity = True
     if payload.current_activity is not None:
         activity = payload.current_activity
         loc = f"（{activity.location}）" if activity.location else ""
@@ -372,8 +464,13 @@ def _schedule_block(payload: ScheduledPromiseComposeInput) -> list[str]:
             f"- 現在進行：{activity.category} — {activity.description}{loc}"
             f"（busy_score={activity.busy_score:.2f}）",
         )
-    if len(lines) == 1:
+        has_activity = True
+    if not has_activity:
         lines.append("- 你目前沒有特別在做什麼，正好可以履行這個承諾。")
+    else:
+        # KB9: an activity description can name a companion or place from
+        # material the player never read (see player_knowledge_lines).
+        lines.append(render_schedule_activity_knowledge_line())
     return lines
 
 

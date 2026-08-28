@@ -1,0 +1,107 @@
+{
+  "objects": [
+    {
+      "id": "seed.tool_call",
+      "text": "{\"tool\": \"web_search\", \"args\": {\"query\": \"夏祭 2026\", \"limit\": 3}}"
+    },
+    {
+      "id": "seed.post_turn",
+      "text": "{\"memories\": [{\"kind\": \"semantic\", \"content\": \"森森喜歡爵士樂\", \"salience\": 0.8, \"tags\": [\"音樂\"]}], \"state\": {\"emotion\": \"開心\", \"affection_delta\": 2, \"current_intent\": \"想再聊音樂\"}, \"schedule_adjustments\": [], \"arc_adjustments\": [], \"message_promises\": [{\"scheduled_for_iso\": \"2026-08-26T20:00\", \"intent\": \"分享今天拍的照片\", \"source_text\": \"晚點傳給你\"}]}"
+    },
+    {
+      "id": "seed.nested_array",
+      "text": "{\"tool\": \"generate_image\", \"args\": {\"positive\": [\"1girl\", \"solo\"], \"caption\": \"走到窗邊，月光灑在臉上\"}}"
+    },
+    {
+      "id": "story.decision_flat",
+      "text": "{\"action\": \"delay_beat\", \"should_start\": true, \"days\": 3, \"reason\": \"時間點還沒到，先延後幾天再看看\", \"hint\": \"可以從角色下班後的空檔切入\", \"narrative\": \"那天終於把話說開了。\"}"
+    },
+    {
+      "id": "story.array_label",
+      "text": "{\"actions\": [\"去廚房倒杯水\", \"問她今天過得怎麼樣\", \"安靜地坐到她旁邊\"], \"seeds\": [\"下班後繞去河堤走走\", \"整理房間時翻到舊照片\"]}"
+    },
+    {
+      "id": "story.nested_beats",
+      "text": "{\"title\": \"她的新篇章\", \"premise\": \"角色生活的下一段旅程。\", \"theme\": \"growth\", \"seed_ids_used\": [\"seed-1\"], \"beats\": [{\"day_offset\": 0, \"title\": \"新的起點\", \"summary\": \"一切從一通電話開始。\", \"tension\": \"setup\", \"scene_type\": \"encounter\", \"location\": \"車站\", \"scene_characters\": [\"小林\"], \"dramatic_question\": \"她會接受這個邀請嗎？\", \"required\": true, \"operator_note\": \"玩家是她最信任的朋友\"}]}"
+    }
+  ],
+  "arrays": [
+    {
+      "id": "seed.memory_array",
+      "text": "[{\"kind\": \"semantic\", \"content\": \"森森住在東京\", \"salience\": 0.9, \"tags\": [\"location\"]}, {\"kind\": \"episodic\", \"content\": \"我們聊了爵士樂\", \"salience\": 0.4, \"tags\": []}]"
+    },
+    {
+      "id": "seed.schedule_array",
+      "text": "[{\"start\": \"09:00\", \"end\": \"10:30\", \"description\": \"去咖啡廳寫稿\", \"category\": \"work\", \"location\": \"澀谷\"}]"
+    }
+  ],
+  "prefixes": [
+    {
+      "id": "none",
+      "text": ""
+    },
+    {
+      "id": "fence_json",
+      "text": "```json\n"
+    },
+    {
+      "id": "fence_bare",
+      "text": "```\n"
+    },
+    {
+      "id": "preamble_zh",
+      "text": "好的，我整理好了：\n"
+    },
+    {
+      "id": "preamble_en",
+      "text": "Here is the JSON you asked for:\n"
+    },
+    {
+      "id": "roleplay_marker",
+      "text": "{微笑}好，我看一下：\n"
+    },
+    {
+      "id": "markdown_heading",
+      "text": "## 輸出\n\n"
+    },
+    {
+      "id": "blank_lines",
+      "text": "\n\n  "
+    }
+  ],
+  "suffixes": [
+    {
+      "id": "none",
+      "text": ""
+    },
+    {
+      "id": "fence_close",
+      "text": "\n```"
+    },
+    {
+      "id": "commentary_zh",
+      "text": "\n以上，有需要再跟我說！"
+    },
+    {
+      "id": "commentary_en",
+      "text": "\nLet me know if you need more."
+    },
+    {
+      "id": "line_comment",
+      "text": " // 這是我抽出來的"
+    },
+    {
+      "id": "trailing_blank",
+      "text": "  \n\n"
+    }
+  ],
+  "truncate_fractions": [
+    0.15,
+    0.3,
+    0.45,
+    0.6,
+    0.75,
+    0.9,
+    0.97
+  ]
+}

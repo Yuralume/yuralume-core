@@ -310,6 +310,7 @@ def test_reset_flag_table_sets_are_pinned() -> None:
         "pending_follow_ups",
         "story_scene_sessions",
         "channel_bindings",
+        "dialogue_checkpoints",
     })
     assert reset_tables_for_flag(ResetFlag.STATE_HISTORY) == frozenset(
         {"state_snapshots"},
@@ -356,6 +357,7 @@ def test_reset_conversation_cascade_verbs_are_pinned() -> None:
 
     assert verb("conversations") is ResetPolicy.PURGE
     assert verb("messages") is ResetPolicy.PURGE
+    assert verb("dialogue_checkpoints") is ResetPolicy.PURGE
     for table in (
         "turn_journals", "pending_follow_ups", "story_scene_sessions",
     ):
@@ -411,6 +413,7 @@ def test_reset_cascade_claims_match_the_schema() -> None:
         ("state_snapshots", "character_id"),
         ("operator_profile_fields", "character_id"),
         ("conversations", "character_id"),
+        ("dialogue_checkpoints", "character_id"),
     ):
         assert column in Base.metadata.tables[table].columns, table
 

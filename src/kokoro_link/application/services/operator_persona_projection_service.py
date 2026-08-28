@@ -20,6 +20,7 @@ from kokoro_link.domain.value_objects.profile_field import ProfileField
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 if TYPE_CHECKING:  # pragma: no cover
     from kokoro_link.application.services.character_service import CharacterService
@@ -353,44 +354,18 @@ def _build_projection_prompt(
 
 
 def _parse_narrative(raw: str) -> str:
-    payload = _extract_json_object(raw)
-    if payload is None:
-        return ""
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return ""
+    # DH2-services: the local balanced-brace scanner (a byte-for-byte
+    # duplicate of ``chat_assist_service``'s, itself a hand-rolled
+    # duplicate of ``llm_output.extract.balanced_end``) is retired in
+    # favour of the shared layer, which additionally repairs a reply
+    # truncated by max_tokens — this prompt unconditionally asks for the
+    # JSON envelope.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="operator_persona_projection")
+    parsed = outcome.value
     if not isinstance(parsed, dict):
         return ""
     return _clean_generated_text(parsed.get("narrative"), max_chars=_MAX_NARRATIVE_CHARS)
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
 
 
 def _clean_generated_text(value: Any, *, max_chars: int) -> str:

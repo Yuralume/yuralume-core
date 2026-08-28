@@ -12,6 +12,8 @@ from kokoro_link.bootstrap.settings import (
 from kokoro_link.application.services.cloud_active_llm_provider import (
     CloudActiveLLMProvider,
 )
+from kokoro_link.application.services.output_quality import OUTCOME_PASS
+from kokoro_link.contracts.novelty_gate import NoveltyGateContext
 from kokoro_link.infrastructure.cloud.official_card_exclusive_client import (
     EXCLUSIVE_READ_SCOPE,
 )
@@ -35,7 +37,6 @@ from kokoro_link.infrastructure.register.null_register_profiler import (
 )
 from kokoro_link.infrastructure.schedule.llm_weather_drift import (
     LLMScheduleWeatherDriftJudge,
-    NullScheduleWeatherDriftJudge,
 )
 from kokoro_link.infrastructure.usage.llm_metering import MeteredActiveLLMProvider
 
@@ -428,20 +429,24 @@ def test_container_wires_schedule_weather_drift_into_the_tick() -> None:
     )
 
 
-def test_container_uses_null_weather_drift_judge_on_the_fake_provider() -> None:
-    fake = build_container(AppSettings(database_url=""))
-    real = build_container(
+def test_container_wires_llm_weather_drift_judge_regardless_of_boot_provider() -> None:
+    """Providers are DB-backed runtime settings registered *after* the
+    container is built, so ``default_provider_id`` at boot says nothing
+    about whether a judge is reachable. The LLM judge's own per-call
+    ``is_fake`` guard (which returns ``()``, the Null judge's answer) is
+    what keeps a genuinely judge-less deployment from paying for a
+    verdict — the old static check silently disabled the judge on
+    self-hosts whose providers live only in the DB."""
+    for settings in (
+        AppSettings(database_url=""),
         AppSettings(database_url="", default_provider_id="lmstudio"),
-    )
+    ):
+        container = build_container(settings)
 
-    assert isinstance(
-        fake.schedule_weather_drift_service._drift_port,  # noqa: SLF001
-        NullScheduleWeatherDriftJudge,
-    )
-    assert isinstance(
-        real.schedule_weather_drift_service._drift_port,  # noqa: SLF001
-        LLMScheduleWeatherDriftJudge,
-    )
+        assert isinstance(
+            container.schedule_weather_drift_service._drift_port,  # noqa: SLF001
+            LLMScheduleWeatherDriftJudge,
+        )
 
 
 @pytest.mark.asyncio
@@ -544,8 +549,17 @@ def test_prompt_quality_flags_default_to_enabled_with_risk_gate() -> None:
     )
 
 
-def test_container_uses_null_material_digester_when_disabled_or_fake() -> None:
-    disabled = build_container(AppSettings(database_url=""))
+def test_container_uses_null_material_digester_only_when_disabled() -> None:
+    """The operator switch is the only bootstrap decision. Whether a real
+    model is reachable is per-call and DB-backed — the LLM digester's
+    ``is_fake`` path returns ``None`` exactly like the Null one, so wiring
+    it on a fake-boot deployment costs nothing."""
+    disabled = build_container(
+        AppSettings(
+            database_url="",
+            prompt_quality=PromptQualitySettings(material_digest_enabled=False),
+        ),
+    )
     fake_enabled = build_container(
         AppSettings(
             database_url="",
@@ -559,7 +573,7 @@ def test_container_uses_null_material_digester_when_disabled_or_fake() -> None:
     )
     assert isinstance(
         fake_enabled.chat_service._prompt_material_digester,  # noqa: SLF001
-        NullPromptMaterialDigester,
+        LLMPromptMaterialDigester,
     )
 
 
@@ -578,7 +592,12 @@ def test_container_wires_llm_material_digester_when_enabled_with_real_provider()
     )
 
 
-def test_container_uses_null_novelty_gate_when_disabled_or_fake() -> None:
+def test_container_uses_null_novelty_gate_only_when_disabled() -> None:
+    """Enabled means the LLM gate, even on a fake boot provider: providers
+    are DB-backed and land after container build, so "is there a judge" is
+    the gate's per-call ``is_fake`` answer (``pass_unrouted``), not a
+    bootstrap fact. The old static check silently turned the whole quality
+    band off on self-hosts whose providers live only in the DB."""
     disabled = build_container(
         AppSettings(
             database_url="",
@@ -598,8 +617,78 @@ def test_container_uses_null_novelty_gate_when_disabled_or_fake() -> None:
     )
     assert isinstance(
         fake_enabled.chat_service._novelty_gate,  # noqa: SLF001
+        LLMNoveltyGate,
+    )
+
+
+def test_container_leaves_the_output_quality_orchestrator_ungated_when_off(
+) -> None:
+    """FC2 — a Null gate is *not* a gate, and the scrape must say so.
+
+    ``NullNoveltyGate`` passes everything without a model call, so handing
+    it to the orchestrator made every message record a ``pass`` on a
+    deployment whose gate is switched off. AC3 is the opposite: a gate that
+    is not wired renders no indicators. The services keep the Null instance
+    — their own guard conditions are ``is None`` tests and would change
+    behaviour — so the substitution happens only at the orchestrator's own
+    parameter. The no-judge-route case is no longer decided here: it is the
+    LLM gate's per-call ``pass_unrouted`` answer, which the orchestrator
+    keeps off the scrape the same way (pinned below).
+    """
+    off = build_container(
+        AppSettings(
+            database_url="",
+            default_provider_id="lmstudio",
+            prompt_quality=PromptQualitySettings(novelty_gate_enabled=False),
+        ),
+    )
+    assert off.output_quality_orchestrator.gate is None
+    assert isinstance(
+        off.chat_service._novelty_gate,  # noqa: SLF001
         NullNoveltyGate,
     )
+
+    on = build_container(
+        AppSettings(
+            database_url="",
+            prompt_quality=PromptQualitySettings(novelty_gate_enabled=True),
+        ),
+    )
+    assert (
+        on.output_quality_orchestrator.gate
+        is on.chat_service._novelty_gate  # noqa: SLF001
+    )
+    assert isinstance(on.output_quality_orchestrator.gate, LLMNoveltyGate)
+
+
+@pytest.mark.asyncio
+async def test_unrouted_container_review_passes_without_counting_anything() -> None:
+    """The counter half of the line above, now via the dynamic path: the
+    gate is wired, its per-call resolution lands on the fake provider, and
+    the review still records **nothing**.
+
+    A ``pass`` recorded here is worse than no number, because it is
+    indistinguishable from a deployment whose judge is reviewing every
+    message and liking all of them.
+    """
+    container = build_container(
+        AppSettings(
+            database_url="",
+            prompt_quality=PromptQualitySettings(novelty_gate_enabled=True),
+        ),
+    )
+
+    review = await container.output_quality_orchestrator.review(
+        "今天過得還可以",
+        surface="promise",
+        context_for=lambda candidate: NoveltyGateContext(
+            character_id="c1", operator_id="op-1", response_text=candidate,
+        ),
+    )
+
+    assert review.final == "今天過得還可以"
+    assert review.outcome == OUTCOME_PASS
+    assert container.output_quality_counters.snapshot() == {}
 
 
 def test_container_wires_llm_novelty_gate_when_enabled_with_real_provider() -> None:
@@ -618,7 +707,120 @@ def test_container_wires_llm_novelty_gate_when_enabled_with_real_provider() -> N
     assert container.chat_service._novelty_gate_max_retries == 1  # noqa: SLF001
 
 
-def test_container_uses_null_register_profiler_when_disabled_or_fake() -> None:
+def test_container_wires_one_output_quality_orchestrator_into_every_surface() -> None:
+    """QG0's whole point: the wiring lands **once**, here, so the six
+    wave-3 tickets that adopt the orchestrator change only their own
+    service file. A surface missing from this list is a surface whose
+    ticket would have to reopen ``container.py`` and race the others.
+    """
+    container = build_container(AppSettings(database_url=""))
+
+    orchestrator = container.output_quality_orchestrator
+    assert orchestrator is not None
+    # One instance, therefore one set of counters: the hard-skip rate is a
+    # number about the deployment, not about whichever seam is asking.
+    assert orchestrator.counters is container.output_quality_counters
+
+    injected = [
+        container.chat_service,
+        container.proactive_dispatcher,
+        container.feed_composer_service,
+        container.feed_comment_reply_service,
+        container.story_scene_service,
+        container.character_encounter_service._runner,  # noqa: SLF001
+    ]
+    for service in injected:
+        assert (
+            service._output_quality_orchestrator  # noqa: SLF001
+            is orchestrator
+        ), type(service).__name__
+    # The 起幕 wrap-up is reached through the scene service rather than the
+    # container, and must not be left holding a different policy than the
+    # opening it closes.
+    assert (
+        container.story_scene_service._closing  # noqa: SLF001
+        ._output_quality_orchestrator is orchestrator
+    )
+
+
+def test_container_wires_the_encounter_runner_gate_flags() -> None:
+    """Encounter used to take the gate port and none of its knobs, so a
+    deployment that turned the gate off still ran it here. Both settings
+    now reach it."""
+    off = build_container(
+        AppSettings(
+            database_url="",
+            default_provider_id="lmstudio",
+            prompt_quality=PromptQualitySettings(
+                novelty_gate_enabled=False, novelty_gate_max_retries=3,
+            ),
+        ),
+    )
+    on = build_container(
+        AppSettings(
+            database_url="",
+            default_provider_id="lmstudio",
+            prompt_quality=PromptQualitySettings(
+                novelty_gate_enabled=True, novelty_gate_max_retries=3,
+            ),
+        ),
+    )
+
+    assert off.character_encounter_service._runner._novelty_gate is None  # noqa: SLF001
+    assert isinstance(
+        on.character_encounter_service._runner._novelty_gate,  # noqa: SLF001
+        LLMNoveltyGate,
+    )
+    assert (
+        on.character_encounter_service._runner._novelty_gate_max_retries == 3  # noqa: SLF001
+    )
+
+
+def test_container_wires_the_story_scene_gate_flags() -> None:
+    """QG7b: 起幕 used to take the orchestrator and none of its knobs, so a
+    deployment that turned the gate off (or raised its retry budget) still
+    ran the opening and the wrap-up under QG7's hardcoded
+    ``enabled=True, max_retries=1``. Both settings now reach both ends —
+    the opening on the service itself and the wrap-up on the closing
+    coordinator it hands the same values down to."""
+    off = build_container(
+        AppSettings(
+            database_url="",
+            prompt_quality=PromptQualitySettings(
+                novelty_gate_enabled=False, novelty_gate_max_retries=3,
+            ),
+        ),
+    )
+    on = build_container(
+        AppSettings(
+            database_url="",
+            prompt_quality=PromptQualitySettings(
+                novelty_gate_enabled=True, novelty_gate_max_retries=3,
+            ),
+        ),
+    )
+
+    assert off.story_scene_service._reply_quality_gate_enabled is False  # noqa: SLF001
+    assert on.story_scene_service._reply_quality_gate_enabled is True  # noqa: SLF001
+    assert on.story_scene_service._reply_quality_gate_max_retries == 3  # noqa: SLF001
+    assert (
+        off.story_scene_service._closing  # noqa: SLF001
+        ._reply_quality_gate_enabled is False
+    )
+    assert (
+        on.story_scene_service._closing  # noqa: SLF001
+        ._reply_quality_gate_enabled is True
+    )
+    assert (
+        on.story_scene_service._closing  # noqa: SLF001
+        ._reply_quality_gate_max_retries == 3
+    )
+
+
+def test_container_uses_null_register_profiler_only_when_disabled() -> None:
+    """Flag-only selection — the LLM profiler's per-call ``is_fake`` path
+    returns ``None`` exactly like the Null one, and DB-backed providers
+    arrive after bootstrap, so a fake boot provider must not disable it."""
     disabled = build_container(
         AppSettings(
             database_url="",
@@ -638,7 +840,7 @@ def test_container_uses_null_register_profiler_when_disabled_or_fake() -> None:
     )
     assert isinstance(
         fake_enabled.chat_service._register_profiler,  # noqa: SLF001
-        NullRegisterProfiler,
+        LLMRegisterProfiler,
     )
 
 

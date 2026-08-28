@@ -2,7 +2,11 @@
 
 Targets PostgreSQL via asyncpg. Pool settings are tuned for the typical
 per-turn burst (~3-5 concurrent writes: main request + post-turn +
-memorialize + schedule adjustments).
+memorialize + schedule adjustments). Since the chat aux loads went
+parallel (``chat_turn_aux``), one turn's *read* burst can momentarily
+demand up to 7 checkouts; every one is a short session-per-call SELECT,
+so overflow demand queues for milliseconds rather than holding — the
+write-burst sizing above still governs the budget.
 """
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine

@@ -15,7 +15,7 @@
  *   - 全局：任何角色的新貼文都觸發 reload
  *   - filter：只對符合的角色 reload，避免 A 看 B 動態時被 B 的事件干擾
  */
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import FeedCard from './FeedCard.vue'
@@ -29,6 +29,7 @@ import {
   createManualFeedPost,
   listCharacterFeed,
   listGlobalFeed,
+  markFeedPostsViewed,
   markFeedReactionsSeen,
 } from '@/utils/api/feed'
 import {
@@ -36,6 +37,13 @@ import {
   type FeedPostEvent,
   connectFeedEvents,
 } from '@/utils/feedEvents'
+import {
+  type FeedViewBatchState,
+  createFeedViewBatchState,
+  enqueueViewed,
+  flushBatch,
+  shouldFlushBatch,
+} from '@/utils/feedViewTracking'
 
 const props = defineProps<{
   characterId: string | null
@@ -213,6 +221,78 @@ async function submitManualPost() {
   }
 }
 
+// ---------------------------------------------------------------- 已讀回報
+// KB11: batch view reports from every mounted FeedCard and flush them to
+// the (per-character-scoped) endpoint. A global-wall batch can span more
+// than one of the caller's characters at once, so a flush groups pending
+// ids by `character_id` looked up from `items` before sending — the id
+// itself carries no character information.
+//
+// The threshold/interval decisions live in `feedViewTracking.ts`; this is
+// only "enqueue on the emit, poll the flush decision, group by character,
+// mark optimistically so a re-render doesn't re-observe an in-flight id."
+let viewBatch: FeedViewBatchState = createFeedViewBatchState()
+let viewFlushTimer: ReturnType<typeof setInterval> | null = null
+const VIEW_FLUSH_POLL_MS = 1000
+
+function applyViewedLocally(postIds: readonly string[]) {
+  if (postIds.length === 0) return
+  const nowIso = new Date().toISOString()
+  const idSet = new Set(postIds)
+  items.value = items.value.map(p => (
+    idSet.has(p.id) && !p.viewed_at ? { ...p, viewed_at: nowIso } : p
+  ))
+}
+
+async function flushViewBatch() {
+  const { ids, state } = flushBatch(viewBatch)
+  viewBatch = state
+  if (ids.length === 0) return
+  const byCharacter = new Map<string, string[]>()
+  for (const id of ids) {
+    const post = items.value.find(p => p.id === id)
+    // Post scrolled out of `items` (e.g. a reload replaced the page)
+    // before the batch flushed — nothing left to scope the call to.
+    if (!post) continue
+    const bucket = byCharacter.get(post.character_id) ?? []
+    bucket.push(id)
+    byCharacter.set(post.character_id, bucket)
+  }
+  applyViewedLocally(ids)
+  await Promise.all(
+    [...byCharacter.entries()].map(([characterId, postIds]) =>
+      markFeedPostsViewed(characterId, postIds).catch(() => {
+        // Best-effort: a dropped report costs nothing but a slightly
+        // later disclosure flip. The like/comment fallback (server-side)
+        // and a future re-observation both still cover this post.
+      }),
+    ),
+  )
+}
+
+function handlePostViewed(postId: string) {
+  viewBatch = enqueueViewed(viewBatch, [postId], Date.now())
+  if (shouldFlushBatch(viewBatch, Date.now())) {
+    void flushViewBatch()
+  }
+}
+
+onMounted(() => {
+  viewFlushTimer = setInterval(() => {
+    if (shouldFlushBatch(viewBatch, Date.now())) void flushViewBatch()
+  }, VIEW_FLUSH_POLL_MS)
+})
+
+onBeforeUnmount(() => {
+  if (viewFlushTimer !== null) {
+    clearInterval(viewFlushTimer)
+    viewFlushTimer = null
+  }
+  // Send whatever dwelled but hasn't hit the interval/size threshold yet
+  // — the panel closing shouldn't cost those posts their read-receipt.
+  void flushViewBatch()
+})
+
 function extractError(err: unknown): string | null {
   if (err && typeof err === 'object' && 'response' in err) {
     const resp = (err as { response?: { data?: { detail?: string } } }).response
@@ -312,6 +392,7 @@ defineExpose({ reload })
         @reaction-changed="applyReactionState"
         @reaction-error="showReactionError"
         @comment-count-changed="applyCommentCount"
+        @viewed="handlePostViewed"
       />
       <div v-if="hasMore" class="feed-more">
         <UiButton

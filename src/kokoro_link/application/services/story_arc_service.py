@@ -1771,7 +1771,10 @@ the everyday gacha never draws
             return ""
         try:
             return await self._dialogue_summarizer.summarize(
-                character=character, messages=messages,
+                character=character,
+                messages=messages,
+                now=datetime.now(timezone.utc),
+                local_tz=self._local_tz or timezone.utc,
             )
         except Exception:
             _LOGGER.exception(

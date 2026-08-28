@@ -111,7 +111,7 @@ class ShowcaseTranslator:
         except Exception as exc:  # noqa: BLE001 — publisher decides what to skip
             _LOGGER.warning("showcase translation to %s failed: %s", locale, exc)
             return None
-        payload = coerce_json_object(raw)
+        payload = coerce_json_object(raw, site="showcase.translate")
         value = payload.get("translation") if payload is not None else None
         if not isinstance(value, str) or not value.strip():
             _LOGGER.warning(

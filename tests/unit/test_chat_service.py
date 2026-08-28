@@ -95,7 +95,7 @@ class _StubDialogueSummarizer:
         self.summary = summary
         self.calls: list[list[Message]] = []
 
-    async def summarize(self, *, character, messages):  # noqa: ANN001
+    async def summarize(self, *, character, messages, now=None, local_tz=None):  # noqa: ANN001
         self.calls.append(list(messages))
         return self.summary
 
@@ -1194,7 +1194,13 @@ async def test_send_message_records_replay_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_message_applies_prompt_material_digest_and_records_refs() -> None:
+async def test_prompt_material_digest_is_budgeted_post_turn_and_read_next_turn() -> None:
+    """DIGEST_OFFPATH — the digest is off the critical path.
+
+    Turn 1 finds a cold cache and renders the source blocks; its post-turn
+    budgets a digest. Turn 2 reads that digest without an upstream call of
+    its own, and the turn record reports it applied.
+    """
     character_repository = InMemoryCharacterRepository()
     conversation_repository = InMemoryConversationRepository()
     memory_repository = InMemoryMemoryRepository()
@@ -1239,21 +1245,46 @@ async def test_send_message_applies_prompt_material_digest_and_records_refs() ->
     await chat_service.send_message(
         SendChatMessageRequest(character_id=created.id, message="今天想聊天"),
     )
-    await turn_recorder.flush()
 
+    # Turn 1: nothing was budgeted yet, so the prompt renders the source
+    # blocks — and the one digester call belongs to the post-turn that ran
+    # after the reply had already gone out.
+    assert prompt_builder.last_kwargs["material_digest"] is None
     assert len(digester.calls) == 1
     context = digester.calls[0]["context"]
     assert isinstance(context, PromptMaterialDigestContext)
     assert context.character_id == created.id
+
+    await chat_service.send_message(
+        SendChatMessageRequest(character_id=created.id, message="那昨天呢"),
+    )
+    await turn_recorder.flush()
+
+    # Turn 2 reads what turn 1 budgeted. Its own digester call is again the
+    # post-turn's, not the turn's.
     assert prompt_builder.last_kwargs["material_digest"] is digest
+    assert len(digester.calls) == 2
     records = await turn_records.list_recent(character_id=created.id)
     chat_record = next(r for r in records if r.kind == "chat")
     material_refs = chat_record.post_turn_refs["material_digest"]
     assert material_refs["enabled"] is True
     assert material_refs["applied"] is True
     assert material_refs["bullet_count"] == 1
+    # Provenance of the bullets survives — which model wrote them.
     assert material_refs["provider_id"] == "unit-provider"
     assert material_refs["model_id"] == "digest-model"
+    # But the cost fields do NOT: they belong to the turn whose post-turn
+    # made the call, and reporting them here would bill turn 2 for turn
+    # 1's latency and tokens. The real spend is metered into
+    # ``generation_usage_events`` under the turn that actually paid it.
+    assert material_refs["precomputed"] is True
+    assert material_refs["latency_ms"] is None
+    assert material_refs["prompt_tokens"] is None
+    assert material_refs["completion_tokens"] is None
+    assert material_refs["error"] is None
+    # The metadata the store round-tripped really did carry costs — the
+    # summary dropping them is a decision, not an empty source.
+    assert digest.digest_metadata["latency_ms"] == 12
 
 
 @pytest.mark.asyncio
@@ -1323,9 +1354,9 @@ async def test_send_message_retries_when_novelty_gate_fails_and_records_refs() -
         active_llm_provider=active_provider,
         state_engine=SimpleStateEngine(),
         turn_recorder=turn_recorder,
-        novelty_gate=novelty_gate,
-        novelty_gate_enabled=True,
-        novelty_gate_max_retries=1,
+        reply_quality_gate=novelty_gate,
+        reply_quality_gate_enabled=True,
+        reply_quality_gate_max_retries=1,
     )
     character_service = CharacterService(
         character_repository,
@@ -1389,9 +1420,9 @@ async def test_stream_message_buffers_retry_when_novelty_gate_fails() -> None:
         active_llm_provider=active_provider,
         state_engine=SimpleStateEngine(),
         turn_recorder=turn_recorder,
-        novelty_gate=novelty_gate,
-        novelty_gate_enabled=True,
-        novelty_gate_max_retries=1,
+        reply_quality_gate=novelty_gate,
+        reply_quality_gate_enabled=True,
+        reply_quality_gate_max_retries=1,
     )
     character_service = CharacterService(
         character_repository,
@@ -1463,8 +1494,8 @@ async def test_stream_message_keeps_incremental_stream_for_low_risk_reply_qualit
         turn_recorder=turn_recorder,
         register_profiler=register_profiler,
         register_profile_enabled=True,
-        novelty_gate=novelty_gate,
-        novelty_gate_enabled=True,
+        reply_quality_gate=novelty_gate,
+        reply_quality_gate_enabled=True,
         reply_quality_gate_risk_threshold=0.9,
     )
     character_service = CharacterService(

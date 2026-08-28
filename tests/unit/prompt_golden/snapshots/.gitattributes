@@ -1,0 +1,4 @@
+# Goldens are compared byte for byte. A CRLF conversion on checkout would
+# make every snapshot fail on the machine that checked it out — pin LF and
+# forbid any other filter from touching them.
+*.prompt.txt -text eol=lf

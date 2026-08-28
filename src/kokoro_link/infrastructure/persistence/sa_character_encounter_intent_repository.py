@@ -122,6 +122,25 @@ class SACharacterEncounterIntentRepository(
             await session.commit()
             return int(result.rowcount or 0)
 
+    async def delete_by_turn_record(
+        self, character_id: str, turn_record_id: str,
+    ) -> int:
+        if not turn_record_id:
+            # Guard, not politeness: ``turn_record_id = ''`` would match
+            # nothing, but ``turn_record_id IS NULL`` semantics are one
+            # typo away and would delete every anchorless row.
+            return 0
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(CharacterEncounterIntentRow).where(
+                    CharacterEncounterIntentRow.character_id == character_id,
+                    CharacterEncounterIntentRow.turn_record_id
+                    == turn_record_id,
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
 
 def _row_to_domain(row: CharacterEncounterIntentRow) -> CharacterEncounterIntent:
     return CharacterEncounterIntent(
@@ -137,6 +156,7 @@ def _row_to_domain(row: CharacterEncounterIntentRow) -> CharacterEncounterIntent
         updated_at=row.updated_at,
         consumed_at=row.consumed_at,
         expires_at=row.expires_at,
+        turn_record_id=getattr(row, "turn_record_id", None) or None,
     )
 
 
@@ -168,3 +188,4 @@ def _apply_domain(
     row.updated_at = item.updated_at
     row.consumed_at = item.consumed_at
     row.expires_at = item.expires_at
+    row.turn_record_id = item.turn_record_id

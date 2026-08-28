@@ -11,12 +11,13 @@ instructs the model to:
 - output clean JSON with no code fences
 
 Malformed output is silently discarded (``merge`` returns ``None``)
-so callers leave the cluster intact instead of corrupting it.
+so callers leave the cluster intact instead of corrupting it. That
+includes output the shared extractor *could* have repaired — see the
+comment at the extraction call for why this site declines the repair.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -34,6 +35,7 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,7 +76,26 @@ class LLMMemoryConsolidator(MemoryConsolidatorPort):
             _LOGGER.exception("Consolidator LLM call failed")
             return None
 
-        parsed = _extract_object(raw)
+        # Truncation repair stays off here, and the reason is the
+        # *consequence*, not the payload shape. A merge proposal is not
+        # read and forgotten: ``_consolidate_cluster`` writes it as a
+        # new memory and then deletes every original in the cluster. So
+        # a reply cut mid-``content`` — ``{"content": "上週跟朋友約好，
+        # 下班後要一起去藍調酒吧`` — is not a degraded read, it is a
+        # half-sentence that replaces the whole-sentence memories it was
+        # built from, permanently and with nothing left to compare it
+        # against. Repair closes the dangling string, so the merged text
+        # arrives as a perfectly ordinary ``str`` and nothing downstream
+        # can tell it was cut.
+        #
+        # Failing closed costs one cluster one pass: ``merge`` returns
+        # ``None``, ``consolidate`` skips it, the originals stay, and the
+        # next consolidation run tries the same cluster again. Same trade
+        # the translator sites made (DH-3), for the same reason — the
+        # write is destructive and the retry is free.
+        outcome = extract_object_outcome(raw, repair_truncated=False)
+        log_parse_outcome(_LOGGER, outcome, site="memory.llm_consolidator")
+        parsed = outcome.value
         if parsed is None:
             return None
         return _coerce_proposal(parsed, fallback_kind=cluster[0].kind)
@@ -98,39 +119,6 @@ def _build_prompt(
         bullet_lines=bullet_lines,
         highest_salience=f"{highest_salience:.2f}",
     )
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _coerce_proposal(

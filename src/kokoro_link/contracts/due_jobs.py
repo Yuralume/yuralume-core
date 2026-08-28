@@ -150,6 +150,19 @@ ENCOUNTER_TICK_KIND = "encounter_tick"
 PERSONA_DREAM_KIND = "persona_dream"
 PEER_KNOWLEDGE_KIND = "peer_knowledge"
 
+#: TR2: how long after creation a never-spoken-to character keeps its proactive
+#: evaluation chain despite NF4 dormancy (see
+#: :attr:`KindSpec.first_contact_grace_hours`).
+#:
+#: 72h is picked from what has to fit inside it, not from taste: TR2-B holds the
+#: first contact back by a delay window (currently 8h) so the character does not
+#: pounce the moment the player finishes creating them, and TR2-A caps
+#: pre-message proactive at a couple of sends with an interval floor between
+#: them. Three days leaves room for that whole sequence plus quiet hours pushing
+#: an occurrence into the next day, and still closes long before an abandoned
+#: character can accumulate meaningful cost.
+FIRST_CONTACT_GRACE_HOURS = 72.0
+
 
 @dataclass(frozen=True, slots=True)
 class KindSpec:
@@ -195,6 +208,23 @@ class KindSpec:
     #: would spend money on its own initiative with nobody watching — is exactly
     #: what dormancy exists to stop, and stays covered.
     dormancy_exempt: bool = False
+    #: TR2 first-contact grace, in hours. NF4 answers "has the player ever
+    #: engaged this character?" with *no* for a character that has never been
+    #: spoken to, which makes it dormant from its first second. That is right
+    #: for every chain that only ever runs *because* a relationship already
+    #: exists — and exactly wrong for the one chain whose job is to *start*
+    #: one. This field is the bounded hole: for this kind only, and only while
+    #: the character is still within ``N`` hours of ``created_at``, and only
+    #: while ``last_active_at`` is still ``None``, dormancy answers ``False``.
+    #:
+    #: It is deliberately NOT ``dormancy_exempt=True``. An exemption is
+    #: unconditional and permanent: it would resurrect proactive evaluation for
+    #: every character abandoned months ago, which is the 97%-of-cost case NF4
+    #: was built to stop. A grace window closes on its own — after it, a
+    #: character nobody ever answered is dormant exactly as before, with no
+    #: recovery path other than the player finally speaking (which is the
+    #: normal wake). ``None`` (every other kind) = no hole at all.
+    first_contact_grace_hours: float | None = None
 
 
 #: The full character-scoped kind registry. Every entry is chained (self-continuing)
@@ -284,6 +314,15 @@ CHARACTER_KIND_REGISTRY: dict[str, KindSpec] = {
         base_interval_seconds=300.0,
         handler="proactive_evaluate",
         knob_gate=KnobGate.PROACTIVE,
+        # TR2: the one chain whose job is to START a relationship, so the one
+        # chain that cannot require the relationship to already exist. NF4 reads
+        # a never-spoken-to character as dormant from creation, which on a tier
+        # with the knob set silences the first contact permanently — the chain
+        # never advances, so the delay window and the send caps below it never
+        # get a tick to run in. The grace is bounded by ``created_at``, not
+        # renewed by anything, so an unanswered character goes dormant on
+        # schedule; it is not an exemption.
+        first_contact_grace_hours=FIRST_CONTACT_GRACE_HOURS,
     ),
     GOAL_REVIEW_KIND: KindSpec(
         kind=GOAL_REVIEW_KIND,

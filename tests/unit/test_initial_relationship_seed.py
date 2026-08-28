@@ -195,3 +195,56 @@ def test_initial_relationship_seed_trims_living_arrangement_and_counts_as_non_em
 
     assert seed.living_arrangement == "住在使用者家裡"
     assert seed.is_empty is False
+
+
+@pytest.mark.asyncio
+async def test_create_character_persists_a_permission_only_seed() -> None:
+    """TR2-B: the pre-checked box alone has to survive creation.
+
+    With ``proactive_permission`` defaulted on in the creation form, the
+    common case is a player who fills in nothing else — and the create
+    path drops seeds that read as empty. If that emptiness test ever
+    stopped counting the permission, flipping the default would become a
+    no-op that no other test would notice: the box would look checked,
+    the seed would be discarded, and the character would go on waiting
+    for a first message forever.
+    """
+    seed_repo = InMemoryCharacterOperatorRelationshipSeedRepository()
+    service = CharacterService(
+        InMemoryCharacterRepository(),
+        relationship_seed_repository=seed_repo,
+    )
+
+    created = await service.create_character(
+        CreateCharacterRequest(
+            name="澄香",
+            initial_relationship=InitialRelationshipPayload(
+                proactive_permission=True,
+            ),
+        )
+    )
+
+    loaded = await seed_repo.get(created.id, "default")
+    assert loaded is not None
+    assert loaded.proactive_permission is True
+
+
+@pytest.mark.asyncio
+async def test_create_character_stores_nothing_when_the_box_is_unchecked() -> None:
+    """The opt-out half: unchecking leaves the character with no seed."""
+    seed_repo = InMemoryCharacterOperatorRelationshipSeedRepository()
+    service = CharacterService(
+        InMemoryCharacterRepository(),
+        relationship_seed_repository=seed_repo,
+    )
+
+    created = await service.create_character(
+        CreateCharacterRequest(
+            name="澄香",
+            initial_relationship=InitialRelationshipPayload(
+                proactive_permission=False,
+            ),
+        )
+    )
+
+    assert await seed_repo.get(created.id, "default") is None

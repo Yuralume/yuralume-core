@@ -182,10 +182,10 @@ async def release_turn_lease(session: StudioLeaseSession | None) -> None:
     """Release a session obtained from :meth:`ChatTurnLease.acquire`.
 
     Idempotent by construction at the call sites that matter: the streaming
-    path releases from the finalizer *and* from the route's ``finally``, and a
-    second call on an already-exited session only cancels an absent heartbeat
-    and re-issues an owner-matched release that the backend treats as a no-op.
-    ``None`` (lease-less wiring) is a no-op.
+    path may release from the finalizer's ``finish`` *and* from the relay's
+    unfinished-turn ``finally``, and a second call on an already-exited session
+    only cancels an absent heartbeat and re-issues an owner-matched release
+    that the backend treats as a no-op. ``None`` (lease-less wiring) is a no-op.
     """
     if session is None:
         return

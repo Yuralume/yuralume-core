@@ -22,6 +22,14 @@ a world event, or a derived signal like "user has been silent").
 - ``reaction_summary`` is a denormalised snapshot of reaction counts
   so the API can render cards without touching the reactions table.
   Phase 1 keeps it at zero; Phase 2 updates it when reactions land.
+- ``viewed_at`` records the moment the *player* actually saw this post
+  (KB11 of ``PLAYER_KNOWLEDGE_BOUNDARY_PLAN``) — distinct from
+  ``reactions_seen_at``, which is the character reading reactions. A
+  single-user world has exactly one reader, so one nullable timestamp
+  is enough; no per-viewer table. This is the read-side foundation KB8
+  will later use to flip a post's source ``private`` memory to
+  ``disclosed`` — this entity only records the fact, it does not
+  translate it into any memory-visibility decision.
 """
 
 from __future__ import annotations
@@ -95,6 +103,7 @@ class FeedPost:
     Same purpose as ``image_prompt`` — debugging + future regenerate."""
     reactions_seen_at: datetime | None = None
     reactions: FeedReactionSummary = field(default_factory=FeedReactionSummary)
+    viewed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -147,6 +156,7 @@ class FeedPost:
         created_at: datetime | None = None,
         reactions: FeedReactionSummary | None = None,
         reactions_seen_at: datetime | None = None,
+        viewed_at: datetime | None = None,
         id: str | None = None,
     ) -> "FeedPost":
         resolved_kind = (
@@ -165,6 +175,7 @@ class FeedPost:
             video_prompt=video_prompt,
             reactions=reactions or FeedReactionSummary(),
             reactions_seen_at=reactions_seen_at,
+            viewed_at=viewed_at,
         )
 
     def with_image(
@@ -200,6 +211,20 @@ class FeedPost:
 
     def mark_reactions_seen(self, *, when: datetime | None = None) -> "FeedPost":
         return replace(self, reactions_seen_at=when or _utcnow())
+
+    def mark_viewed(self, *, when: datetime | None = None) -> "FeedPost":
+        """Record that the player has actually seen this post.
+
+        Idempotent by design (KB11): once ``viewed_at`` is set it never
+        moves — first read wins. A like/comment landing after the
+        exposure event that already set it, or a duplicate batch from
+        the frontend replaying the same post id, must not overwrite the
+        original moment; the ledger only cares *that* it was seen, not
+        which of several signals happened to notice second.
+        """
+        if self.viewed_at is not None:
+            return self
+        return replace(self, viewed_at=when or _utcnow())
 
     def with_fields(
         self,

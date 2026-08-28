@@ -108,6 +108,10 @@ def _activity_to_dict(activity: ScheduleActivity) -> dict[str, Any]:
         "location": activity.location,
         "busy_score": activity.busy_score,
         "memorialized": activity.memorialized,
+        # KB2 lineage travels with the block: a restored reserved scene
+        # slot that lost it would come back as an ordinary activity and
+        # the memorializer would write the beat a second memory.
+        "source_beat_id": activity.source_beat_id,
     }
 
 
@@ -121,6 +125,7 @@ def _activity_from_dict(payload: dict[str, Any]) -> ScheduleActivity:
         location=payload.get("location"),
         busy_score=float(payload.get("busy_score", DEFAULT_UNKNOWN_BUSY_SCORE)),
         memorialized=bool(payload.get("memorialized", False)),
+        source_beat_id=payload.get("source_beat_id") or None,
     )
 
 
@@ -131,6 +136,7 @@ def schedule_to_dict(schedule: DailySchedule) -> dict[str, Any]:
         "date": schedule.date.isoformat(),
         "activities": [_activity_to_dict(a) for a in schedule.activities],
         "generated_at": schedule.generated_at.isoformat(),
+        "manually_adjusted": schedule.manually_adjusted,
     }
 
 
@@ -143,6 +149,8 @@ def schedule_from_dict(payload: dict[str, Any]) -> DailySchedule:
             _activity_from_dict(a) for a in payload.get("activities") or ()
         ),
         generated_at=datetime.fromisoformat(payload["generated_at"]),
+        # Snapshots taken before the flag existed restore as untouched.
+        manually_adjusted=bool(payload.get("manually_adjusted", False)),
     )
 
 

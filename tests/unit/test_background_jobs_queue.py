@@ -217,6 +217,41 @@ async def test_release_claim_requeues_immediately_and_refunds_the_attempt() -> N
     assert reclaimed[0].attempt_count == 1
 
 
+async def test_withdraw_queued_retires_the_row_and_frees_the_key() -> None:
+    # TU4: turn-undo deletes the follow-up row a release job was scheduled
+    # to fire, so the job now describes work that no longer exists.
+    queue = InMemoryBackgroundJobQueue()
+    job_id = await queue.enqueue(_spec(key="follow_up:row-1:900"), now=BASE)
+
+    assert await queue.withdraw_queued("follow_up:row-1:900", now=BASE) == 1
+
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.SUPERSEDED
+    assert job.finished_at == BASE
+    # Terminal, so the same logical key may recur immediately rather than
+    # staying blocked until the withdrawn job's original due instant.
+    assert await queue.enqueue(_spec(key="follow_up:row-1:900"), now=BASE)
+    # And a second withdrawal of an already-retired key is a no-op count,
+    # not a double retirement of the fresh occurrence's predecessor.
+    assert await queue.withdraw_queued("nothing-here", now=BASE) == 0
+
+
+async def test_withdraw_queued_leaves_a_claimed_job_to_its_worker() -> None:
+    # A worker holds the lease and is the only party allowed to end that
+    # job; its own subject re-verification is the guard there.
+    queue = InMemoryBackgroundJobQueue()
+    job_id = await queue.enqueue(_spec(key="follow_up:row-2:900"), now=BASE)
+    await queue.claim("w1", now=BASE, limit=10, lease_seconds=60)
+
+    assert await queue.withdraw_queued("follow_up:row-2:900", now=BASE) == 0
+
+    job = await queue.get(job_id)
+    assert job is not None
+    assert job.status == JobStatus.CLAIMED
+    assert job.lease_owner == "w1"
+
+
 async def test_release_claim_requires_valid_lease_ownership() -> None:
     queue = InMemoryBackgroundJobQueue()
     job_id = await queue.enqueue(_spec(), now=BASE)

@@ -42,6 +42,19 @@ class PersonaCuriosityRepositoryPort(Protocol):
         fail soft during undo/retry races.
         """
 
+    async def delete_created_since(
+        self, character_id: str, conversation_id: str, since: datetime,
+    ) -> int:
+        """Delete attempts for ``character_id`` in ``conversation_id``
+        recorded at-or-after ``since``.
+
+        Scoped by conversation as well as character: the journal that
+        drives turn-undo carries a ``conversation_id`` but no
+        ``operator_id``, and a character can be live in more than one
+        conversation at once, so character-only scoping would risk
+        sweeping up another conversation's attempts. Returns the number
+        removed."""
+
 
 @dataclass(frozen=True, slots=True)
 class PersonaCuriosityPlan:

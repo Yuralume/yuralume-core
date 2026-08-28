@@ -66,14 +66,19 @@ class _RecordingSummarizer:
         self.calls: list[list[Message]] = []
 
     async def summarize(
-        self, *, character: Character, messages: list[Message],
+        self,
+        *,
+        character: Character,
+        messages: list[Message],
+        now=None,
+        local_tz=None,
     ) -> str:
         self.calls.append(list(messages))
         return self.output
 
 
 class _ExplodingSummarizer:
-    async def summarize(self, *, character, messages):  # noqa: ANN001
+    async def summarize(self, *, character, messages, now=None, local_tz=None):  # noqa: ANN001
         raise RuntimeError("LLM is down")
 
 

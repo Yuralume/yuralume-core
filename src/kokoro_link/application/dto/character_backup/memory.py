@@ -34,6 +34,7 @@ class MemoryItemBackupRecord(BackupRecord):
     world_id: str | None = None
     location: str | None = None
     audience: str = ""
+    player_knowledge: str | None = None
 
 
 class MemoirPinBackupRecord(BackupRecord):

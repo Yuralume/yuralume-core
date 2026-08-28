@@ -12,7 +12,7 @@ the character's medium-term goals.
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from inspect import signature
@@ -46,9 +46,26 @@ from kokoro_link.application.services.quota_overage_service import (
 from kokoro_link.application.services.subscription_access_guard import (
     SubscriptionAccessGuard,
 )
+from kokoro_link.application.services.chat_turn_aux import (
+    load_turn_aux_context,
+)
 from kokoro_link.application.services.chat_turn_lease import (
     ChatTurnLease,
     release_turn_lease,
+)
+from kokoro_link.application.services.dialogue_checkpoint import (
+    PROMPT_RAW_TAIL_MESSAGES,
+    CheckpointUpdateOutcome,
+    DialogueCheckpointReader,
+    DialogueCheckpointUpdater,
+    DialoguePromptContext,
+)
+from kokoro_link.application.services.dialogue_window_loader import (
+    load_unified_recent_messages,
+)
+from kokoro_link.application.services.material_digest_precompute import (
+    MaterialDigestPrecomputer,
+    digest_operator_id,
 )
 from kokoro_link.application.services.drain_state import (
     ActiveTurn,
@@ -76,6 +93,17 @@ from kokoro_link.application.services.goal_review_service import (
 )
 from kokoro_link.application.services.goal_service import GoalService
 from kokoro_link.application.services.location_context import prompt_location_fact
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    OutputQualityReview,
+    script_mix_lines,
+)
+from kokoro_link.infrastructure.prompt.temporal_evidence import (
+    TemporalEvent,
+    quoted_event,
+    render_temporal_context_lines,
+)
 from kokoro_link.application.services.memory_embedding import attach_embeddings
 from kokoro_link.application.services.nsfw_mode import (
     CONTENT_MODE_NSFW,
@@ -110,11 +138,21 @@ from kokoro_link.application.services.tool_call_parser import (
 from kokoro_link.application.services.tts_pregeneration_service import (
     TTSPregenerationService,
 )
+from kokoro_link.application.services.turn_journal_snapshots import (
+    address_preference_to_dict, follow_up_to_dict, scene_session_to_dict,
+)
 from kokoro_link.application.services.turn_snapshot_codec import (
     arc_to_dict, goal_to_dict, schedule_to_dict, state_to_dict,
 )
 from kokoro_link.application.services.post_turn_runner import (
     PostTurnEnqueueOutcome,
+)
+from kokoro_link.application.services.memory_disclosure_service import (
+    MemoryDisclosureService,
+    select_private_candidates,
+)
+from kokoro_link.application.services.undone_turn_gate import (
+    POST_TURN_SKIPPED_UNDONE, POST_TURN_SKIPPED_UNDONE_IN_FLIGHT, UndoneTurnGate,
 )
 from kokoro_link.application.services.vision_media import (
     MAX_INLINE_IMAGE_BYTES as _MAX_INLINE_IMAGE_BYTES,
@@ -159,6 +197,7 @@ from kokoro_link.contracts.persona_curiosity import (
     PersonaCuriosityPlannerPort,
 )
 from kokoro_link.contracts.novelty_gate import (
+    ALL_AXES,
     NoveltyGateContext,
     NoveltyGatePort,
     NoveltyVerdict,
@@ -172,6 +211,7 @@ from kokoro_link.contracts.prompt_material_digest import (
     PromptMaterialDigest,
     PromptMaterialDigestContext,
     PromptMaterialDigestPort,
+    PromptMaterialDigestStorePort,
 )
 from kokoro_link.contracts.reply_quality import ReplyDiversityEvidence
 from kokoro_link.contracts.self_reflection import (
@@ -336,6 +376,9 @@ from kokoro_link.domain.value_objects.tool_call import ToolAttachment, ToolCall
 from kokoro_link.infrastructure.localization import localized_fallback_text
 from kokoro_link.infrastructure.memory.deduplicator import deduplicate
 from kokoro_link.infrastructure.memory.ranker import rank, rank_hybrid
+from kokoro_link.infrastructure.repositories.in_memory_prompt_material_digests import (
+    InMemoryPromptMaterialDigestRepository,
+)
 from kokoro_link.infrastructure.prompt.initial_relationship import (
     render_initial_relationship_seed_lines,
 )
@@ -358,9 +401,6 @@ from kokoro_link.domain.value_objects.address_change_event import (
     SOURCE_OBSERVED,
 )
 from kokoro_link.domain.value_objects.resolved_address import ResolvedAddress
-from kokoro_link.infrastructure.diversity.reply_evidence import (
-    build_reply_diversity_evidence,
-)
 from kokoro_link.infrastructure.observability.llm_metadata_wrapper import (
     LLMCallMetadata,
     MetadataCapturingChatModel,
@@ -371,7 +411,32 @@ from kokoro_link.infrastructure.state.recovery import apply_rest_recovery
 _MEMORY_POOL_SIZE = 80
 _MEMORY_PROMPT_TOP_K = 8
 _RECENT_MESSAGE_LIMIT = 8
-_PROMPT_RAW_RECENT_MESSAGE_LIMIT = 3
+_PROMPT_RAW_RECENT_MESSAGE_LIMIT = PROMPT_RAW_TAIL_MESSAGES
+"""How many turns stay verbatim. One fact, stated in
+``dialogue_checkpoint.window``: the undo guard has to reason about the
+same tail without importing this module."""
+_OUTPUT_QUALITY_SURFACE = "chat"
+"""Label every QG counter and log line from this module carries.
+
+One string because the metric it becomes is per-surface: splitting chat
+into ``chat_stream`` / ``chat_tool`` would make the hard-failure rate a
+statement about a code path rather than about what players are seeing,
+and no dashboard would ever add the pieces back up."""
+_SCRIPT_MIX_WINDOW = 5
+"""How many recent assistant messages the script-mix summary covers (D3).
+
+Short enough that a character which *stops* mixing scripts stops being
+routed into the buffered path within a handful of turns, long enough that
+one quoted English title cannot swing the composition on its own."""
+_SCRIPT_MIX_RISK_WEIGHT = 0.8
+"""Risk contributed when recent output has visibly started mixing scripts.
+
+Above the 0.65 default threshold on its own — that is the point of D3:
+once the mixing is visible in the window, the *next* turn is buffered and
+gated whether or not anything else about it looks risky. Above the 0.7
+that phrase-frequency evidence carries, because a script shift is the
+deterministic precursor of a **hard** axis (``language_mismatch``) while
+phrase repetition only precedes soft ones."""
 _DEFAULT_GOAL_REVIEW_INTERVAL = 10  # user-assistant exchanges between reviews
 _BUSY_DECIDER_INVOKE_FLOOR = BUSY_REPLY_DECIDER_INVOKE_FLOOR
 """Skip the busy-reply decider's LLM call when the current activity's
@@ -584,17 +649,73 @@ class ChatGenerationTrace:
 
 
 @dataclass(frozen=True, slots=True)
+class _ChatDraft:
+    """One candidate reply and the trace of the call that produced it.
+
+    The output-quality band reviews *a candidate* and may hand back a
+    regenerated one; on chat every draft also owns a usage trace that has
+    to travel with it, because the trace of the draft that was thrown away
+    is not the trace of the reply the player received. Keeping the pair in
+    one object is what stops those two from drifting apart across the
+    review — the alternative (return the text, stash the trace in a
+    ``nonlocal``) silently pairs a shipped text with a discarded trace on
+    the one path where the retry came back blank.
+    """
+
+    text: str
+    trace: ChatGenerationTrace
+
+
+def _regenerated_draft(
+    text: str, trace: ChatGenerationTrace,
+) -> _ChatDraft | None:
+    """A regenerated chat draft, or ``None`` when it came back blank.
+
+    The band's own blank check can only read strings, and a chat candidate
+    is a ``_ChatDraft`` — so an empty regeneration would sail past it as
+    "usable" and be handed to the player *instead of* the flawed-but-real
+    first draft. Answering ``None`` is the contract the band documents for
+    exactly this ("a surface whose candidate is a structured object knows
+    its own emptiness rules"), and it routes into the already-tested
+    "regeneration failed → ship the original" path rather than a new one.
+    """
+    return _ChatDraft(text=text, trace=trace) if (text or "").strip() else None
+
+
+@dataclass(frozen=True, slots=True)
 class ChatGenerationResult:
     text: str
     attachments: list[MessageAttachment]
     forced_fired: bool
     trace: ChatGenerationTrace
+    offered_tool_names: tuple[str, ...] = ()
+    """HV4 — the tools this turn actually put in front of the model.
+
+    Empty on the no-tool branch, and that emptiness is load-bearing: it is
+    what tells the post-turn audit there was nothing the character could
+    have called and then lied about calling, so no judge call is worth
+    paying for. NOT the per-hop list (the last hop hides the tools block
+    to force a reply), and not the registry's wish list either — the
+    capability set for this character on this turn."""
+    tool_outcomes: tuple[ToolOutcomeMessage, ...] = ()
+    """HV4 — what those tools returned, successes and failures alike.
+
+    The audit's only admissible evidence, and the reason the judge runs at
+    the write point rather than in the distributed post-turn worker: this
+    never reaches storage, so a worker rebuilding the turn from the
+    conversation could not reconstruct it."""
     persona_curiosity_plan: PersonaCuriosityPlan | None = None
     material_digest: PromptMaterialDigest | None = None
     register_profile: RegisterProfile | None = None
     diversity_evidence: ReplyDiversityEvidence | None = None
     novelty_verdict: NoveltyVerdict | None = None
     novelty_retry_count: int = 0
+    novelty_outcome: str = ""
+    """QG5 — the output-quality band's disposal label for this reply.
+
+    Empty when the risk gate never ran, so ``""`` and ``"pass"`` are
+    different answers: the first means nobody looked, the second means
+    somebody looked and was satisfied."""
 
 
 def _image_drop_placeholder(count: int) -> str:
@@ -911,6 +1032,9 @@ class ChatService:
         schedule_memorializer: ScheduleMemorializer | None = None,
         feed_reaction_memorializer: FeedReactionMemorializer | None = None,
         dialogue_summarizer: DialogueSummarizerPort | None = None,
+        dialogue_checkpoint_reader: "DialogueCheckpointReader | None" = None,
+        dialogue_checkpoint_updater: "DialogueCheckpointUpdater | None" = None,
+        dialogue_window_limit: int | None = None,
         embedder: EmbedderPort | None = None,
         state_tracker: "StateChangeTracker | None" = None,
         auto_consolidation_trigger: AutoConsolidationTrigger | None = None,
@@ -950,11 +1074,27 @@ class ChatService:
         persona_curiosity_planner: "PersonaCuriosityPlannerPort | None" = None,
         prompt_material_digester: PromptMaterialDigestPort | None = None,
         prompt_material_digest_enabled: bool = False,
+        prompt_material_digest_store: (
+            PromptMaterialDigestStorePort | None
+        ) = None,
         register_profiler: RegisterProfilePort | None = None,
         register_profile_enabled: bool = False,
-        novelty_gate: NoveltyGatePort | None = None,
-        novelty_gate_enabled: bool = False,
-        novelty_gate_max_retries: int = 1,
+        # QG0 — one name for one setting. This gate arrived on chat as
+        # ``novelty_gate`` and on every background surface as
+        # ``reply_quality_gate``, wired from the same setting, which meant
+        # a reader comparing two surfaces had to first work out they were
+        # looking at the same knob. Chat now spells it the way the others
+        # do; the private attributes keep their older names, because those
+        # are read in a hundred places and renaming them would be churn
+        # with no reader on the other end.
+        reply_quality_gate: NoveltyGatePort | None = None,
+        reply_quality_gate_enabled: bool = False,
+        reply_quality_gate_max_retries: int = 1,
+        # QG0/QG5 — the shared disposal band. Chat runs every gated reply
+        # through it under ``CHAT_BEST_EFFORT``: one regeneration, no
+        # re-review, always send. Optional only so callers that build this
+        # service by hand keep working; see the fallback in the body.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
         reply_quality_gate_risk_threshold: float = 0.0,
         reply_quality_similarity_threshold: float = 0.88,
         turn_recorder: TurnRecorderPort | None = None,
@@ -993,6 +1133,14 @@ class ChatService:
         self._character_repository = character_repository
         self._conversation_repository = conversation_repository
         self._memory_repository = memory_repository
+        # KB8 — built here rather than injected: the chat channel's flip
+        # needs nothing but the memory repository this service already
+        # owns, and an optional constructor argument would let a caller
+        # wire the service without the ledger and lose disclosures
+        # silently.
+        self._memory_disclosure = MemoryDisclosureService(
+            memories=memory_repository,
+        )
         self._post_turn_processor = post_turn_processor
         self._prompt_context_builder = prompt_context_builder
         self._model_registry = model_registry
@@ -1021,6 +1169,21 @@ class ChatService:
         self._schedule_memorializer = schedule_memorializer
         self._feed_reaction_memorializer = feed_reaction_memorializer
         self._dialogue_summarizer = dialogue_summarizer
+        # DH3 — both ``None`` unless ``FEATURE_DIALOGUE_CHECKPOINT`` is on.
+        # That is the whole flag: with nothing wired, every branch below
+        # falls through to the pre-DH3 code, so "flag off" is not a
+        # condition evaluated on the hot path but an absent collaborator.
+        self._dialogue_checkpoint_reader = dialogue_checkpoint_reader
+        self._dialogue_checkpoint_updater = dialogue_checkpoint_updater
+        # How many messages the *chat prompt* loads. The module constant
+        # stays the default and the post-turn's own prior-message window
+        # keeps using it directly — widening that one would change what
+        # the extractor sees, which is not this ticket's change to make.
+        self._dialogue_window_limit = (
+            _RECENT_MESSAGE_LIMIT
+            if dialogue_window_limit is None
+            else max(1, int(dialogue_window_limit))
+        )
         self._embedder = embedder
         self._state_tracker = state_tracker
         self._auto_consolidation_trigger = auto_consolidation_trigger
@@ -1065,6 +1228,18 @@ class ChatService:
         # on embedded / self-host it stays None → ``_run_post_turn`` runs the post-turn
         # in-process exactly as before (§ red line — zero path difference).
         self._post_turn_enqueuer = None
+        # HV4: the post-turn honesty audit for chat. Wired by a setter
+        # because the shared honesty guard is built after this service in
+        # the container; ``None`` (self-host without a judge route, every
+        # test that does not opt in) means no audit and no repair — the
+        # exact pre-HV4 behaviour, with no branch on the hot path.
+        self._outcome_claim_auditor = None
+        # TU2: the undo interlock the post-turn asks before it writes.
+        # An unwired gate answers "not undone" for everything, which is
+        # exactly the behaviour that predates the tombstone — so the
+        # default is a real object rather than ``None`` and the hot path
+        # carries no null check.
+        self._undone_turn_gate = UndoneTurnGate()
         self._character_encounter_intent_repository = (
             character_encounter_intent_repository
         )
@@ -1076,11 +1251,37 @@ class ChatService:
         self._persona_curiosity_planner = persona_curiosity_planner
         self._prompt_material_digester = prompt_material_digester
         self._prompt_material_digest_enabled = bool(prompt_material_digest_enabled)
+        # DIGEST_OFFPATH — the digest is no longer an aux-LLM call on the
+        # turn. The post-turn budgets it into a store and the chat path
+        # only reads; a miss renders the source blocks, which is the same
+        # fallback an unwired or failing digester has always had.
+        #
+        # The default store is in-memory rather than ``None``, following
+        # ``_undone_turn_gate`` above: a real collaborator that simply
+        # holds nothing across restarts is correct on embedded (one
+        # process writes and reads it) and keeps the read path free of a
+        # null check. The container replaces it with the SA store wherever
+        # a database exists — which is the only place the two ends of the
+        # handoff can be different processes.
+        self._material_digest_precompute = MaterialDigestPrecomputer(
+            prompt_material_digest_store
+            or InMemoryPromptMaterialDigestRepository(),
+        )
         self._register_profiler = register_profiler
         self._register_profile_enabled = bool(register_profile_enabled)
-        self._novelty_gate = novelty_gate
-        self._novelty_gate_enabled = bool(novelty_gate_enabled)
-        self._novelty_gate_max_retries = max(0, int(novelty_gate_max_retries))
+        self._novelty_gate = reply_quality_gate
+        self._novelty_gate_enabled = bool(reply_quality_gate_enabled)
+        self._novelty_gate_max_retries = max(0, int(reply_quality_gate_max_retries))
+        # QG5 — chat reviews through the shared band, so it needs one
+        # unconditionally. The container always supplies the process-wide
+        # instance (one counters set for the whole deployment); the
+        # fallback exists so an embedding caller that hands over a gate but
+        # no band still gets reviewed rather than silently ungated, and it
+        # binds the very gate it was given so the two can never disagree.
+        self._output_quality_orchestrator = (
+            output_quality_orchestrator
+            or OutputQualityOrchestrator(gate=reply_quality_gate)
+        )
         self._reply_quality_gate_risk_threshold = max(
             0.0,
             min(1.0, float(reply_quality_gate_risk_threshold)),
@@ -1954,13 +2155,15 @@ class ChatService:
         content_mode = prelude.content_mode
         presence_frame = prelude.presence_frame
         recent_messages = await self._load_unified_recent_messages(
-            character_id=payload.character_id, conversation=conversation,
+            character_id=payload.character_id,
         )
         prompt_recent_messages, older_dialogue_summary = (
             await self._prepare_prompt_dialogue_context(
                 character=character,
                 recent_messages=recent_messages,
                 content_tolerance=_content_tolerance_for_content_mode(content_mode),
+                now=self._resolve_now(),
+                local_tz=_operator_timezone(operator),
             )
         )
         # Convert any unseen feed likes/comments into memories *before*
@@ -2317,6 +2520,31 @@ class ChatService:
             persona_enabled=payload.operator_persona_enabled,
             content_mode=content_mode.value,
             has_user_message=user_message is not None,
+            # KB8 — which memories the player could have learned from
+            # this turn. Derived from the same list ``_touch_memories``
+            # marks as used a few lines up: "went into the prompt" is
+            # already a fact this path establishes, so the disclosure
+            # ledger reads it rather than re-deriving its own notion of
+            # what was injected.
+            private_memory_ids=tuple(
+                item.id for item in select_private_candidates(memories)
+            ),
+        )
+        # HV4 — the reply is already with the player, so this can only
+        # audit and owe a repair, never withhold. Scheduled after the
+        # post-turn so the two background tails start in the order their
+        # log lines will be read in.
+        self._schedule_outcome_claim_audit(
+            character=character,
+            conversation_id=updated_conversation.id,
+            turn_record_id=turn_record_id,
+            assistant_text=assistant_text,
+            generation=generation,
+            operator=operator,
+            content_mode=content_mode.value,
+            turn_started_at=(
+                journal.turn_started_at if journal is not None else None
+            ),
         )
         self._maybe_schedule_goal_review(
             character=character,
@@ -2326,7 +2554,7 @@ class ChatService:
             character=character,
             conversation=updated_conversation,
         )
-        await self._persist_journal(journal)
+        await self._persist_journal(journal, turn_record_id=turn_record_id)
 
         await self._record_turn_safely(TurnRecordingDraft(
             id=turn_record_id,
@@ -2370,6 +2598,7 @@ class ChatService:
                     generation.novelty_verdict,
                     enabled=self._novelty_gate_enabled,
                     retry_count=generation.novelty_retry_count,
+                    outcome=generation.novelty_outcome,
                 ),
                 "presence_frame": presence_frame.to_metadata(),
                 # SN1 deliberately reuses the ``chat`` feature key and the
@@ -2420,7 +2649,7 @@ class ChatService:
         payload: SendChatMessageRequest,
         *,
         current_user_id: str | None = None,
-    ) -> tuple[AsyncIterator[str], "StreamFinalizer"]:
+    ) -> tuple[AsyncIterator[str | dict], "StreamFinalizer"]:
         """Start a streaming chat reply.
 
         Returns a (token_stream, finalizer) tuple.
@@ -2430,9 +2659,10 @@ class ChatService:
         The conversation lease spans BOTH calls: it is claimed here, before the
         user turn is persisted, and handed to the finalizer, which releases it
         once the assistant message has landed. A turn that fails before the
-        finalizer exists releases here; the route additionally releases in a
-        ``finally`` so an abandoned stream (client disconnect, mid-stream
-        error) frees the conversation immediately instead of after the TTL.
+        finalizer exists releases here. Past that point the caller owns it:
+        ``TurnStreamRelay`` drains the stream in its own task and releases in
+        its ``finally`` for every path that never reaches ``finish`` (upstream
+        error mid-generation, refusal, detach timeout).
         """
         prelude = await self._begin_turn(payload, current_user_id=current_user_id)
         # GD1-A: already counted — ``_begin_turn`` admitted the turn before it
@@ -2483,20 +2713,22 @@ class ChatService:
         self,
         payload: SendChatMessageRequest,
         prelude: TurnPrelude,
-    ) -> tuple[AsyncIterator[str], "StreamFinalizer"]:
+    ) -> tuple[AsyncIterator[str | dict], "StreamFinalizer"]:
         character = prelude.character
         operator = prelude.operator
         conversation = prelude.conversation
         content_mode = prelude.content_mode
         presence_frame = prelude.presence_frame
         recent_messages = await self._load_unified_recent_messages(
-            character_id=payload.character_id, conversation=conversation,
+            character_id=payload.character_id,
         )
         prompt_recent_messages, older_dialogue_summary = (
             await self._prepare_prompt_dialogue_context(
                 character=character,
                 recent_messages=recent_messages,
                 content_tolerance=_content_tolerance_for_content_mode(content_mode),
+                now=self._resolve_now(),
+                local_tz=_operator_timezone(operator),
             )
         )
         await self._memorialize_feed_reactions(payload.character_id)
@@ -2658,17 +2890,26 @@ class ChatService:
         )
         tool_descriptors = self._describe_tools(character)
 
-        # Tool-use path swaps streaming for a single blocking cycle:
+        # Tool-use path swaps token streaming for a single blocking cycle:
         # we have to see the *full* first reply to decide whether it's
         # a tool call, and the subsequent tool run can take tens of
         # seconds — trying to stream tokens before we know the answer
-        # would leak the raw JSON tool-call shape to the user. The
-        # streaming adapter is reduced to yielding the final reply
-        # text as one chunk, followed by the normal finalizer. Chat UI
-        # still shows it as a complete message; the latency hit only
-        # applies when tools are enabled on the character.
+        # would leak the raw JSON tool-call shape to the user. The cycle
+        # runs as a task while ``_tool_cycle_stream`` forwards
+        # tool-activity frames to the client, then yields the final
+        # reply text as one chunk. Chat UI still shows it as a complete
+        # message; the latency hit only applies when tools are enabled
+        # on the character.
+        #
+        # ``create_task`` here, inside the caller's
+        # ``client_quoted_price_scope`` / ``interaction_scope`` blocks:
+        # the task copies the current contextvars context at creation,
+        # which is what keeps both scopes visible to the whole cycle
+        # even though the generator is iterated by the route long after
+        # those ``with`` blocks exited.
         if tool_descriptors and self._tool_orchestrator is not None:
-            generation = await self._generate_reply_with_tools(
+            activity_events: asyncio.Queue[dict] = asyncio.Queue()
+            generation_task = asyncio.create_task(self._generate_reply_with_tools(
                 character=character,
                 conversation=conversation,
                 recent_messages=prompt_recent_messages,
@@ -2714,10 +2955,11 @@ class ChatService:
                     content_mode,
                 ),
                 source_surface="chat_stream",
-            )
-            final_text = generation.text
-            attachments = generation.attachments
-            token_stream = _single_chunk_stream(final_text)
+                on_tool_activity=activity_events.put_nowait,
+            ))
+            # Generation fields (text / attachments / trace / …) are
+            # late-bound by ``_tool_cycle_stream`` via
+            # ``attach_generation`` once the cycle completes.
             finalizer = StreamFinalizer(
                 service=self,
                 character=character,
@@ -2726,25 +2968,18 @@ class ChatService:
                 pending_state=pending_state,
                 used_memories=memories,
                 prior_messages=recent_messages,
-                pre_resolved_text=final_text,
-                pre_resolved_attachments=attachments,
                 journal=journal,
                 persona_enabled=payload.operator_persona_enabled,
-                trace=generation.trace,
                 safe_summary_model=model,
                 safe_summary_model_id=model_id,
-                forced_tool=generation.forced_fired,
-                persona_curiosity_plan=generation.persona_curiosity_plan,
-                material_digest=generation.material_digest,
-                register_profile=generation.register_profile,
-                diversity_evidence=generation.diversity_evidence,
-                novelty_verdict=generation.novelty_verdict,
-                novelty_retry_count=generation.novelty_retry_count,
                 presence_frame=presence_frame,
                 content_mode=content_mode,
                 scene_session=scene_session,
                 operator=operator,
                 stage_nudge=nudge.enabled,
+            )
+            token_stream = _tool_cycle_stream(
+                generation_task, activity_events, finalizer,
             )
             return token_stream, finalizer
 
@@ -2766,70 +3001,46 @@ class ChatService:
         # Recognition routes on CONTENT-driven tolerance (see the tool
         # path): the provider-derived ``content_tolerance`` above is right
         # for history sanitization but wrong for user-uploaded images.
-        image_recognition_context = await self._build_image_recognition_context(
-            character=character,
-            main_model=model,
-            attachment_urls=vision_urls,
-            content_tolerance=_content_tolerance_for_content_mode(content_mode),
-        )
-        operator_persona = await self._load_operator_persona(
-            character.id, operator,
-        )
-        operator_persona_lines = self._render_operator_persona_lines(operator_persona)
-        player_persona_note = await self._load_player_persona_note(
-            character.id,
-            operator,
-            enabled=payload.operator_persona_enabled,
-        )
-        peer_roster_lines = await self._load_peer_roster_lines(character.id)
-        initial_relationship_lines = await self._load_initial_relationship_lines(
-            character.id, operator,
-        )
-        persona_curiosity_plan = await self._load_persona_curiosity_plan(
+        #
+        # Everything below loads in two parallel waves — see
+        # ``chat_turn_aux``. This branch loads the operator persona
+        # unconditionally (unlike the tool path): the address resolver
+        # downstream consumes the same aggregate regardless of whether the
+        # persona prompt block is enabled.
+        turn_aux = await load_turn_aux_context(
+            self,
             character=character,
             operator=operator,
-            enabled=payload.operator_persona_enabled,
             conversation_id=conversation.id,
-            recent_dialogue_summary=older_dialogue_summary or "",
-            initial_relationship_lines=initial_relationship_lines,
             now=now_utc,
-        )
-        emotion_events = await self._load_recent_emotion_events(
-            character_id=character.id, operator=operator, now=now_utc,
-        )
-        self_reflections = await self._load_self_reflections(
-            character_id=character.id, operator=operator,
-        )
-        material_digest = await self._load_prompt_material_digest(
-            character=character,
-            operator=operator,
-            emotion_events=emotion_events,
-            self_reflections=self_reflections,
-            story_events=story_events,
-            story_arc=story_arc,
-            upcoming_arc_beats=upcoming_arc_beats,
-            recent_feed_posts=recent_feed_posts,
-            content_tolerance=content_tolerance,
-        )
-        phrase_habit_lines = await self._load_phrase_habit_lines(character.id)
-        register_profile = await self._load_register_profile(
-            character=character,
-            operator=operator,
-            latest_user_message=turn_text,
-            recent_dialogue_summary=older_dialogue_summary or "",
-            relationship_context=tuple(
-                [
-                    *(operator_persona_lines or []),
-                    *(initial_relationship_lines or []),
-                ],
+            main_model=model,
+            vision_urls=vision_urls,
+            recognition_content_tolerance=_content_tolerance_for_content_mode(
+                content_mode,
             ),
             content_tolerance=content_tolerance,
-        )
-        diversity_evidence = await build_reply_diversity_evidence(
-            recent_messages=prompt_messages_for_model,
+            persona_enabled=payload.operator_persona_enabled,
+            load_operator_persona=True,
+            latest_user_message=turn_text,
+            recent_dialogue_summary=older_dialogue_summary or "",
+            diversity_messages=prompt_messages_for_model,
             self_repetition_hint=self_repetition_hint,
             embedder=self._embedder,
+            script_mix_decorator=_with_script_mix_evidence,
         )
+        image_recognition_context = turn_aux.image_recognition_context
+        operator_persona = turn_aux.operator_persona
+        operator_persona_lines = turn_aux.operator_persona_lines
+        player_persona_note = turn_aux.player_persona_note
+        peer_roster_lines = turn_aux.peer_roster_lines
+        initial_relationship_lines = turn_aux.initial_relationship_lines
+        persona_curiosity_plan = turn_aux.persona_curiosity_plan
+        emotion_events = turn_aux.emotion_events
+        self_reflections = turn_aux.self_reflections
+        material_digest = turn_aux.material_digest
+        phrase_habit_lines = turn_aux.phrase_habit_lines
+        register_profile = turn_aux.register_profile
+        diversity_evidence = turn_aux.diversity_evidence
         # Phase 3.6 lite — derived-view overlay: latest turn event's
         # emotion_label may diverge from the column when the rich
         # `emotion_events` path is in play (Item 2), so the prompt sees
@@ -2875,6 +3086,12 @@ class ChatService:
                 pending_invite_activities=pending_invite_activities,
                 now=now_utc,
                 idle_minutes=idle_minutes,
+                # HV2 — this generator is the streaming branch, reached only
+                # when the tool cycle above declined the turn: either the
+                # character has no permitted tool or no orchestrator is
+                # wired. Both mean nothing can be invoked, so the capability
+                # set is positively empty rather than merely undeclared.
+                character_tool_names=(),
                 story_events=story_events,
                 story_arc=story_arc,
                 upcoming_arc_beats=upcoming_arc_beats,
@@ -2968,40 +3185,47 @@ class ChatService:
             diversity_evidence=diversity_evidence,
         )
         if should_evaluate_gate:
-            final_text, trace = await generate_buffered_stream_once()
-            novelty_verdict = await self._evaluate_novelty_gate(
-                character=character,
-                operator=operator,
-                response_text=final_text,
-                material_digest=material_digest,
-                emotion_events=emotion_events,
-                self_reflections=self_reflections,
-                story_events=story_events,
-                story_arc=story_arc,
-                upcoming_arc_beats=upcoming_arc_beats,
-                recent_feed_posts=recent_feed_posts,
-                recent_messages=prompt_messages_for_model,
-                self_repetition_hint=self_repetition_hint,
-                latest_user_message=turn_text,
-                content_tolerance=content_tolerance,
-                register_profile=register_profile,
-                diversity_evidence=diversity_evidence,
-                persona_context=tuple([
-                    f"性格：{', '.join(character.personality)}",
-                    f"說話風格：{character.speaking_style}",
-                    *initial_relationship_lines,
-                ]),
-            )
-            novelty_retry_count = 0
-            if (
-                novelty_verdict is not None
-                and not novelty_verdict.passes
-                and self._novelty_gate_max_retries > 0
-            ):
-                novelty_retry_count = 1
-                final_text, trace = await generate_buffered_stream_once(
-                    novelty_verdict.feedback,
+            async def regenerate_buffered_stream(
+                feedback: str,
+            ) -> _ChatDraft | None:
+                return _regenerated_draft(
+                    *await generate_buffered_stream_once(feedback),
                 )
+
+            first_draft = _ChatDraft(*await generate_buffered_stream_once())
+            review = await self._review_chat_draft(
+                first_draft,
+                context_for=self._novelty_context_factory(
+                    character=character,
+                    operator=operator,
+                    material_digest=material_digest,
+                    emotion_events=emotion_events,
+                    self_reflections=self_reflections,
+                    story_events=story_events,
+                    story_arc=story_arc,
+                    upcoming_arc_beats=upcoming_arc_beats,
+                    recent_feed_posts=recent_feed_posts,
+                    recent_messages=prompt_messages_for_model,
+                    self_repetition_hint=self_repetition_hint,
+                    latest_user_message=turn_text,
+                    content_tolerance=content_tolerance,
+                    register_profile=register_profile,
+                    diversity_evidence=diversity_evidence,
+                    persona_context=_novelty_persona_context(
+                        character, initial_relationship_lines,
+                    ),
+                ),
+                regenerate=regenerate_buffered_stream,
+                character=character,
+            )
+            # ``final`` is never ``None`` under ``CHAT_BEST_EFFORT`` — the
+            # policy has no "send nothing" move — so falling back to the
+            # first draft is a no-op today and the right answer on the day
+            # this turn is reviewed under some other policy.
+            shipped = review.final or first_draft
+            final_text, trace = shipped.text, shipped.trace
+            novelty_verdict = review.first_verdict
+            novelty_retry_count = 1 if review.regen_attempted else 0
             token_stream = _single_chunk_stream(final_text)
             finalizer = StreamFinalizer(
                 service=self,
@@ -3023,6 +3247,7 @@ class ChatService:
                 diversity_evidence=diversity_evidence,
                 novelty_verdict=novelty_verdict,
                 novelty_retry_count=novelty_retry_count,
+                novelty_outcome=review.outcome,
                 presence_frame=presence_frame,
                 content_mode=content_mode,
                 scene_session=scene_session,
@@ -3102,9 +3327,15 @@ class ChatService:
             except Exception:
                 _LOGGER.exception("journal: goal snapshot failed")
         prev_arc: dict | None = None
+        # Tri-state on purpose. ``prev_arc is None`` cannot say whether
+        # there was no arc or whether we never got to look, and undo has
+        # to know the difference before it dares delete an arc the turn
+        # created. ``None`` here = never found out.
+        had_active_arc: bool | None = None
         if self._story_arc_service is not None:
             try:
                 arc = await self._story_arc_service.get_active(character.id)
+                had_active_arc = arc is not None
                 if arc is not None:
                     prev_arc = arc_to_dict(arc)
             except Exception:
@@ -3119,6 +3350,52 @@ class ChatService:
                     prev_schedule = schedule_to_dict(schedule)
             except Exception:
                 _LOGGER.exception("journal: schedule snapshot failed")
+        # Every open deferred-reply row, snapshotted *before* the turn
+        # can touch it. One pre-turn fact covers all three things a turn
+        # can do to one — cancel it (normal reply), merge into it (busy
+        # defer), or leave it alone — which no post-hoc "what did this
+        # turn cancel" record could, because the merge case produces no
+        # cancellation to record.
+        #
+        # *Every* row, not just the newest: the row a turn cancels is the
+        # open **busy-defer** one, while ``find_open_for_conversation``
+        # returns whichever row is newest regardless of kind. With a
+        # scheduled promise queued after the defer, the snapshot named
+        # the promise — which the turn never touched, so restoring it is
+        # a no-op — and the cancelled defer went unrecorded, staying
+        # cancelled straight through the undo and taking the reply the
+        # player was waiting for with it.
+        prev_follow_ups: list[dict] = []
+        if self._pending_follow_up_repository is not None:
+            try:
+                open_rows = (
+                    await self._pending_follow_up_repository
+                    .list_open_for_conversation(conversation.id)
+                )
+                prev_follow_ups = [follow_up_to_dict(r) for r in open_rows]
+            except Exception:
+                _LOGGER.exception("journal: pending follow-up snapshot failed")
+        prev_address: dict | None = None
+        if self._address_preference_repository is not None:
+            # ``_fetch_address_preference`` already fail-softs to ``None``.
+            preference = await self._fetch_address_preference(
+                character_id=character.id,
+                operator_id=getattr(
+                    character, "user_id", DEFAULT_OPERATOR_ID,
+                ),
+            )
+            if preference is not None:
+                prev_address = address_preference_to_dict(preference)
+        prev_scene: dict | None = None
+        if self._story_scene_sessions is not None:
+            try:
+                scene = await self._story_scene_sessions.get_open_for_character(
+                    character.id,
+                )
+                if scene is not None:
+                    prev_scene = scene_session_to_dict(scene)
+            except Exception:
+                _LOGGER.exception("journal: scene session snapshot failed")
         return TurnJournal.new(
             conversation_id=conversation.id,
             character_id=character.id,
@@ -3128,10 +3405,30 @@ class ChatService:
             prev_goals=prev_goals,
             prev_active_arc=prev_arc,
             prev_daily_schedule=prev_schedule,
+            had_active_arc=had_active_arc,
+            prev_open_follow_ups=prev_follow_ups,
+            prev_address_preference=prev_address,
+            prev_scene_session=prev_scene,
         )
 
-    async def _persist_journal(self, journal: TurnJournal | None) -> None:
+    async def _persist_journal(
+        self,
+        journal: TurnJournal | None,
+        *,
+        turn_record_id: str | None = None,
+    ) -> None:
         """Persist the finalised journal + GC old entries for the conversation.
+
+        ``turn_record_id`` is stamped in here rather than at build time
+        because it does not exist yet when the journal is built: the
+        journal is captured before the turn runs, the turn record is
+        minted when it finishes. Undo's post-turn interlock is keyed on
+        that id, so this is the seam that gives it one.
+
+        ``None`` is a legitimate argument, not a caller's oversight —
+        the busy-defer branch never runs a post-turn and mints no turn
+        record. Such a journal simply carries no anchor, and every
+        reader of the field has to cope with that.
 
         Pruning is best-effort: if the prune query crashes we keep the
         fresh row anyway (worst case the table grows slightly above
@@ -3141,6 +3438,7 @@ class ChatService:
         """
         if journal is None or self._journal_repository is None:
             return
+        journal = journal.with_turn_record_id(turn_record_id)
         try:
             await self._journal_repository.add(journal)
         except Exception:
@@ -3683,6 +3981,9 @@ class ChatService:
             prior_messages=recent_messages,
             content_mode=content_mode,
         )
+        # Busy-defer runs no post-turn and therefore mints no turn
+        # record: the journal keeps ``turn_record_id = None``, which
+        # every reader treats as "no anchor" rather than an error.
         await self._persist_journal(journal)
         return conv_with_brief, user_msg, brief_msg, final_state, follow_up
 
@@ -3817,6 +4118,90 @@ class ChatService:
         built. Self-host / embedded never calls this, so ``_run_post_turn`` keeps
         running the post-turn in-process (byte-identical)."""
         self._post_turn_enqueuer = enqueuer
+
+    def set_undone_turn_gate(self, gate: UndoneTurnGate) -> None:
+        """Wire the undo interlock (TU2) — every runtime, not just hosted.
+
+        Unlike the two enqueuers above this is not a distributed-only
+        collaborator: the race it closes exists in embedded mode too,
+        where the post-turn is a fire-and-forget task the undo cannot
+        wait for. It is still set here rather than taken in the
+        constructor because the tombstone store is built after this
+        service in the container."""
+        self._undone_turn_gate = gate
+
+    def set_outcome_claim_auditor(self, auditor) -> None:  # noqa: ANN001
+        """Wire the HV4 chat post-turn honesty audit.
+
+        A setter for the same reason as the two enqueuers above: the
+        shared ``OutcomeClaimGuard`` is built after this service in the
+        container. Unwired, every write point below skips the audit
+        entirely."""
+        self._outcome_claim_auditor = auditor
+
+    def _schedule_outcome_claim_audit(
+        self,
+        *,
+        character: Character,
+        conversation_id: str,
+        turn_record_id: str,
+        assistant_text: str,
+        generation: "ChatGenerationResult | None",
+        operator: "OperatorProfile | None",
+        content_mode: str,
+        turn_started_at: datetime | None = None,
+    ) -> None:
+        """Judge the reply that just streamed out, in the background (HV4).
+
+        Off the write point rather than inside ``_do_post_turn``, and that
+        placement is forced rather than chosen: the judge's only
+        admissible evidence is this turn's ``tool_outcomes``, which live
+        for the duration of the generation and are never persisted. The
+        distributed post-turn worker rebuilds its turn from the
+        conversation under an ids-only payload (§3.1 / §11 red line), so
+        it could not be told what the tools returned without either
+        putting chat content on the queue or inventing a second store for
+        it. The audit therefore runs where the facts are.
+
+        Fire-and-forget through ``_schedule_background``, which also puts
+        it under ``GenerationTrigger.BACKGROUND`` — the judge is a
+        background observer and must not charge the player for the turn
+        they already paid for. Zero foreground latency: the reply has been
+        delivered and persisted before this is scheduled.
+        """
+        auditor = self._outcome_claim_auditor
+        if auditor is None or generation is None:
+            return
+        if not generation.offered_tool_names:
+            # No tool was on the table this turn, so there is no completed
+            # external action to have lied about. The prompt-side red line
+            # covers this shape (HV2).
+            return
+        self._schedule_background(auditor.audit(
+            character=character,
+            conversation_id=conversation_id,
+            turn_record_id=turn_record_id,
+            assistant_text=assistant_text,
+            offered_tools=generation.offered_tool_names,
+            tool_outcomes=generation.tool_outcomes,
+            delivered_attachments=len(generation.attachments or ()),
+            operator_primary_language=(
+                getattr(operator, "primary_language", "") or ""
+            ),
+            content_mode=content_mode,
+            # Both are wired onto *this* service by later setters; handing
+            # over the instances rather than letting the auditor hold its
+            # own is what keeps a hosted deployment from auditing against
+            # an inert tombstone gate and an absent release queue.
+            undone_turn_gate=self._undone_turn_gate,
+            release_enqueuer=self._pending_follow_up_release_enqueuer,
+            # B-3. The instant this turn's pre-turn journal was taken, so
+            # the F5 merge can only reach a repair row that snapshot
+            # names — the only kind undo can rewind a merge out of.
+            # ``None`` where no journal was built (no journal, no undo).
+            turn_started_at=turn_started_at,
+            now=self._resolve_now(),
+        ))
 
     async def _maybe_enqueue_follow_up_release(
         self, row: "PendingFollowUp", *, now: datetime,
@@ -4008,6 +4393,7 @@ class ChatService:
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         routing_content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
         source_surface: str = "chat",
+        on_tool_activity: Callable[[dict], None] | None = None,
     ) -> ChatGenerationResult:
         """Multi-hop tool-use cycle.
 
@@ -4043,6 +4429,18 @@ class ChatService:
                 content_tolerance=content_tolerance,
             )
         tool_descriptors = self._describe_tools(character)
+        # HV2 — the *capability set*, which is not the same list the hop
+        # loop below offers. ``tools_for_hop`` is emptied on the final hop
+        # so the model has to stop chaining and write to the player, and a
+        # prompt section reasoning about "can this character reach the web"
+        # from that list would conclude "no" on exactly the hop that writes
+        # the user-visible text. Without an orchestrator nothing can run at
+        # all, so the honest capability set there is empty rather than the
+        # registry's wish list.
+        character_tool_names = (
+            tuple(tool.name for tool in tool_descriptors)
+            if self._tool_orchestrator is not None else ()
+        )
         # Vision inventory — pick which images we'll forward this turn
         # (cap = ``_VISION_HISTORY_LIMIT``, FIFO eviction). Computed
         # once and reused by both prompt builder (for ``[圖 N]``
@@ -4055,74 +4453,45 @@ class ChatService:
         # main-model-provider-derived ``content_tolerance``: its input is
         # user-uploaded images, so a text-only / non-frontier main model
         # must not drag recognition onto the community NSFW target.
-        image_recognition_context = await self._build_image_recognition_context(
-            character=character,
-            main_model=model,
-            attachment_urls=vision_urls,
-            content_tolerance=routing_content_tolerance,
-        )
-        # Load operator-persona prompt lines once outside the hop loop —
-        # the lines are stable for the duration of one turn and the
-        # service hits the DB to assemble them.
-        operator_persona = (
-            await self._load_operator_persona(character.id, operator)
-            if operator_persona_enabled else None
-        )
-        operator_persona_lines = self._render_operator_persona_lines(operator_persona)
-        player_persona_note = await self._load_player_persona_note(
-            character.id,
-            operator,
-            enabled=operator_persona_enabled,
-        )
-        peer_roster_lines = await self._load_peer_roster_lines(character.id)
-        initial_relationship_lines = await self._load_initial_relationship_lines(
-            character.id, operator,
-        )
-        persona_curiosity_plan = await self._load_persona_curiosity_plan(
+        #
+        # The whole aux block loads in two parallel waves — see
+        # ``chat_turn_aux``. The operator persona is loaded once outside
+        # the hop loop (the lines are stable for one turn and assembling
+        # them costs a DB read), and only when the persona block is
+        # enabled here — unlike the streaming branch, which always needs
+        # the aggregate for address resolution.
+        turn_aux = await load_turn_aux_context(
+            self,
             character=character,
             operator=operator,
-            enabled=operator_persona_enabled,
             conversation_id=conversation.id,
-            recent_dialogue_summary=older_dialogue_summary or "",
-            initial_relationship_lines=initial_relationship_lines,
             now=now,
-        )
-        emotion_events = await self._load_recent_emotion_events(
-            character_id=character.id, operator=operator, now=now,
-        )
-        self_reflections = await self._load_self_reflections(
-            character_id=character.id, operator=operator,
-        )
-        material_digest = await self._load_prompt_material_digest(
-            character=character,
-            operator=operator,
-            emotion_events=emotion_events,
-            self_reflections=self_reflections,
-            story_events=story_events,
-            story_arc=story_arc,
-            upcoming_arc_beats=upcoming_arc_beats,
-            recent_feed_posts=recent_feed_posts,
+            main_model=model,
+            vision_urls=vision_urls,
+            recognition_content_tolerance=routing_content_tolerance,
             content_tolerance=content_tolerance,
-        )
-        phrase_habit_lines = await self._load_phrase_habit_lines(character.id)
-        register_profile = await self._load_register_profile(
-            character=character,
-            operator=operator,
+            persona_enabled=operator_persona_enabled,
+            load_operator_persona=operator_persona_enabled,
             latest_user_message=latest_user_message,
             recent_dialogue_summary=older_dialogue_summary or "",
-            relationship_context=tuple(
-                [
-                    *(operator_persona_lines or []),
-                    *(initial_relationship_lines or []),
-                ],
-            ),
-            content_tolerance=content_tolerance,
-        )
-        diversity_evidence = await build_reply_diversity_evidence(
-            recent_messages=recent_messages,
+            diversity_messages=recent_messages,
             self_repetition_hint=self_repetition_hint,
             embedder=self._embedder,
+            script_mix_decorator=_with_script_mix_evidence,
         )
+        image_recognition_context = turn_aux.image_recognition_context
+        operator_persona = turn_aux.operator_persona
+        operator_persona_lines = turn_aux.operator_persona_lines
+        player_persona_note = turn_aux.player_persona_note
+        peer_roster_lines = turn_aux.peer_roster_lines
+        initial_relationship_lines = turn_aux.initial_relationship_lines
+        persona_curiosity_plan = turn_aux.persona_curiosity_plan
+        emotion_events = turn_aux.emotion_events
+        self_reflections = turn_aux.self_reflections
+        material_digest = turn_aux.material_digest
+        phrase_habit_lines = turn_aux.phrase_habit_lines
+        register_profile = turn_aux.register_profile
+        diversity_evidence = turn_aux.diversity_evidence
         # ``getattr`` fallback handles legacy unit tests that pass the
         # ``CharacterResponse`` DTO straight in — production callers
         # always hand over a domain ``Character`` with ``user_id`` set.
@@ -4168,6 +4537,7 @@ class ChatService:
                     pending_invite_activities=pending_invite_activities,
                     now=now,
                     idle_minutes=idle_minutes,
+                    character_tool_names=character_tool_names,
                     story_events=story_events,
                     story_arc=story_arc,
                     upcoming_arc_beats=upcoming_arc_beats,
@@ -4250,41 +4620,47 @@ class ChatService:
 
             text, trace = await generate_no_tool_once()
             novelty_verdict = None
+            novelty_retry_count = 0
+            novelty_outcome = ""
             if self._reply_quality_gate_required(
                 register_profile=register_profile,
                 diversity_evidence=diversity_evidence,
             ):
-                novelty_verdict = await self._evaluate_novelty_gate(
+                async def regenerate_no_tool(feedback: str) -> _ChatDraft | None:
+                    return _regenerated_draft(
+                        *await generate_no_tool_once(feedback),
+                    )
+
+                review = await self._review_chat_draft(
+                    _ChatDraft(text=text, trace=trace),
+                    context_for=self._novelty_context_factory(
+                        character=character,
+                        operator=operator,
+                        material_digest=material_digest,
+                        emotion_events=emotion_events,
+                        self_reflections=self_reflections,
+                        story_events=story_events,
+                        story_arc=story_arc,
+                        upcoming_arc_beats=upcoming_arc_beats,
+                        recent_feed_posts=recent_feed_posts,
+                        recent_messages=recent_messages,
+                        self_repetition_hint=self_repetition_hint,
+                        latest_user_message=latest_user_message,
+                        content_tolerance=content_tolerance,
+                        register_profile=register_profile,
+                        diversity_evidence=diversity_evidence,
+                        persona_context=_novelty_persona_context(
+                            character, initial_relationship_lines,
+                        ),
+                    ),
+                    regenerate=regenerate_no_tool,
                     character=character,
-                    operator=operator,
-                    response_text=text,
-                    material_digest=material_digest,
-                    emotion_events=emotion_events,
-                    self_reflections=self_reflections,
-                    story_events=story_events,
-                    story_arc=story_arc,
-                    upcoming_arc_beats=upcoming_arc_beats,
-                    recent_feed_posts=recent_feed_posts,
-                    recent_messages=recent_messages,
-                    self_repetition_hint=self_repetition_hint,
-                    latest_user_message=latest_user_message,
-                    content_tolerance=content_tolerance,
-                    register_profile=register_profile,
-                    diversity_evidence=diversity_evidence,
-                    persona_context=tuple([
-                        f"性格：{', '.join(character.personality)}",
-                        f"說話風格：{character.speaking_style}",
-                        *initial_relationship_lines,
-                    ]),
                 )
-            novelty_retry_count = 0
-            if (
-                novelty_verdict is not None
-                and not novelty_verdict.passes
-                and self._novelty_gate_max_retries > 0
-            ):
-                novelty_retry_count = 1
-                text, trace = await generate_no_tool_once(novelty_verdict.feedback)
+                if review.final is not None:
+                    text, trace = review.final.text, review.final.trace
+                novelty_verdict = review.first_verdict
+                novelty_retry_count = 1 if review.regen_attempted else 0
+                novelty_outcome = review.outcome
             return ChatGenerationResult(
                 text=text,
                 attachments=[],
@@ -4296,6 +4672,7 @@ class ChatService:
                 diversity_evidence=diversity_evidence,
                 novelty_verdict=novelty_verdict,
                 novelty_retry_count=novelty_retry_count,
+                novelty_outcome=novelty_outcome,
             )
 
         tool_outcomes: list[ToolOutcomeMessage] = []
@@ -4405,6 +4782,7 @@ class ChatService:
                 now=now,
                 idle_minutes=idle_minutes,
                 available_tools=tools_for_hop,
+                character_tool_names=character_tool_names,
                 tool_outcomes=tool_outcomes,
                 forced_tool_name=forced_directive,
                 story_events=story_events,
@@ -4638,6 +5016,7 @@ class ChatService:
                     force_final_reply = True
                     continue
                 image_overage = quota.overage
+            _notify_tool_activity(on_tool_activity, call.name, "started")
             try:
                 # An over-quota picture is bought once, at the overage price
                 # (which the plan requires to be >= the base price). Declaring
@@ -4658,6 +5037,7 @@ class ChatService:
                     )
             except Exception:
                 _LOGGER.exception("chat tool-use: orchestrator crashed")
+                _notify_tool_activity(on_tool_activity, call.name, "finished")
                 await self._quota_overage_release(image_overage)
                 tool_outcomes.append(
                     ToolOutcomeMessage(
@@ -4666,6 +5046,7 @@ class ChatService:
                     ),
                 )
                 continue
+            _notify_tool_activity(on_tool_activity, call.name, "finished")
             # A picture the player paid extra for and never received is the
             # one outcome this feature cannot afford, so the purchase only
             # settles once the tool actually produced something.
@@ -4696,33 +5077,7 @@ class ChatService:
                 force_final_reply = True
         novelty_retry_count = 0
         novelty_verdict = None
-        if self._reply_quality_gate_required(
-            register_profile=register_profile,
-            diversity_evidence=diversity_evidence,
-        ):
-            novelty_verdict = await self._evaluate_novelty_gate(
-                character=character,
-                operator=operator,
-                response_text=last_text,
-                material_digest=material_digest,
-                emotion_events=emotion_events,
-                self_reflections=self_reflections,
-                story_events=story_events,
-                story_arc=story_arc,
-                upcoming_arc_beats=upcoming_arc_beats,
-                recent_feed_posts=recent_feed_posts,
-                recent_messages=recent_messages,
-                self_repetition_hint=self_repetition_hint,
-                latest_user_message=latest_user_message,
-                content_tolerance=content_tolerance,
-                register_profile=register_profile,
-                diversity_evidence=diversity_evidence,
-                persona_context=tuple([
-                    f"性格：{', '.join(character.personality)}",
-                    f"說話風格：{character.speaking_style}",
-                    *initial_relationship_lines,
-                ]),
-            )
+        novelty_outcome = ""
 
         async def generate_tool_retry_once(
             retry_directive: str,
@@ -4743,6 +5098,7 @@ class ChatService:
                 now=now,
                 idle_minutes=idle_minutes,
                 available_tools=[],
+                character_tool_names=character_tool_names,
                 tool_outcomes=tool_outcomes,
                 forced_tool_name=None,
                 story_events=story_events,
@@ -4825,27 +5181,68 @@ class ChatService:
                 raise
             return retry_text, replace(trace, prompt_pack_hash=prompt_pack_hash)
 
-        if (
-            novelty_verdict is not None
-            and not novelty_verdict.passes
-            and self._novelty_gate_max_retries > 0
+        if self._reply_quality_gate_required(
+            register_profile=register_profile,
+            diversity_evidence=diversity_evidence,
         ):
-            novelty_retry_count = 1
-            last_text, retry_trace = await generate_tool_retry_once(
-                novelty_verdict.feedback,
+            async def regenerate_tool_reply(feedback: str) -> _ChatDraft | None:
+                retry_text, retry_trace = await generate_tool_retry_once(feedback)
+                # This path bills per hop and folds the hops at the end, so a
+                # regeneration *joins* the trace list rather than replacing
+                # the draft's own trace — the player is charged for the try
+                # that was thrown away just the same.
+                traces.append(retry_trace)
+                return _regenerated_draft(retry_text, retry_trace)
+
+            review = await self._review_chat_draft(
+                _ChatDraft(text=last_text, trace=_merge_traces(traces)),
+                context_for=self._novelty_context_factory(
+                    character=character,
+                    operator=operator,
+                    material_digest=material_digest,
+                    emotion_events=emotion_events,
+                    self_reflections=self_reflections,
+                    story_events=story_events,
+                    story_arc=story_arc,
+                    upcoming_arc_beats=upcoming_arc_beats,
+                    recent_feed_posts=recent_feed_posts,
+                    recent_messages=recent_messages,
+                    self_repetition_hint=self_repetition_hint,
+                    latest_user_message=latest_user_message,
+                    content_tolerance=content_tolerance,
+                    register_profile=register_profile,
+                    diversity_evidence=diversity_evidence,
+                    persona_context=_novelty_persona_context(
+                        character, initial_relationship_lines,
+                    ),
+                ),
+                regenerate=regenerate_tool_reply,
+                character=character,
             )
-            traces.append(retry_trace)
+            if review.final is not None:
+                last_text = review.final.text
+            novelty_verdict = review.first_verdict
+            novelty_retry_count = 1 if review.regen_attempted else 0
+            novelty_outcome = review.outcome
         return ChatGenerationResult(
             text=last_text,
             attachments=collected,
             forced_fired=forced_fired,
             trace=_merge_traces(traces),
+            # HV4 evidence for the post-turn audit. ``character_tool_names``
+            # rather than ``tools_for_hop``: the last hop hides the tools
+            # block on purpose, and the honest answer to "what could this
+            # character have called this turn" must not flip to "nothing"
+            # on the very hop that writes the player-visible text.
+            offered_tool_names=character_tool_names,
+            tool_outcomes=tuple(tool_outcomes),
             persona_curiosity_plan=persona_curiosity_plan,
             material_digest=material_digest,
             register_profile=register_profile,
             diversity_evidence=diversity_evidence,
             novelty_verdict=novelty_verdict,
             novelty_retry_count=novelty_retry_count,
+            novelty_outcome=novelty_outcome,
         )
 
     async def _reserve_runtime_chat_image_quota(
@@ -5445,7 +5842,6 @@ class ChatService:
         self,
         *,
         character_id: str,
-        conversation: Conversation | None = None,
     ) -> list[Message]:
         """Fetch the character's cross-source history for prompt material.
 
@@ -5466,13 +5862,34 @@ class ChatService:
         mirrors here — at the single load point every downstream block
         (transcript, self-lines rail, diversity evidence, tool context)
         reads from — fixes all of them at once. Both DB rows are untouched.
+
+        The window is ``_RECENT_MESSAGE_LIMIT`` unless DH3's checkpoint
+        is on, in which case it is the configured (wider) one. Eight was
+        never a judgement about how much history helps — it was the point
+        past which every extra message cost an LLM summarisation call on
+        every turn. With a persisted checkpoint carrying the older
+        material that cost is gone, so the window widens and the token
+        budget, not the message count, becomes the ceiling.
+
+        The load itself lives in ``dialogue_window_loader`` rather than
+        here, because this is no longer the only consumer: the DH3
+        post-turn updater has to split *the same list* into the same
+        covered / middle / raw-tail regions this prompt does, and a
+        second copy of "fetch then dedupe" is exactly how the two sides
+        end up disagreeing about where the tail starts.
+
+        For the same reason this no longer nominates ``conversation`` as
+        the preferred survivor of a mirror pair. It read as a nicety —
+        keep the timestamps of the thread the user is looking at — but
+        the updater has no conversation to nominate, so the two sides
+        kept *different copies of the same sentence*, and the checkpoint
+        cursor is that copy's timestamp. See
+        ``dialogue_window_loader.load_unified_recent_window``.
         """
-        recent = await self._conversation_repository.recent_messages_for_character(
-            character_id, limit=_RECENT_MESSAGE_LIMIT,
-        )
-        return dedupe_mirrored_messages(
-            recent,
-            preferred=conversation.messages if conversation is not None else (),
+        return await load_unified_recent_messages(
+            self._conversation_repository,
+            character_id=character_id,
+            limit=self._dialogue_window_limit,
         )
 
     async def _prepare_prompt_dialogue_context(
@@ -5481,19 +5898,56 @@ class ChatService:
         character: Character,
         recent_messages: list[Message],
         content_tolerance: str = CONTENT_TOLERANCE_FRONTIER,
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
     ) -> tuple[list[Message], str]:
         """Return ``(raw_tail, older_summary)`` for prompt composition.
 
-        Policy:
+        Two implementations behind one signature, chosen by whether the
+        DH3 checkpoint reader is wired:
+
+        **Checkpoint (DH3, opt-in).** The persisted cumulative summary
+        stands in for everything older than the window, the middle band
+        is rendered raw under a token budget, and the raw tail is always
+        whole. A read failure or a pair with no checkpoint yet falls
+        through to the path below — narrowing, never widening.
+
+        **Pre-DH3 (default).** Unchanged, byte for byte:
         - Keep the latest ``_PROMPT_RAW_RECENT_MESSAGE_LIMIT`` turns raw.
-        - Older turns are condensed through ``DialogueSummarizerPort``.
+        - Older turns are condensed through ``DialogueSummarizerPort``,
+          on a fresh LLM call, every turn, kept nowhere.
         - Summary unavailable/fails/empty => keep the original raw list
-          (fail-soft, no context loss).
+          (fail-soft, no context loss) — except when dropping back to
+          the full list would put restricted originals into a frontier
+          prompt, which the second branch below guards.
+
+        **The fallback runs on the pre-DH3 window, not the wide one.**
+        When the flag is on the caller loads a much wider window (30
+        rather than 8) because the checkpoint is meant to be carrying
+        everything behind the tail. On the turns where there is no
+        checkpoint yet — the first minutes of every pair, and any turn
+        the store would not answer — control lands here, and handing the
+        old per-turn summariser the *wide* window would put an
+        LLM call over ~27 messages in front of the player's reply, every
+        turn: five times the pre-DH3 cost, on the request path, in
+        exactly the situation DH3 exists to remove. The window is
+        therefore narrowed back to ``_RECENT_MESSAGE_LIMIT`` first, so
+        this branch costs what it always cost.
+
+        With the flag off the narrowing is a no-op — the caller already
+        loaded at most ``_RECENT_MESSAGE_LIMIT`` — which is what keeps
+        the flag-off path byte-identical.
         """
-        if len(recent_messages) <= _PROMPT_RAW_RECENT_MESSAGE_LIMIT:
-            return recent_messages, ""
-        raw_tail = recent_messages[-_PROMPT_RAW_RECENT_MESSAGE_LIMIT:]
-        older = recent_messages[:-_PROMPT_RAW_RECENT_MESSAGE_LIMIT]
+        checkpointed = await self._read_dialogue_checkpoint_context(
+            character=character, recent_messages=recent_messages,
+        )
+        if checkpointed is not None:
+            return checkpointed.messages, checkpointed.summary
+        legacy_window = recent_messages[-_RECENT_MESSAGE_LIMIT:]
+        if len(legacy_window) <= _PROMPT_RAW_RECENT_MESSAGE_LIMIT:
+            return legacy_window, ""
+        raw_tail = legacy_window[-_PROMPT_RAW_RECENT_MESSAGE_LIMIT:]
+        older = legacy_window[:-_PROMPT_RAW_RECENT_MESSAGE_LIMIT]
         older_for_summary = sanitize_messages_for_tolerance(
             older,
             content_tolerance=content_tolerance,
@@ -5501,6 +5955,8 @@ class ChatService:
         summary = await self._summarize_older_dialogue(
             character=character,
             messages=older_for_summary,
+            now=now,
+            local_tz=local_tz,
         )
         if summary:
             return raw_tail, summary
@@ -5510,13 +5966,15 @@ class ChatService:
             and contains_restricted_messages(older)
         ):
             return raw_tail, ""
-        return recent_messages, ""
+        return legacy_window, ""
 
     async def _summarize_older_dialogue(
         self,
         *,
         character: Character,
         messages: list[Message],
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
     ) -> str:
         if self._dialogue_summarizer is None or not messages:
             return ""
@@ -5534,6 +5992,8 @@ class ChatService:
             return (await self._dialogue_summarizer.summarize(
                 character=character,
                 messages=filtered,
+                now=now,
+                local_tz=local_tz,
             )).strip()
         except Exception:
             _LOGGER.exception(
@@ -5541,6 +6001,63 @@ class ChatService:
                 character.id,
             )
             return ""
+
+    async def _read_dialogue_checkpoint_context(
+        self,
+        *,
+        character: Character,
+        recent_messages: list[Message],
+    ) -> "DialoguePromptContext | None":
+        """The DH3 dialogue section, or ``None`` to use the old path.
+
+        ``None`` covers three cases that all want the same answer: the
+        flag is off (no reader wired), the pair has no checkpoint yet,
+        and the store would not answer. In each of them there is no
+        summary of the older turns, so showing the turns raw is the only
+        way not to lose them — the pre-DH3 behaviour, exactly.
+
+        The checkpoint carries no tolerance parameter because it is
+        built from frontier-safe text unconditionally (see
+        ``DialogueCheckpointUpdater``): restricted originals never enter
+        it, so no failure path here can put them back into a prompt.
+        """
+        reader = self._dialogue_checkpoint_reader
+        if reader is None:
+            return None
+        return await reader.read(
+            character_id=character.id,
+            operator_id=getattr(character, "user_id", "") or "",
+            recent_messages=recent_messages,
+        )
+
+    async def _advance_dialogue_checkpoint(
+        self, *, character: Character,
+    ) -> None:
+        """Post-turn hook: let the checkpoint absorb what it has earned.
+
+        No-op unless DH3 is on. Fail-soft by construction — the updater
+        swallows its own exceptions and reports an outcome — so this
+        cannot break the post-turn's remaining work, and a run that
+        declines to write costs nothing but a longer raw section on the
+        next prompt.
+        """
+        updater = self._dialogue_checkpoint_updater
+        if updater is None:
+            return
+        report = await updater.run(
+            character=character,
+            operator_id=getattr(character, "user_id", "") or "",
+            now=self._resolve_now(),
+        )
+        if report.outcome is CheckpointUpdateOutcome.WRITTEN:
+            _LOGGER.info(
+                "dialogue checkpoint advanced character=%s absorbed=%d "
+                "backlog_tokens=%d summary_tokens=%d",
+                character.id,
+                report.absorbed_messages,
+                report.backlog_tokens,
+                report.summary_tokens,
+            )
 
     async def _load_current_schedule(
         self,
@@ -5926,6 +6443,176 @@ class ChatService:
             if pattern.description.strip()
         ]
 
+    @property
+    def material_digest_precomputer(self) -> MaterialDigestPrecomputer:
+        """The per-(character, operator) digest budget (DIGEST_OFFPATH).
+
+        Exposed so the container can hand the same instance to the turn
+        undo, which has to forget what a reversed turn budgeted.
+        """
+        return self._material_digest_precompute
+
+    async def _load_cached_prompt_material_digest(
+        self,
+        *,
+        character: Character,
+        operator: "OperatorProfile | None",
+        content_tolerance: str,
+        now: datetime,
+    ) -> PromptMaterialDigest | None:
+        """What the previous turn's post-turn budgeted, or ``None``.
+
+        The chat path's *only* way to a digest (DIGEST_OFFPATH). One
+        primary-key SELECT in wave 1, and never a fallback to computing
+        one: a miss renders the source blocks, which the prompt builder
+        has always supported, and computing here would restore the
+        per-turn upstream call the ticket removed.
+
+        The master switch is honoured on the read as well as the write, so
+        flipping it off stops the digest reaching prompts immediately
+        rather than only once the stored rows age out.
+        """
+        if (
+            not self._prompt_material_digest_enabled
+            or self._prompt_material_digester is None
+        ):
+            return None
+        return await self._material_digest_precompute.cached(
+            character_id=character.id,
+            operator_id=digest_operator_id(character, operator),
+            content_tolerance=content_tolerance,
+            now=now,
+        )
+
+    async def _load_material_digest_story_inputs(
+        self,
+        *,
+        character: Character,
+        today: "date | None",
+    ) -> "tuple[list[StoryEvent], StoryArc | None, list[StoryArcBeat]]":
+        """Read-only story material for the post-turn digest budget.
+
+        Deliberately **not** ``_ensure_story_events`` / ``_ensure_story_arc``:
+        those roll the daily gacha and may auto-start an arc, and a
+        background budgeting pass must not be what creates a character's
+        story. Every failure degrades to "no story material", which the
+        digest prompt already renders as 「（無）」.
+        """
+        story_events: list[StoryEvent] = []
+        if self._story_event_service is not None:
+            try:
+                story_events = list(
+                    await self._story_event_service.list_recent(character.id),
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "digest precompute: story event read failed character=%s",
+                    character.id,
+                )
+        story_arc: "StoryArc | None" = None
+        upcoming: "list[StoryArcBeat]" = []
+        if self._story_arc_service is not None:
+            try:
+                story_arc = await self._story_arc_service.get_active(character.id)
+                if story_arc is not None:
+                    anchor = today if today is not None else story_arc.start_date
+                    upcoming = story_arc.forward_beats(
+                        after=anchor, limit=2, include_today=False,
+                    )
+            except Exception:
+                _LOGGER.exception(
+                    "digest precompute: arc read failed character=%s",
+                    character.id,
+                )
+                story_arc, upcoming = None, []
+        return story_events, story_arc, upcoming
+
+    async def _precompute_material_digest(
+        self,
+        *,
+        character: Character,
+        operator: "OperatorProfile | None",
+        content_mode: str,
+        today: "date | None",
+        turn_record_id: str | None = None,
+    ) -> None:
+        """Budget the *next* turn's digest from the post-turn body.
+
+        Awaited rather than spun off: the post-turn is already detached
+        from the player's turn (a background task on embedded, a worker job
+        on hosted), so one more await costs nobody any wall clock and
+        leaves no orphan task behind.
+
+        ``turn_record_id`` rides along so the budget can re-ask the undo
+        gate *after* it writes. The gate this body already asked twice is
+        not enough for this one write: it is the last thing the post-turn
+        does and there are two or three upstream round trips between that
+        second ask and this row landing.
+        """
+        if (
+            not self._prompt_material_digest_enabled
+            or self._prompt_material_digester is None
+        ):
+            return
+        content_tolerance = await self._resolve_digest_content_tolerance(
+            character=character, content_mode=content_mode,
+        )
+        # One clock read, taken before the source material is loaded, so
+        # the stamp the store versions on is the instant this digest's
+        # inputs were true — not the instant the upstream call returned.
+        await self._material_digest_precompute.recompute(
+            self,
+            character=character,
+            operator=operator,
+            content_tolerance=content_tolerance,
+            now=self._resolve_now(),
+            today=today,
+            turn_record_id=turn_record_id,
+            undone_turn_gate=self._undone_turn_gate,
+        )
+
+    async def _resolve_digest_content_tolerance(
+        self,
+        *,
+        character: Character,
+        content_mode: str,
+    ) -> str:
+        """Reproduce the turn's ``content_tolerance`` from the post-turn.
+
+        The chat path derives it from the routed main model plus the
+        turn's content mode; this side has the mode but not the model, so
+        it re-resolves the same ``FEATURE_CHAT`` route. A mismatch is not a
+        correctness problem — the entry simply fails the tolerance check on
+        the next read and the turn renders source blocks — but a
+        *systematic* mismatch would make every read a miss, which is why
+        this mirrors ``_content_tolerance_for_model`` rather than guessing.
+        """
+        mode = content_mode
+        if isinstance(mode, str):
+            try:
+                mode = MessageContentMode(mode)
+            except ValueError:
+                mode = MessageContentMode.NORMAL
+        if mode is MessageContentMode.NSFW:
+            # Community by construction, whatever the provider is.
+            return CONTENT_TOLERANCE_COMMUNITY
+        provider_id = ""
+        if self._active_llm_provider is not None:
+            try:
+                model = await self._active_llm_provider.resolve(
+                    FEATURE_CHAT, character=character,
+                )
+                provider_id = str(getattr(model, "provider_id", "") or "")
+            except Exception:
+                _LOGGER.exception(
+                    "digest precompute: chat route resolution failed "
+                    "character=%s",
+                    character.id,
+                )
+        return content_tolerance_for_llm_provider(
+            provider_id, current_content_mode=mode,
+        )
+
     async def _load_prompt_material_digest(
         self,
         *,
@@ -5939,16 +6626,18 @@ class ChatService:
         recent_feed_posts: tuple[FeedPost, ...],
         content_tolerance: str,
     ) -> PromptMaterialDigest | None:
+        """Run the digest aux-LLM call for one set of source material.
+
+        Only the post-turn budget (``_precompute_material_digest``) calls
+        this now — the chat path reads
+        ``_load_cached_prompt_material_digest`` instead.
+        """
         if (
             not self._prompt_material_digest_enabled
             or self._prompt_material_digester is None
         ):
             return None
-        operator_id = getattr(operator, "id", None) or getattr(
-            character,
-            "user_id",
-            DEFAULT_OPERATOR_ID,
-        )
+        operator_id = digest_operator_id(character, operator)
         context = PromptMaterialDigestContext(
             character_id=character.id,
             operator_id=operator_id,
@@ -6025,12 +6714,11 @@ class ChatService:
         )
         return score >= self._reply_quality_gate_risk_threshold
 
-    async def _evaluate_novelty_gate(
+    def _novelty_context_factory(
         self,
         *,
         character: Character,
         operator: "OperatorProfile | None",
-        response_text: str,
         material_digest: PromptMaterialDigest | None,
         emotion_events: list[EmotionEvent],
         self_reflections: list,
@@ -6045,40 +6733,97 @@ class ChatService:
         register_profile: RegisterProfile | None = None,
         diversity_evidence: ReplyDiversityEvidence | None = None,
         persona_context: tuple[str, ...] = (),
-    ) -> NoveltyVerdict | None:
-        if not self._novelty_gate_enabled or self._novelty_gate is None:
-            return None
+    ) -> Callable[[_ChatDraft], NoveltyGateContext]:
+        """Bind everything but the candidate into a per-turn context builder.
+
+        The band reviews drafts, not turns, and on a background surface it
+        reviews a *second* draft after regeneration — so what it needs is
+        a function from candidate to context, not a context. Everything
+        assembled here is a fact about the turn and is computed once;
+        only ``response_text`` differs between the drafts.
+        """
         operator_id = getattr(operator, "id", None) or getattr(
             character,
             "user_id",
             DEFAULT_OPERATOR_ID,
         )
-        context = NoveltyGateContext(
-            character_id=character.id,
-            operator_id=operator_id,
-            response_text=response_text,
-            known_material=tuple(_novelty_known_material_lines(
-                material_digest=material_digest,
-                emotion_events=emotion_events,
-                self_reflections=self_reflections,
-                story_events=story_events or [],
-                story_arc=story_arc,
-                upcoming_arc_beats=upcoming_arc_beats or [],
-                recent_feed_posts=recent_feed_posts,
-            )),
-            recent_self_lines=tuple(_recent_assistant_lines(recent_messages)),
-            self_repetition_hint=self_repetition_hint or "",
-            latest_user_message=latest_user_message,
-            content_tolerance=content_tolerance,
-            register_profile=register_profile,
+        known_material = tuple(_novelty_known_material_lines(
+            material_digest=material_digest,
+            emotion_events=emotion_events,
+            self_reflections=self_reflections,
+            story_events=story_events or [],
+            story_arc=story_arc,
+            upcoming_arc_beats=upcoming_arc_beats or [],
+            recent_feed_posts=recent_feed_posts,
+        ))
+        recent_self_lines = tuple(_recent_assistant_lines(recent_messages))
+        # QG5 — the two new evidence channels, both already paid for.
+        # The language label is the operator field chat resolved for this
+        # turn anyway, and it is the judge's *sole* reference for
+        # ``language_mismatch``: without it the rubric leaves that axis
+        # false rather than guessing a language from the text.
+        operator_primary_language = getattr(operator, "primary_language", "") or ""
+        # The script mix was computed before generation (it feeds the risk
+        # score); handing the same tuple to the judge costs nothing and
+        # keeps one number behind both readers.
+        mechanical_evidence_lines = _script_mix_evidence_lines(
             diversity_evidence=diversity_evidence,
-            persona_context=persona_context,
+            recent_messages=recent_messages,
+            primary_language=operator_primary_language,
         )
-        try:
-            return await self._novelty_gate.evaluate(context, character=character)
-        except Exception as exc:
-            _LOGGER.exception("novelty gate failed open")
-            return NoveltyVerdict.pass_open(repr(exc))
+        temporal_context_lines = _chat_temporal_lines(
+            recent_messages=recent_messages,
+            now=self._resolve_now(),
+            local_tz=_operator_timezone(operator),
+        )
+
+        def build(draft: _ChatDraft) -> NoveltyGateContext:
+            return NoveltyGateContext(
+                character_id=character.id,
+                operator_id=operator_id,
+                response_text=draft.text,
+                known_material=known_material,
+                recent_self_lines=recent_self_lines,
+                self_repetition_hint=self_repetition_hint or "",
+                latest_user_message=latest_user_message,
+                content_tolerance=content_tolerance,
+                register_profile=register_profile,
+                diversity_evidence=diversity_evidence,
+                persona_context=persona_context,
+                operator_primary_language=operator_primary_language,
+                mechanical_evidence_lines=mechanical_evidence_lines,
+                temporal_context_lines=temporal_context_lines,
+            )
+
+        return build
+
+    async def _review_chat_draft(
+        self,
+        draft: _ChatDraft,
+        *,
+        context_for: Callable[[_ChatDraft], NoveltyGateContext],
+        regenerate: Callable[[str], Awaitable[_ChatDraft | None]],
+        character: Character,
+    ) -> OutputQualityReview[_ChatDraft]:
+        """Run one chat draft through the shared band. Never raises.
+
+        ``CHAT_BEST_EFFORT`` is the whole of chat's disposal policy and the
+        reason this is three lines rather than a branch: a player is
+        watching the typing indicator, so the reply always ships, the
+        regeneration is never re-reviewed (the 2026-06-17 D5 latency call,
+        unchanged here), and the lever for a hard failure that survives is
+        D3's sticky risk escalation on the *following* turns.
+        """
+        return await self._output_quality_orchestrator.review(
+            draft,
+            surface=_OUTPUT_QUALITY_SURFACE,
+            context_for=context_for,
+            regenerate=regenerate,
+            policy=OutputQualityPolicy.CHAT_BEST_EFFORT,
+            character=character,
+            max_retries=self._novelty_gate_max_retries,
+            enabled=self._novelty_gate_enabled,
+        )
 
     async def _load_persona_curiosity_plan(
         self,
@@ -6167,7 +6912,18 @@ class ChatService:
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
         has_user_message: bool = True,
+        private_memory_ids: tuple[str, ...] = (),
     ) -> dict:
+        # ``private_memory_ids`` (KB8) are the memories this turn's prompt
+        # carried that the player has never been told. They ride the job
+        # payload rather than being re-derived worker-side because they
+        # cannot be: memory selection is a ranked, embedding-dependent
+        # pick over a live pool, so re-running it minutes later on a
+        # different process would answer a different question ("what
+        # would be injected now") than the one the flip depends on
+        # ("what was injected then"). Ids only — the worker re-reads the
+        # rows themselves, so the §11 payload rail is untouched.
+        #
         # Distributed (hosted) backend: offload the post-turn LLM extraction to a
         # worker by enqueuing ONE immediate one-shot job carrying ids / flags only
         # (§11 payload red line). The worker re-reads the conversation to rebuild the
@@ -6182,6 +6938,7 @@ class ChatService:
                 persona_enabled=persona_enabled,
                 content_mode=content_mode,
                 has_user_message=has_user_message,
+                private_memory_ids=private_memory_ids,
             )
             # Fall back to in-process ONLY when no worker owns the turn (NO_LEADER).
             # INSERTED / ALREADY_ACTIVE mean a worker has it; AMBIGUOUS deliberately
@@ -6204,6 +6961,7 @@ class ChatService:
             prior_messages=prior_messages,
             persona_enabled=persona_enabled,
             content_mode=content_mode,
+            private_memory_ids=private_memory_ids,
         )
         if self._extract_in_background:
             self._schedule_background(coro)
@@ -6221,6 +6979,7 @@ class ChatService:
         persona_enabled: bool,
         content_mode: str,
         has_user_message: bool = True,
+        private_memory_ids: tuple[str, ...] = (),
     ) -> PostTurnEnqueueOutcome:
         """Enqueue the distributed post-turn job and return its classified outcome.
 
@@ -6241,6 +7000,7 @@ class ChatService:
                 content_mode=content_mode,
                 has_user_message=has_user_message,
                 operator_id=operator_id,
+                private_memory_ids=private_memory_ids,
                 now=self._resolve_now(),
             )
         except Exception:
@@ -6260,6 +7020,7 @@ class ChatService:
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
         has_user_message: bool = True,
+        private_memory_ids: tuple[str, ...] = (),
         now: datetime | None = None,
     ) -> dict:
         """Id-only post-turn entry (distributed worker) — rebuild inputs, then run.
@@ -6274,7 +7035,13 @@ class ChatService:
         **Anchor**: the assistant message's positional index in the conversation.
         Conversations are append-only, so a concurrent later turn only appends at the
         end and never shifts an earlier index — a stale slice-by-last-message would
-        instead pick up a NEWER turn's text. The prior-dialogue window is rebuilt from
+        instead pick up a NEWER turn's text. The one writer that is *not* an append is
+        an undo, which truncates; a later turn can then re-occupy the very index this
+        job holds and the rebuild will find a perfectly well-formed turn that is not
+        this one. ``turn_not_found`` cannot see that, so the guard for it is the
+        tombstone checked in ``_do_post_turn`` (TU2), which is keyed by
+        ``turn_record_id`` and so still names the reversed turn. The prior-dialogue
+        window is rebuilt from
         the cross-source ``recent_messages_for_character`` cut at the turn's user
         message instant, reproducing the pre-turn window the write point captured.
 
@@ -6314,6 +7081,7 @@ class ChatService:
             prior_messages=prior_messages,
             persona_enabled=persona_enabled,
             content_mode=content_mode,
+            private_memory_ids=private_memory_ids,
         )
 
     def _rebuild_post_turn_texts(
@@ -6395,7 +7163,45 @@ class ChatService:
         prior_messages: list[Message],
         persona_enabled: bool = True,
         content_mode: str = CONTENT_MODE_NORMAL,
+        private_memory_ids: tuple[str, ...] = (),
     ) -> dict:
+        """The one post-turn body — and therefore the one undo gate (TU2).
+
+        Both entries reach here: the embedded fire-and-forget task off
+        ``_run_post_turn`` and the hosted worker's
+        ``run_post_turn_for_record``. The tombstone is checked *here*
+        rather than at each entry so there is a single place that decides
+        whether a reversed turn may still write, and no possibility of
+        the two paths drifting apart.
+
+        Checking this late also covers a case the worker's index anchor
+        cannot: after an undo truncates the conversation, a new turn can
+        append at the very same assistant index, so the rebuild happily
+        finds a well-formed turn and ``turn_not_found`` never fires. The
+        tombstone is keyed by ``turn_record_id``, which still names the
+        turn that was reversed, so the wrong turn is never processed
+        under the reversed turn's job.
+
+        The gate is asked **twice inside this one body**, which is not the
+        same thing as two gates. The ask on entry is an optimisation: the
+        post-turn's first act is an LLM extraction, and running it only to
+        throw the result away costs a provider call for nothing. But it
+        can only see an undo that had already landed, because every write
+        below is on the far side of that extraction — several seconds of
+        upstream call — and on embedded this ask *is* the background
+        task's first await, reached before the write point has persisted
+        the journal, so the turn is not even undoable yet. The ask that
+        protects the writes is therefore the second one, taken after the
+        extraction returns and before anything is persisted; it reports
+        ``turn_undone_in_flight`` so the two are told apart downstream.
+        Either hit abandons the whole body rather than part of it.
+        """
+        if await self._undone_turn_gate.is_undone(turn_record_id):
+            _LOGGER.info(
+                "post-turn refused: turn %s was undone (conversation=%s)",
+                turn_record_id, conversation_id,
+            )
+            return {"post_turn_skipped": POST_TURN_SKIPPED_UNDONE}
         operator = await self._load_operator(
             user_id=getattr(character, "user_id", DEFAULT_OPERATOR_ID),
         )
@@ -6429,6 +7235,15 @@ class ChatService:
         resolved_player_address = await self._resolve_player_address_for_aux(
             character, operator,
         )
+        # KB8 — re-read the rows the write point named. Re-reading rather
+        # than carrying the objects across is what makes this correct on
+        # both entries: the hosted worker only ever had ids, and a memory
+        # that was disclosed by another channel in the meantime (a viewed
+        # feed post) is no longer a candidate, which a snapshot taken at
+        # prompt-assembly time could not know.
+        disclosure_candidates = await self._load_disclosure_candidates(
+            character_id=character.id, memory_ids=private_memory_ids,
+        )
 
         try:
             kwargs = {
@@ -6460,6 +7275,13 @@ class ChatService:
                 kwargs["player_persona_note"] = await self._load_player_persona_note(
                     character.id, operator, enabled=persona_enabled,
                 )
+            # KB8 — only when there is something to ask about. Handing
+            # over an empty list would still print the field's rules to
+            # a model that has no candidates to answer with.
+            if disclosure_candidates and _accepts_keyword(
+                self._post_turn_processor.process, "disclosure_candidates",
+            ):
+                kwargs["disclosure_candidates"] = list(disclosure_candidates)
             result = await self._post_turn_processor.process(**kwargs)
         except Exception as exc:
             _LOGGER.exception("Post-turn processing crashed")
@@ -6477,6 +7299,22 @@ class ChatService:
                 },
             ))
             return {"post_turn_error": repr(exc)}
+
+        # The ask that actually guards the writes. Everything below this
+        # line persists something — memories, emotion events keyed by this
+        # very ``turn_record_id``, the state suggestion, schedule and arc
+        # mutations, promises, encounter intents, the address change, the
+        # persona pass — and all of it was queued behind an extraction the
+        # player had no reason to wait for. An undo landing in that window
+        # deletes the turn and then watches this body write it back, one
+        # subsystem at a time, under the key the rollback just cleared.
+        if await self._undone_turn_gate.is_undone(turn_record_id):
+            _LOGGER.info(
+                "post-turn refused after extraction: turn %s was undone "
+                "while it was in flight (conversation=%s)",
+                turn_record_id, conversation_id,
+            )
+            return {"post_turn_skipped": POST_TURN_SKIPPED_UNDONE_IN_FLIGHT}
 
         memory_ids: list[str] = []
         emotion_event_ids: list[str] = []
@@ -6604,6 +7442,14 @@ class ChatService:
                                 beat_id=sig.beat_id,
                                 narrative=sig.narrative,
                                 now=post_turn_started,
+                                # KB6/F2: post-turn ``mark_realized``
+                                # only fires because the beat happened
+                                # *in the turn the player just had* —
+                                # the narrative is a summary of lines
+                                # they read. Common ground, whatever the
+                                # beat's ``operator_position`` guessed
+                                # (it is unset on most of the corpus).
+                                player_present=True,
                             )
                         )
                         if event is not None:
@@ -6645,6 +7491,7 @@ class ChatService:
                     character_id=character.id,
                     conversation_id=conversation_id,
                     promises=result.message_promises,
+                    turn_record_id=turn_record_id,
                     operator=operator,
                     content_mode=content_mode,
                 )
@@ -6662,6 +7509,7 @@ class ChatService:
                 await self._persist_peer_meet_intents(
                     character_id=character.id,
                     intents=result.peer_meet_intents,
+                    turn_record_id=turn_record_id,
                     operator=operator,
                 )
             except Exception:
@@ -6675,6 +7523,31 @@ class ChatService:
                 character=character,
                 operator=operator,
                 changes=result.address_changes,
+            )
+
+        # KB8 — the character told the player about these, so they stop
+        # being introduced as news. Intersected against the candidates
+        # this body actually injected: the processor already bounds its
+        # own answer, and this repeats the bound because the port allows
+        # any implementation, and a ledger this hard to walk back does
+        # not lean on a collaborator's discipline.
+        #
+        # Sitting on the far side of the undo gate is deliberate rather
+        # than incidental. Disclosure is not undone once it has landed —
+        # the player read the message and "she already told me that" is
+        # not a fact a rollback can retract — but a turn reversed *before*
+        # this line runs never gets the flip in the first place, which is
+        # the safe direction: re-introducing something is cheap, and the
+        # gate above has already decided this turn's writes don't count.
+        disclosed_ids: tuple[str, ...] = ()
+        if result.disclosed_memory_ids and disclosure_candidates:
+            allowed = {item.id for item in disclosure_candidates}
+            disclosed_ids = await self._disclose_memories(
+                character_id=character.id,
+                memory_ids=[
+                    item_id for item_id in result.disclosed_memory_ids
+                    if item_id in allowed
+                ],
             )
 
         # Persona accumulation — per-character (this character builds
@@ -6696,11 +7569,86 @@ class ChatService:
                 resolved_player_address=resolved_player_address,
             )
 
+        # DH3 — last, and on the far side of the undo gate above, so a
+        # turn that was reversed while this body ran never gets folded
+        # into a summary nothing can un-merge.
+        await self._advance_dialogue_checkpoint(character=character)
+
+        # DIGEST_OFFPATH — budget the next turn's material digest.
+        #
+        # Two placement constraints, and this is the only line that meets
+        # both. **After the second undo gate**, so a reversed turn never
+        # distils its material into a cache the next prompt reads. **After
+        # this body's writes**, because the whole point is that the digest
+        # a turn reads already contains the turn before it — the memories,
+        # emotion events and arc mutations above land in the very rows the
+        # recompute is about to re-read, and a recompute placed at the gate
+        # would have read them one turn too early.
+        #
+        # The gate above is not enough for *this* write, though, and that
+        # is why the turn id goes with it: between that ask and this row
+        # landing sit the persona pass, the checkpoint merge and the
+        # digester's own call — seconds of upstream latency in which an
+        # undo can run its entire rollback, delete this row, and then have
+        # a late write put it back. ``recompute`` re-asks after it writes.
+        #
+        # Fail-open end to end: ``recompute`` never raises, and a digest it
+        # cannot produce leaves the next turn rendering source blocks.
+        await self._precompute_material_digest(
+            character=character,
+            operator=operator,
+            content_mode=content_mode,
+            today=today_local,
+            turn_record_id=turn_record_id,
+        )
+
         return {
             "memory_ids": memory_ids,
             "emotion_event_ids": emotion_event_ids,
             "state_suggestion_applied": result.state_suggestion is not None,
+            "disclosed_memory_ids": list(disclosed_ids),
         }
+
+    async def _load_disclosure_candidates(
+        self, *, character_id: str, memory_ids: "tuple[str, ...]",
+    ) -> "tuple[MemoryItem, ...]":
+        """Re-read the injected memories that are still ``private`` (KB8).
+
+        Ids that no longer resolve, belong to another character, or have
+        already been disclosed drop out here — so the post-turn prompt
+        never lists a memory the flip could not act on, and the model is
+        never asked about one it cannot change.
+
+        Fail-soft: a repository error yields no candidates, which means
+        no section, no verdict and no flip. The next turn that recalls
+        the same memory gets another chance.
+        """
+        if not memory_ids:
+            return ()
+        found: list[MemoryItem] = []
+        for item_id in memory_ids:
+            try:
+                item = await self._memory_repository.get(item_id)
+            except Exception:
+                _LOGGER.exception(
+                    "post-turn: disclosure candidate lookup failed id=%s",
+                    item_id,
+                )
+                continue
+            if item is None or item.character_id != character_id:
+                continue
+            found.append(item)
+        return select_private_candidates(found)
+
+    async def _disclose_memories(
+        self, *, character_id: str, memory_ids: list[str],
+    ) -> "tuple[str, ...]":
+        """Route the chat verdict through the shared ledger writer."""
+        if not memory_ids:
+            return ()
+        return await self._memory_disclosure.disclose(
+            character_id=character_id, memory_ids=memory_ids,
+        )
 
     async def _run_persona_extraction(
         self,
@@ -6819,8 +7767,23 @@ class ChatService:
         *,
         character_id: str,
         intents: list,
+        turn_record_id: str,
         operator: OperatorProfile | None = None,
     ) -> None:
+        """Record the meetings this turn's reply agreed to.
+
+        ``turn_record_id`` is required for the reason the promise writer
+        needs one — this runs in the background post-turn, so a window
+        anchored on the turn's start races its own writer — plus one this
+        table makes worse: ``character_encounter_intents`` has no
+        conversation column, so the window undo used to run was scoped to
+        the character alone. A character live in a web conversation and a
+        LINE conversation at once (which ``recent_messages_for_character``
+        supports by design) had undo in one thread deleting the meeting
+        the other thread had just agreed to, with nothing in that thread
+        undone at all. An anchor names a turn, and a turn is one
+        thread's.
+        """
         from kokoro_link.domain.entities.character_encounter_intent import (
             CharacterEncounterIntent as _CharacterEncounterIntent,
         )
@@ -6854,6 +7817,7 @@ class ChatService:
                 topic=intent.topic,
                 source="chat_agreement",
                 source_text=intent.source_text,
+                turn_record_id=turn_record_id,
                 now=now,
             )
             try:
@@ -6877,6 +7841,7 @@ class ChatService:
         character_id: str,
         conversation_id: str,
         promises: list,
+        turn_record_id: str,
         operator: OperatorProfile | None = None,
         content_mode: MessageContentMode | str = MessageContentMode.NORMAL,
     ) -> None:
@@ -6886,6 +7851,16 @@ class ChatService:
         are logged but never raise — the chat turn already succeeded
         and the user shouldn't see a 500 because the LLM emitted a
         slightly malformed promise.
+
+        ``turn_record_id`` is required rather than optional because this
+        runs in the **background** post-turn: the ``queued_at`` it stamps
+        is the instant the write lands, which can be seconds after the
+        turn ended and therefore inside the *next* turn's time window.
+        Undo of that next turn used to hard-delete the row on exactly
+        that evidence — killing a promise the character made in a message
+        still on screen, with no cancellation left for the release
+        reconciler to rescue. Stamping the turn that actually made the
+        promise is what lets undo delete by identity, not by coincidence.
         """
         from kokoro_link.domain.entities.pending_follow_up import (
             PendingFollowUp as _PendingFollowUp,
@@ -6920,6 +7895,7 @@ class ChatService:
                 scheduled_for=scheduled,
                 source_message_content=promise.source_text,
                 source_content_mode=content_mode,
+                turn_record_id=turn_record_id,
                 now=now,
             )
             try:
@@ -7633,6 +8609,30 @@ def _material_digest_summary(
     *,
     enabled: bool,
 ) -> dict[str, object] | None:
+    """What the *chat turn* can honestly say about the material digest.
+
+    Since DIGEST_OFFPATH the chat turn never calls the digester: it reads
+    a row some earlier turn's post-turn wrote. So the cost fields carried
+    in ``digest_metadata`` — latency, prompt tokens, completion tokens —
+    belong to **that** turn, not this one, and reporting them here made
+    this record say three false things at once: turn N+1 billed with turn
+    N's latency, a cache miss reported as ``applied: false`` on a turn
+    that had in fact just paid for a digester call in its post-turn, and
+    the last call of any conversation appearing in no record at all.
+
+    They are nulled rather than dropped so the key set stays stable for
+    anything already reading this shape, and ``precomputed`` marks why.
+    What survives is what is still true of this turn: whether a digest
+    reached the prompt, how many bullets it carried, and — as
+    *provenance*, not cost — which provider and model produced it.
+
+    The real call is not unrecorded. The digester resolves through
+    ``MeteredActiveLLMProvider``, and ``FEATURE_PROMPT_MATERIAL_DIGEST``
+    is not in its skip set, so the post-turn's upstream call is metered
+    into ``generation_usage_events`` under the turn that actually made it.
+    That ledger is where digest spend reconciles; this field is an audit
+    trail of what the prompt was given.
+    """
     if not enabled and digest is None:
         return None
     metadata = dict(digest.digest_metadata) if digest is not None else {}
@@ -7640,12 +8640,15 @@ def _material_digest_summary(
         "enabled": enabled,
         "applied": digest is not None,
         "bullet_count": len(digest.bullets) if digest is not None else 0,
+        # Provenance of the bullets, not this turn's spend.
         "provider_id": metadata.get("provider_id", ""),
         "model_id": metadata.get("model_id", ""),
-        "latency_ms": metadata.get("latency_ms"),
-        "prompt_tokens": metadata.get("prompt_tokens"),
-        "completion_tokens": metadata.get("completion_tokens"),
-        "error": metadata.get("error"),
+        "precomputed": True,
+        # Another turn's cost. See the docstring — never this turn's.
+        "latency_ms": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "error": None,
     }
 
 
@@ -7670,14 +8673,123 @@ def _novelty_known_material_lines(
     ]
 
 
-def _recent_assistant_lines(messages: list[Message]) -> list[str]:
-    lines: list[str] = []
+def _novelty_persona_context(
+    character: Character,
+    initial_relationship_lines: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """The character's tone baseline, as the gate judge reads it.
+
+    Stated once because all three chat gate points must show the judge the
+    same baseline — a ``register_mismatch`` verdict means nothing if the
+    streaming path and the tool path are measuring against different
+    descriptions of the same character."""
+    return (
+        f"性格：{', '.join(character.personality)}",
+        f"說話風格：{character.speaking_style}",
+        *initial_relationship_lines,
+    )
+
+
+def _recent_assistant_texts(messages: list[Message], *, limit: int) -> list[str]:
+    """Newest-first, whole assistant texts — at most *limit* of them.
+
+    Uncropped on purpose: this feeds character-composition counting, and
+    clipping every line to the same width would quietly bias the mix of a
+    long reply toward whatever its opening happens to be written in."""
+    texts: list[str] = []
     for message in reversed(messages):
-        if message.role is MessageRole.ASSISTANT and message.content.strip():
-            lines.append(_clip(message.content, 240))
-        if len(lines) >= 4:
+        content = (message.content or "").strip()
+        if message.role is MessageRole.ASSISTANT and content:
+            texts.append(content)
+        if len(texts) >= limit:
             break
-    return lines
+    return texts
+
+
+def _recent_assistant_lines(messages: list[Message]) -> list[str]:
+    return [
+        _clip(text, 240)
+        for text in _recent_assistant_texts(messages, limit=4)
+    ]
+
+
+def _with_script_mix_evidence(
+    evidence: ReplyDiversityEvidence,
+    *,
+    recent_messages: list[Message],
+    primary_language: str = "",
+) -> ReplyDiversityEvidence:
+    """Attach the recent-output script composition to *evidence* (D3).
+
+    Called once per turn, before generation, off messages chat has already
+    loaded — no new query, no new model call. Both readers of the result
+    come later: the pre-generation risk score (which path this turn takes)
+    and the gate context (what the judge is shown).
+
+    *primary_language* is the operator's own language, and it is what makes
+    the per-line flag mean "drifted out of the operator's script" instead
+    of "contains Latin letters". Omitting it would make the sticky risk
+    escalation fire on every turn of every Latin-writing operator, which
+    costs them token-by-token streaming permanently."""
+    lines = script_mix_lines(
+        _recent_assistant_texts(recent_messages, limit=_SCRIPT_MIX_WINDOW),
+        primary_language=primary_language,
+    )
+    if not lines:
+        return evidence
+    return replace(evidence, language_mix_lines=lines)
+
+
+def _script_mix_evidence_lines(
+    *,
+    diversity_evidence: ReplyDiversityEvidence | None,
+    recent_messages: list[Message],
+    primary_language: str = "",
+) -> tuple[str, ...]:
+    """The script-mix lines for the gate context, computed at most once."""
+    if diversity_evidence is not None:
+        return diversity_evidence.language_mix_lines
+    return script_mix_lines(
+        _recent_assistant_texts(recent_messages, limit=_SCRIPT_MIX_WINDOW),
+        primary_language=primary_language,
+    )
+
+
+def _chat_temporal_lines(
+    *,
+    recent_messages: list[Message],
+    now: datetime,
+    local_tz: tzinfo,
+) -> tuple[str, ...]:
+    """The 時間座標 block for one chat turn.
+
+    Chat is the surface least likely to be *stale* — the player is right
+    there — so the anchor that earns its place is the gap *before* this
+    turn: a player who comes back after three days is answered with 「剛剛
+    你說的那個」 unless the judge can see that 「剛剛」 was Tuesday. The
+    current turn's own message is skipped; it is the thing being replied
+    to, and dating it "0 分鐘前" tells the judge nothing.
+    """
+    previous = next(
+        (
+            message for message in reversed(recent_messages[:-1])
+            if getattr(message, "role", None) is MessageRole.USER
+            and getattr(message, "created_at", None) is not None
+        ),
+        None,
+    )
+    events: list[TemporalEvent] = []
+    if previous is not None:
+        events.append(
+            quoted_event(
+                "在這之前，對方上一次說",
+                getattr(previous, "content", "") or "",
+                previous.created_at,
+            ),
+        )
+    return render_temporal_context_lines(
+        now=now, local_tz=local_tz, events=events,
+    )
 
 
 def _novelty_gate_summary(
@@ -7685,6 +8797,7 @@ def _novelty_gate_summary(
     *,
     enabled: bool,
     retry_count: int,
+    outcome: str = "",
 ) -> dict[str, object] | None:
     if not enabled and verdict is None:
         return None
@@ -7693,11 +8806,22 @@ def _novelty_gate_summary(
         "enabled": enabled,
         "evaluated": verdict is not None,
         "passes": True if verdict is None else verdict.passes,
-        "lacks_novelty": False if verdict is None else verdict.lacks_novelty,
-        "imagery_relapse": False if verdict is None else verdict.imagery_relapse,
-        "register_mismatch": False if verdict is None else verdict.register_mismatch,
-        "over_warm": False if verdict is None else verdict.over_warm,
-        "formulaic": False if verdict is None else verdict.formulaic,
+        # QG5 — every axis the contract declares, plus the derived flag.
+        # Chat ships a hard failure anyway (a player is waiting), so this
+        # record is the only place the turn's defect is ever written down:
+        # without it the ``hard_published_best_effort`` counter tells an
+        # operator how many players saw one and nothing tells them which
+        # turns. Written by iteration so a newly declared axis cannot go
+        # missing here silently — nothing would go red if it did.
+        **{
+            axis: False if verdict is None else getattr(verdict, axis)
+            for axis in ALL_AXES
+        },
+        "hard_fail": False if verdict is None else verdict.hard_fail,
+        # The band's disposal label. ``""`` means the risk gate declined to
+        # review this turn at all — distinct from ``"pass"``, and the
+        # difference is the whole of D3's routing decision.
+        "outcome": outcome,
         "feedback": "" if verdict is None else verdict.feedback,
         "retry_count": retry_count,
         "provider_id": metadata.get("provider_id", ""),
@@ -7732,6 +8856,19 @@ def _reply_quality_risk_score(
             scores.append(diversity_evidence.max_self_similarity)
         if diversity_evidence.has_frequency_evidence:
             scores.append(0.7)
+        # D3 — sticky escalation. A character whose last few replies have
+        # visibly drifted into mixed script is the one whose *next* reply is
+        # worth buffering, so the deterministic composition signal raises
+        # this turn's risk above the routing threshold on its own.
+        #
+        # Routing, not filtering: nothing here reads the text's meaning,
+        # nothing rejects anything, and the only consequence is that the
+        # turn goes through the buffered path where the LLM judge — still
+        # the sole authority on whether the reply is 晶晶體 or a perfectly
+        # ordinary quoted title — gets to look at it. Exactly the standing
+        # the embedding self-similarity number above already has.
+        if diversity_evidence.has_script_mix_evidence:
+            scores.append(_SCRIPT_MIX_RISK_WEIGHT)
     return max(scores, default=0.0)
 
 
@@ -7865,6 +9002,77 @@ async def _single_chunk_stream(text: str) -> AsyncIterator[str]:
         yield text
 
 
+def _notify_tool_activity(
+    callback: Callable[[dict], None] | None,
+    tool_name: str,
+    status: str,
+) -> None:
+    """Surface a tool start/finish to the streaming UI, fail-soft.
+
+    A progress hint must never be able to break the turn: any callback
+    failure is swallowed after logging.
+    """
+    if callback is None:
+        return
+    try:
+        callback({"tool": tool_name, "status": status})
+    except Exception:  # pragma: no cover - defensive
+        _LOGGER.exception("chat tool-use: tool activity callback failed")
+
+
+async def _tool_cycle_stream(
+    generation_task: "asyncio.Task",
+    activity_events: "asyncio.Queue[dict]",
+    finalizer: "StreamFinalizer",
+) -> AsyncIterator[str | dict]:
+    """Stream tool-activity frames while the blocking tool cycle runs.
+
+    The tool path can't stream real tokens (the first hop may be a JSON
+    tool call that must never reach the wire), but the connection would
+    otherwise sit silent for the whole cycle — tens of seconds on an
+    image tool. Running the cycle as a task lets this generator drain
+    ``activity_events`` (dict frames, forwarded verbatim by the SSE
+    route) in the meantime, then hand the finished generation to the
+    finalizer *before* yielding the reply text — the route calls
+    ``finalizer.finish`` only after the stream is fully drained, so the
+    ordering guarantees the pre-resolved fields are in place.
+
+    Closing the generator cancels the cycle. Since ``TurnStreamRelay``
+    took over draining this stream, a client disconnect no longer closes
+    it — the relay's turn task keeps consuming, so the tool cycle runs to
+    completion and ``finish`` still persists the reply. The close below is
+    now reached only when the turn is *genuinely* abandoned (the detached
+    watchdog's timeout, process teardown), which is exactly when leaving a
+    multi-minute image cycle running would be wrong.
+    """
+    try:
+        while not generation_task.done() or not activity_events.empty():
+            if generation_task.done():
+                yield {"tool_activity": activity_events.get_nowait()}
+                continue
+            getter = asyncio.ensure_future(activity_events.get())
+            await asyncio.wait(
+                {generation_task, getter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # ``getter`` may have raced an item in even when ``wait``
+            # returned for the task — cancelling and re-awaiting is the
+            # only shape that neither drops nor duplicates an event.
+            getter.cancel()
+            try:
+                event = await getter
+            except asyncio.CancelledError:
+                continue
+            yield {"tool_activity": event}
+        generation = await generation_task
+        finalizer.attach_generation(generation)
+        if generation.text:
+            yield generation.text
+    except (GeneratorExit, asyncio.CancelledError):
+        generation_task.cancel()
+        raise
+
+
 class StreamFinalizer:
     """Holds context needed to persist state after streaming completes."""
 
@@ -7894,6 +9102,7 @@ class StreamFinalizer:
         diversity_evidence: ReplyDiversityEvidence | None = None,
         novelty_verdict: NoveltyVerdict | None = None,
         novelty_retry_count: int = 0,
+        novelty_outcome: str = "",
         presence_frame: PresenceFrame | None = None,
         content_mode: MessageContentMode = MessageContentMode.NORMAL,
         scene_session: "StorySceneSession | None" = None,
@@ -7918,6 +9127,10 @@ class StreamFinalizer:
         # through the SSE layer.
         self._pre_resolved_text = pre_resolved_text
         self._pre_resolved_attachments = pre_resolved_attachments or []
+        # HV4 evidence, kept whole rather than unpacked into two more
+        # fields: ``None`` here IS the "no tools were offered this turn"
+        # answer, because the token-streaming path never builds one.
+        self._generation: "ChatGenerationResult | None" = None
         self._journal = journal
         self._persona_enabled = persona_enabled
         self._trace = trace or ChatGenerationTrace()
@@ -7931,6 +9144,7 @@ class StreamFinalizer:
         self._diversity_evidence = diversity_evidence
         self._novelty_verdict = novelty_verdict
         self._novelty_retry_count = novelty_retry_count
+        self._novelty_outcome = novelty_outcome
         self._presence_frame = presence_frame or PresenceFrame.web_stage()
         self._content_mode = content_mode
         # 起幕 (SC1-C): the scene this turn is being played inside, read
@@ -7966,6 +9180,30 @@ class StreamFinalizer:
         """Take ownership of the turn's conversation lease."""
         self._turn_lease_session = session
 
+    def attach_generation(self, generation: "ChatGenerationResult") -> None:
+        """Late-bind the tool cycle's outcome onto this finalizer.
+
+        The tool path now runs its (blocking) generation cycle *inside*
+        the token stream so tool-activity frames can go out while it
+        works — which means the finalizer is constructed before the
+        generation exists. ``_tool_cycle_stream`` calls this right
+        before yielding the reply text, and the route only reaches
+        ``finish`` after draining the stream, so every ``finish`` on
+        this path still sees the resolved values.
+        """
+        self._pre_resolved_text = generation.text
+        self._pre_resolved_attachments = generation.attachments or []
+        self._generation = generation
+        self._trace = generation.trace or ChatGenerationTrace()
+        self._forced_tool = generation.forced_fired
+        self._persona_curiosity_plan = generation.persona_curiosity_plan
+        self._material_digest = generation.material_digest
+        self._register_profile = generation.register_profile
+        self._diversity_evidence = generation.diversity_evidence
+        self._novelty_verdict = generation.novelty_verdict
+        self._novelty_retry_count = generation.novelty_retry_count
+        self._novelty_outcome = generation.novelty_outcome
+
     def attach_active_turn(self, active_turn: "ActiveTurn | None") -> None:
         """Take ownership of this turn's drain counter slot (GD1-A)."""
         self._active_turn = active_turn
@@ -7977,13 +9215,17 @@ class StreamFinalizer:
     async def release_turn_lease(self) -> None:
         """Release everything an unfinished turn still holds.
 
-        Idempotent — the route calls it in a ``finally`` to cover streams that
-        never reach :meth:`finish`. That is also the only hook an abandoned
-        stream offers, so releasing the action charge belongs here too:
-        otherwise a client that disconnected mid-generation would leave the
-        player's credits reserved until upstream expiry. :meth:`finish`
-        settles first, so by the time it reaches this the charge is closed and
-        the call below is a no-op.
+        Idempotent — ``TurnStreamRelay`` calls it in a ``finally`` to cover
+        streams that never reach :meth:`finish` (upstream error, refusal, the
+        detached-completion timeout). That is also the only hook such a turn
+        offers, so releasing the action charge belongs here too: otherwise a
+        turn that died mid-generation would leave the player's credits reserved
+        until upstream expiry. :meth:`finish` settles first, so by the time it
+        reaches this the charge is closed and the call below is a no-op.
+
+        Note what is *not* on this list any more: a client disconnect. That is
+        no longer an unfinished turn — the relay keeps generating and the reply
+        lands, so the turn settles through :meth:`finish` like any other.
         """
         try:
             session, self._turn_lease_session = self._turn_lease_session, None
@@ -8097,6 +9339,28 @@ class StreamFinalizer:
             persona_enabled=self._persona_enabled,
             content_mode=self._content_mode.value,
             has_user_message=self._user_message is not None,
+            # KB8 — the streaming twin of the non-streaming site: same
+            # list ``_touch_memories`` was just handed, so the two paths
+            # cannot disagree about what this turn injected.
+            private_memory_ids=tuple(
+                item.id
+                for item in select_private_candidates(self._used_memories)
+            ),
+        )
+        # HV4 — same audit as the non-streaming twin, and the surface the
+        # whole "audit instead of gate" decision was made for.
+        self._service._schedule_outcome_claim_audit(
+            character=self._character,
+            conversation_id=updated_conversation.id,
+            turn_record_id=turn_record_id,
+            assistant_text=assistant_text,
+            generation=self._generation,
+            operator=self._operator,
+            content_mode=self._content_mode.value,
+            turn_started_at=(
+                self._journal.turn_started_at
+                if self._journal is not None else None
+            ),
         )
         self._service._maybe_schedule_goal_review(
             character=self._character,
@@ -8106,7 +9370,9 @@ class StreamFinalizer:
             character=self._character,
             conversation=updated_conversation,
         )
-        await self._service._persist_journal(self._journal)
+        await self._service._persist_journal(
+            self._journal, turn_record_id=turn_record_id,
+        )
 
         turn_started_at = (
             self._journal.turn_started_at if self._journal is not None else None
@@ -8164,6 +9430,7 @@ class StreamFinalizer:
                     self._novelty_verdict,
                     enabled=self._service._novelty_gate_enabled,
                     retry_count=self._novelty_retry_count,
+                    outcome=self._novelty_outcome,
                 ),
                 "presence_frame": self._presence_frame.to_metadata(),
                 # SN1 audit trail — see the non-streaming twin.

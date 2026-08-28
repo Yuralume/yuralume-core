@@ -328,27 +328,32 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
         """Bind a routing-level reasoning override onto the resolved
         adapter, when one applies.
 
-        Follows the same feature → group precedence as model routing but
-        falls through independently, so an entry can pin reasoning
-        without pinning a model (and vice versa). NSFW reroutes skip the
-        override — the posture was written for the normal route, not
-        the dedicated NSFW target. Adapters without
+        Follows the same feature → group → active_model precedence as
+        model routing but falls through independently, so an entry can
+        pin reasoning without pinning a model (and vice versa). NSFW
+        reroutes use the NSFW target's OWN reasoning — the normal
+        route's postures were written for a different model and never
+        ride onto the dedicated target; a target without reasoning
+        keeps its connection defaults. Adapters without
         ``with_reasoning_overrides`` (fake, cloud gateway) pass through
         unchanged, as does everything when no override is set: the
         registry singleton is returned as-is.
         """
-        if not feature_key:
-            return model
         binder = getattr(model, "with_reasoning_overrides", None)
         if binder is None:
             return model
-        if await self._read_nsfw_target(character=character) is not None:
-            return model
-        if _requires_community_tolerance(content_tolerance):
-            return model
-        overrides = await self._read_reasoning_overrides(
-            feature_key, character=character,
-        )
+        nsfw_target = await self._read_nsfw_target(character=character)
+        if nsfw_target is not None:
+            overrides = getattr(nsfw_target, "reasoning", None)
+        elif _requires_community_tolerance(content_tolerance):
+            nsfw_target = await self._read_configured_nsfw_target(
+                character=character,
+            )
+            overrides = getattr(nsfw_target, "reasoning", None)
+        else:
+            overrides = await self._read_reasoning_overrides(
+                feature_key, character=character,
+            )
         if overrides is None:
             return model
         try:
@@ -363,20 +368,49 @@ class PreferenceBackedActiveLLMProvider(ActiveLLMProviderPort):
 
     async def _read_reasoning_overrides(
         self,
-        feature_key: str,
+        feature_key: str | None,
         *,
         character: Character | None,
     ) -> ReasoningOverrides | None:
-        feature_entry = await self._read_feature_entry(
-            feature_key, character=character,
-        )
-        overrides = parse_reasoning_override(feature_entry)
-        if overrides is not None:
-            return overrides
-        group_entry = await self._read_group_entry(
-            feature_key, character=character,
-        )
-        return parse_reasoning_override(group_entry)
+        """Resolve the reasoning posture with feature → group →
+        active_model precedence.
+
+        Feature and group fall through independently of their model
+        pins (unchanged pre-active_model semantics). The active_model
+        posture is scoped like its vision flag: it describes calls that
+        actually resolve through active_model, so it is eligible only
+        when NO upper layer (per-character override, feature entry,
+        group entry) pinned a provider/model — a pinning layer without
+        reasoning means "connection defaults for my model", never
+        "borrow the primary pick's posture". With no ``feature_key``
+        (plain resolve) the active_model posture applies directly."""
+        feature_entry = None
+        group_entry = None
+        if feature_key:
+            feature_entry = await self._read_feature_entry(
+                feature_key, character=character,
+            )
+            overrides = parse_reasoning_override(feature_entry)
+            if overrides is not None:
+                return overrides
+            group_entry = await self._read_group_entry(
+                feature_key, character=character,
+            )
+            overrides = parse_reasoning_override(group_entry)
+            if overrides is not None:
+                return overrides
+            if character is not None:
+                char_override = _per_character_override(character, feature_key)
+                if char_override is not None and (
+                    char_override.provider_id or char_override.model_id
+                ):
+                    return None
+            if _entry_pins_model(feature_entry) or _entry_pins_model(
+                group_entry,
+            ):
+                return None
+        raw = await self._read_pref(_ACTIVE_MODEL_KEY, character=character)
+        return parse_reasoning_override(raw if isinstance(raw, dict) else None)
 
     async def _maybe_bind_vision(
         self,

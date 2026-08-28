@@ -4,14 +4,23 @@ import { useI18n } from 'vue-i18n'
 import { notification } from 'ant-design-vue'
 import {
   getAdminNsfwModeTarget,
+  hasReasoningOverride,
   listImageProfiles,
   listProviderModels,
   setAdminNsfwModeTarget,
+  type FeatureReasoningOverride,
   type ImageProfileSummary,
   type NsfwModeTarget,
 } from '@/utils/api/system'
 import { UiButton, UiCombobox } from '@/components/ui'
+import ReasoningOverrideFields from '@/components/ReasoningOverrideFields.vue'
 import { providerConnectionLabel } from '@/utils/catalogLabels'
+import {
+  NSFW_IMAGE_GENERATION_OFF,
+  hasSelectableNsfwTarget,
+  imageProfileIdForSave,
+  imageProfileSelectionFromTarget,
+} from '@/utils/nsfwModeTarget'
 
 const props = defineProps<{
   providers: string[]
@@ -28,19 +37,28 @@ const imageProfiles = ref<ImageProfileSummary[]>([])
 const selectedProviderId = ref('')
 const selectedModelId = ref('')
 const selectedImageProfileId = ref('')
+/** Reasoning posture bound onto the NSFW target while the reroute is
+ * active — null keeps the target connection's defaults. */
+const selectedReasoning = ref<FeatureReasoningOverride | null>(null)
 const configured = ref(false)
 
-const hasSelectableTarget = computed(() => (
-  selectedProviderId.value.length > 0
-  && selectedModelId.value.length > 0
-  && selectedImageProfileId.value.length > 0
+const hasSelectableTarget = computed(() => hasSelectableNsfwTarget({
+  llmProviderId: selectedProviderId.value,
+  llmModelId: selectedModelId.value,
+  imageProfileSelection: selectedImageProfileId.value,
+}))
+
+const imageGenerationOff = computed(() => (
+  selectedImageProfileId.value === NSFW_IMAGE_GENERATION_OFF
 ))
 
 function applyTarget(nextTarget: NsfwModeTarget | null): void {
   if (!nextTarget) return
   selectedProviderId.value = nextTarget.llm_provider_id
   selectedModelId.value = nextTarget.llm_model_id
-  selectedImageProfileId.value = nextTarget.image_profile_id
+  selectedImageProfileId.value
+    = imageProfileSelectionFromTarget(nextTarget.image_profile_id)
+  selectedReasoning.value = nextTarget.reasoning ?? null
 }
 
 async function loadModels(providerId: string, preferredModelId: string | null = null): Promise<void> {
@@ -116,7 +134,10 @@ async function saveTarget(): Promise<void> {
     const result = await setAdminNsfwModeTarget({
       llm_provider_id: selectedProviderId.value,
       llm_model_id: selectedModelId.value,
-      image_profile_id: selectedImageProfileId.value,
+      image_profile_id: imageProfileIdForSave(selectedImageProfileId.value),
+      reasoning: hasReasoningOverride(selectedReasoning.value)
+        ? selectedReasoning.value
+        : null,
     })
     configured.value = result.configured
     applyTarget(result.target)
@@ -189,7 +210,7 @@ watch(() => props.providersLoaded, (next) => {
         <select
           v-model="selectedImageProfileId"
           class="field-select"
-          :disabled="saving || imageProfiles.length === 0"
+          :disabled="saving"
         >
           <option v-if="imageProfiles.length === 0" value="">
             {{ t('nsfwModeTargetSetting.empty.imageProfiles') }}
@@ -201,9 +222,20 @@ watch(() => props.providersLoaded, (next) => {
           >
             {{ providerConnectionLabel(t, profile.label) }}
           </option>
+          <option :value="NSFW_IMAGE_GENERATION_OFF">
+            {{ t('nsfwModeTargetSetting.options.imageGenerationOff') }}
+          </option>
         </select>
+        <span v-if="imageGenerationOff" class="field-hint">
+          {{ t('nsfwModeTargetSetting.hints.imageDisabled') }}
+        </span>
       </label>
     </div>
+
+    <ReasoningOverrideFields
+      v-if="loaded && providersLoaded"
+      v-model="selectedReasoning"
+    />
 
     <div class="target-actions">
       <span

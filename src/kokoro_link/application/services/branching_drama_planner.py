@@ -39,6 +39,11 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -261,13 +266,42 @@ def _with_prompt_preamble(
 # ── parsers ───────────────────────────────────────────────────────────
 
 
-def _strip_fences(raw: str) -> str:
-    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly — see the identical helper's
+    docstring in ``fusion_story_critic``."""
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:
-        return ""
-    return text[start : end + 1]
+        return False
+    try:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _decode_planner_json(raw: str, *, site: str) -> dict[str, Any] | None:
+    """DH2-services: object extraction via the shared scanner.
+
+    Truncation repair is on — both prompts unconditionally ask for the
+    JSON envelope, so a reply chopped by ``max_tokens`` is now worth
+    trying to salvage rather than dropping the whole plan. Downstream
+    still requires the specific nested keys (``root``, or all three
+    tone keys) to *also* be ``dict``s — that stays at the call site.
+
+    Branch selection still mirrors the old crude find/rfind slice
+    exactly (see the helper above) so a genuinely array-shaped reply is
+    not misread as its first nested object. FX1/DH-2: the array half of
+    that guard is structural — see
+    ``fusion_story_critic._parse_critique`` for what the old
+    whole-string spelling let through.
+    """
+    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
+        return None
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site=site)
+    return outcome.value
 
 
 def _parse_root(
@@ -276,14 +310,8 @@ def _parse_root(
     *,
     operator_primary_language: str = "zh-TW",
 ) -> tuple[str, NodeOutline] | None:
-    blob = _strip_fences(raw)
-    if not blob:
-        return None
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    data = _decode_planner_json(raw, site="branching_drama.planner.root")
+    if data is None:
         return None
 
     pack = _synthetic_template_pack(operator_primary_language)
@@ -300,14 +328,8 @@ def _parse_root(
 def _parse_children(
     raw: str, briefs: Sequence[CharacterBrief],
 ) -> dict[str, NodeOutline] | None:
-    blob = _strip_fences(raw)
-    if not blob:
-        return None
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    data = _decode_planner_json(raw, site="branching_drama.planner.children")
+    if data is None:
         return None
 
     result: dict[str, NodeOutline] = {}

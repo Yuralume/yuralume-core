@@ -127,6 +127,15 @@ class StoryBeatSceneService:
             narrative=narrative,
             now=now,
             emotional_tone=draft.emotional_tone,
+            # KB6/F2: explicitly *not* a player-present station, despite
+            # producing a fully written scene. Both callers play the
+            # beat with nobody in the room — ``BeatDueChecker``'s
+            # unattended tick and the operator-only ``/simulate``
+            # route — so the beat's own ``operator_position`` remains
+            # the only evidence about the player's place in it. Stated
+            # rather than defaulted so a future third caller has to
+            # answer the question instead of inheriting an answer.
+            player_present=False,
         )
 
     async def _record_failed_attempt(

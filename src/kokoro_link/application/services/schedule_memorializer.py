@@ -27,6 +27,21 @@ Design:
   structured evidence in
   :mod:`kokoro_link.domain.services.shared_activity_evidence`; with no
   such account, nothing is written.
+- **Single writer for story beats (KB2 red line).** A block carrying
+  ``ScheduleActivity.source_beat_id`` is the slot the schedule planner
+  reserved for the day's arc beat — a plan for a scene, not an hour the
+  character lived. It is latched and never memorialised, unconditionally
+  and without consulting the beat's status: the beat's record is written
+  by the realize path
+  (:mod:`kokoro_link.application.services.story_event_service`, OP2-E)
+  and nowhere else. A pending beat has nothing to remember yet, and a
+  realized one has already been remembered there; either way a memory
+  written from here would be a second writer for the same event. This is
+  the fix for the incident where a beat the player was central to got
+  staged as a solo day and became a memory of something the player never
+  took part in. Preparation *for* a beat carries no lineage and is
+  memorialised normally — the character really did spend that hour
+  getting ready.
 - Because of that, ``memorialized`` means only "this run considered the
   block" — the idempotency latch. Whether a memory actually exists is
   ``has_memory``, and CF3's expiry sweep
@@ -50,7 +65,11 @@ from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.contracts.schedule_repository import ScheduleRepositoryPort
 from kokoro_link.domain.entities.character import Character
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_PRIVATE,
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.entities.schedule import (
     DailySchedule,
     ScheduleActivity,
@@ -123,7 +142,10 @@ class ScheduleMemorializer:
                 targets.append(schedule)
 
         completed: list[tuple[DailySchedule, ScheduleActivity]] = []
-        encounter_completed: list[tuple[DailySchedule, ScheduleActivity]] = []
+        # Blocks that get the idempotency latch but never a memory of
+        # their own: encounters (written by the encounter service) and
+        # reserved story-beat slots (written by the realize path, KB2).
+        latch_only_completed: list[tuple[DailySchedule, ScheduleActivity]] = []
         generic_completed: list[tuple[DailySchedule, ScheduleActivity]] = []
         for schedule in targets:
             for activity in schedule.activities:
@@ -132,8 +154,8 @@ class ScheduleMemorializer:
                 if activity.end_at >= moment:
                     continue
                 completed.append((schedule, activity))
-                if _is_encounter_activity(activity):
-                    encounter_completed.append((schedule, activity))
+                if _is_encounter_activity(activity) or _is_beat_slot(activity):
+                    latch_only_completed.append((schedule, activity))
                 else:
                     generic_completed.append((schedule, activity))
 
@@ -141,7 +163,7 @@ class ScheduleMemorializer:
             return 0
 
         if not generic_completed:
-            await self._mark_memorialized(encounter_completed)
+            await self._mark_memorialized(latch_only_completed)
             return 0
 
         # CF4: read the operator's involvement off structured data before
@@ -253,13 +275,13 @@ class ScheduleMemorializer:
                     "Embedder unavailable; deferring memorialisation of %d activit(y|ies)",
                     len(generic_completed),
                 )
-                await self._mark_memorialized(encounter_completed)
+                await self._mark_memorialized(latch_only_completed)
                 return 0
             claimed_activity_ids = await self._schedule_repository.claim_memorialize(
                 [activity.id for _, activity in memory_completed],
             )
             if not claimed_activity_ids:
-                await self._mark_memorialized(encounter_completed)
+                await self._mark_memorialized(latch_only_completed)
                 return 0
             embedded = [
                 item for item in embedded
@@ -273,7 +295,7 @@ class ScheduleMemorializer:
                 await self._schedule_repository.release_memorialize(
                     list(claimed_activity_ids),
                 )
-                await self._mark_memorialized(encounter_completed)
+                await self._mark_memorialized(latch_only_completed)
                 return 0
             has_memory_activity_ids.update(
                 activity_ids_by_memory_id[item.id]
@@ -503,6 +525,16 @@ def _activity_to_memory(
         for name in activity.companion_names
     )
     participants = activity.participant_refs or npc_participants
+    # KB6: a lived hour is the character's alone unless the CF4 evidence
+    # chain already ruled the operator was *verifiably* there
+    # (``VERIFIED`` = they agreed **and** interacted while the block ran).
+    # Reusing that verdict rather than re-deriving one keeps a single
+    # source of truth for "did this really happen together", and its
+    # deliberate asymmetry — absence of evidence never reads as presence
+    # — is exactly the direction this field wants: an under-claimed
+    # ``private`` costs one re-introduction, an over-claimed ``shared``
+    # is the gaslighting bug. Nothing here inspects the memory text.
+    is_shared = evidence is not None and evidence.may_claim_shared_completion
     return MemoryItem.create(
         character_id=character_id,
         kind=MemoryKind.EPISODIC,
@@ -511,8 +543,21 @@ def _activity_to_memory(
         tags=tuple(tags),
         participants=participants,
         location=activity.location,
+        player_knowledge=(
+            PLAYER_KNOWLEDGE_SHARED if is_shared else PLAYER_KNOWLEDGE_PRIVATE
+        ),
     )
 
 
 def _is_encounter_activity(activity: ScheduleActivity) -> bool:
     return any(ref.role == "encounter_partner" for ref in activity.participant_refs)
+
+
+def _is_beat_slot(activity: ScheduleActivity) -> bool:
+    """KB2 — this block is a story beat's reserved slot, not a lived hour.
+
+    Structural lineage only; the beat's status is deliberately not
+    consulted (see the single-writer note in the module docstring), and
+    the activity's own text is never inspected.
+    """
+    return bool(activity.source_beat_id)

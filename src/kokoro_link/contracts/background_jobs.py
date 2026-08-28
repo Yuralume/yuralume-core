@@ -301,6 +301,26 @@ class BackgroundJobQueuePort(Protocol):
         applied any effect the job goes through ``complete`` / ``fail``."""
         ...
 
+    async def withdraw_queued(
+        self, idempotency_key: str, *, now: datetime,
+    ) -> int:
+        """Retire every still-``queued`` job under ``idempotency_key`` as
+        ``superseded``. Returns how many rows were retired.
+
+        For work whose subject stopped existing — turn-undo deleting the
+        follow-up row a ``pending_follow_up_release`` job was scheduled to
+        release. The handler re-verifies its subject and would skip, so this
+        is not a correctness guard; it is what keeps the queue's contents a
+        description of work that actually exists (and frees the active-idem
+        key immediately instead of at the job's due time).
+
+        ``claimed`` rows are deliberately left alone: a worker holds the
+        lease and is the only party allowed to end that job. Its own
+        re-verification is the guard there, and flipping status underneath it
+        would race the lease-owner checks in ``complete`` / ``fail``.
+        """
+        ...
+
     async def fail(
         self,
         job_id: str,

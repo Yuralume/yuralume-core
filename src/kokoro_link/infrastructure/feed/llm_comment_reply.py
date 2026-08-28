@@ -5,8 +5,12 @@ but with a much simpler output shape: one short string, no image
 prompt, no JSON schema. The reply is meant to read like a real IG
 comment — terse, in-character, naturally responding to whatever the
 user said. Parsing is lenient: we strip optional markdown / quote
-fences and trim to a hard ceiling so a runaway model doesn't post a
-five-paragraph comment.
+fences. The hard length ceiling used to be applied here too, silently;
+QG3 moved it to the service, *after* the output-quality gate has had a
+chance to see the untruncated draft and its overrun evidence — a
+runaway five-paragraph comment is now something the gate can catch
+and ask the model to redo, not just something we quietly chop
+mid-sentence.
 
 A ``NullFeedCommentReplyComposer`` is also exported here so the
 container can wire in a no-op when the deployment runs on the fake
@@ -41,12 +45,12 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 
 _LOGGER = logging.getLogger(__name__)
 
-_MAX_REPLY_CHARS = 180
-"""Cap on the rendered reply. IG comments are short; anything past
-this almost always reads as a paragraph the model wandered into. The
-service treats over-cap output as "trim to cap" not "reject" — if the
-model produced something coherent we'd rather keep the gist than skip
-the whole tick."""
+MAX_REPLY_CHARS = 180
+"""Target length told to the model, and the cap the service (QG3)
+enforces on whatever ships. IG comments are short; anything past this
+almost always reads as a paragraph the model wandered into. Public
+(no leading underscore) because the service imports it to keep the
+prompt's stated target and the post-gate hard cap from drifting apart."""
 
 _MAX_USER_COMMENT_CHARS_PER_LINE = 160
 _MAX_POST_BODY_CHARS = 200
@@ -126,7 +130,7 @@ def _build_prompt(payload: FeedCommentReplyInput) -> str:
         busy_clause = "\n".join([busy_clause, *note_lines])
     body = get_default_loader().render(
         "feed/comment_reply",
-        max_reply_chars=_MAX_REPLY_CHARS,
+        max_reply_chars=MAX_REPLY_CHARS,
         persona_block="\n".join(persona),
         busy_clause=busy_clause,
         post_body=post_body,
@@ -137,6 +141,15 @@ def _build_prompt(payload: FeedCommentReplyInput) -> str:
     )
     if language_hint:
         body = f"{language_hint}\n\n{body}"
+    # QG3 — the orchestrator's regeneration call, carrying the gate's
+    # feedback on the rejected first draft. Appended rather than folded
+    # into the template: the template's own instructions describe the
+    # character forever, this describes one failed attempt just past.
+    if payload.quality_feedback:
+        body = (
+            f"{body}\n\n上一輪回覆沒有通過品質檢查，原因："
+            f"{payload.quality_feedback}\n請依照角色語氣重寫一則更短、更自然的回覆。"
+        )
     return body
 
 
@@ -181,8 +194,6 @@ def _normalize(raw: str) -> str:
         text = text[label_match.end():]
     text = _LEADING_QUOTE_RE.sub("", text)
     text = _TRAILING_QUOTE_RE.sub("", text)
-    if len(text) > _MAX_REPLY_CHARS:
-        text = text[: _MAX_REPLY_CHARS - 1].rstrip() + "…"
     return text.strip()
 
 

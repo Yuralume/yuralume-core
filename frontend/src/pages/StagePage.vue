@@ -612,6 +612,18 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
   selectedCharacter.value = char
   characters.value = characters.value.map(c => c.id === char.id ? char : c)
 }
+
+/**
+ * The panel could not compute the thread locally and wants the server's copy
+ * (see `ChatPanel`'s `conversationReloadRequested`). Reuses the ordinary
+ * open-a-character load, which reseeds `historyPage` too — the pagination
+ * cursor has to restart along with the thread it points into.
+ */
+function handleConversationReloadRequested() {
+  const characterId = selectedCharacter.value?.id
+  if (!characterId) return
+  void loadHistoryFor(characterId)
+}
 </script>
 
 <template>
@@ -762,6 +774,7 @@ function handleConversationUpdate(convId: string, msgs: ChatMessage[], char: Cha
           :stage-layout-mode="stageLayoutMode"
           @conversation-update="handleConversationUpdate"
           @conversation-id-learned="conversationId = $event"
+          @conversation-reload-requested="handleConversationReloadRequested"
           @toggle-stage-layout="toggleStageLayout"
         />
       </div>

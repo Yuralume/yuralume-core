@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -85,6 +85,21 @@ class SAPersonaCuriosityRepository(PersonaCuriosityRepositoryPort):
                 row.cooldown_until = cooldown_until
             await session.commit()
             return True
+
+    async def delete_created_since(
+        self, character_id: str, conversation_id: str, since: datetime,
+    ) -> int:
+        moment = _ensure_tz(since)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(PersonaCuriosityAttemptRow).where(
+                    PersonaCuriosityAttemptRow.character_id == character_id,
+                    PersonaCuriosityAttemptRow.conversation_id == conversation_id,
+                    PersonaCuriosityAttemptRow.created_at >= moment,
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
 
 def _row_to_domain(row: PersonaCuriosityAttemptRow) -> PersonaCuriosityAttempt:

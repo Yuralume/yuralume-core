@@ -1,10 +1,17 @@
 """add turn_journals table
 
-Per-turn rollback records. Stores enough snapshots + added-row ids to
-reverse one chat turn (conversation truncation + state/goal/arc/schedule
-restore + memory/state_snapshot/story_event deletion). Keeps at most 5
-per conversation (enforced in service layer after each write); FK
+Per-turn rollback records. Stores the pre-turn snapshots needed to
+reverse one chat turn: conversation truncation back to ``turn_index``,
+state/goal/arc/schedule restore, and time-window deletion of the
+memory + state_snapshot rows the turn added. Keeps at most 5 per
+conversation (enforced in the service layer after each write); FK
 cascade to ``conversations`` cleans up when a conversation is removed.
+
+(Correction, 2026-08-25 / TU1: this docstring used to claim the undo
+also deleted ``story_event`` rows and that the payload carried
+``added_*`` id lists. Neither was ever implemented — the deletes are
+time-window based off ``turn_started_at``, and story events were left
+alone. Story-event rollback is TU6's job, not this migration's.)
 
 Revision ID: z8h4d1g60023
 Revises: y7g3c0f50022

@@ -677,8 +677,13 @@ function fieldInputType(kind: string): string {
 // English; route them through the shared `providerFields` i18n
 // namespace (keyed by field.key so shared fields aren't duplicated per
 // provider) and fall back to the backend string on a miss.
+// Preset id (e.g. "anthropic" / "openrouter") drives the per-preset
+// override layer in providerFieldLabel/Hint — some field keys are
+// deliberately shared across presets with different wire semantics
+// (see catalogLabels.ts), so the same key needs different copy
+// depending on which connection type is being edited.
 function fieldLabel(field: ProviderFieldSpec): string {
-  return providerFieldLabel(t, field)
+  return providerFieldLabel(t, field, form.provider)
 }
 
 function fieldPlaceholder(field: ProviderFieldSpec): string {
@@ -686,10 +691,11 @@ function fieldPlaceholder(field: ProviderFieldSpec): string {
 }
 
 // Persistent helper text under an input (routed through the same
-// providerFields i18n namespace, keyed `<field.key>.hint`). Empty when
-// the catalog spec ships no hint.
+// providerFields i18n namespace, keyed `<presetId>.<field.key>.hint`
+// first, then `<field.key>.hint`). Empty when neither the per-preset
+// nor the shared entry exists and the catalog spec ships no hint.
 function fieldHint(field: ProviderFieldSpec): string {
-  return providerFieldHint(t, field)
+  return providerFieldHint(t, field, form.provider)
 }
 
 function humanizeError(reason: unknown): string {
@@ -1222,6 +1228,7 @@ onMounted(loadAll)
 .provider-settings__header,
 .provider-settings__actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-3);
@@ -1395,6 +1402,7 @@ onMounted(loadAll)
 }
 .provider-settings__cap-card-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);

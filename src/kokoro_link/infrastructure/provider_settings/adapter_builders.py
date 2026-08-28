@@ -36,8 +36,12 @@ from kokoro_link.contracts.video_profile import (
 )
 from kokoro_link.infrastructure.embedder.lm_studio import LMStudioEmbedder
 from kokoro_link.infrastructure.llm.anthropic import AnthropicChatModel
-from kokoro_link.infrastructure.llm.openai_compatible import OpenAICompatibleChatModel
+from kokoro_link.infrastructure.llm.openai_compatible import (
+    OpenAICompatibleChatModel,
+    REASONING_DIALECT_CHAT_TEMPLATE,
+)
 from kokoro_link.infrastructure.persistence.models import MEMORY_EMBEDDING_DIM
+from kokoro_link.infrastructure.provider_settings.catalog import catalog_by_id
 from kokoro_link.infrastructure.provider_settings.runtime_ids import (
     runtime_provider_id,
 )
@@ -334,6 +338,10 @@ def build_chat_model(
         model = _config_str(row, "default_model", default_model)
         if not base_url or not model:
             raise ValueError("OpenAI-compatible provider requires base_url and default_model")
+        # ``row.provider`` is the catalog preset id, so the entry (not
+        # the row's base_url) decides which reasoning dialect this
+        # connection speaks — per-preset protocol adaptation.
+        catalog_entry = catalog_by_id().get(row.provider)
         return OpenAICompatibleChatModel(
             # Row-scoped, not preset-scoped: two rows of one preset must
             # occupy two registry slots instead of overwriting each other
@@ -351,6 +359,14 @@ def build_chat_model(
             max_tokens=_config_optional_int(row, "max_tokens"),
             disable_reasoning=_config_bool(row, "disable_reasoning", False),
             reasoning_effort=_config_optional_str(row, "reasoning_effort"),
+            thinking_budget_tokens=_config_optional_int(
+                row, "thinking_budget_tokens",
+            ),
+            reasoning_dialect=(
+                catalog_entry.reasoning_dialect
+                if catalog_entry is not None
+                else REASONING_DIALECT_CHAT_TEMPLATE
+            ),
             extra_request_params=_config_optional_json_object(
                 row, "extra_request_params",
             ),

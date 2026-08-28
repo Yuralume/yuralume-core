@@ -17,6 +17,7 @@ them. The port hides that detail from callers.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from kokoro_link.domain.entities.operator_persona import OperatorPersona
@@ -24,6 +25,20 @@ from kokoro_link.domain.value_objects.profile_field import (
     CandidateField,
     ProfileField,
 )
+
+
+ADDRESS_NAME_FIELD_KEY = "name"
+"""The layer-1 ``field_key`` a rename of how the character addresses the
+player reconciles onto.
+
+Lives beside the port rather than in either caller because two
+independent subsystems have to agree on it and neither owns the other:
+``RelationshipNamesService`` writes it (supersede-then-insert through
+``OperatorPersonaService.set_explicit_field_for_operator``) and TU5's
+undo step reverses that write. Two string literals in two files is
+exactly the drift that let the rename's persona half go un-reversed in
+the first place.
+"""
 
 
 class OperatorPersonaRepositoryPort(Protocol):
@@ -135,6 +150,38 @@ class OperatorPersonaRepositoryPort(Protocol):
 
         Used by the character reset / delete paths. Returns the number
         of rows affected.
+        """
+
+    async def revert_field_write_since(
+        self,
+        *,
+        character_id: str,
+        operator_id: str,
+        field_key: str,
+        value: str,
+        since: datetime,
+    ) -> bool:
+        """Undo one *supersede-then-insert* on a confirmed field.
+
+        :meth:`upsert_field` is only half the write
+        ``OperatorPersonaService.set_explicit_field_for_operator``
+        performs: the previous confirmed row is stamped ``superseded``
+        first, so reversing it means both retiring the row that was
+        inserted **and** bringing back the row that was retired. Leaving
+        the second half out would undo the new value into *nothing*
+        rather than into what was there before.
+
+        Scoped by ``value`` and not by time alone: ``since`` says "inside
+        the reverted turn's window", ``value`` says "this is the write we
+        are reversing" — the caller takes it from the ``observed``
+        address-change log entry it just deleted, so a dream pass that
+        happened to touch the same key in the same window is left alone.
+
+        Returns ``True`` when a row was actually rejected. ``False``
+        means nothing in the window carried that value — the write never
+        landed (an ``observed`` rename does not retire a deliberate
+        ``user_explicit`` row), or something else already reversed it.
+        Never raises for a row that is simply absent.
         """
 
     async def reject_evidence_since(

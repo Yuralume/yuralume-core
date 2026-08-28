@@ -279,3 +279,32 @@ async def test_stale_replan_preserves_operator_commitment() -> None:
         any(ref.role == OPERATOR_INVITE_PENDING_ROLE for ref in act.participant_refs)
         for act in pre_committed
     ), "operator commitment must survive a stale-today re-plan"
+
+
+@pytest.mark.asyncio
+async def test_manually_adjusted_today_schedule_is_not_replanned() -> None:
+    """An operator edit via the manual routes takes ownership of the day.
+
+    Regression for「刪掉的行程自己補回來」: every pre-planned day has
+    ``generated_at`` on an earlier local day, so without this guard the
+    same-day weather refresh rebuilt the whole day from the planner and
+    resurrected the deleted activity. The explicit regenerate route stays
+    the operator-controlled way to re-open such a day.
+    """
+    repo = InMemoryScheduleRepository()
+    character = _character()
+    await repo.save(
+        _planned_schedule(
+            character,
+            target=TODAY,
+            generated_at=datetime(2026, 5, 18, 20, 0, tzinfo=UTC),
+        ).with_manual_adjustment(),
+    )
+    planner = _RecordingPlanner()
+    weather = _RecordingWeather()
+    service = _service(repo, planner, weather)
+
+    result = await service.ensure_schedule(character, date_=TODAY, now=NOW)
+
+    assert planner.calls == 0, "a manually-adjusted day must stay frozen"
+    assert result.activities[0].description == "到室內咖啡廳躲雨"

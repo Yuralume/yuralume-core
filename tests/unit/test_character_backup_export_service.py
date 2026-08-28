@@ -76,6 +76,7 @@ from kokoro_link.infrastructure.persistence.models import (
     CharacterRow,
     ConversationRow,
     DailyScheduleRow,
+    DialogueCheckpointRow,
     FeedPostRow,
     MemoryItemRow,
     MessageRow,
@@ -251,6 +252,18 @@ async def _seed_full_character(env) -> dict[str, str]:
             id="act-1", schedule_id="sched-1", position=0,
             start_at=now, end_at=now + timedelta(hours=1),
             description="picnic", category="rest",
+        ))
+        # DH3 — the cumulative dialogue summary. Carried because it is
+        # the only place the character's memory of everything older than
+        # the loaded window still exists; the messages behind it are in
+        # the archive but a summary of them is not re-derivable.
+        session.add(DialogueCheckpointRow(
+            character_id="char-1",
+            operator_id=OPERATOR,
+            summary_text="他們約好下個月去舊書店。",
+            covers_until_message_key="a" * 32,
+            covers_until_created_at=now,
+            updated_at=now,
         ))
         session.add(StorySeedRow(
             id="seed-private", seed_text="她想起舊書店的約定。",

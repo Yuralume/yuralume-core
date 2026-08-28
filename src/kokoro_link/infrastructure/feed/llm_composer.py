@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from dataclasses import replace
+from typing import Any
 
 from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.application.services.video_storyboard_shape import (
@@ -42,6 +43,9 @@ from kokoro_link.infrastructure.prompt.visual_subject import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+    render_feed_post_knowledge_line,
+)
 from kokoro_link.infrastructure.prompt.role_boundary import (
     render_role_knowledge_boundary_lines,
 )
@@ -49,13 +53,35 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
     render_current_time_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    iter_embedded_json,
+    log_parse_outcome,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-_MAX_BODY_CHARS = 280
-"""Cap on the published post body — Twitter-ish; long posts feel
+MAX_BODY_CHARS = 280
+"""Cap on the **published** post body — Twitter-ish; long posts feel
 out of place on an IG-style feed wall and longer payloads burn more
-ComfyUI context for the matching image prompt."""
+ComfyUI context for the matching image prompt.
+
+Deliberately *not* applied here any more (QG2/D6). A body that runs long
+is the loudest signal there is that something which is not prose ended up
+inside ``content_text`` — the 2026-08-26 incident was an image-prompt tag
+string appended to the caption, a payload that satisfies every type check
+this parser can make. Slicing it to 280 turned that into a caption ending
+mid-word and a post with no picture, silently. So the overrun now travels
+to the quality gate as evidence, and the service applies this cap after
+the gate has had its say. Exported for that caller."""
+
+_BODY_CHAR_CEILING = MAX_BODY_CHARS * 4
+"""Pathological-output backstop, not the publishing cap.
+
+Four times the cap is far past anything the prompt asks for, so nothing a
+model writes in good faith reaches it; it exists so a runaway generation
+cannot carry a megabyte of text through the gate prompt and into the
+service's own buffers."""
 
 _MAX_IMAGE_PROMPT_CHARS = 320
 _MAX_VIDEO_PROMPT_CHARS = 600
@@ -184,7 +210,13 @@ def _build_prompt(
     character = payload.character
     persona_lines = _persona_block(character)
     subject_prompt = build_visual_subject_prompt(character)
-    knowledge_boundary_lines = render_role_knowledge_boundary_lines()
+    # KB9: role_boundary covers "what the character plausibly knows";
+    # the feed-post rider covers a separate gap — the player's own
+    # knowledge of whoever/whatever the post ends up naming.
+    knowledge_boundary_lines = [
+        *render_role_knowledge_boundary_lines(),
+        render_feed_post_knowledge_line(),
+    ]
     snippet_block = "\n".join(f"- {line}" for line in payload.context_snippets) \
         if payload.context_snippets else "（無）"
     if not payload.image_required:
@@ -284,7 +316,7 @@ def _build_prompt(
     body = get_default_loader().render(
         "feed/composer",
         schema_line=schema_line,
-        max_body_chars=_MAX_BODY_CHARS,
+        max_body_chars=MAX_BODY_CHARS,
         prompts_clause=prompts_clause,
         persona_block="\n".join(persona_lines),
         knowledge_boundary_block="\n".join(knowledge_boundary_lines),
@@ -413,16 +445,17 @@ def _persona_block(character: Character) -> list[str]:
     return lines
 
 
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-# Field-level rescue for a structurally-broken composer object. When the
-# model emits invalid JSON — a stray un-keyed element, or a response cut
-# off mid-object by a ``max_tokens`` ceiling — neither ``json.loads`` nor
-# the ``{...}`` block regex above can recover it (the latter needs a
-# closing brace the truncated tail never reached). But the leading string
-# fields are usually intact and already quote-closed, so we can pull their
-# values out directly. The capture honours JSON backslash escapes so an
-# escaped quote inside the value doesn't end the match early.
+# Field-level rescue for a structurally-broken composer object. The
+# shared extractor (``extract_object_outcome``, with truncation repair
+# on) now does what the old whole-parse + greedy ``{...}`` block regex
+# did here, and does it correctly on nested / string-embedded braces —
+# but a response cut off mid-*string* (an unclosed quote inside
+# ``content_text`` itself, before repair can even find a place to close
+# it) can still leave the balanced scanner with nothing. The leading
+# string fields are usually intact and already quote-closed at that
+# point, so we can pull their values out directly as a last resort. The
+# capture honours JSON backslash escapes so an escaped quote inside the
+# value doesn't end the match early.
 _CONTENT_TEXT_FIELD_RE = re.compile(
     r'"content_text"\s*:\s*"((?:\\.|[^"\\])*)"', re.DOTALL,
 )
@@ -449,16 +482,46 @@ def _salvage_string_field(
     Returns the JSON-decoded, stripped value, or ``None`` when the field
     is absent (genuine prose that dropped the wrapper) or its escapes
     can't be decoded. Only matches a fully quote-closed value, so a field
-    truncated mid-string yields ``None`` and degrades cleanly."""
-    match = pattern.search(candidate)
-    if match is None:
-        return None
-    try:
-        value = json.loads(f'"{match.group(1)}"')
-    except json.JSONDecodeError:
-        return None
-    value = value.strip()
-    return value or None
+    truncated mid-string yields ``None`` and degrades cleanly.
+
+    Scans *every* occurrence and returns the first usable one, because
+    the first occurrence is not always the useful one: a reply that
+    spells the schema out twice — an empty stub followed by the filled
+    envelope, which is what a model does when it echoes the shape before
+    answering — would otherwise be judged by the stub and rescue
+    nothing."""
+    for match in pattern.finditer(candidate):
+        try:
+            value = json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            continue
+        value = value.strip()
+        if value:
+            return value
+    return None
+
+
+def _first_object_carrying_body(candidate: str) -> dict[str, Any] | None:
+    """The first top-level object that actually carries ``content_text``.
+
+    L2-1. Anchoring on the *first* ``{`` in the reply assumes the model
+    writes nothing structured before the envelope. Reasoning-first models
+    break that assumption in the most ordinary way there is: they emit a
+    small thought object, then the post. The anchor then reads the
+    thought object, ``content_text`` comes back ``None``, and the whole
+    post is discarded — while the finished post sits in the very next
+    region, untouched.
+
+    So the question asked here is not "what is the first object" but
+    "which object is the one we asked for", answered by the schema's own
+    required field. Purely additive: this runs only after the anchored
+    extraction has failed to produce a usable envelope, so it can rescue
+    a post but never redirect one that already parsed.
+    """
+    for value in iter_embedded_json(candidate):
+        if isinstance(value, dict) and isinstance(value.get("content_text"), str):
+            return value
+    return None
 
 
 def _looks_like_schema_leak(candidate: str) -> bool:
@@ -501,17 +564,23 @@ def _parse_output(
         candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
         candidate = re.sub(r"```$", "", candidate)
         candidate = candidate.strip()
-    parsed: dict | None = None
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        match = _JSON_BLOCK_RE.search(candidate)
-        if match is not None:
-            try:
-                parsed = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-    if not isinstance(parsed, dict):
+    # Truncation repair stays off here on purpose. The shared repairer
+    # closes a dangling *string* to rescue the object — exactly what
+    # this site must not do: a response cut off mid-``content_text`` is
+    # usually a mid-multibyte-character truncation (garbled tail), and
+    # auto-closing that string would ship broken text to a player-facing
+    # post. The field-level salvage below is this site's own, narrower
+    # recovery: it only accepts a field that is already quote-closed —
+    # unchanged by this migration.
+    outcome = extract_object_outcome(candidate, repair_truncated=False)
+    log_parse_outcome(_LOGGER, outcome, site="feed.llm_composer")
+    parsed = outcome.value
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("content_text"), str):
+        # The first region isn't the envelope (a leading thought object,
+        # or a first region that didn't decode at all). Look at the
+        # others before giving up — see ``_first_object_carrying_body``.
+        parsed = _first_object_carrying_body(candidate) or parsed
+    if parsed is None:
         # Structurally broken JSON — a stray un-keyed element, or a
         # response truncated mid-object by a max_tokens ceiling — lands
         # here alongside wrapper-less prose and scalar sentinels. Rescue
@@ -528,7 +597,7 @@ def _parse_output(
                 if recovered:
                     image_prompt = recovered[:_MAX_IMAGE_PROMPT_CHARS]
             return FeedComposerOutput(
-                content_text=salvaged[:_MAX_BODY_CHARS],
+                content_text=salvaged[:_BODY_CHAR_CEILING],
                 image_prompt=image_prompt,
             )
         reason = (
@@ -541,13 +610,33 @@ def _parse_output(
     raw_body = parsed.get("content_text")
     if not isinstance(raw_body, str):
         raise _InvalidComposerOutput("content_text_not_string")
-    body = raw_body.strip()[:_MAX_BODY_CHARS]
+    body = raw_body.strip()[:_BODY_CHAR_CEILING]
     if not body:
         raise _InvalidComposerOutput("content_text_empty")
     image_prompt = (
         str(parsed.get("image_prompt", "") or "").strip()[:_MAX_IMAGE_PROMPT_CHARS]
         if image_required else ""
     )
+    if image_required and not image_prompt:
+        # The envelope we anchored on is not always the whole answer.
+        # A model that splits the schema across two objects —
+        # ``{"content_text": …}`` then ``{"image_prompt": …}`` — gives
+        # a first region that parses cleanly and carries a real post, so
+        # nothing above this line fails and the salvage branch below is
+        # never reached. The picture then simply goes missing: the post
+        # publishes as text-only and the tags the model *did* write sit
+        # unread one line further down.
+        #
+        # Asking for the missing field on its own costs one regex pass
+        # and cannot redirect anything — a filled ``image_prompt`` in
+        # the anchored object short-circuits this, and the salvage only
+        # accepts a quote-closed value, so a truncated tail still yields
+        # nothing. An empty ``image_prompt`` is a legitimate "no
+        # picture" answer, and this leaves it empty when the reply says
+        # so nowhere else.
+        recovered = _salvage_string_field(candidate, _IMAGE_PROMPT_FIELD_RE)
+        if recovered:
+            image_prompt = recovered[:_MAX_IMAGE_PROMPT_CHARS]
 
     # media_kind + video_prompt are only honoured when the container
     # actually has a video provider wired. Falls back to "image" so a

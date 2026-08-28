@@ -15,7 +15,10 @@ from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.memory_extractor import MemoryExtractorPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import Message, MessageRole
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.value_objects.memory_kind import CANONICAL_KINDS, MemoryKind
 from kokoro_link.infrastructure.memory.json_parser import parse_memory_payload
 from kokoro_link.infrastructure.prompts import get_default_loader
@@ -140,6 +143,11 @@ def _payload_to_item(
             content=trimmed,
             salience=salience,
             tags=tags,
+            # KB6: this station only ever runs on a completed chat turn,
+            # so the player was structurally in the room for whatever
+            # was extracted. The verdict comes from the pathway, never
+            # from the model — nothing in the payload is consulted.
+            player_knowledge=PLAYER_KNOWLEDGE_SHARED,
         )
     except ValueError:
         return None

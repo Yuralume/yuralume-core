@@ -17,7 +17,6 @@ with text-only so the user still gets a usable draft.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from datetime import date
 from typing import Any
@@ -44,6 +43,7 @@ from kokoro_link.domain.value_objects.visual_subject import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -448,7 +448,9 @@ def _build_messages(instruction: str, image: ImageInput | None) -> list[dict[str
 
 
 def _parse_draft(raw: str) -> CharacterDraft | None:
-    obj = _extract_object(raw)
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="character_draft.llm_generator")
+    obj = outcome.value
     if obj is None:
         return None
     return CharacterDraft(
@@ -540,39 +542,6 @@ def _coerce_companions(value: Any) -> list[CompanionDraft]:
         if len(out) >= _MAX_COMPANIONS_IN_DRAFT:
             break
     return out
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _coerce_str(value: Any, max_chars: int) -> str:

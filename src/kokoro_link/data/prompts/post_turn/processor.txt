@@ -16,6 +16,7 @@ ${operator_section}
 ${history_section}
 ${schedule_section}
 ${arc_section}
+${disclosure_section}
 
 本輪對話：
 使用者說：${user_message}
@@ -23,7 +24,10 @@ ${character_name} 回覆：${assistant_message}
 
 輸出規則：
 - 只輸出一個 JSON 物件，不要任何散文、前言或 code fence。
-- 物件包含六個欄位：memories、state、schedule_adjustments、arc_adjustments、message_promises、address_changes。
+- 物件包含以下欄位（各欄位規則見下方對應段落）：memories、state、schedule_adjustments、
+  arc_adjustments、message_promises、address_changes、emotion_events。
+- 若上方出現「玩家還不知道的記憶」區段，再多輸出一個欄位 disclosed_memory_ids（見下方說明）；
+  沒有那個區段就完全不要輸出這個欄位。
 
 時間紀律（memories.content、schedule_adjustments.description／reason、arc_adjustments 的
 title／summary／narrative 共同適用；state 與 address_changes 不受此限）：
@@ -98,6 +102,11 @@ state 欄位：
 - **正向回饋同樣不要吝嗇**（與負向對稱）：若使用者展現真誠關心、主動分享脆弱、兌現承諾、表達感激、送上有心意的內容，affection_delta 與 trust_delta 應明顯上升（+3 ~ +8，視深度與誠意判斷）；特別有意義的時刻（第一次袒露脆弱、重大承諾、深度情感交流）可以直接 +8。不要因為本輪剛好也該扣負分而把正向互動一律壓成 0——正負可以同時存在（例：使用者先冒犯、再誠懇道歉，負→正都該如實反映）。
 - current_intent 是角色「接下來幾輪」想做的短期意圖（一句話、第一人稱；此欄位玩家可見，必須使用上方指定的玩家可見輸出語言）；
   例如「想多聽對方分享今天的事」「想幫對方釐清心情」。若沒有明確意圖，給 null。
+- **這個意圖若來自上方 arc 區段裡「尚未發生的 beat」或「玩家不在場的 beat」，只能寫成不點名的模糊意圖，
+  不可以點出玩家沒聽過的人名／地名／事件**（壞例：「想找機會跟對方聊聊山區那次的事」——「山區那次」是玩家
+  從沒聽過的 beat 內容；好例：「想找機會聊聊心裡在想的事」）。這個欄位會被原樣寫回下一輪 prompt 的事實層、
+  也會被主動訊息的判斷模型讀到，一旦這裡先洩了漏，下一輪又會照樣抄一次、越滾越大，所以務必在這裡先擋下來。
+  角色自己知情不算洩漏；只有當玩家自己也在場、或對話脈絡顯示玩家已經知道時，才可以點名。
 
 schedule_adjustments 欄位：
 - 是一個 JSON 陣列；若本輪對話沒提到行程異動，給空陣列 []（這是預設）。
@@ -242,6 +251,21 @@ address_changes 欄位（稱呼／叫法變更；多數輪是空陣列）：
   (e) 對方用親屬稱謂、暱稱、或你的名字**直接稱呼你（角色）本人**（例：兄妹設定裡喊你「哥哥」、情侶喊你「老公／寶貝」、或直接喊你的名字）——那是對方在**呼喚你**，不是在指定「對方自己以後要被怎麼叫」，也不是要改口。這類一律**不要**輸出 address_changes；尤其 direction="player" 更不可能成立，因為那個詞是用來叫「你」的，不是用來叫「對方」的。
 - 判斷準則：必須是對方**祈使式、刻意指定**「之後一直要這樣叫」的稱呼。模糊或不確定就給空陣列（寧缺勿錯）。同一輪通常最多 1 筆。
 - 寫了 address_changes 的那件事，就**不要**再寫成 memories（見上方 memories 規則）。
+
+disclosed_memory_ids 欄位（只有在上方出現「玩家還不知道的記憶」區段時才輸出）：
+- 是一個字串陣列，元素只能是那個區段裡列出的 id。
+- 判準只有一個：**${character_name} 在本輪回覆裡，有沒有真的把那件事講給對方聽**。
+  講了（哪怕只是簡短提一句、或換句話說出同一件事）→ 收進陣列；沒講 → 不收。
+- 以下情況一律**不要**收：
+  (a) 那則記憶只是影響了角色的語氣、心情或反應，內容本身沒說出口。
+  (b) 角色只在心裡想到、或只在括號的動作描述裡提到，對方讀不到。
+  (c) 對方自己講起某件事，而角色只是附和——那件事本來就不是角色告訴他的。
+  (d) 角色只講了一半、含糊帶過，對方無從得知那件事是什麼。
+- 沒有任何一則被講出來，就給空陣列 []（這是最常見的情況，不要為了填而填）。
+- 只輸出 id，不要輸出內容；不要輸出區段裡沒有的 id。
+- 這個判斷會讓系統記下「這件事已經跟對方說過了」，之後角色就不會再從頭介紹一次。
+  收錯的代價比漏收大得多（漏收只是下次再講一次；收錯會讓角色把沒說過的事當成共識），
+  所以不確定就不要收。
 
 範例輸出：
 {"memories": [{"kind": "semantic", "content": "艾力說他住在東京", "salience": 0.8, "tags": ["location"], "participants": [{"actor_kind": "operator", "actor_id": "default", "display_name": "艾力", "role": null}], "location": null, "audience": "shareable"}], "state": {"emotion": "開心", "affection_delta": 2, "fatigue_delta": 1, "trust_delta": 1, "energy_delta": -1, "current_intent": "想多聊聊對方的城市故事"}, "emotion_events": [{"emotion_label": "開心", "evidence_quote": "我住東京啊", "valence": 0.6, "arousal": 0.4, "intensity": 0.6, "affection_delta": 2, "trust_delta": 1, "fatigue_delta": 1, "energy_delta": -1, "decay_half_life_minutes": 240}], "schedule_adjustments": [], "arc_adjustments": [], "message_promises": [], "address_changes": []}

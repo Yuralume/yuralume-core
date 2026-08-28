@@ -33,6 +33,7 @@ async def test_chat_service_persists_peer_meet_intents() -> None:
                 source_text="明天去找小鈴",
             ),
         ],
+        turn_record_id="turn-1",
     )
 
     rows = await repo.list_pending_for_character(
@@ -43,3 +44,7 @@ async def test_chat_service_persists_peer_meet_intents() -> None:
     assert rows[0].peer_character_id == "char-b"
     assert rows[0].topic == "聊使用者交代的明天碰面"
     assert rows[0].desired_after == datetime(2026, 5, 18, 0, 0, tzinfo=timezone.utc)
+    # The anchor turn-undo deletes by: without it the row is only findable
+    # by a ``created_at`` window that this writer's own background timing
+    # races, and that has no conversation scope to lose.
+    assert rows[0].turn_record_id == "turn-1"

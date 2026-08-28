@@ -39,6 +39,11 @@ from kokoro_link.infrastructure.localization.fallback_texts import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"```(?:\w+)?\n?")
@@ -452,6 +457,19 @@ def _fallback_analysis(
 
 
 def _has_relationship_intent(relationship: InitialRelationshipPayload) -> bool:
+    """Did the player actually describe a relationship?
+
+    Gates the follow-up questions that only make sense once they did —
+    "you said you already know each other, so what may they know?"
+
+    ``proactive_permission`` is deliberately **not** on this list since
+    TR2-B: it arrives pre-checked from the creation form, so its being
+    true says nothing about whether the player set anything up. Counting
+    it would greet everyone who left the whole section blank with
+    questions about a relationship they never claimed to have.
+    ``proactive_cadence_hint`` — which is still typed by hand — is read
+    separately below, and only ever non-blocking.
+    """
     return any((
         relationship.relationship_label.strip(),
         relationship.user_address_name.strip(),
@@ -461,7 +479,6 @@ def _has_relationship_intent(relationship: InitialRelationshipPayload) -> bool:
         relationship.familiarity_boundary.strip(),
         relationship.user_profile_notes.strip(),
         relationship.schedule_involvement_policy != "none",
-        relationship.proactive_permission,
         relationship.safe_user_profile.has_values(),
     ))
 
@@ -521,24 +538,57 @@ def _build_prompt(
     )
 
 
-def _extract_json_object(raw: str) -> Any:
-    text = _strip_fences(raw).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        return json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return None
-
-
 def _strip_fences(text: str) -> str:
     return _FENCE_RE.sub("", text).replace("```", "")
+
+
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly: does the first-``{`` to
+    last-``}`` slice parse as JSON at all — no balance-awareness, no
+    repair. When it does, the pre-migration fallback already succeeded
+    with exactly this value (an array wrapping a *single* object is the
+    live case), so the guard below must not start refusing it. Used
+    only as a gate; see ``_extract_json_object``.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return False
+    try:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _extract_json_object(raw: str) -> Any:
+    """DH2-services: object extraction via the shared scanner.
+
+    Truncation repair is on — the intake prompt unconditionally asks
+    for the JSON envelope. The scanner is fence-agnostic, so the
+    separate whole-text ``json.loads`` attempt the old code tried first
+    is redundant with (and a strict subset of) the balanced-brace scan
+    — redundant except for the one thing it used to gate on: an
+    array-shaped reply.
+
+    The old code's first step was a whole-text ``json.loads``: when that
+    succeeded with a non-dict value (most commonly the model wrapping
+    its answer in ``[...]``), the site's own ``isinstance(data, dict)``
+    gate downstream discarded it — so a balanced-scan extractor must not
+    dig past that same value for a plausible-looking nested object and
+    hand a caller a fragment old would have rejected outright.
+
+    FX1/DH-2: the guard is structural now, because spelled as a
+    whole-text parse it vanished exactly when it was needed — an array
+    with a sentence after it doesn't decode as a whole, so the check
+    said "not an array reply" about a reply that plainly was one.
+    """
+    text = _strip_fences(raw).strip()
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
+        return None
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="character_creation_intake")
+    return outcome.value
 
 
 def _coerce_list(value: object) -> list[object]:

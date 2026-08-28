@@ -345,6 +345,74 @@ async def test_climax_arc_beat_realization_writes_milestone_memory() -> None:
     assert arc_memory.salience == pytest.approx(0.9)
     assert completion_memory.kind == MemoryKind.RELATIONSHIP_MILESTONE
     assert completion_memory.salience == pytest.approx(0.95)
+    # F3a: the beat's own operator_position is unjudged (None → beat
+    # memory player_knowledge == ""), and the milestone must not mint a
+    # verdict the beat itself never earned.
+    assert arc_memory.player_knowledge == ""
+    assert completion_memory.player_knowledge == ""
+
+
+@pytest.mark.asyncio
+async def test_arc_completion_milestone_merges_realized_beat_player_knowledge() -> (
+    None
+):
+    """F3a: the milestone's ``player_knowledge`` is not re-projected from
+    ``operator_position`` — it is read back from the actual memory each
+    realized beat wrote (via the ``arc_beat_id:<id>`` tag), so a beat
+    the writer marked ``present`` propagates ``shared`` onto the recap
+    rather than the milestone independently re-deriving it."""
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, _, _, _, _, memory_repo = _services(
+        today,
+        tension=TENSION_CLIMAX,
+        operator_position=OPERATOR_POSITION_PRESENT,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    await event_service.record_arc_beat_realization(
+        character,
+        beat_id=beat.id,
+        narrative="我們一起把最重要的話說出口了。",
+        now=now,
+    )
+
+    memories = await memory_repo.query(character.id)
+    arc_memory = next(m for m in memories if "arc_milestone" in m.tags)
+    completion_memory = next(m for m in memories if "arc_completion" in m.tags)
+    assert arc_memory.player_knowledge == "shared"
+    assert completion_memory.player_knowledge == "shared"
+
+
+@pytest.mark.asyncio
+async def test_arc_completion_milestone_inherits_private_beat_knowledge() -> None:
+    """F3a: ``private`` on a realized beat's own memory must win the
+    merge outright (KB6 rule 1) — the milestone recap must not launder
+    a beat the player was structurally absent from into an unjudged or
+    shared summary."""
+    today = date(2026, 5, 10)
+    now = datetime(2026, 5, 10, 10, 0, tzinfo=timezone.utc)
+    event_service, arc_service, _, _, _, _, memory_repo = _services(
+        today,
+        tension=TENSION_CLIMAX,
+        operator_position=OPERATOR_POSITION_ABSENT,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    beat = arc.beats[0]
+
+    await event_service.record_arc_beat_realization(
+        character,
+        beat_id=beat.id,
+        narrative="她獨自把最重要的話說出口了。",
+        now=now,
+    )
+
+    memories = await memory_repo.query(character.id)
+    completion_memory = next(m for m in memories if "arc_completion" in m.tags)
+    assert completion_memory.player_knowledge == "private"
 
 
 @pytest.mark.asyncio

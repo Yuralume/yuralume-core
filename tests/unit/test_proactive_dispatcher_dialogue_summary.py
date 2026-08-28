@@ -4,6 +4,14 @@ The summary comes from running the wired ``DialogueSummarizerPort``
 against the latest web conversation (tool-only turns filtered). When no
 summarizer is configured, ``recent_dialogue_summary`` stays empty — the
 decider prompt treats empty as "no context" and skips that section.
+
+TD (2026-08-26 incident: a ten-minute-old question resurfacing in a push
+as 「昨天」) adds a second, deterministic anchor beside the summary. The
+dispatcher now hands the summariser the tick's instant and the operator
+zone, and appends the last few turns *verbatim with their timestamps*
+to the same field. Both are asserted here: the summary alone is model
+output and can lose the anchor however the template is worded, so the
+raw tail is the part that cannot.
 """
 
 from __future__ import annotations
@@ -52,9 +60,13 @@ class _RecordingSummarizer:
     def __init__(self, output: str) -> None:
         self.output = output
         self.calls: list[list[Message]] = []
+        self.anchors: list[tuple[object, object]] = []
 
-    async def summarize(self, *, character, messages):  # noqa: ANN001
+    async def summarize(  # noqa: ANN001
+        self, *, character, messages, now=None, local_tz=None,
+    ):
         self.calls.append(list(messages))
+        self.anchors.append((now, local_tz))
         return self.output
 
 
@@ -130,10 +142,73 @@ async def test_dispatcher_threads_dialogue_summary_into_context() -> None:
     )
 
     assert decider.last_context is not None
-    assert decider.last_context.recent_dialogue_summary == "你剛陪對方處理心情低落"
+    assert decider.last_context.recent_dialogue_summary.startswith(
+        "你剛陪對方處理心情低落",
+    )
     # Tool-only turn got filtered out before reaching the summarizer.
     assert len(summarizer.calls) == 1
     assert all(m.kind is MessageKind.CHAT for m in summarizer.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_hands_the_summarizer_the_tick_instant_and_zone() -> None:
+    """The summariser cannot anchor turns it has no "now" to measure from.
+
+    It fails soft to the UTC wall clock, which would have masked the
+    incident in production while looking fine in tests — so the *caller*
+    passing the real tick instant is pinned here explicitly.
+    """
+    harness, character = await _prepare_harness_with_enabled_character()
+    await _seed_web_conversation(harness, character.id)
+
+    summarizer = _RecordingSummarizer(output="你剛陪對方處理心情低落")
+    dispatcher = _build_dispatcher(
+        harness, decider=_CapturingDecider(), dialogue_summarizer=summarizer,
+    )
+
+    await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+
+    assert len(summarizer.anchors) == 1
+    now, local_tz = summarizer.anchors[0]
+    assert isinstance(now, datetime)
+    assert now.tzinfo is not None
+    assert local_tz is not None
+
+
+@pytest.mark.asyncio
+async def test_decider_sees_raw_recent_turns_with_their_timestamps() -> None:
+    """The deterministic half of the fix.
+
+    A summary that drops the time anchor is still possible — it is model
+    output. The last turns therefore also reach the decider verbatim,
+    stamped, assembled in Python, so a misdated summary is contradicted
+    by the material directly beneath it.
+    """
+    harness, character = await _prepare_harness_with_enabled_character()
+    await _seed_web_conversation(harness, character.id)
+
+    decider = _CapturingDecider()
+    dispatcher = _build_dispatcher(
+        harness,
+        decider=decider,
+        dialogue_summarizer=_RecordingSummarizer(output="你剛陪對方處理心情低落"),
+    )
+
+    await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK,
+    )
+
+    assert decider.last_context is not None
+    material = decider.last_context.recent_dialogue_summary
+    assert "最近幾則對話原文" in material
+    # Raw text, not a paraphrase, and carrying its own anchor.
+    assert "使用者：今天有點悶" in material
+    assert "剛剛]" in material
+    # Seeded seconds ago — nothing in this block may read as another day.
+    for word in ("昨天", "前天", "上禮拜"):
+        assert word not in material
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,8 @@ export interface FeedPost {
   video_prompt: string | null
   reactions: FeedReactionSummary
   reactions_seen_at: string | null
+  /** When the player actually saw this post (KB11). `null` = never viewed. */
+  viewed_at: string | null
   created_at: string
   liked: boolean
 }

@@ -15,7 +15,6 @@ direction → ±1 band shift. We never write keyword-trigger rules here.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -27,6 +26,7 @@ from kokoro_link.contracts.disposition_drift import (
     DispositionDriftProposal,
 )
 from kokoro_link.contracts.llm import ChatModelPort
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_REASON_CHARS = 240
@@ -70,14 +70,10 @@ class LLMDispositionDriftJudge(DispositionDriftJudgePort):
             )
             return None
 
-        body = _extract_json_object(raw)
-        if body is None:
-            return None
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(parsed, dict):
+        outcome = extract_object_outcome(raw)
+        log_parse_outcome(_LOGGER, outcome, site="disposition.llm_drift_judge")
+        parsed = outcome.value
+        if parsed is None:
             return None
 
         dimension = _coerce_str(parsed.get("dimension"))
@@ -165,29 +161,3 @@ def _coerce_str(value: Any) -> str:
     return str(value).strip()
 
 
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        ch = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None

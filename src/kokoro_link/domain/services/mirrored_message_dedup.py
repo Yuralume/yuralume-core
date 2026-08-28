@@ -31,7 +31,7 @@ collapsed.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 from kokoro_link.domain.entities.conversation import Message
@@ -43,7 +43,6 @@ from kokoro_link.domain.entities.conversation import Message
 DEFAULT_MIRROR_WINDOW = timedelta(minutes=10)
 
 _MessageKey = tuple[str, str, str, tuple[str, ...]]
-_Identity = tuple[_MessageKey, datetime]
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -80,33 +79,9 @@ def _message_key(message: Message) -> _MessageKey | None:
     return (message.role.value, message.kind.value, text, urls)
 
 
-def _identity(message: Message) -> _Identity | None:
-    key = _message_key(message)
-    if key is None:
-        return None
-    return key, _as_utc(message.created_at)
-
-
-def preferred_identities(messages: Iterable[Message]) -> frozenset[_Identity]:
-    """Build the "keep this copy" set from one conversation's own rows.
-
-    Callers pass the conversation the prompt is being built for; when a
-    mirror pair is found, the copy that lives on *this* conversation wins
-    so the transcript keeps the timestamps and ordering the user is
-    actually looking at.
-    """
-    out: set[_Identity] = set()
-    for message in messages:
-        identity = _identity(message)
-        if identity is not None:
-            out.add(identity)
-    return frozenset(out)
-
-
 def dedupe_mirrored_messages(
     messages: Sequence[Message],
     *,
-    preferred: Iterable[Message] = (),
     window: timedelta = DEFAULT_MIRROR_WINDOW,
 ) -> list[Message]:
     """Return ``messages`` with cross-channel mirror copies collapsed.
@@ -114,16 +89,26 @@ def dedupe_mirrored_messages(
     Two entries are the same delivery when they share role, kind,
     whitespace-normalised text and attachment URLs, **and** their
     timestamps fall inside ``window`` of the first copy in the cluster.
-    The surviving copy is the one belonging to ``preferred`` (the
-    conversation being rendered) when present, otherwise the earliest —
-    the original delivery rather than the echo.
+    The surviving copy is the **earliest** — the original delivery
+    rather than the echo.
+
+    **The rule takes no arguments, and that is deliberate.** It used to
+    accept a ``preferred`` conversation whose copy would win instead, so
+    that a rendered transcript kept its own thread's timestamps. The two
+    copies carry different ``created_at`` values, and the dialogue
+    checkpoint identifies its coverage boundary by exactly that
+    timestamp plus a fingerprint of the surviving row — so the prompt
+    (which named a preferred conversation) and the background checkpoint
+    updater (which has none) picked different survivors and then
+    disagreed about whether the boundary message was covered. A rule
+    that varies with the caller cannot be the rule two sides use to
+    agree on a boundary.
 
     Relative order of the survivors is preserved exactly as given; this
     never reorders, rewrites or merges content.
     """
     if len(messages) < 2:
         return list(messages)
-    preferred_keys = preferred_identities(preferred)
 
     grouped: dict[_MessageKey, list[int]] = {}
     for index, message in enumerate(messages):
@@ -142,8 +127,9 @@ def dedupe_mirrored_messages(
         for cluster in _cluster_by_window(messages, ordered, window):
             if len(cluster) < 2:
                 continue
-            winner = _pick_survivor(messages, cluster, key, preferred_keys)
-            dropped.update(i for i in cluster if i != winner)
+            # ``ordered`` sorts by timestamp then original index, so the
+            # cluster head is the earliest copy — the original delivery.
+            dropped.update(cluster[1:])
 
     if not dropped:
         return list(messages)
@@ -177,16 +163,3 @@ def _cluster_by_window(
     if current:
         clusters.append(current)
     return clusters
-
-
-def _pick_survivor(
-    messages: Sequence[Message],
-    cluster: Sequence[int],
-    key: _MessageKey,
-    preferred_keys: frozenset[_Identity],
-) -> int:
-    if preferred_keys:
-        for index in cluster:
-            if (key, _as_utc(messages[index].created_at)) in preferred_keys:
-                return index
-    return cluster[0]

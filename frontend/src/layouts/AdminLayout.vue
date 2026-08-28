@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, RouterLink, RouterView } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import SidebarBrand from '@/components/SidebarBrand.vue'
@@ -10,6 +10,11 @@ import {
   isModelRoutingDiscovered,
   rememberModelRoutingDiscovered,
 } from '@/utils/modelRoutingDiscovery'
+import {
+  nextAdminDrawerOpen,
+  shouldCloseAdminDrawerOnKey,
+  shouldShowAdminMobileBackLink,
+} from '@/utils/adminDrawer'
 
 interface AdminNavItem {
   /**
@@ -107,6 +112,32 @@ watch(
   { immediate: true },
 )
 
+// Mobile nav drawer (≤900px, see the media query below): the sidebar is
+// hidden from the grid and re-shown as a viewport-fixed drawer opened by
+// the topbar hamburger. `nextAdminDrawerOpen` / `shouldCloseAdminDrawerOnKey`
+// carry the actual state-transition rules (unit-tested in
+// tests/adminDrawer.test.ts) so this component only wires DOM events to them.
+const sidebarOpen = ref(false)
+const showMobileBackLink = computed(() => shouldShowAdminMobileBackLink(route.path))
+
+function toggleSidebarDrawer(): void {
+  sidebarOpen.value = nextAdminDrawerOpen(sidebarOpen.value, 'toggle')
+}
+function closeSidebarDrawer(): void {
+  sidebarOpen.value = nextAdminDrawerOpen(sidebarOpen.value, 'close')
+}
+function handleDrawerKeydown(event: KeyboardEvent): void {
+  if (sidebarOpen.value && shouldCloseAdminDrawerOnKey(event.key)) closeSidebarDrawer()
+}
+
+// A route change (nav link click, mobile back link, browser back) always
+// closes the drawer — staying open across navigation would leave a stale
+// scrim covering the newly-routed page.
+watch(() => route.path, closeSidebarDrawer)
+
+onMounted(() => window.addEventListener('keydown', handleDrawerKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', handleDrawerKeydown))
+
 const breadcrumb = computed(() => {
   const path = route.path
   const matched = navItems.find(item => {
@@ -119,7 +150,17 @@ const breadcrumb = computed(() => {
 
 <template>
   <div class="admin-layout">
-    <aside class="admin-layout__sidebar">
+    <!-- ≤900px only: scrim behind the drawer, dismisses it on click. Not
+         rendered at all while closed, and the CSS that gives it its fixed
+         full-viewport look only exists inside the mobile media query, so
+         resizing back to desktop mid-open leaves nothing behind. -->
+    <div
+      v-if="sidebarOpen"
+      class="admin-layout__scrim"
+      @click="closeSidebarDrawer"
+    />
+
+    <aside class="admin-layout__sidebar" :class="{ 'is-open': sidebarOpen }">
       <SidebarBrand
         :to="{ path: '/' }"
         :link-title="t('admin.layout.back')"
@@ -138,6 +179,7 @@ const breadcrumb = computed(() => {
               :to="item.to"
               class="admin-layout__nav-link"
               :class="{ 'is-active': route.path === item.to || (item.to !== '/admin' && route.path.startsWith(item.to + '/')) }"
+              @click="closeSidebarDrawer"
             >
               {{ t(item.labelKey) }}
               <span
@@ -154,10 +196,28 @@ const breadcrumb = computed(() => {
 
     <main class="admin-layout__main">
       <header class="admin-layout__topbar">
-        <div class="admin-layout__breadcrumb">
-          <RouterLink to="/admin" class="admin-layout__crumb">{{ t('admin.layout.brand') }}</RouterLink>
-          <span v-if="route.path !== '/admin'" class="admin-layout__crumb-sep">/</span>
-          <span v-if="route.path !== '/admin'" class="admin-layout__crumb is-current">{{ breadcrumb }}</span>
+        <div class="admin-layout__topbar-nav">
+          <button
+            type="button"
+            class="admin-layout__menu-btn"
+            :aria-expanded="sidebarOpen"
+            :aria-label="t('admin.layout.toggleNav')"
+            @click="toggleSidebarDrawer"
+          >
+            {{ sidebarOpen ? '✕' : '☰' }}
+          </button>
+          <RouterLink
+            v-if="showMobileBackLink"
+            to="/admin"
+            class="admin-layout__mobile-back"
+          >
+            ← {{ t('admin.layout.backToOverview') }}
+          </RouterLink>
+          <div class="admin-layout__breadcrumb">
+            <RouterLink to="/admin" class="admin-layout__crumb">{{ t('admin.layout.brand') }}</RouterLink>
+            <span v-if="showMobileBackLink" class="admin-layout__crumb-sep">/</span>
+            <span v-if="showMobileBackLink" class="admin-layout__crumb is-current">{{ breadcrumb }}</span>
+          </div>
         </div>
         <div class="admin-layout__topbar-meta">
           <span
@@ -272,6 +332,54 @@ const breadcrumb = computed(() => {
   flex-shrink: 0;
 }
 
+/* Groups the hamburger, mobile back-link and breadcrumb so the ≤600px
+   wrap rule can push the whole cluster to its own line as one unit
+   instead of stranding the hamburger on a line by itself. */
+.admin-layout__topbar-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* Hamburger + "back to overview": both are drawer-mode-only affordances,
+   hidden on desktop where the sidebar is always visible. See the ≤900px
+   media query below for the breakpoint that reveals them. */
+.admin-layout__menu-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: var(--font-md);
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.admin-layout__menu-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.admin-layout__mobile-back {
+  display: none;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+  font-size: var(--font-sm);
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.admin-layout__mobile-back:hover {
+  color: var(--color-text);
+  text-decoration: underline;
+}
+
 .admin-layout__breadcrumb {
   display: flex;
   align-items: center;
@@ -282,6 +390,10 @@ const breadcrumb = computed(() => {
 .admin-layout__crumb {
   color: var(--color-text-secondary);
   text-decoration: none;
+}
+.admin-layout__crumb:not(.is-current):hover {
+  color: var(--color-text);
+  text-decoration: underline;
 }
 .admin-layout__crumb.is-current {
   color: var(--color-text);
@@ -294,6 +406,14 @@ const breadcrumb = computed(() => {
 .admin-layout__crumb-sep {
   color: var(--color-text-secondary);
   margin: 0 var(--space-1);
+}
+
+/* ≤900px only (see media query below): scrim behind the drawer. Defined
+   here, not inside the query, only so the `display: none` default holds
+   even if `sidebarOpen` is still true when a resize crosses back over
+   the breakpoint — the fixed/z-index look itself stays mobile-only. */
+.admin-layout__scrim {
+  display: none;
 }
 
 .admin-layout__warn-badge {
@@ -346,8 +466,64 @@ const breadcrumb = computed(() => {
   .admin-layout {
     grid-template-columns: 1fr;
   }
+
+  .admin-layout__menu-btn,
+  .admin-layout__mobile-back {
+    display: inline-flex;
+  }
+
+  /* Sidebar becomes a viewport-fixed drawer instead of a grid column —
+     `position: fixed` lets the scrim cover the whole viewport even when
+     `.admin-layout__main` is short, rather than being clipped to the
+     grid cell. Mirrors the sidebar-drawer pattern in FusionStoryPage.vue
+     / BranchingDramaPage.vue. */
   .admin-layout__sidebar {
-    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: min(82vw, 300px);
+    height: 100vh;
+    height: 100dvh;
+    z-index: 45;
+    transform: translateX(-110%);
+    /* Closed drawer is still slid fully off-screen by the transform above,
+       but transform alone doesn't remove it from the tab order or from
+       assistive tech — its 21 nav links stay focusable and screen-reader
+       reachable while invisible. `visibility: hidden` closes that gap;
+       delaying it with the same duration as the transform lets the
+       slide-out animation finish before the links actually vanish, so
+       there's no visible pop mid-transition. */
+    visibility: hidden;
+    transition: transform 180ms ease, visibility 0ms linear 180ms;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+    padding-top: var(--safe-area-top, 0px);
+    padding-bottom: var(--safe-area-bottom, 0px);
+    padding-left: var(--safe-area-left, 0px);
+  }
+  .admin-layout__sidebar.is-open {
+    transform: translateX(0);
+    visibility: visible;
+    transition: transform 180ms ease;
+  }
+
+  .admin-layout__scrim {
+    display: block;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(2px);
+    z-index: 35;
+  }
+}
+
+@media (max-width: 900px) and (prefers-reduced-motion: reduce) {
+  .admin-layout__sidebar,
+  .admin-layout__sidebar.is-open {
+    transition: none;
   }
 }
 
@@ -361,7 +537,7 @@ const breadcrumb = computed(() => {
     padding: var(--space-2) var(--space-3);
   }
 
-  .admin-layout__breadcrumb {
+  .admin-layout__topbar-nav {
     flex: 1 1 100%;
   }
 

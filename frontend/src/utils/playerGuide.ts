@@ -168,6 +168,12 @@ export const PLAYER_GUIDE_CHAPTERS: readonly PlayerGuideChapter[] = [
     ready: true,
     items: [
       { id: 'card' },
+      // IC 系列（player_identity_card）：帶的是創角時的關係/人設欄位，不
+      // 是角色本身，也不是檔案——與 .lumecard／.lumebackup 的檔案語意不
+      // 同，但同樣是「把設定帶著走」的概念，所以緊接在 .lumecard 後面講
+      // 清楚兩者的差別。三個入口一次講完（創角精靈帶入與存卡／角色設定
+      // 頁回存／設定頁「個人」分頁管理），不分散進其他章。
+      { id: 'identityCard' },
       // hosted 的匯出節流（以帳號計的滾動窗）在自架不存在，所以匯出這條
       // 也要換句子——自架版不談節流。
       { id: 'backup', siteAware: true },

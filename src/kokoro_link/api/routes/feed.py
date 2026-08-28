@@ -22,6 +22,16 @@ Browse-trigger memorialize (Phase A close-out):
   the frontend trigger it when the user only browses the feed without
   opening chat, so engagement still surfaces in the next conversation.
 
+Read-receipt (KB11 of PLAYER_KNOWLEDGE_BOUNDARY_PLAN):
+
+* ``POST /api/v1/characters/{character_id}/feed/viewed`` — idempotent
+  batch: the frontend reports post ids the player has actually looked
+  at (IntersectionObserver exposure, or a like/comment as fallback
+  proof). This is the read-side foundation for KB8's disclosure
+  ledger — a post's source ``private`` memory only flips to
+  ``disclosed`` once the player demonstrably saw it, not merely once
+  the character published it. This endpoint only records the fact.
+
 Like paths (Phase A1):
 
 * ``POST /api/v1/feed/posts/{post_id}/like`` — idempotent like.
@@ -228,6 +238,30 @@ class FeedSeenResponse(BaseModel):
     updated: int
 
 
+class FeedViewedRequest(BaseModel):
+    """Batch of post ids the frontend has observed as actually seen.
+
+    ``post_ids`` is capped the same way ``limit`` is elsewhere in this
+    file — a malformed or hostile client can't force an unbounded
+    ``IN (...)`` clause. Duplicates are fine; the repo dedupes.
+    """
+
+    post_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class FeedViewedResponse(BaseModel):
+    """Result of a viewed-batch report.
+
+    ``updated`` is the number of posts whose ``viewed_at`` watermark
+    was newly set this call — ids already viewed, or that don't
+    belong to this character, silently contribute 0. Zero is the
+    steady-state response for a replayed batch (the frontend retries
+    on network failure without knowing whether the first attempt
+    landed)."""
+
+    updated: int
+
+
 class FeedUnreadResponse(BaseModel):
     """全局未讀貼文計數，紅點通知用。
 
@@ -423,6 +457,47 @@ async def mark_feed_reactions_seen(
         return FeedSeenResponse(updated=0)
     updated = await memorializer.memorialize(character_id=character_id)
     return FeedSeenResponse(updated=updated)
+
+
+@router.post(
+    "/characters/{character_id}/feed/viewed",
+    response_model=FeedViewedResponse,
+)
+async def mark_feed_posts_viewed(
+    character_id: str,
+    payload: FeedViewedRequest,
+    container: ServiceContainer = Depends(get_container),
+    _owned_character_id: str = Depends(ensure_owned_character_id),
+) -> FeedViewedResponse:
+    """Record that the player actually saw the given posts (KB11).
+
+    Fire-and-forget from the frontend's exposure batcher, so this
+    stays permission-checked the same way ``.../feed/seen`` is
+    (``ensure_owned_character_id`` 404s before any repo write for a
+    character the caller doesn't own) but otherwise degrades quietly:
+    a test harness without ``feed_post_repository`` wired still gets a
+    200/0 rather than a 500, matching every other feed endpoint's
+    unwired-harness behaviour in this file.
+
+    KB8: having seen a post is also how the player learns whatever
+    memory the post was made of, so the watermark write is followed by
+    the disclosure sweep. It runs on the reported ids rather than only
+    the newly-stamped ones — the sweep is idempotent, and pairing it to
+    ``updated`` would make a crash between the two writes strand a
+    memory as ``private`` with no later event able to reach it. The
+    response still reports the watermark count only: the ledger flip is
+    an internal consequence, not something the client asked about.
+    """
+    repo = container.feed_post_repository
+    if repo is None:
+        return FeedViewedResponse(updated=0)
+    updated = await repo.mark_viewed(character_id, payload.post_ids)
+    disclosure = container.memory_disclosure_service
+    if disclosure is not None:
+        await disclosure.disclose_from_viewed_posts(
+            character_id=character_id, post_ids=payload.post_ids,
+        )
+    return FeedViewedResponse(updated=updated)
 
 
 @router.get(

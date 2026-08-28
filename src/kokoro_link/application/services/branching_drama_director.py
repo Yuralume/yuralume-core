@@ -12,10 +12,10 @@ Three operations:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections.abc import Sequence
+from typing import Any
 
 from kokoro_link.application.services.fusion_character_brief import (
     CharacterBrief,
@@ -41,6 +41,14 @@ from kokoro_link.infrastructure.prompt.drama_operator_position_lines import (
 )
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
+)
+from kokoro_link.llm_output import (
+    OBJECT_REGION,
+    ParseReason,
+    extract_object_outcome,
+    first_balanced_region,
+    iter_embedded_json,
+    log_parse_outcome,
 )
 
 
@@ -360,21 +368,100 @@ def _summarise_exchanges(exchanges: Sequence[Exchange]) -> str:
     return "\n".join(parts)
 
 
+def _carries_narration(value: object) -> bool:
+    """Is this the scene envelope — i.e. does it carry a ``response``?
+
+    A string ``response`` is the whole contract. Anything else (missing
+    key, wrong type) means we are holding some other object.
+    """
+    return isinstance(value, dict) and isinstance(value.get("response"), str)
+
+
+def _scene_object(raw: str, cleaned: str) -> dict[str, Any] | None:
+    """The object this reply's narration lives in, or ``None`` for prose.
+
+    Three answers, in order:
+
+    1. the anchored extraction (first opener, truncation repair on) when
+       it carries ``response`` — the overwhelmingly common case, and the
+       one that recovers a reply chopped by ``max_tokens``;
+    2. otherwise **any** later top-level region that carries it. L2-3: a
+       reasoning-first model writes a small thought object before the
+       envelope, and anchoring on the first opener then reads
+       ``response`` out of the wrong object. That is worse than it
+       sounds — a missing key comes back as ``""`` from ``.get``, which
+       is a ``str``, so the JSON branch is taken and the player gets the
+       "（回應生成失敗）" placeholder instead of the narration;
+    3. otherwise the anchored object only if it *is* the entire reply.
+       That is the pre-migration outcome for an envelope-shaped answer
+       that simply forgot ``response`` (placeholder, not prose) and the
+       differential pins it. An object with text around it is not that
+       case, and falls through to the prose fallback the way it always
+       did.
+    """
+    outcome = extract_object_outcome(raw)
+    if outcome.reason is not ParseReason.NO_JSON:
+        # L2-4: prose is a *designed-legal* reply on this path (see the
+        # fallback below), so ``no_json`` is not a failure worth a
+        # WARNING every turn. Same rule, same reason as
+        # ``tool_call_parser``: log only when the model looks like it
+        # tried to produce JSON and botched it.
+        log_parse_outcome(
+            _LOGGER, outcome, site="branching_drama.director.scene_response",
+        )
+    anchored = outcome.value
+    if _carries_narration(anchored):
+        return anchored
+    for value in iter_embedded_json(raw):
+        if _carries_narration(value):
+            return value
+    if isinstance(anchored, dict) and _is_the_whole_reply(cleaned):
+        return anchored
+    return None
+
+
+def _is_the_whole_reply(cleaned: str) -> bool:
+    """Does ``cleaned`` consist of exactly one object region, start to end?
+
+    The structural spelling of the old code's "``json.loads`` on the
+    whole fence-stripped reply succeeded". Deliberately balance-based
+    rather than decode-based: a whole-reply object that fails to decode
+    has nothing to hand back anyway, so widening here cannot change an
+    outcome, while requiring a decode would reintroduce the guard that
+    disappears the moment a model adds a trailing sentence.
+    """
+    region = first_balanced_region(cleaned)
+    return (
+        region is not None
+        and region.kind == OBJECT_REGION
+        and region.start == 0
+        and region.end == len(cleaned) - 1
+    )
+
+
 def _parse_scene_response(raw: str) -> tuple[str, str | None]:
     if not raw:
         return "（回應生成失敗）", None
     cleaned = _strip_fences(raw).strip()
-    try:
-        obj = json.loads(cleaned)
-        response = obj.get("response", "").strip()
-        hint = obj.get("advance_hint")
-        if isinstance(hint, str):
-            hint = hint.strip() or None
-        else:
-            hint = None
-        return response or "（回應生成失敗）", hint
-    except (json.JSONDecodeError, AttributeError):
-        return cleaned, None
+    # DH2-services: extraction goes through the shared scanner
+    # (balanced-brace, truncation repair on — this prompt unconditionally
+    # asks for the JSON envelope). The fallback quirk is preserved on
+    # purpose: a reply that isn't a well-shaped ``{"response": str, ...}``
+    # object — not JSON at all, or JSON with a non-string ``response`` —
+    # is *not* a parse failure here. It falls back to treating the
+    # fence-stripped raw text itself as the narration, because this path
+    # has no other source of prose. Migrating to a strict ``None``-on-
+    # failure extractor without keeping this branch would silently drop
+    # replies that came back as plain prose instead of the JSON envelope.
+    obj = _scene_object(raw, cleaned)
+    if obj is not None:
+        response_raw = obj.get("response", "")
+        if isinstance(response_raw, str):
+            response = response_raw.strip()
+            hint = obj.get("advance_hint")
+            hint = hint.strip() or None if isinstance(hint, str) else None
+            return response or "（回應生成失敗）", hint
+    return cleaned, None
 
 
 def _strip_fences(text: str) -> str:

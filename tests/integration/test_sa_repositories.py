@@ -179,6 +179,61 @@ async def test_character_encounter_intent_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_character_encounter_intent_delete_by_turn_record(
+    session_factory: sessionmaker,
+) -> None:
+    """Turn-undo's delete, by anchor rather than by clock.
+
+    The window this replaced was scoped to ``character_id`` and
+    ``created_at`` only — and this table has no conversation column, so a
+    character live in two threads at once had undo in one thread deleting
+    the other thread's agreement. Four rows, one anchor: the row of the
+    reverted turn goes and the rest stay — an intent from a *different*
+    turn written at the same instant, one the peer character recorded
+    about the same pair, and one written before the anchor column existed
+    at all."""
+    repo = SACharacterEncounterIntentRepository(session_factory)
+    now = datetime(2026, 5, 17, 9, 0, tzinfo=timezone.utc)
+
+    legacy = CharacterEncounterIntent.create(
+        character_id="char-a", peer_character_id="char-b",
+        desired_after=now + timedelta(days=1), topic="早就約好",
+        now=now - timedelta(hours=1),
+    )
+    await repo.add(legacy)
+    this_turn = CharacterEncounterIntent.create(
+        character_id="char-a", peer_character_id="char-b",
+        desired_after=now + timedelta(days=2), topic="這輪剛約好",
+        turn_record_id="turn-1", now=now,
+    )
+    await repo.add(this_turn)
+    other_turn = CharacterEncounterIntent.create(
+        character_id="char-a", peer_character_id="char-c",
+        desired_after=now + timedelta(days=2), topic="另一條對話約的",
+        turn_record_id="turn-2", now=now,
+    )
+    await repo.add(other_turn)
+    peer_recorded = CharacterEncounterIntent.create(
+        character_id="char-b", peer_character_id="char-a",
+        desired_after=now + timedelta(days=3), topic="對方自己的紀錄",
+        turn_record_id="turn-1", now=now,
+    )
+    await repo.add(peer_recorded)
+
+    deleted = await repo.delete_by_turn_record("char-a", "turn-1")
+
+    assert deleted == 1
+    assert await repo.get(this_turn.id) is None
+    assert await repo.get(legacy.id) is not None
+    assert await repo.get(other_turn.id) is not None
+    assert await repo.get(peer_recorded.id) is not None
+    # An empty anchor is not a wildcard: it must not sweep the
+    # anchorless rows a rolling deployment leaves behind.
+    assert await repo.delete_by_turn_record("char-a", "") == 0
+    assert await repo.get(legacy.id) is not None
+
+
+@pytest.mark.asyncio
 async def test_character_save_and_get(session_factory: sessionmaker) -> None:
     repo = SACharacterRepository(session_factory)
     character = Character.create(

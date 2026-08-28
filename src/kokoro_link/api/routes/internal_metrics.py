@@ -39,6 +39,12 @@ from kokoro_link.infrastructure.observability.drain_metrics import (
 from kokoro_link.infrastructure.observability.execution_mode_metrics import (
     render_execution_mode_metrics,
 )
+from kokoro_link.infrastructure.observability.outcome_claim_metrics import (
+    render_outcome_claim_metrics,
+)
+from kokoro_link.infrastructure.observability.output_quality_metrics import (
+    render_output_quality_metrics,
+)
 from kokoro_link.infrastructure.observability.prompt_pack_metrics import (
     render_prompt_pack_metrics,
 )
@@ -120,7 +126,52 @@ async def scrape_metrics(
     drain_body = _render_drain_metrics(container)
     if drain_body:
         body = body + drain_body
+    honesty_body = _render_outcome_claim_metrics(container)
+    if honesty_body:
+        body = body + honesty_body
+    quality_body = _render_output_quality_metrics(container)
+    if quality_body:
+        body = body + quality_body
     return PlainTextResponse(body, media_type=_PROMETHEUS_CONTENT_TYPE)
+
+
+def _render_output_quality_metrics(container: ServiceContainer) -> str:
+    """Append the QG output-quality counters when the gate is wired.
+
+    Two silences live in these series and neither shows up anywhere else:
+    a background tick that sent nothing because a hard defect survived its
+    regeneration (``outcome="hard_skipped"``), and a surface whose reviews
+    are all failing open, so its output ships unreviewed
+    (``failopen_outage``). Absent until a surface has actually recorded an
+    outcome. Synchronous: in-process integers, no port to await."""
+    try:
+        return render_output_quality_metrics(
+            getattr(container, "output_quality_counters", None),
+        )
+    except Exception:  # never let a counter read break the scrape
+        _LOGGER.exception("internal metrics: output quality render failed")
+        return ""
+
+
+def _render_outcome_claim_metrics(container: ServiceContainer) -> str:
+    """Append the HV1 honesty-gate counters when the gate is wired.
+
+    The gate fails closed, so an unreachable judge withholds promise
+    fulfilments without producing any error a player or operator would
+    notice — ``yuralume_outcome_claim_judge_outage`` is the only place
+    that becomes visible. Absent on a deployment with no judge route,
+    where the guard is never built. Synchronous: in-process integers, no
+    port to await."""
+    try:
+        return render_outcome_claim_metrics(
+            getattr(
+                getattr(container, "outcome_claim_guard", None),
+                "counters", None,
+            ),
+        )
+    except Exception:  # never let a counter read break the scrape
+        _LOGGER.exception("internal metrics: outcome claim render failed")
+        return ""
 
 
 def _render_drain_metrics(container: ServiceContainer) -> str:

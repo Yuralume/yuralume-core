@@ -51,6 +51,7 @@ function basePost(overrides: Partial<FeedPost> = {}): FeedPost {
     video_prompt: null,
     reactions: { likes: 0, comments: 0 },
     reactions_seen_at: null,
+    viewed_at: null,
     created_at: new Date().toISOString(),
     liked: false,
     ...overrides,

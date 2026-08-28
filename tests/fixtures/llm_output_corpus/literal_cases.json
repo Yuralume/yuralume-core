@@ -1,0 +1,459 @@
+[
+  {
+    "id": "literal.contract_object",
+    "note": "our own {\"tool\": …} contract, clean",
+    "raw": "{\"tool\": \"web_search\", \"args\": {\"query\": \"夏祭\"}}"
+  },
+  {
+    "id": "literal.openai_function_shape",
+    "note": "OpenAI function-call habit",
+    "raw": "{\"name\": \"generate_image\", \"arguments\": {\"positive\": \"自拍\"}}"
+  },
+  {
+    "id": "literal.single_quoted",
+    "note": "single quotes — shape only, json.loads must fail",
+    "raw": "{'tool': 'generate_image', 'args': {}}"
+  },
+  {
+    "id": "literal.function_call_wrapper",
+    "note": "nested function_call wrapper",
+    "raw": "{\"function_call\": {\"name\": \"web_search\", \"args\": {}}}"
+  },
+  {
+    "id": "literal.tool_name_key",
+    "note": "another foreign key convention",
+    "raw": "{\"tool_name\": \"web_search\", \"parameters\": {}}"
+  },
+  {
+    "id": "literal.fenced_json_lang",
+    "note": "```json fence",
+    "raw": "```json\n{\"name\": \"web_search\", \"arguments\": {}}\n```"
+  },
+  {
+    "id": "literal.fenced_bare",
+    "note": "bare ``` fence",
+    "raw": "```\n{\"tool\": \"web_search\", \"args\": {}}\n```"
+  },
+  {
+    "id": "literal.surrounding_whitespace",
+    "note": "leading/trailing blank lines",
+    "raw": "\n\n  {\"tool\": \"web_search\", \"args\": {}}  \n"
+  },
+  {
+    "id": "literal.empty_object",
+    "note": "the empty object",
+    "raw": "{}"
+  },
+  {
+    "id": "literal.batched_list",
+    "note": "upstreams that think in batches",
+    "raw": "[{\"name\": \"generate_image\", \"arguments\": {\"positive\": \"自拍\"}}]"
+  },
+  {
+    "id": "literal.batched_list_multiline",
+    "note": "batched, pretty-printed",
+    "raw": "[\n  {\"tool\": \"web_search\", \"args\": {\"query\": \"夏祭\"}}\n]"
+  },
+  {
+    "id": "prose.empty",
+    "note": "empty string",
+    "raw": ""
+  },
+  {
+    "id": "prose.whitespace",
+    "note": "whitespace only",
+    "raw": "   \n  "
+  },
+  {
+    "id": "prose.zh",
+    "note": "plain Chinese reply",
+    "raw": "查到了！今年抽選是七月一號開始。"
+  },
+  {
+    "id": "prose.en",
+    "note": "plain English reply",
+    "raw": "Looked it up — the lottery opens on July 1st."
+  },
+  {
+    "id": "prose.ja",
+    "note": "plain Japanese reply",
+    "raw": "調べておいたよ。抽選は 7/1 からだって！"
+  },
+  {
+    "id": "prose.emoji",
+    "note": "reply with emoji",
+    "raw": "查到囉～ 🎆 抽選 7/1 開始！"
+  },
+  {
+    "id": "prose.roleplay_marker",
+    "note": "brace used as a stage direction",
+    "raw": "{微笑}我查到了，抽選七月一號開始。"
+  },
+  {
+    "id": "prose.brace_around_date",
+    "note": "braces around a date",
+    "raw": "抽選在 {7/1} 開始，我幫你標起來了。"
+  },
+  {
+    "id": "prose.quoted_flat_json",
+    "note": "prose quoting one flat level of data",
+    "raw": "網站上寫著 {\"date\": \"7/1\"}，我猜是抽選開始日。"
+  },
+  {
+    "id": "prose.quoted_api_response",
+    "note": "prose quoting an API response",
+    "raw": "他們的 API 回 {\"open\": true}，看起來今天有開。"
+  },
+  {
+    "id": "prose.paragraphs",
+    "note": "two paragraphs",
+    "raw": "我查完了。\n\n抽選是七月一號開始。"
+  },
+  {
+    "id": "prose.lone_open_brace",
+    "note": "a single opening brace",
+    "raw": "{"
+  },
+  {
+    "id": "prose.lone_close_brace",
+    "note": "a single closing brace",
+    "raw": "}"
+  },
+  {
+    "id": "prose.bracket_stage_direction",
+    "note": "bracketed stage direction",
+    "raw": "[微笑]我查到了，抽選七月一號開始。"
+  },
+  {
+    "id": "prose.bracket_only",
+    "note": "bracketed stage direction alone",
+    "raw": "[微笑]"
+  },
+  {
+    "id": "prose.bracket_date",
+    "note": "brackets around a date",
+    "raw": "抽選日期 [7/1] 我幫你圈起來了"
+  },
+  {
+    "id": "prose.python_snippet",
+    "note": "a python snippet with an f-string brace",
+    "raw": "你要的片段：\n```python\ndef greet(name):\n    return f\"哈囉 {name}\"\n```"
+  },
+  {
+    "id": "embedded.sentence_before",
+    "note": "model narrates before the call",
+    "raw": "好的，我幫你查一下：\n{\"name\": \"generate_image\", \"arguments\": {\"positive\": \"自拍\"}}"
+  },
+  {
+    "id": "embedded.markdown_heading",
+    "note": "markdown heading before the call",
+    "raw": "## 工具呼叫\n\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"夏祭\"}}"
+  },
+  {
+    "id": "embedded.sentence_and_fence",
+    "note": "sentence plus fenced call",
+    "raw": "這是我要呼叫的工具：\n```json\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"夏祭\"}}\n```"
+  },
+  {
+    "id": "embedded.batched_with_prose",
+    "note": "batched call with a preamble",
+    "raw": "我先查一下喔\n[{\"name\": \"web_search\", \"arguments\": {\"query\": \"夏祭\"}}]"
+  },
+  {
+    "id": "embedded.trailing_commentary",
+    "note": "commentary after the blob",
+    "raw": "{\"name\": \"web_search\", \"arguments\": {\"query\": \"夏祭\"}}\n查完再跟你說！"
+  },
+  {
+    "id": "embedded.marker_then_call",
+    "note": "roleplay marker in front of a real call",
+    "raw": "{微笑}好，我查一下：{\"name\": \"web_search\", \"arguments\": {\"query\": \"夏祭\"}} 等我一下"
+  },
+  {
+    "id": "trunc.fenced_clean",
+    "note": "well-formed call inside a fence",
+    "raw": "```json\n{\"tool\": \"generate_image\", \"args\": {\"positive\": \"sunset\"}}\n```"
+  },
+  {
+    "id": "trunc.missing_outer_brace",
+    "note": "cut after the inner args dict closed",
+    "raw": "```json\n{\"tool\": \"generate_image\", \"args\": {\"positive\": \"1girl, solo\", \"aspect\": \"portrait\", \"caption\": \"走到窗邊\"}"
+  },
+  {
+    "id": "trunc.cut_inside_string",
+    "note": "cut mid-string",
+    "raw": "{\"tool\": \"generate_image\", \"args\": {\"positive\": \"short hair\", \"caption\": \"走到窗邊，月光灑在臉"
+  },
+  {
+    "id": "trunc.brace_soup",
+    "note": "prose with a stray brace — must NOT become a dict",
+    "raw": "今天天氣很好{但我有點累"
+  },
+  {
+    "id": "trunc.hint_only",
+    "note": "the hint shape with nothing after it",
+    "raw": "{\"tool\": \"generate_image\""
+  },
+  {
+    "id": "trunc.hint_args_key",
+    "note": "cut right after the args key",
+    "raw": "```json\n{\"tool\": \"echo\", \"args\":"
+  },
+  {
+    "id": "trunc.hint_whitespace_key",
+    "note": "whitespace between key and quote",
+    "raw": "{\n  \"tool\"  :\n  \"x\","
+  },
+  {
+    "id": "prose.mentions_tool_word",
+    "note": "prose that merely says the word tool",
+    "raw": "I'll use a tool for this"
+  },
+  {
+    "id": "prose.normal_reply",
+    "note": "an ordinary chat reply",
+    "raw": "just a normal chat reply"
+  },
+  {
+    "id": "array.fenced",
+    "note": "memory array inside a ```json fence",
+    "raw": "```json\n[{\"kind\": \"semantic\", \"content\": \"likes jazz\", \"salience\": 0.8, \"tags\": [\"music\"]}]\n```"
+  },
+  {
+    "id": "array.preamble_and_trailer",
+    "note": "preamble and trailing text around the array",
+    "raw": "Here are the memories:\n[{\"kind\": \"semantic\", \"content\": \"loves cats\"}] cheers!"
+  },
+  {
+    "id": "array.no_json",
+    "note": "prose where an array was demanded",
+    "raw": "sorry, no memories today"
+  },
+  {
+    "id": "array.unclosed_garbage",
+    "note": "an opening bracket over garbage",
+    "raw": "[not valid json"
+  },
+  {
+    "id": "array.object_not_array",
+    "note": "an object where an array was demanded",
+    "raw": "{}"
+  },
+  {
+    "id": "array.bracket_inside_string",
+    "note": "a ] inside a string value",
+    "raw": "[{\"content\": \"quote with ]\", \"kind\": \"semantic\"}]"
+  },
+  {
+    "id": "adv.cjk_quotes",
+    "note": "CJK quotation marks instead of ASCII quotes",
+    "raw": "{「tool」：「web_search」}"
+  },
+  {
+    "id": "adv.nested_braces_in_string",
+    "note": "braces inside a string value",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"他說 {不要} 就是 [不要]\"}}"
+  },
+  {
+    "id": "adv.escaped_quote_in_string",
+    "note": "an escaped quote inside a string value",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"她說「\\\"好\\\"」然後笑了\"}}"
+  },
+  {
+    "id": "adv.trailing_comma",
+    "note": "a trailing comma json.loads rejects",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"hi\"},}"
+  },
+  {
+    "id": "adv.comment_after_object",
+    "note": "a // comment after the object",
+    "raw": "{\"tool\": \"echo\", \"args\": {}} // 這是我選的工具"
+  },
+  {
+    "id": "adv.two_objects",
+    "note": "two complete objects in a row",
+    "raw": "{\"tool\": \"a\", \"args\": {}}\n{\"tool\": \"b\", \"args\": {}}"
+  },
+  {
+    "id": "adv.marker_then_truncated",
+    "note": "roleplay marker, then a truncated call",
+    "raw": "{微笑}好：{\"tool\": \"web_search\", \"args\": {\"query\": \"夏"
+  },
+  {
+    "id": "adv.cut_after_backslash",
+    "note": "cut immediately after a backslash escape",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"路徑是 C:\\\\"
+  },
+  {
+    "id": "adv.cut_inside_nested_array",
+    "note": "cut inside an array nested in the args",
+    "raw": "{\"tool\": \"web_search\", \"args\": {\"queries\": [\"夏祭\", \"花火"
+  },
+  {
+    "id": "adv.array_cut_between_items",
+    "note": "array cut between two items",
+    "raw": "[{\"kind\": \"semantic\", \"content\": \"likes jazz\"}, {\"kind\": \"episodic\", "
+  },
+  {
+    "id": "adv.array_cut_inside_string",
+    "note": "array cut mid-string",
+    "raw": "[{\"kind\": \"semantic\", \"content\": \"他住在東"
+  },
+  {
+    "id": "adv.array_of_scalars",
+    "note": "an array with no objects in it",
+    "raw": "[1, 2, 3]"
+  },
+  {
+    "id": "adv.array_mixed",
+    "note": "an array mixing objects and scalars",
+    "raw": "[\"note\", {\"kind\": \"semantic\", \"content\": \"loves cats\"}, 7]"
+  },
+  {
+    "id": "adv.misnested",
+    "note": "a region that closes in the wrong order",
+    "raw": "{\"a\": [ } ]"
+  },
+  {
+    "id": "adv.extra_closer",
+    "note": "one closing brace too many",
+    "raw": "{\"a\": 1}}"
+  },
+  {
+    "id": "adv.deep_nesting",
+    "note": "four levels of nesting",
+    "raw": "{\"a\": {\"b\": {\"c\": {\"d\": [1, {\"e\": \"f\"}]}}}}"
+  },
+  {
+    "id": "adv.unicode_escapes",
+    "note": "\\u escapes in a string value",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"\\u590f\\u796d\"}}"
+  },
+  {
+    "id": "adv.fence_no_newline",
+    "note": "fence with no newline before the payload",
+    "raw": "```json{\"tool\": \"echo\", \"args\": {}}```"
+  },
+  {
+    "id": "adv.fence_unclosed",
+    "note": "an opening fence that never closes",
+    "raw": "```json\n{\"tool\": \"echo\", \"args\": {\"text\": \"hi\"}}"
+  },
+  {
+    "id": "adv.full_width_colon",
+    "note": "full-width punctuation inside the payload",
+    "raw": "{\"tool\": \"echo\", \"args\": {\"text\": \"他說：「好」\"}}"
+  },
+  {
+    "id": "adv.newlines_in_payload",
+    "note": "pretty-printed multi-line object",
+    "raw": "{\n  \"tool\": \"web_search\",\n  \"args\": {\n    \"query\": \"夏祭\"\n  }\n}"
+  },
+  {
+    "id": "adv.numbers_and_null",
+    "note": "nulls, floats and booleans",
+    "raw": "{\"a\": null, \"b\": 1.5, \"c\": true, \"d\": [null]}"
+  },
+  {
+    "id": "adv.empty_array",
+    "note": "the empty array",
+    "raw": "[]"
+  },
+  {
+    "id": "adv.array_then_object",
+    "note": "an array followed by an object",
+    "raw": "[{\"a\": 1}]\n{\"b\": 2}"
+  },
+  {
+    "id": "adv.object_then_array",
+    "note": "an object followed by an array",
+    "raw": "{\"a\": 1}\n[{\"b\": 2}]"
+  },
+  {
+    "id": "story.scene_opener_literal_newline",
+    "note": "DH2-story: scene opener narration with a literal newline byte inside a JSON string value (models write real line breaks instead of \\n escapes for multi-paragraph narration); strict json.loads must reject this, strict=False must accept it",
+    "raw": "{\"narration\": \"夜風有點涼。\n\n她靠在欄杆上，看著遠處的燈火。\", \"character_line\": \"你今天怎麼這麼晚才回來？\", \"title\": \"深夜的陽台\", \"location\": \"公寓陽台\", \"mood\": \"平靜又有點緊張\"}"
+  },
+  {
+    "id": "wave_persona.single_backtick_wrap",
+    "note": "DH2-persona: one backtick either side, not a real ``` fence — the address/coherence-detector char-strip idiom is gated on startswith('```') and would not touch this at all",
+    "raw": "`{\"salutation\": \"哥哥\"}`"
+  },
+  {
+    "id": "wave_persona.array_of_plain_strings",
+    "note": "DH2-persona: phrase-habit's real output shape — a JSON array of bare strings, not the array-of-objects shape the rest of the corpus favours",
+    "raw": "[\"結尾常加『欸』\", \"開場常用『嗯～』\"]"
+  },
+  {
+    "id": "wave_persona.array_of_plain_strings_fenced",
+    "note": "DH2-persona: the string-array shape wrapped in a ```json fence",
+    "raw": "```json\n[\"結尾常加『欸』\", \"開場常用『嗯～』\"]\n```"
+  },
+  {
+    "id": "wave_persona.array_of_plain_strings_truncated",
+    "note": "DH2-persona: string array cut mid-item, no closing bracket",
+    "raw": "[\"結尾常加『欸』\", \"開場常用『嗯"
+  },
+  {
+    "id": "wave_persona.labeled_bool_object",
+    "note": "DH2-persona: a labelled boolean-flag object (decider/curiosity-planner should_send / should_ask shape)",
+    "raw": "{\"should_ask\": false, \"safety_reason\": \"太早問\", \"avoid\": [\"別問收入\"]}"
+  },
+  {
+    "id": "wave_persona.empty_actions_object",
+    "note": "DH2-persona: consolidator's explicit \"nothing to do\" answer — still a real object, not prose",
+    "raw": "{\"actions\": []}"
+  },
+  {
+    "id": "wave_persona.uppercase_json_fence_label",
+    "note": "DH2-persona: ```JSON fence label in caps — exercises the .lower() prefix-drop path in the address/coherence char-strip idiom",
+    "raw": "```JSON\n{\"should_send\": true, \"message\": \"嗨\"}\n```"
+  },
+  {
+    "id": "wave_persona.actions_array_truncated",
+    "note": "DH2-persona: consolidator-shaped object cut mid-string inside a nested actions array",
+    "raw": "{\"actions\": [{\"type\": \"promote\", \"candidate_id\": \"abc123\", \"field_key\": \"occupation\", \"value\": \"工程師\", \"new_confidence\": 0.9, \"reason\": \"對方明確自"
+  },
+  {
+    "id": "wave_persona.address_observer_fenced_clean",
+    "note": "DH2-persona: address-observer's real output shape inside a bare fence — old char-strip idiom parses this too, so this pins equal-value not just widening",
+    "raw": "```\n{\"salutation\": \"哥哥\", \"formality_level\": \"medium\", \"response_length_pref\": \"short\", \"evidence_quote\": \"哥哥你在幹嘛\"}\n```"
+  },
+  {
+    "id": "wave_persona.address_observer_preamble",
+    "note": "DH2-persona: address-observer's output shape behind a preamble sentence — old whole-string json.loads never even tries (body doesn't start with a fence), new anchor-and-scan widens",
+    "raw": "這是我的判斷：\n{\"salutation\": \"哥哥\", \"formality_level\": \"medium\", \"response_length_pref\": \"short\", \"evidence_quote\": \"哥哥你在幹嘛\"}"
+  },
+  {
+    "id": "pathological.unclosed_array_nesting",
+    "note": "FX1/DH-1: a model stuck in a repetition loop emits nothing but openers. json.loads recurses once per level and raises RecursionError (not JSONDecodeError) — the crash that used to escape parse_tool_call and kill the whole turn",
+    "raw": "[",
+    "repeat": 3000
+  },
+  {
+    "id": "pathological.unclosed_object_nesting",
+    "note": "FX1/DH-1: the brace flavour of the same loop. Fails shallower inside json.loads (a { must be followed by a key) but the scanners must still bound it",
+    "raw": "{",
+    "repeat": 3000
+  },
+  {
+    "id": "pathological.unclosed_mixed_nesting",
+    "note": "FX1/DH-1: alternating openers — nests as deep as the bracket flavour while looking object-shaped to a find('{') anchor",
+    "raw": "[{",
+    "repeat": 1500
+  },
+  {
+    "id": "pathological.contract_then_deep_nesting",
+    "note": "FX1/DH-1: the reported shape — a real tool-call envelope whose argument value runs away into ~3000 unclosed brackets, so the object anchor finds a legitimate '{' and the repair step is the thing that blows up",
+    "prefix": "{\"tool\": \"web_search\", \"args\": {\"queries\": ",
+    "raw": "[",
+    "repeat": 2999
+  },
+  {
+    "id": "pathological.balanced_deep_nesting",
+    "note": "FX1/DH-1: deep but *balanced* — no truncation to repair, so the crash would come from decoding the region itself rather than from the invented closers",
+    "prefix": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    "raw": "]",
+    "repeat": 1200
+  }
+]

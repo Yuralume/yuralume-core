@@ -311,6 +311,30 @@ class InMemoryBackgroundJobQueue(BackgroundJobQueuePort):
             rec.updated_at = now
             return True
 
+    async def withdraw_queued(
+        self, idempotency_key: str, *, now: datetime,
+    ) -> int:
+        now = ensure_utc(now)
+        async with self._mutex:
+            withdrawn = 0
+            for rec in self._records.values():
+                if (
+                    rec.idempotency_key != idempotency_key
+                    or rec.status != JobStatus.QUEUED
+                ):
+                    continue
+                # Parity with the SA adapter: ``claimed`` rows are skipped
+                # (their lease owner is the only party that may end them),
+                # and the retired row goes to the terminal ``superseded``
+                # marker so retention prunes it on the normal 7-day clock.
+                rec.status = JobStatus.SUPERSEDED
+                rec.lease_owner = None
+                rec.lease_until = None
+                rec.finished_at = now
+                rec.updated_at = now
+                withdrawn += 1
+            return withdrawn
+
     async def fail(
         self,
         job_id: str,

@@ -95,6 +95,10 @@ class PendingFollowUpComposeInput:
     tool_results: tuple[ToolOutcomeMessage, ...] = ()
     """What the requested tools returned — second pass only, failures
     included (see ``ScheduledPromiseComposeInput.tool_results``)."""
+    honesty_correction: str = ""
+    """Set ONLY on a re-compose ordered by the HV1 honesty gate — see
+    ``ScheduledPromiseComposeInput.honesty_correction``. Empty on every
+    ordinary compose, leaving the rendered prompt byte-identical."""
 
 
 @dataclass(frozen=True, slots=True)

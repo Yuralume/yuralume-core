@@ -36,6 +36,7 @@ from kokoro_link.contracts.address_change_log import (
 from kokoro_link.contracts.initial_relationship import (
     CharacterOperatorRelationshipSeedRepositoryPort,
 )
+from kokoro_link.contracts.operator_persona import ADDRESS_NAME_FIELD_KEY
 from kokoro_link.domain.entities.character_operator_relationship_seed import (
     SCHEDULE_INVOLVEMENT_POLICIES,
     CharacterOperatorRelationshipSeed,
@@ -305,14 +306,21 @@ class RelationshipNamesService:
 
         A chat-``observed`` change writes the persona name at a lower
         confidence and never retires a deliberate settings edit; a
-        ``player_edit`` is authoritative."""
+        ``player_edit`` is authoritative.
+
+        Reversible on purpose: this is one of the three writes a turn's
+        rename makes, and TU5's undo reverses all three. The reverse of
+        this one is ``OperatorPersonaRepositoryPort
+        .revert_field_write_since``, which finds the row by the value
+        written here — so a change to *what* value lands has to be made
+        knowing the undo identifies the write by it."""
         if self._persona_service is None:
             return
         try:
             await self._persona_service.set_explicit_field_for_operator(
                 character_id=character_id,
                 operator_id=operator_id,
-                field_key="name",
+                field_key=ADDRESS_NAME_FIELD_KEY,
                 value=new_value,
                 observed=(source == SOURCE_OBSERVED),
                 now=when,

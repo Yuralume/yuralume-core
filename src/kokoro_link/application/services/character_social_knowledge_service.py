@@ -29,7 +29,10 @@ from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.character_peer_profile import CharacterPeerProfile
 from kokoro_link.domain.entities.character_relationship import CharacterRelationship
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_PRIVATE,
+    MemoryItem,
+)
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.infrastructure.prompt.memory_lines import format_memory_line
@@ -536,8 +539,15 @@ def _render_peer_memory_line(
     Reuses the chat renderer (participant tag + relative-time suffix) so
     encounter and chat quote memories identically; hearsay additionally
     gets an explicit second-hand marker because a bare "聽說資訊" section
-    header does not exist in this bucketed context."""
-    rendered = format_memory_line(memory, now=now)
+    header does not exist in this bucketed context.
+
+    ``knowledge_frame=False``: this prompt reasons about what a *peer
+    character* knows, not the player, and the KB7 disclosure ledger says
+    nothing about that axis (``PLAYER_KNOWLEDGE_BOUNDARY_PLAN`` §3.2
+    excludes the character↔character surfaces; the peer axis belongs to
+    ``CHARACTER_SOCIAL_KNOWLEDGE_PLAN``). Telling this prompt 「玩家不知道
+    這件事」 would answer a question it never asked."""
+    rendered = format_memory_line(memory, now=now, knowledge_frame=False)
     body = rendered[2:] if rendered.startswith("- ") else rendered
     if memory.kind is MemoryKind.HEARSAY:
         return f"  - （聽說、未經證實）{body}"
@@ -583,6 +593,9 @@ def _seed_memory(
         salience=0.64,
         tags=("relationship_seed", "peer_fact", f"peer:{peer_character_id}"),
         created_at=now,
+        # KB6: background consolidation of what one character knows about
+        # another. No player turn produced it and no player saw it.
+        player_knowledge=PLAYER_KNOWLEDGE_PRIVATE,
         participants=(
             ParticipantRef(
                 actor_kind="character",

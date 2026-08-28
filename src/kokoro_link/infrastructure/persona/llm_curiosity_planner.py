@@ -1,8 +1,11 @@
-"""LLM-backed planner for conversational persona discovery."""
+"""LLM-backed planner for conversational persona discovery.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the field bounds and layer/topic validation.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -25,6 +28,7 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -160,7 +164,12 @@ def _render_attempts(context: PersonaCuriosityContext) -> str:
 
 
 def _parse_plan(raw: str) -> PersonaCuriosityPlan:
-    obj = _extract_object(raw or "")
+    # The prompt unconditionally asks for one JSON object (a
+    # ``should_ask: false`` branch is still an object), so a cut reply
+    # is worth repairing and any non-clean parse is worth a log line.
+    outcome = extract_object_outcome(raw or "")
+    log_parse_outcome(_LOGGER, outcome, site="persona.llm_curiosity_planner")
+    obj = outcome.value
     if obj is None:
         return PersonaCuriosityPlan.no_ask()
     should_ask = obj.get("should_ask") is True
@@ -222,38 +231,6 @@ def _with_planner_metadata(
         avoid=plan.avoid,
         planner_metadata=planner_metadata,
     )
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    parsed = json.loads(text[start:index + 1])
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _parse_layer(raw: Any) -> int | None:

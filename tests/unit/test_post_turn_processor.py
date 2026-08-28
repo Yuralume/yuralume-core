@@ -210,6 +210,29 @@ async def test_post_turn_prompt_states_absolute_date_discipline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_turn_prompt_gates_current_intent_arc_disclosure() -> None:
+    """KB9 (2026-08-25 incident, fifth ring): ``current_intent`` is
+    player-visible *and* gets written back verbatim into next round's
+    fact layer and the proactive decider — a beat the player was never
+    in leaking through here self-replicates every round after. The
+    template must tell the model to keep it unnamed in that case."""
+    model = _ScriptedModel('{"memories": []}')
+    processor = LLMPostTurnProcessor(model=model)
+
+    await processor.process(
+        character=_character(),
+        conversation_id="conv-1",
+        user_message="今天怎麼樣？",
+        assistant_message="還好，就一般般。",
+    )
+
+    prompt = model.prompts[0]
+    assert "只能寫成不點名的模糊意圖" in prompt
+    assert "不可以點出玩家沒聽過的人名／地名／事件" in prompt
+    assert "只有當玩家自己也在場、或對話脈絡顯示玩家已經知道時，才可以點名" in prompt
+
+
+@pytest.mark.asyncio
 async def test_nsfw_content_mode_injects_born_safe_memory_instruction() -> None:
     model = _ScriptedModel('{"memories": []}')
     processor = LLMPostTurnProcessor(model=model)

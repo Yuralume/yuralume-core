@@ -54,6 +54,13 @@ from kokoro_link.infrastructure.cloud.hosted_channel_proactive_client import (
     HostedChannelProactiveClient,
 )
 
+# Consumer-facing fallback text for a channel decline that carried no body
+# ``reason`` (LQ-F2) — preserves the string every existing consumer (notably
+# the LINE reactivation candidate listing) already saw before the channel
+# started sending specific reasons, so an absent body field cannot silently
+# change what an operator reads.
+_FALLBACK_NO_ENDPOINT_REASON = "no active channel endpoint"
+
 _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_ELIGIBLE_TTL_SECONDS = 60.0
@@ -89,8 +96,10 @@ class HostedChannelProactiveDeliveryAdapter(ExternalProactiveDeliveryPort):
         self._eligible_ttl = max(0.0, eligible_ttl_seconds)
         self._negative_ttl = max(0.0, negative_ttl_seconds)
         self._monotonic = monotonic
-        # key -> (eligible, expires_at_monotonic)
-        self._cache: dict[tuple[str, str, str], tuple[bool, float]] = {}
+        # key -> (eligible, reason, expires_at_monotonic)
+        self._cache: dict[
+            tuple[str, str, str], tuple[bool, str | None, float],
+        ] = {}
 
     async def check_eligibility(
         self, character_id: str,
@@ -108,7 +117,7 @@ class HostedChannelProactiveDeliveryAdapter(ExternalProactiveDeliveryPort):
         if cached is not None:
             return cached
         try:
-            eligible = await self._client.get_eligibility(
+            verdict = await self._client.get_eligibility(
                 tenant_id=tenant_id,
                 account_id=account_id,
                 character_id=character_id,
@@ -116,18 +125,30 @@ class HostedChannelProactiveDeliveryAdapter(ExternalProactiveDeliveryPort):
         except ChannelDeliveryTransientError:
             # Retryable failure — answer negative with the short TTL. Acceptance
             # revalidates, so a brief false-negative only defers, never misroutes.
-            self._store(key, eligible=False)
+            reason = "channel eligibility unavailable"
+            self._store(key, eligible=False, reason=reason)
             return DeliveryEligibility(
                 eligible=False,
-                reason="channel eligibility unavailable",
+                reason=reason,
                 ttl_seconds=self._negative_ttl,
             )
-        self._store(key, eligible=eligible)
+        # LQ-F2: carry the channel body's own reason through verbatim (e.g.
+        # ``quota_character_monthly_exhausted``) instead of collapsing every
+        # decline to the same generic string — the LINE reactivation candidate
+        # listing renders this to an operator, who must not be sent chasing a
+        # binding that is not actually broken. A decline the channel did not
+        # explain falls back to the pre-LQ-F2 text so an absent body field
+        # cannot silently change what existing consumers see.
+        reason = (
+            None if verdict.eligible
+            else (verdict.reason or _FALLBACK_NO_ENDPOINT_REASON)
+        )
+        self._store(key, eligible=verdict.eligible, reason=reason)
         return DeliveryEligibility(
-            eligible=eligible,
-            reason=None if eligible else "no active channel endpoint",
+            eligible=verdict.eligible,
+            reason=reason,
             ttl_seconds=(
-                self._eligible_ttl if eligible else self._negative_ttl
+                self._eligible_ttl if verdict.eligible else self._negative_ttl
             ),
         )
 
@@ -263,18 +284,20 @@ class HostedChannelProactiveDeliveryAdapter(ExternalProactiveDeliveryPort):
         entry = self._cache.get(key)
         if entry is None:
             return None
-        eligible, expires_at = entry
+        eligible, reason, expires_at = entry
         if self._monotonic() >= expires_at:
             self._cache.pop(key, None)
             return None
         return DeliveryEligibility(
             eligible=eligible,
-            reason=None if eligible else "no active channel endpoint",
+            reason=reason,
             ttl_seconds=(
                 self._eligible_ttl if eligible else self._negative_ttl
             ),
         )
 
-    def _store(self, key: tuple[str, str, str], *, eligible: bool) -> None:
+    def _store(
+        self, key: tuple[str, str, str], *, eligible: bool, reason: str | None,
+    ) -> None:
         ttl = self._eligible_ttl if eligible else self._negative_ttl
-        self._cache[key] = (eligible, self._monotonic() + ttl)
+        self._cache[key] = (eligible, reason, self._monotonic() + ttl)

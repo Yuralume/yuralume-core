@@ -17,7 +17,6 @@ LLM-first 紅線:
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -32,6 +31,7 @@ from kokoro_link.domain.entities.self_reflection import SelfReflection
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_NARRATIVE_CHARS = 480
@@ -69,14 +69,10 @@ class LLMSelfReflectionGenerator(SelfReflectionGeneratorPort):
             )
             return None
 
-        body = _extract_json_object(raw)
-        if body is None:
-            return None
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(parsed, dict):
+        outcome = extract_object_outcome(raw)
+        log_parse_outcome(_LOGGER, outcome, site="reflection.llm_generator")
+        parsed = outcome.value
+        if parsed is None:
             return None
 
         narrative = _coerce_str(parsed.get("narrative"))[:_MAX_NARRATIVE_CHARS]
@@ -186,29 +182,3 @@ def _coerce_str_list(value: Any, *, limit: int) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        ch = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None

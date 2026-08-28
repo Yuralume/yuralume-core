@@ -4,12 +4,24 @@ LLM responses often wrap JSON in code fences, prepend preambles, or
 append trailing commentary. This module extracts the first balanced
 JSON array from arbitrary text so the extractor can survive sloppy
 formatting without forcing a specific prompt style.
+
+The balance scanning itself lives in ``kokoro_link.llm_output``; what
+remains here is the contract this parser owns — "an array of objects,
+and nothing else counts".
+
+Also used by the schedule planner and the weather-drift adjuster, whose
+prompts share the same array-of-objects shape.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 from typing import Any
+
+from kokoro_link.llm_output import extract_array_outcome, log_parse_outcome
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def parse_memory_payload(raw: str) -> list[dict[str, Any]]:
@@ -17,48 +29,14 @@ def parse_memory_payload(raw: str) -> list[dict[str, Any]]:
 
     Never raises. Returns an empty list when no JSON array is found or
     when the payload is not an array of objects.
+
+    Every caller's prompt demands an array — an empty one when there is
+    nothing to report — so *any* failure here is the model ignoring the
+    contract, and worth a warning rather than the silent ``[]`` this
+    used to return. The return value is unchanged.
     """
-    candidate = _extract_array(raw)
-    if candidate is None:
+    outcome = extract_array_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="memory.parse_memory_payload")
+    if outcome.value is None:
         return []
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return [entry for entry in parsed if isinstance(entry, dict)]
-
-
-def _extract_array(text: str) -> str | None:
-    """Return the first top-level JSON array substring, or ``None``.
-
-    Walks the string with a small state machine that tracks quoting and
-    escape sequences so brackets inside strings do not throw off the
-    depth counter.
-    """
-    start = text.find("[")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "[":
-            depth += 1
-        elif char == "]":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
+    return [entry for entry in outcome.value if isinstance(entry, dict)]

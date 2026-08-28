@@ -2,8 +2,19 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { CloseOutlined } from '@ant-design/icons-vue'
-import { UiButton } from '@/components/ui'
+import { UiButton, UiInput, UiTextarea } from '@/components/ui'
+import IdentityCardPicker from '@/components/IdentityCardPicker.vue'
 import type { InitialRelationshipPayload } from '@/types/character'
+import {
+  IDENTITY_CARD_NAME_MAX_CHARS,
+  type IdentityCard,
+} from '@/utils/api/identityCards'
+import {
+  applyIdentityCardToForm,
+  buildIdentityCardContent,
+} from '@/utils/identityCard'
+import type { CharacterCreationFollowUp } from '@/utils/characterCreationFollowUp'
+import { PLAYER_PERSONA_NOTE_MAX_CHARS } from '@/utils/api/playerPersonaNote'
 import {
   analyzeCharacterCreationIntake,
   type CharacterCardPreview,
@@ -18,7 +29,7 @@ import {
 import { buildCharacterCardIntakeDraft } from '@/utils/characterCardInitialRelationship'
 import {
   buildInitialRelationshipPayload,
-  emptyInitialRelationshipForm,
+  newCharacterInitialRelationshipForm,
 } from '@/composables/useInitialRelationshipForm'
 
 const props = defineProps<{
@@ -34,11 +45,22 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  confirm: [payload: InitialRelationshipPayload | null]
+  /**
+   * 送出。第一個參數是既有的關係 seed（略過＝`null`），語意一字未改。
+   *
+   * 第二個參數是 IC2 新增的「建角成功之後才做得到的事」（寫玩家人設補充、
+   * 存成身分卡）——精靈送出時角色還不存在，所以這兩件事只能由呼叫端拿到
+   * character id 之後執行（見 `useCharacterCreationFollowUp`）。完全沒碰
+   * 人設欄與存卡勾選時它是一包空的，呼叫端一個請求都不會多發。
+   */
+  confirm: [
+    payload: InitialRelationshipPayload | null,
+    followUp: CharacterCreationFollowUp,
+  ]
 }>()
 
 const { t, locale } = useI18n()
-const form = ref(emptyInitialRelationshipForm())
+const form = ref(newCharacterInitialRelationshipForm())
 const intakeLoading = ref(false)
 const intakeRound = ref(0)
 const intakeQuestions = ref<CharacterCreationIntakeQuestion[]>([])
@@ -48,8 +70,39 @@ const intakePassed = ref(false)
 const intakeStale = ref(false)
 const intakeError = ref<string | null>(null)
 
+/**
+ * 「你的人設」（PP 系列的 `player_persona_note`）。
+ *
+ * 不在 `form` 裡：它不是關係 seed 的一部分，寫入路徑也不同（建角成功後才
+ * 走 `PUT /characters/{id}/player-persona-note`）。混進 form 會讓
+ * `buildInitialRelationshipPayload` 多一個它不該認識的欄位。
+ */
+const personaNote = ref('')
+const saveAsIdentityCard = ref(false)
+const identityCardName = ref('')
+
+const personaNoteMaxChars = PLAYER_PERSONA_NOTE_MAX_CHARS
+const identityCardNameMaxChars = IDENTITY_CARD_NAME_MAX_CHARS
+const personaNoteCounter = computed(() => t('playerPersonaNote.counter', {
+  used: personaNote.value.length,
+  max: personaNoteMaxChars,
+}))
+
 const payload = computed(() => buildInitialRelationshipPayload(form.value))
 const canSubmitSeed = computed(() => payload.value !== null)
+/**
+ * 送出鍵的閘。
+ *
+ * 除了既有的「seed 有值」之外，只填了人設也算有東西可送——那時關係 seed
+ * 照舊送 `null`（等同略過），但人設仍會在建角後寫進去。勾了存卡就必須有卡
+ * 名，否則按下去會拿到一個必然的 422。
+ */
+const canSubmit = computed(() => {
+  if (!canSubmitSeed.value && !personaNote.value.trim()) return false
+  if (!saveAsIdentityCard.value) return true
+  const name = identityCardName.value.trim()
+  return Boolean(name) && name.length <= identityCardNameMaxChars
+})
 const intakeActionLabel = computed(() => {
   if (intakeLoading.value) return t('playerSidebar.characterCards.relationship.analyzing')
   return intakeChecked.value
@@ -65,13 +118,16 @@ const showIntakeFeedback = computed(() => Boolean(
 
 watch(() => props.visible, (visible) => {
   if (visible) {
-    const fresh = emptyInitialRelationshipForm()
+    const fresh = newCharacterInitialRelationshipForm()
     // Pre-fill known_context from a converted SillyTavern scenario (D5).
     // The importer still edits/confirms it before it seeds anything.
     if (props.suggestedKnownContext) {
       fresh.known_context = props.suggestedKnownContext
     }
     form.value = fresh
+    personaNote.value = ''
+    saveAsIdentityCard.value = false
+    identityCardName.value = ''
     resetIntakeState()
   }
 })
@@ -85,12 +141,51 @@ function close() {
 
 function skip() {
   if (props.loading || intakeLoading.value) return
-  emit('confirm', null)
+  // 「略過」只略過**關係 seed**（第一個參數照舊是 null），不是略過整個表單。
+  //
+  // 人設與存卡不是關係 seed 的一部分：玩家打完人設、勾了存卡，再按下這顆
+  // 「先不設定關係」，合理的期待是那兩件事照做。過去這裡送一包空的後續工
+  // 作，等於把玩家剛填的東西無聲丟掉——沒有提示、沒有二次確認，只有事後發
+  // 現卡沒存到。都沒填時 `buildFollowUp()` 本來就是空的，
+  // `hasCharacterCreationFollowUpWork` 會擋掉，零請求的既有行為一字未變。
+  emit('confirm', null, buildFollowUp())
 }
 
 function confirm() {
   if (props.loading || intakeLoading.value) return
-  emit('confirm', payload.value)
+  emit('confirm', payload.value, buildFollowUp())
+}
+
+function buildFollowUp(): CharacterCreationFollowUp {
+  return {
+    personaNote: personaNote.value.trim(),
+    saveCardName: saveAsIdentityCard.value
+      ? identityCardName.value.trim()
+      : null,
+    // 送出當下的快照。卡片之後再改不影響這次建的角色，這次改了表單也不會
+    // 回寫任何既有卡片（IC 計畫 §1「套用語意＝複製快照」）。
+    cardContent: buildIdentityCardContent(form.value, personaNote.value),
+  }
+}
+
+/**
+ * 帶入一張身分卡：11 個 seed 欄位 ＋ 人設一起填進表單。
+ *
+ * 純填值，不建立任何持續連結——填完之後每一欄都照常可改，改了也不回寫卡
+ * 片。卡片已經回答過的欄位順手把對應的 intake 追問撤掉，比照玩家自己回答
+ * 追問時的既有處理，不讓玩家對著已經有答案的欄位再被問一次。
+ *
+ * 「有值才覆寫」——空欄代表這張卡對那欄沒意見，不是「請把它清空」（見
+ * `applyIdentityCardToForm`）。人設欄跟著同一條規則：卡片沒帶人設時，玩家
+ * 剛打的那段留著。
+ */
+function applyIdentityCard(card: IdentityCard) {
+  const answered = applyIdentityCardToForm(form.value, card)
+  const personaFromCard = (card.persona_note ?? '').trim()
+  if (personaFromCard) personaNote.value = personaFromCard
+  for (const field of answered) removeAnsweredIntakeQuestion(field)
+  markIntakeStale()
+  intakeError.value = null
 }
 
 async function runRelationshipIntake() {
@@ -206,6 +301,12 @@ function resetIntakeState() {
         <p class="field-hint">
           {{ t('playerSidebar.characterCards.relationship.hint') }}
         </p>
+
+        <IdentityCardPicker
+          :active="visible"
+          :disabled="loading || intakeLoading"
+          @select="applyIdentityCard"
+        />
 
         <div v-if="showIntakeFeedback" class="relationship-wizard__intake">
           <div v-if="intakeError" class="intake-warning">
@@ -331,6 +432,9 @@ function resetIntakeState() {
           <input v-model="form.proactive_permission" type="checkbox" />
           <span>{{ t('characterCreate.initialRelationship.proactivePermission') }}</span>
         </label>
+        <p v-if="form.proactive_permission" class="field-hint">
+          {{ t('characterCreate.initialRelationship.proactivePermissionHint') }}
+        </p>
         <input
           v-if="form.proactive_permission"
           v-model="form.proactive_cadence_hint"
@@ -371,6 +475,41 @@ function resetIntakeState() {
           :placeholder="t('characterCreate.initialRelationship.notesPlaceholder')"
         />
 
+        <UiTextarea
+          v-model="personaNote"
+          :label="t('identityCard.personaNote.label')"
+          :placeholder="t('identityCard.personaNote.placeholder')"
+          :rows="3"
+          :maxlength="personaNoteMaxChars"
+          :disabled="loading"
+        />
+        <p class="field-hint">{{ t('identityCard.personaNote.hint', { name: cardName }) }}</p>
+        <p class="relationship-wizard__counter">{{ personaNoteCounter }}</p>
+
+        <div class="relationship-wizard__save-card">
+          <label class="relationship-wizard__checkbox">
+            <input
+              v-model="saveAsIdentityCard"
+              type="checkbox"
+              class="field-checkbox"
+              :disabled="loading || intakeLoading"
+            />
+            <span>{{ t('identityCard.save.checkbox') }}</span>
+          </label>
+          <template v-if="saveAsIdentityCard">
+            <UiInput
+              v-model="identityCardName"
+              :label="t('identityCard.save.nameLabel')"
+              :placeholder="t('identityCard.save.namePlaceholder')"
+              :disabled="loading"
+              required
+            />
+            <p class="field-hint">
+              {{ t('identityCard.save.hint', { max: identityCardNameMaxChars }) }}
+            </p>
+          </template>
+        </div>
+
         <footer class="relationship-wizard__actions">
           <UiButton variant="ghost" :disabled="loading || intakeLoading" @click="skip">
             {{ t('playerSidebar.characterCards.relationship.skipAction') }}
@@ -378,7 +517,7 @@ function resetIntakeState() {
           <UiButton
             variant="primary"
             :loading="loading"
-            :disabled="intakeLoading || !canSubmitSeed"
+            :disabled="intakeLoading || !canSubmit"
             @click="confirm"
           >
             {{ t('playerSidebar.characterCards.relationship.confirmAction') }}
@@ -531,6 +670,23 @@ function resetIntakeState() {
   border-color: rgba(147, 197, 253, 0.72);
   background: rgba(37, 99, 235, 0.22);
   color: #eff6ff;
+}
+
+.relationship-wizard__counter {
+  margin: -6px 0 0;
+  align-self: flex-end;
+  color: #9ca3af;
+  font-size: 0.78rem;
+}
+
+.relationship-wizard__save-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.72);
 }
 
 .relationship-wizard__checkbox {

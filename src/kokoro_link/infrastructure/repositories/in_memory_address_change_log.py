@@ -7,7 +7,10 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from kokoro_link.contracts.address_change_log import AddressChangeLogRepositoryPort
-from kokoro_link.domain.value_objects.address_change_event import AddressChangeEvent
+from kokoro_link.domain.value_objects.address_change_event import (
+    SOURCE_OBSERVED,
+    AddressChangeEvent,
+)
 
 
 class InMemoryAddressChangeLogRepository(AddressChangeLogRepositoryPort):
@@ -49,6 +52,24 @@ class InMemoryAddressChangeLogRepository(AddressChangeLogRepositoryPort):
             if e.character_id == character_id and e.operator_id == operator_id
         ]
         return sorted(matches, key=_sort_key, reverse=True)
+
+    async def delete_observed_since(
+        self, *, character_id: str, operator_id: str, since: datetime,
+    ) -> list[AddressChangeEvent]:
+        keep: list[AddressChangeEvent] = []
+        removed: list[AddressChangeEvent] = []
+        for event in self._events:
+            if (
+                event.character_id == character_id
+                and event.operator_id == operator_id
+                and event.source == SOURCE_OBSERVED
+                and _sort_key(event) >= since
+            ):
+                removed.append(event)
+            else:
+                keep.append(event)
+        self._events = keep
+        return removed
 
 
 def _sort_key(event: AddressChangeEvent) -> datetime:

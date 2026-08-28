@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_, select, update
@@ -30,6 +31,13 @@ from kokoro_link.domain.value_objects.visual_generation_style import (
     normalise_character_visual_generation_style,
 )
 from kokoro_link.infrastructure.persistence.models import CharacterRow
+
+
+_NAME_LOOKUP_CHUNK = 500
+"""Ids per ``IN`` clause in :meth:`SACharacterRepository.list_names`.
+Under SQLite's 999 bind-parameter ceiling with room to spare, and small
+enough that one oversized selection cannot build a statement PostgreSQL
+has to plan for thousands of literals."""
 
 
 def _ensure_utc(value: datetime | None) -> datetime | None:
@@ -202,6 +210,32 @@ class SACharacterRepository(CharacterRepositoryPort):
             if row is None:
                 return None
             return _row_to_domain(row)
+
+    async def list_names(
+        self, character_ids: Sequence[str],
+    ) -> dict[str, str]:
+        """Two columns for many ids, instead of many whole aggregates.
+
+        ``_row_to_domain`` rehydrates companions, loras, disposition,
+        image profiles and state from JSON; a caller that only wants a
+        label for a report row would pay all of it, per row, per poll."""
+        wanted = list(dict.fromkeys(character_ids))
+        if not wanted:
+            return {}
+        names: dict[str, str] = {}
+        async with self._session_factory() as session:
+            # Chunked because the bind-parameter ceiling is a real limit
+            # (SQLite's default is 999) and this is fed by an operator's
+            # selection, whose size is not ours to bound.
+            for start in range(0, len(wanted), _NAME_LOOKUP_CHUNK):
+                chunk = wanted[start : start + _NAME_LOOKUP_CHUNK]
+                result = await session.execute(
+                    select(CharacterRow.id, CharacterRow.name).where(
+                        CharacterRow.id.in_(chunk),
+                    )
+                )
+                names.update({row.id: row.name for row in result})
+        return names
 
     async def save(self, character: Character) -> None:
         async with self._session_factory() as session:

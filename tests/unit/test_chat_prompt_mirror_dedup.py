@@ -84,24 +84,35 @@ def test_mirror_pair_collapses_to_one_copy() -> None:
     assert result[1].created_at == web_copy.created_at
 
 
-def test_preferred_conversation_copy_wins_over_the_earlier_one() -> None:
-    """The rendered conversation's own row survives, not merely the first.
+def test_the_survivor_does_not_depend_on_who_is_asking() -> None:
+    """The earliest copy wins, whichever thread is being rendered.
 
-    The fan-out order is not guaranteed: the messaging adapter can land
-    first. The transcript the user is looking at must still keep its own
-    timestamps.
+    This reverses an earlier rule (the rendered conversation's own row
+    survived, so a transcript kept its own timestamps) and the reversal
+    is the point. The dialogue checkpoint identifies its coverage
+    boundary by the surviving copy's timestamp plus a fingerprint of it;
+    the prompt named a preferred conversation and the background
+    checkpoint updater — which has no conversation in hand — could not,
+    so the two picked different rows for the same sentence and then
+    disagreed about whether the boundary was covered. The visible
+    symptom is a line appearing inside the summary *and* verbatim in the
+    transcript under it.
+
+    So the rule takes no caller-supplied input at all: same list in,
+    same survivor out, on both sides of the feature.
     """
     telegram_copy = _assistant(MIRRORED_LINE, _at(70))
     web_copy = _assistant(MIRRORED_LINE, _at(69, 7))
     web_conversation = Conversation.start(character_id="c1", source="web")
     web_conversation = web_conversation.append(web_copy)
 
-    result = dedupe_mirrored_messages(
-        [telegram_copy, web_copy], preferred=web_conversation.messages,
-    )
+    result = dedupe_mirrored_messages([telegram_copy, web_copy])
 
     assert len(result) == 1
-    assert result[0].created_at == web_copy.created_at
+    # The telegram row landed first, and it survives even though the web
+    # conversation is the one a prompt would be rendering.
+    assert result[0].created_at == telegram_copy.created_at
+    assert web_conversation.messages[-1].created_at == web_copy.created_at
 
 
 def test_whitespace_only_differences_are_the_same_message() -> None:
@@ -323,13 +334,17 @@ async def test_mirrored_line_appears_once_per_prompt_rail() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_material_keeps_the_rendered_conversation_copy() -> None:
-    """Even when the messaging channel's row landed first, the surviving
-    copy is the one on the conversation being rendered."""
+async def test_prompt_material_keeps_the_copy_that_was_delivered_first(
+) -> None:
+    """The prompt keeps the original delivery even when it landed on the
+    *other* channel — the same copy the background checkpoint updater
+    keeps, which is the whole reason the choice is not the caller's."""
     prompt_builder = _RecordingPromptBuilder()
     chat_service, character_service, conversations, _ = _build_service(
         prompt_builder=prompt_builder,
     )
+    # ``web_first=False``: the telegram row is the earlier one, and the
+    # conversation being rendered is the web one.
     character_id, web = await _seed_mirrored_history(
         character_service, conversations, web_first=False,
     )
@@ -345,7 +360,7 @@ async def test_prompt_material_keeps_the_rendered_conversation_copy() -> None:
     contents = [m.content for m in prompt_builder.last_recent_messages]
     assert contents == ["早安", MIRRORED_LINE]
     survivor = prompt_builder.last_recent_messages[-1]
-    assert survivor.created_at == web.messages[-1].created_at
+    assert survivor.created_at < web.messages[-1].created_at
 
 
 @pytest.mark.asyncio

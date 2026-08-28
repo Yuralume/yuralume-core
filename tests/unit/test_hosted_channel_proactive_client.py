@@ -91,10 +91,11 @@ async def test_eligibility_200_eligible_true_with_path_and_auth_headers(
         )
 
     _install(monkeypatch, handler)
-    eligible = await _client().get_eligibility(
+    verdict = await _client().get_eligibility(
         tenant_id="t1", account_id="a1", character_id="c1",
     )
-    assert eligible is True
+    assert verdict.eligible is True
+    assert verdict.reason is None
     assert seen["url"] == (
         "https://channel.example/internal/v1/delivery-eligibility/t1/a1/c1"
     )
@@ -124,10 +125,13 @@ async def test_eligibility_200_eligible_false_is_false_and_logs_reason(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.INFO):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is False
+    assert verdict.eligible is False
+    # LQ-F2: the channel's own reason rides the verdict verbatim, not just the
+    # log — the LINE reactivation candidate listing surfaces it to an operator.
+    assert verdict.reason == "not_opted_in"
     assert "not_opted_in" in caplog.text
     # Module logging discipline: identifiers never reach this module's log —
     # correlation lives server-side in the channel's delivery ledger. (Scoped
@@ -143,6 +147,36 @@ async def test_eligibility_200_eligible_false_is_false_and_logs_reason(
 
 
 @pytest.mark.asyncio
+async def test_eligibility_200_quota_exhausted_reason_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LQ-F2: a quota decline must read as a quota decline downstream.
+
+    Before LQ-F2 every decline collapsed to the same generic string by the
+    time it reached the LINE reactivation candidate listing, so an operator
+    facing a merely-exhausted-quota character had no way to tell it apart
+    from a genuinely broken binding. The channel's specific reason string
+    must survive the client layer untouched.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "eligible": False,
+                "ttl_seconds": 30,
+                "reason": "quota_character_monthly_exhausted",
+            },
+        )
+
+    _install(monkeypatch, handler)
+    verdict = await _client().get_eligibility(
+        tenant_id="t1", account_id="a1", character_id="c1",
+    )
+    assert verdict.eligible is False
+    assert verdict.reason == "quota_character_monthly_exhausted"
+
+
+@pytest.mark.asyncio
 async def test_eligibility_200_declined_without_reason_still_false(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -151,10 +185,14 @@ async def test_eligibility_200_declined_without_reason_still_false(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.INFO):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is False
+    assert verdict.eligible is False
+    # The log line still says "unspecified" (existing log discipline), but the
+    # propagated verdict carries None so callers apply their OWN fallback text
+    # instead of "unspecified" leaking into a consumer-facing surface.
+    assert verdict.reason is None
     assert "unspecified" in caplog.text
 
 
@@ -172,10 +210,11 @@ async def test_eligibility_200_missing_field_keeps_legacy_true_with_warning(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.WARNING):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is True
+    assert verdict.eligible is True
+    assert verdict.reason is None
     assert any(
         record.levelno == logging.WARNING for record in caplog.records
     )
@@ -202,10 +241,10 @@ async def test_eligibility_200_unreadable_body_keeps_legacy_true_with_warning(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.WARNING):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is True
+    assert verdict.eligible is True
     assert any(
         record.levelno == logging.WARNING for record in caplog.records
     )
@@ -237,10 +276,10 @@ async def test_eligibility_200_hostile_body_degrades_to_legacy_true(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.WARNING):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is True
+    assert verdict.eligible is True
     assert any(
         record.levelno == logging.WARNING for record in caplog.records
     )
@@ -263,10 +302,10 @@ async def test_eligibility_200_invalid_utf8_reason_does_not_crash(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.INFO):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is False
+    assert verdict.eligible is False
     declines = [
         record.getMessage() for record in caplog.records
         if "eligibility declined" in record.getMessage()
@@ -288,10 +327,10 @@ async def test_eligibility_declined_reason_is_collapsed_to_one_log_line(
 
     _install(monkeypatch, handler)
     with caplog.at_level(logging.INFO):
-        eligible = await _client().get_eligibility(
+        verdict = await _client().get_eligibility(
             tenant_id="t1", account_id="a1", character_id="c1",
         )
-    assert eligible is False
+    assert verdict.eligible is False
     declines = [
         record for record in caplog.records
         if "eligibility declined" in record.getMessage()
@@ -306,6 +345,9 @@ async def test_eligibility_declined_reason_is_collapsed_to_one_log_line(
     reason = message.split("reason=", 1)[1].split(" — ", 1)[0]
     assert reason == expected
     assert len(reason) <= 120
+    # The same normalized/clamped text is what the verdict propagates —
+    # log line and consumer-facing reason must never disagree (LQ-F2).
+    assert verdict.reason == expected
 
 
 @pytest.mark.asyncio
@@ -314,10 +356,13 @@ async def test_eligibility_404_false(monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx.Response(404)
 
     _install(monkeypatch, handler)
-    eligible = await _client().get_eligibility(
+    verdict = await _client().get_eligibility(
         tenant_id="t1", account_id="a1", character_id="c1",
     )
-    assert eligible is False
+    assert verdict.eligible is False
+    # A bare 404 carries no body — the client never invents a reason string;
+    # the adapter layer supplies the consumer-facing fallback text (LQ-F2).
+    assert verdict.reason is None
 
 
 @pytest.mark.asyncio

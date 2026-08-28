@@ -24,6 +24,7 @@ def schedule_to_row(schedule: DailySchedule) -> DailyScheduleRow:
         date=schedule.date.isoformat(),
         generated_at=schedule.generated_at,
         is_planned=bool(schedule.is_planned),
+        manually_adjusted=bool(schedule.manually_adjusted),
         weather_vet_activity_id=schedule.weather_vet_activity_id,
         weather_vet_condition=schedule.weather_vet_condition,
     )
@@ -39,6 +40,7 @@ def apply_schedule_to_row(schedule: DailySchedule, row: DailyScheduleRow) -> Non
     row.date = schedule.date.isoformat()
     row.generated_at = schedule.generated_at
     row.is_planned = bool(schedule.is_planned)
+    row.manually_adjusted = bool(schedule.manually_adjusted)
     row.weather_vet_activity_id = schedule.weather_vet_activity_id
     row.weather_vet_condition = schedule.weather_vet_condition
     # Fully replace the activity collection; cascade delete-orphan cleans rows.
@@ -71,6 +73,7 @@ def _activity_to_row(
             activity.meeting_affordance.value
             if activity.meeting_affordance is not None else None
         ),
+        source_beat_id=activity.source_beat_id,
         memorialized=bool(activity.memorialized),
         has_memory=bool(activity.has_memory),
         companion_names_json=json.dumps(
@@ -95,6 +98,9 @@ def row_to_schedule(row: DailyScheduleRow) -> DailySchedule:
         # 2026-05-17 migration (column default fills True for them).
         # Treat the absence as "planned" to match historical behaviour.
         is_planned=bool(getattr(row, "is_planned", True)),
+        # Same tolerance for rows predating the manually-adjusted
+        # migration: absence means the operator never touched the day.
+        manually_adjusted=bool(getattr(row, "manually_adjusted", False)),
         # Same tolerance for rows predating the weather-vet migration: an
         # absent marker simply means the drift gate is open for that day.
         weather_vet_activity_id=getattr(row, "weather_vet_activity_id", None),
@@ -128,6 +134,9 @@ def _row_to_activity(row: ScheduleActivityRow) -> ScheduleActivity:
         participant_refs=refs,
         scene_privacy=getattr(row, "scene_privacy", None),
         meeting_affordance=getattr(row, "meeting_affordance", None),
+        # Rows written before the KB2 migration have no lineage recorded;
+        # absence reads as "an ordinary activity", the same as NULL.
+        source_beat_id=getattr(row, "source_beat_id", None),
     )
 
 

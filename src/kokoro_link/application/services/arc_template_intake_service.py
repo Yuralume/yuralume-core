@@ -52,6 +52,12 @@ from kokoro_link.domain.services.story_tone_policy import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import (
+    ParseReason,
+    extract_array_outcome,
+    extract_object_outcome,
+    log_parse_outcome,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"```(?:\w+)?\n?")
@@ -838,24 +844,75 @@ def _extract_json_object(raw: str) -> Any:
     """Locate the outermost JSON object / array in ``raw`` and parse it.
 
     Returns the parsed value or ``None`` on any failure. Tolerant of
-    leading prose, trailing commentary, and code fences — matches the
-    pattern used by other LLM-output adapters in the codebase.
+    leading prose, trailing commentary, and code fences (the shared
+    scanner is fence-agnostic — see ``kokoro_link.llm_output``).
+
+    DH2-services: this is the one site in the wave where object-vs-array
+    *branch selection* has to stay byte-identical to the pre-migration
+    helper rather than just delegating straight to the shared scanner.
+    The old code tried a crude (non-balanced, non-repairing) find/rfind
+    span for ``{...}`` first and only fell back to ``[...]`` when that
+    span failed to decode; every call site downstream only accepts a
+    ``dict`` back, so a genuinely array-shaped reply (multiple top-level
+    objects) has to keep losing to the array branch here exactly as it
+    did before — a raw balanced-scan-first swap would instead grab the
+    *first nested object* out of such a reply and hand it to a caller
+    expecting the whole draft, passing the ``isinstance(dict)`` gate
+    with a plausible-looking but wrong fragment instead of the safe
+    "not a dict, fall back" it used to get.
+
+    So branch selection still runs the old crude check; only the
+    *parsing* of whichever branch wins goes through the shared scanner
+    (balanced, repair-capable) — and when neither crude span decodes at
+    all (the most common truncation shape: the object never closes),
+    the shared scanner's repair still gets a final, wider try at the
+    object.
     """
     text = _strip_fences(raw or "").strip()
     if not text:
         return None
-    # Prefer object form; fall back to array form.
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = text.find(opener)
-        end = text.rfind(closer)
-        if start < 0 or end <= start:
-            continue
-        blob = text[start: end + 1]
-        try:
-            return json.loads(blob)
-        except json.JSONDecodeError:
-            continue
-    return None
+    if _crude_span_decodes(text, "{", "}"):
+        object_outcome = extract_object_outcome(raw)
+        if object_outcome.value is not None:
+            log_parse_outcome(_LOGGER, object_outcome, site="arc_template_intake.json")
+            return object_outcome.value
+    if _crude_span_decodes(text, "[", "]"):
+        array_outcome = extract_array_outcome(raw)
+        if array_outcome.value is not None:
+            log_parse_outcome(_LOGGER, array_outcome, site="arc_template_intake.json")
+            return array_outcome.value
+    object_outcome = extract_object_outcome(raw)
+    if object_outcome.reason is not ParseReason.NO_JSON:
+        # L2-4: one consumer of this helper — ``_parse_beat_summary_response``
+        # — treats a plain-prose reply as a *legal* answer (the summary
+        # is the whole response; the position proposal is simply absent),
+        # so ``no_json`` here is a design-sanctioned outcome, not a
+        # failure, and warning on it every time would bury the
+        # ``unbalanced`` / ``decode_error`` lines that do mean something.
+        # Same rule as ``tool_call_parser``: log only when the model
+        # looks like it attempted JSON and botched it.
+        log_parse_outcome(_LOGGER, object_outcome, site="arc_template_intake.json")
+    return object_outcome.value
+
+
+def _crude_span_decodes(text: str, opener: str, closer: str) -> bool:
+    """Old behaviour, preserved exactly: does the first-``opener`` to
+    last-``closer`` slice parse as JSON at all — no balance-awareness,
+    no repair. Used only to pick a branch; see ``_extract_json_object``.
+    """
+    start = text.find(opener)
+    end = text.rfind(closer)
+    if start < 0 or end <= start:
+        return False
+    try:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        # RecursionError, not just a decode error: a model stuck in a
+        # repetition loop emits thousands of nested openers and
+        # ``json.loads`` blows its C-stack guard on those. See
+        # ``llm_output.extract.MAX_NESTING_DEPTH``.
+        return False
+    return True
 
 
 def _coerce_str_list(

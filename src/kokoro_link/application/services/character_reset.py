@@ -44,7 +44,7 @@ and pinned these; this ticket does not revisit them):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from kokoro_link.application.dto.character_backup.consumer_policies import (
@@ -97,13 +97,29 @@ class RepositoryCharacterResetEraser:
     A flag with no repository wired reports zero rather than raising,
     matching pre-CD3 behaviour where an unwired repository silently left
     that flag's count at zero.
+
+    ``secondary`` is for the tables a flag purges that are **not** reached
+    through the primary repository and **not** reached by a parent
+    cascade either — a table with its own ``character_id`` column and its
+    own repository. ``dialogue_checkpoints`` is the one such table today:
+    the RESET policy names it under ``CONVERSATIONS`` explicitly because
+    nothing else would reach it, and a mode that skipped it would leave
+    the accumulated summary pointing at deleted messages, which the
+    prompt would then keep quoting back at a player who just cleared
+    their history. Their row counts are deliberately not reported — the
+    count is the *primary* table's, unchanged since pre-CD3.
     """
 
     def __init__(
         self,
         repositories: Mapping[ResetFlag, SupportsCharacterScopedDelete | None],
+        *,
+        secondary: Mapping[
+            ResetFlag, Sequence[SupportsCharacterScopedDelete | None]
+        ] | None = None,
     ) -> None:
         self._repositories = dict(repositories)
+        self._secondary = dict(secondary or {})
 
     async def erase(
         self, character_id: str, flags: frozenset[ResetFlag],
@@ -111,11 +127,14 @@ class RepositoryCharacterResetEraser:
         counts: dict[ResetFlag, int] = {}
         for flag in flags:
             repository = self._repositories.get(flag)
-            if repository is None:
-                counts[flag] = 0
-                continue
-            deleted = await repository.delete_for_character(character_id)
-            counts[flag] = int(deleted or 0)
+            counts[flag] = (
+                0 if repository is None
+                else int(await repository.delete_for_character(character_id)
+                         or 0)
+            )
+            for extra in self._secondary.get(flag, ()):
+                if extra is not None:
+                    await extra.delete_for_character(character_id)
         return counts
 
 

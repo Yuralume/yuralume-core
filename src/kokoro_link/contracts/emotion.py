@@ -2,7 +2,9 @@
 
 * ``EmotionEventRepositoryPort`` — append-only event store keyed on
   ``(character_id, operator_id)``. List queries are time-windowed so
-  the aggregator never scans the full history.
+  the aggregator never scans the full history; the one *removal* the
+  store offers besides character erasure is keyed on the cause instead,
+  because reversing a turn has to hit that turn's rows and no others.
 * ``EmotionAggregatorPort`` — pure function from event list + now →
   derived snapshot. Kept as a port so dream / disposition-drift can
   swap in alternative aggregation policies (e.g. seasonal weighting)
@@ -53,6 +55,35 @@ class EmotionEventRepositoryPort(Protocol):
         since: datetime,
         limit: int = 100,
     ) -> list[EmotionEvent]: ...
+
+    async def delete_by_cause(
+        self,
+        *,
+        character_id: str,
+        cause_ref_kind: str,
+        cause_ref_id: str,
+    ) -> int:
+        """Delete every event this one cause produced. Returns the count.
+
+        Keyed on the cause, never on a time window. The producer of
+        ``cause_ref_kind="turn"`` events is the *background* post-turn,
+        so a window anchored on when the turn started either misses the
+        events that land after it closes or swallows a neighbouring
+        turn's — and undo has exactly one job that a near-miss ruins.
+        The cause reference is the identity the writer already stamped,
+        so it is the identity the reverser reads.
+
+        ``character_id`` is part of the key for two reasons: it is the
+        indexed column on the table, which keeps the delete off a full
+        scan; and it confines an undo to the character whose turn is
+        being reversed, so a stray reference can never reach across.
+
+        Idempotent by construction — a second call finds nothing and
+        returns ``0``. Implementations return ``0`` rather than raising
+        when any part of the key is empty: a missing anchor means there
+        is nothing addressable to delete, not an error.
+        """
+        ...
 
     async def delete_for_character(
         self, character_id: str,

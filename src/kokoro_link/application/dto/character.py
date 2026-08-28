@@ -521,7 +521,11 @@ class CreateCharacterRequest(BaseModel):
     """Daily cap on autonomous feed-wall posts. ``0`` disables the
     feed for this character entirely (the composer's ``_is_feed_enabled``
     short-circuits before any LLM / image work)."""
-    world_awareness_enabled: bool = False
+    world_awareness_enabled: bool | None = None
+    """``None`` = let the service pick the TR1 frame-based default
+    (``domain.value_objects.world_frame.default_world_awareness_enabled``);
+    an explicit ``true``/``false`` (e.g. from an installed character card)
+    always wins over that default."""
     world_topics: list[str] = Field(default_factory=list)
     subscribed_categories: list[str] = Field(default_factory=list)
     """RSS category allow-list for this character's event-inbox curator."""

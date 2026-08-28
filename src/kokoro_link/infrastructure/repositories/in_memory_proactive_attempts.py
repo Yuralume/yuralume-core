@@ -4,15 +4,10 @@ from datetime import datetime
 
 from kokoro_link.contracts.proactive import ProactiveAttemptRepositoryPort
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
-from kokoro_link.domain.value_objects.proactive_outcome import ProactiveOutcome
-
-# Outcomes where the gate stopped the attempt before any expensive work
-# happened. Keeping the cooldown anchored to "last time we passed the
-# gate" means gate-blocked ticks don't extend the cooldown forever.
-_NON_GATE_PASSING_OUTCOMES = {
-    ProactiveOutcome.DISABLED,
-    ProactiveOutcome.GATE_BLOCKED,
-}
+from kokoro_link.domain.value_objects.proactive_outcome import (
+    NON_COOLDOWN_ANCHOR_OUTCOMES,
+    ProactiveOutcome,
+)
 
 
 class InMemoryProactiveAttemptRepository(ProactiveAttemptRepositoryPort):
@@ -65,7 +60,7 @@ class InMemoryProactiveAttemptRepository(ProactiveAttemptRepositoryPort):
         matches = [
             r for r in self._rows
             if r.character_id == character_id
-            and r.outcome not in _NON_GATE_PASSING_OUTCOMES
+            and r.outcome not in NON_COOLDOWN_ANCHOR_OUTCOMES
         ]
         if not matches:
             return None

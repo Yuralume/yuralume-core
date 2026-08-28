@@ -18,13 +18,22 @@ from kokoro_link.api.dependencies import (
     is_cloud_mode,
     require_admin,
 )
+from kokoro_link.api.routes.system import FeatureReasoningOverride
 from kokoro_link.application.services.nsfw_mode import (
     NsfwModeService,
     NsfwModeStatus,
     NsfwModeTarget,
     NsfwModeTargetError,
 )
+from kokoro_link.application.services.routing_reasoning import (
+    reasoning_override_from_fields,
+)
+from kokoro_link.application.services.routing_reasoning_validation import (
+    ReasoningEffortValidationError,
+    RoutingReasoningValidationService,
+)
 from kokoro_link.bootstrap.container import ServiceContainer
+from kokoro_link.contracts.llm import ReasoningOverrides
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 
 router = APIRouter(tags=["system"])
@@ -33,7 +42,13 @@ router = APIRouter(tags=["system"])
 class NsfwModeTargetPayload(BaseModel):
     llm_provider_id: str = Field(min_length=1)
     llm_model_id: str = Field(min_length=1)
-    image_profile_id: str = Field(min_length=1)
+    # JSON null = the operator explicitly disabled image generation while
+    # the mode is active (no fallback to a normal profile), not "unset".
+    image_profile_id: str | None = Field(default=None, min_length=1)
+    # Reasoning posture for the NSFW target itself — the normal route's
+    # feature/group postures never ride onto the reroute. ``null`` /
+    # all-default = keep the target connection's reasoning defaults.
+    reasoning: FeatureReasoningOverride | None = None
 
 
 class NsfwModePreferenceUpdate(BaseModel):
@@ -141,11 +156,19 @@ async def set_admin_nsfw_mode_target(
         )
     service = _require_service(container)
     _validate_target(payload, container=container)
+    reasoning = _reasoning_from_payload(payload.reasoning)
+    await _preflight_reasoning_effort(
+        reasoning,
+        provider_id=payload.llm_provider_id,
+        model_id=payload.llm_model_id,
+        container=container,
+    )
     try:
         target = await service.set_global_target(
             llm_provider_id=payload.llm_provider_id,
             llm_model_id=payload.llm_model_id,
             image_profile_id=payload.image_profile_id,
+            reasoning=reasoning,
         )
     except NsfwModeTargetError as exc:
         raise HTTPException(
@@ -175,18 +198,71 @@ def _validate_target(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"unknown llm provider id: {target.llm_provider_id!r}",
         )
-    if container.image_profile_registry.get_profile(target.image_profile_id) is None:
+    if (
+        target.image_profile_id is not None
+        and container.image_profile_registry.get_profile(target.image_profile_id)
+        is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"unknown image profile id: {target.image_profile_id!r}",
         )
 
 
+def _reasoning_from_payload(
+    reasoning: FeatureReasoningOverride | None,
+) -> ReasoningOverrides | None:
+    """Normalise the submitted posture — all-default collapses to None
+    (matching the routing-entry write-side rule)."""
+    if reasoning is None:
+        return None
+    return reasoning_override_from_fields(
+        disable_reasoning=reasoning.disable_reasoning,
+        reasoning_effort=reasoning.reasoning_effort,
+        thinking_budget_tokens=reasoning.thinking_budget_tokens,
+    )
+
+
+async def _preflight_reasoning_effort(
+    reasoning: ReasoningOverrides | None,
+    *,
+    provider_id: str,
+    model_id: str,
+    container: ServiceContainer,
+) -> None:
+    """Probe a free-text effort against the real target upstream before
+    persisting — same live preflight as the feature/group entries."""
+    if reasoning is None or reasoning.reasoning_effort is None:
+        return
+    validator = RoutingReasoningValidationService(container.model_registry)
+    try:
+        await validator.validate(
+            provider_id=provider_id,
+            model_id=model_id,
+            effort=reasoning.reasoning_effort,
+        )
+    except ReasoningEffortValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+
 def _target_to_payload(target: NsfwModeTarget) -> NsfwModeTargetPayload:
+    reasoning = target.reasoning
     return NsfwModeTargetPayload(
         llm_provider_id=target.llm_provider_id,
         llm_model_id=target.llm_model_id,
         image_profile_id=target.image_profile_id,
+        reasoning=(
+            FeatureReasoningOverride(
+                disable_reasoning=reasoning.disable_reasoning,
+                reasoning_effort=reasoning.reasoning_effort,
+                thinking_budget_tokens=reasoning.thinking_budget_tokens,
+            )
+            if reasoning is not None
+            else None
+        ),
     )
 
 

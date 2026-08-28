@@ -127,7 +127,24 @@ def _journal_to_payload(journal: TurnJournal) -> dict:
         "prev_goals": journal.prev_goals,
         "prev_active_arc": journal.prev_active_arc,
         "prev_daily_schedule": journal.prev_daily_schedule,
+        "had_active_arc": journal.had_active_arc,
+        "prev_open_follow_ups": journal.prev_open_follow_ups,
+        "prev_address_preference": journal.prev_address_preference,
+        "prev_scene_session": journal.prev_scene_session,
+        "turn_record_id": journal.turn_record_id,
     }
+
+
+def _optional_bool(raw: object) -> bool | None:
+    """``None`` stays ``None`` — it is the "never captured" state.
+
+    Written out because ``bool(None)`` is ``False``, and ``False`` here
+    is the value that licenses deleting an arc the turn created. A
+    journal from before the field existed must not be read as a licence.
+    """
+    if raw is None:
+        return None
+    return bool(raw)
 
 
 def _row_to_domain(row: TurnJournalRow) -> TurnJournal:
@@ -152,5 +169,10 @@ def _row_to_domain(row: TurnJournalRow) -> TurnJournal:
         prev_goals=list(payload.get("prev_goals") or []),
         prev_active_arc=payload.get("prev_active_arc"),
         prev_daily_schedule=payload.get("prev_daily_schedule"),
+        had_active_arc=_optional_bool(payload.get("had_active_arc")),
+        prev_open_follow_ups=list(payload.get("prev_open_follow_ups") or []),
+        prev_address_preference=payload.get("prev_address_preference"),
+        prev_scene_session=payload.get("prev_scene_session"),
+        turn_record_id=payload.get("turn_record_id") or None,
         created_at=created or datetime.now(timezone.utc),
     )

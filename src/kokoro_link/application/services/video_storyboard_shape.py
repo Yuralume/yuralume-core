@@ -45,6 +45,8 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from kokoro_link.llm_output import extract_object_outcome, first_region_is_array
+
 DEFAULT_CLIP_SECONDS = 5
 """The clip length every hosted I2V pass renders today. Threaded through
 rather than hard-coded in the prompt so a future provider with a
@@ -278,7 +280,6 @@ class NeutralStoryboard:
 
 _FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*")
 _FENCE_CLOSE_RE = re.compile(r"```\s*$")
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _SHOTS_ARRAY_RE = re.compile(r'"shots"\s*:\s*\[')
 
 SCHEMA_LEAK_MARKERS = (
@@ -305,24 +306,61 @@ def strip_code_fence(raw: str) -> str:
     return text
 
 
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly: does the first-``{`` to
+    last-``}`` slice parse as JSON at all. Behaviourally identical to
+    the old greedy ``\\{.*\\}`` (``DOTALL``) regex it replaces here — both
+    are "grab from the first opener to the last closer" — just spelled
+    with string methods instead of a pattern. Used only as a gate; see
+    ``decode_json_object``.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return False
+    try:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
 def decode_json_object(text: str) -> Mapping[str, object] | None:
-    """Whole document first, then the first ``{...}`` block inside prose."""
+    """Whole document first, then the first ``{...}`` block inside prose.
+
+    DH2-services: the second step used to be a **greedy** regex
+    (``\\{.*\\}``, ``DOTALL``) that ran from the first ``{`` to the
+    *last* ``}`` in the whole string. That crude span is now only used
+    to *gate* the swap to the shared scanner: when it already decodes
+    (the common single-object-reply case, or a lone object nested one
+    level inside otherwise-scalar wrapping), old already succeeded with
+    exactly that value and the balanced scanner recovers it identically.
+    When it does *not* decode, ``text`` is checked for opening with a
+    balanced **array** — an array of several shot-shaped objects, most
+    likely — and if so, extraction is refused rather than reaching past
+    that structure for a plausible-looking fragment (a caller expecting
+    the *whole* storyboard must not be handed just its first shot
+    dressed up as the top-level document). FX1/DH-2: that check is
+    structural now. It used to require the whole reply to be complete,
+    well-formed JSON, which meant a storyboard array followed by one
+    line of commentary switched the guard off and produced exactly the
+    first-shot-as-document confusion it exists to prevent. Only when
+    neither crude check finds a verdict
+    (most likely: the object never closed at all — truncated) does the
+    shared scanner get a wider try. Repair is deliberately **off**
+    throughout — this module's own :func:`_salvage_payload` already owns
+    truncation recovery for the ``shots`` schema specifically (it can
+    build a partial storyboard out of the shots that arrived before a
+    cut; the generic repair in ``llm_output`` knows nothing about that
+    schema and could reach a parseable-but-wrong dict for a truncated
+    reply, pre-empting the schema-aware salvage path that
+    ``parse_storyboard`` falls to below).
+    """
     if not text:
         return None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, Mapping):
-        return parsed
-    match = _JSON_BLOCK_RE.search(text)
-    if match is None:
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
         return None
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, Mapping) else None
+    return extract_object_outcome(text, repair_truncated=False).value
 
 
 def parse_storyboard(

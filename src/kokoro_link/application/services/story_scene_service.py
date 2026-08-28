@@ -6,7 +6,7 @@ character's first line + a visible scene frame), the opening lands in the
 character's ordinary web thread, and a ``story_scene_sessions`` row marks
 the character as being inside a scene until SC1-D/E close it.
 
-Four behaviours are worth reading the code for, because they are choices
+Five behaviours are worth reading the code for, because they are choices
 rather than mechanics:
 
 * **The waterfall is a list, not a chain of ifs.** ``material_providers``
@@ -19,7 +19,16 @@ rather than mechanics:
   half-open scene would lock them out of the button until the timeout
   closer ran. The one price is therefore raised as late as it can be —
   after every refusal this service can answer on its own — and released
-  by the same exception that fails the action (SC3-C).
+  by the same exception that fails the action (SC3-C). QG7 added a
+  refusal that arrives *after* the writer has already run (the quality
+  gate withholding a defective opening), so the covered upstream call is
+  now held aside until the scene reaches the thread — see
+  :func:`_deferred_opening_delivery` — and "charges nothing" stays true
+  for it too.
+* **The opening is reviewed before it is raised.** 起幕 is a background
+  surface on the QG disposal table: an opening that fails a hard axis
+  twice is not sent, and not sending it costs the player nothing they
+  cannot recover by pressing the button again.
 * **A player pull is not a retry.** Staging attempts are recorded with a
   non-failure result, so pressing 起幕 never spends the autonomous scene
   writer's retry budget for that beat (SC0 / §10 #3).
@@ -39,6 +48,8 @@ weakest path, and the timeout path is the one nobody is watching.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as date_type, datetime, timezone, tzinfo
 from typing import Sequence
@@ -54,10 +65,17 @@ from kokoro_link.application.services.cloud_action_billing_service import (
     CloudActionBillingService,
     NullActionBillingService,
 )
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    script_mix_lines,
+)
 from kokoro_link.application.services.story_arc_service import StoryArcService
 from kokoro_link.application.services.story_scene_closing import (
+    SCENE_OPENING_QUALITY_SURFACE,
     SceneClosing,
     SceneClosingCoordinator,
+    labelled_scene_segments,
 )
 from kokoro_link.application.services.story_scene_thread import (
     append_scene_messages,
@@ -67,7 +85,14 @@ from kokoro_link.contracts.cloud_action_billing import (
     client_quoted_price,
 )
 from kokoro_link.contracts.embedder import EmbedderPort
+from kokoro_link.contracts.interaction_context import (
+    InteractionContext,
+    confirm_deferred_deliveries,
+    current_interaction,
+    interaction_scope,
+)
 from kokoro_link.contracts.memory import MemoryRepositoryPort
+from kokoro_link.contracts.novelty_gate import NoveltyGateContext
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story_scene import (
     SCENE_NARRATION_SPEAKER,
@@ -240,6 +265,21 @@ class StorySceneService:
         # Appended and optional for the same signature-compatibility reason as
         # every block above.
         activity_anchor: CharacterActivityAnchor | None = None,
+        # QG0 — the shared review→regenerate→dispose band. Taken here and
+        # handed straight down to the closing coordinator, because a
+        # scene's two player-visible writes (the opening and the wrap-up)
+        # are one surface as far as the disposal policy is concerned, and a
+        # second injection point would let them drift apart. QG7 adopts it
+        # on both ends; ``None`` leaves every path byte-identical.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
+        # QG7b — the container-wired knob QG7 could not reach (it did not
+        # touch ``container.py``), so both ends of the scene were stuck
+        # with QG7's hardcoded ``enabled=True, max_retries=1``. Threaded
+        # to the closing coordinator below so the opening and the wrap-up
+        # read one pair of values, same as they share one orchestrator.
+        # Defaults preserve QG7's behaviour byte for byte.
+        reply_quality_gate_enabled: bool = True,
+        reply_quality_gate_max_retries: int = 1,
     ) -> None:
         self._sessions = sessions
         self._conversations = conversations
@@ -260,6 +300,11 @@ class StorySceneService:
         # state transition the player depends on ("結束場景" must work on
         # a self-host deployment with no model), and only the narration
         # depends on the writer.
+        self._output_quality_orchestrator = output_quality_orchestrator
+        self._reply_quality_gate_enabled = bool(reply_quality_gate_enabled)
+        self._reply_quality_gate_max_retries = max(
+            0, int(reply_quality_gate_max_retries),
+        )
         self._closing = SceneClosingCoordinator(
             sessions=sessions,
             conversations=conversations,
@@ -267,6 +312,9 @@ class StorySceneService:
             story_event_service=story_event_service,
             memory_repository=memory_repository,
             embedder=embedder,
+            output_quality_orchestrator=output_quality_orchestrator,
+            reply_quality_gate_enabled=reply_quality_gate_enabled,
+            reply_quality_gate_max_retries=reply_quality_gate_max_retries,
         )
 
     # ── read ─────────────────────────────────────────────────────────
@@ -337,21 +385,37 @@ class StorySceneService:
                 quoted_price_cr=client_quoted_price(ACTION_STORY_SCENE_OPEN),
                 character_origin=character.origin_official_card_id,
             ):
-                draft = await self._write_opening(
-                    character,
-                    material=material,
-                    today=today,
-                    language=language,
-                    player_persona_note=player_persona_note,
-                )
-                opening = await self._persist_opening(
-                    character,
-                    conversation_id=conversation.id,
-                    material=material,
-                    draft=draft,
-                    now=moment,
-                    language=language,
-                )
+                # QG7: everything the one price buys happens inside this
+                # deferral, and the charge only counts the upstream call once
+                # the scene is actually in the thread. See the helper.
+                with _deferred_opening_delivery() as opening_delivered:
+                    context = self._opening_context(
+                        character,
+                        material=material,
+                        today=today,
+                        language=language,
+                        player_persona_note=player_persona_note,
+                    )
+                    draft = await self._write_opening(
+                        character, context=context,
+                    )
+                    draft = await self._review_opening(
+                        draft=draft, context=context,
+                    )
+                    if draft is None:
+                        raise SceneOpenFailed(
+                            "the story scene opening did not pass the "
+                            "player-visible output quality gate",
+                        )
+                    opening = await self._persist_opening(
+                        character,
+                        conversation_id=conversation.id,
+                        material=material,
+                        draft=draft,
+                        now=moment,
+                        language=language,
+                    )
+                    opening_delivered()
                 # NF4: the curtain is up and the player paid for it — that is
                 # a foreground interaction with this character by every
                 # definition the rest of the system uses. After the write, so
@@ -516,7 +580,7 @@ class StorySceneService:
                 return material
         return None
 
-    async def _write_opening(
+    def _opening_context(
         self,
         character: Character,
         *,
@@ -524,30 +588,125 @@ class StorySceneService:
         today: date_type,
         language: str,
         player_persona_note: str = "",
-    ) -> StorySceneOpeningDraft:
-        context = StorySceneOpeningContext(
+    ) -> StorySceneOpeningContext:
+        """The staging for this opening, built once.
+
+        Built once rather than per call because QG7 asks the opener for a
+        second draft: an opening and its regeneration that disagreed about
+        the date, the language or the player's declaration would be two
+        different scenes, and the second one is the one the player would
+        end up reading.
+        """
+        return StorySceneOpeningContext(
             character=character,
             material=material,
             today=today,
             operator_primary_language=language,
             player_persona_note=player_persona_note,
         )
-        try:
-            draft = await self._opener.write_opening(context)
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.exception(
-                "story scene opener crashed character=%s layer=%s",
-                character.id,
-                material.layer,
-            )
-            raise SceneOpenFailed(
-                "the story scene opening could not be written",
-            ) from exc
+
+    async def _write_opening(
+        self,
+        character: Character,
+        *,
+        context: StorySceneOpeningContext,
+    ) -> StorySceneOpeningDraft:
+        draft = await self._draft_opening(character, context=context)
         if draft is None:
             raise SceneOpenFailed(
                 "the story scene opening could not be written",
             )
         return draft
+
+    async def _draft_opening(
+        self,
+        character: Character,
+        *,
+        context: StorySceneOpeningContext,
+    ) -> StorySceneOpeningDraft | None:
+        """One call to the opener; ``None`` for every way it can fail.
+
+        Split out of :meth:`_write_opening` so the quality gate's
+        regeneration can ask for another draft without the exception the
+        *first* draft's absence has to raise — the orchestrator reads a
+        missing retry as "no second draft", which is a disposal, not an
+        error.
+        """
+        try:
+            return await self._opener.write_opening(context)
+        except Exception:  # noqa: BLE001 - the port owns its own failures
+            _LOGGER.exception(
+                "story scene opener crashed character=%s layer=%s",
+                character.id,
+                context.material.layer,
+            )
+            return None
+
+    async def _review_opening(
+        self,
+        *,
+        draft: StorySceneOpeningDraft,
+        context: StorySceneOpeningContext,
+    ) -> StorySceneOpeningDraft | None:
+        """Review the opening, regenerate it once, or refuse to raise it.
+
+        ``None`` back means the curtain stays down. 起幕 is a background
+        surface by the disposal table even though a player is waiting for
+        it, and that is the right side of the table for exactly one reason:
+        unlike a chat reply, an opening that is never sent costs the player
+        nothing — the action fails, the session row is never created, the
+        daily ceiling is untouched and (hosted) the charge is refunded in
+        full, so they can simply press the button again. Shipping a leaked
+        schema fragment as the first thing they read would cost the scene.
+        """
+        orchestrator = self._output_quality_orchestrator
+        if orchestrator is None or not self._reply_quality_gate_enabled:
+            return draft
+        character = context.character
+        layer = context.material.layer
+
+        async def _regenerate(
+            feedback: str,
+        ) -> StorySceneOpeningDraft | None:
+            # The feedback is logged (here and by the orchestrator) but not
+            # delivered: ``StorySceneOpeningContext`` has no revision field
+            # and the opener port is outside this ticket, so the retry is a
+            # fresh sample rather than a directed rewrite.
+            _LOGGER.info(
+                "story scene opening regenerating after the quality gate "
+                "character=%s layer=%s feedback=%s",
+                character.id, layer, feedback,
+            )
+            retry = await self._draft_opening(character, context=context)
+            if retry is None or not _has_opening_prose(retry):
+                # Not a second draft. The orchestrator cannot see inside a
+                # structured candidate to tell (``_is_blank`` only answers
+                # for strings), so the emptiness rule is enforced here — an
+                # opening with no narration or no first line is not an
+                # opening the disposal table should re-review.
+                return None
+            return retry
+
+        review = await orchestrator.review(
+            draft,
+            surface=SCENE_OPENING_QUALITY_SURFACE,
+            context_for=lambda candidate: _opening_gate_context(
+                candidate, context=context,
+            ),
+            regenerate=_regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=character,
+            max_retries=self._reply_quality_gate_max_retries,
+            enabled=self._reply_quality_gate_enabled,
+        )
+        if review.skipped:
+            _LOGGER.warning(
+                "story scene opening withheld by the quality gate "
+                "character=%s layer=%s — the curtain stays down and the "
+                "action fails",
+                character.id, layer,
+            )
+        return review.final
 
     async def _persist_opening(
         self,
@@ -799,6 +958,138 @@ class StorySceneService:
             )
             return ""
         return row.note if row is not None else ""
+
+
+# ── quality gate (QG7) ───────────────────────────────────────────────
+
+
+def _has_opening_prose(draft: StorySceneOpeningDraft) -> bool:
+    """Does this draft contain both halves of an opening?"""
+    return bool(
+        (draft.narration or "").strip()
+        and (draft.character_line or "").strip()
+    )
+
+
+def _opening_gate_context(
+    draft: StorySceneOpeningDraft,
+    *,
+    context: StorySceneOpeningContext,
+) -> NoveltyGateContext:
+    """What the judge reads about one opening.
+
+    The two messages are reviewed as one body because that is how the
+    player meets them — narration and the character's first line land in
+    the same breath, and a line that reads as a non-sequitur only reads
+    that way next to the narration it answers.
+
+    ``known_material`` is the waterfall material verbatim. It is the one
+    piece of context the opening is genuinely a *restatement* risk against:
+    the material is an internal note the player has never read, so an
+    opening that merely paraphrases it back is the failure the novelty axis
+    exists for. The frame the player can already see (title, place, mood)
+    is not here — the opener invents those, so they cannot be prior art.
+    """
+    character = context.character
+    material = context.material
+    return NoveltyGateContext(
+        character_id=character.id,
+        operator_id=getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID,
+        response_text=labelled_scene_segments(
+            (SCENE_NARRATION_SPEAKER, draft.narration),
+            (character.name, draft.character_line),
+        ),
+        known_material=_material_lines(material),
+        # There is no user message — 起幕 is a button — so the closest true
+        # statement of what was asked for goes here instead. Blank would be
+        # worse: the register axes read this field to know what the reply is
+        # answering, and 「（無）」 tells them the opening answers nothing.
+        latest_user_message=(
+            f"玩家按下「起幕」，要求現在就演一段《{material.title}》。"
+        ),
+        operator_primary_language=context.operator_primary_language,
+        mechanical_evidence_lines=script_mix_lines(
+            (draft.narration, draft.character_line),
+            # Same language the judge is given as its reference for the
+            # ``language_mismatch`` axis, so the deterministic evidence and
+            # the rubric are measuring drift against the same script.
+            primary_language=context.operator_primary_language,
+        ),
+    )
+
+
+def _material_lines(material: StorySceneMaterial) -> tuple[str, ...]:
+    """The chosen material as labelled lines. Blank fields are dropped."""
+    fields: tuple[tuple[str, str | None], ...] = (
+        ("本場標題", material.title),
+        ("本場摘要", material.summary),
+        ("劇情弧標題", material.arc_title),
+        ("劇情弧前提", material.arc_premise),
+        ("張力", material.tension),
+        ("戲劇問題", material.dramatic_question),
+        ("玩家在這場戲裡的位置", material.operator_position),
+        ("玩家在場註記", material.operator_note),
+    )
+    return tuple(
+        f"{label}：{(value or '').strip()}"
+        for label, value in fields
+        if (value or "").strip()
+    )
+
+
+@contextmanager
+def _deferred_opening_delivery() -> Iterator[Callable[[], None]]:
+    """Hold this action's covered-call record until the scene is delivered.
+
+    The action charge is refunded or kept on one fact: did the Gateway
+    serve a *covered* call under it. The LLM adapter answers that the
+    moment prose comes back, which for 起幕 is one step too early — the
+    thing the fixed price buys is **a scene in the player's thread**, and
+    prose the quality gate refuses (QG7), or prose the thread refuses to
+    take, never becomes one. Without this, a hard skip would fail the
+    action *and* settle the charge: a player billed for an opening that
+    never happened, which is the plan's §3.4 red line 2 verbatim.
+
+    Media calls already solve exactly this by deferring their receipt until
+    storage confirms it
+    (:meth:`~kokoro_link.contracts.interaction_context.CoveredCallReceipt.defer_delivery`).
+    The opening cannot, because the adapter that makes its call has no
+    persistence step of its own to wait for — the persistence step is here.
+    So the deferral is here too: the writer (and its regeneration, and the
+    chips) run against a holding record, and only a delivered opening folds
+    that record onto the charge. Never confirmed ⇒ never counted ⇒ the
+    refund is whole, which is the same safe direction the receipt takes.
+
+    Outside an action charge — self-host, a token-billed tier — there is
+    nothing to hold and no scope is entered at all, so the opener sees the
+    exact ``None`` interaction it saw before this existed.
+    """
+    outer = current_interaction()
+    if outer is None:
+        yield _no_delivery_to_confirm
+        return
+    holding = InteractionContext(
+        interaction_id=outer.interaction_id, charge_id=outer.charge_id,
+    )
+    confirmed = False
+
+    def _confirm() -> None:
+        nonlocal confirmed
+        if confirmed:
+            return
+        confirmed = True
+        # Any receipt an adapter deferred is settled first, so a call that
+        # only counts once its own persistence landed is counted here too.
+        confirm_deferred_deliveries()
+        for _ in range(holding.usage.covered_calls):
+            outer.usage.mark_call_served()
+
+    with interaction_scope(holding):
+        yield _confirm
+
+
+def _no_delivery_to_confirm() -> None:
+    """Nothing was held, so there is nothing to fold back."""
 
 
 def _as_utc(value: datetime | None) -> datetime:

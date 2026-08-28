@@ -32,6 +32,27 @@ Per-character flow:
 5. On success → ``resolved``; on any failure → flip back to ``queued``
    with ``last_error`` set so the next tick retries.
 
+   With one exception (F1): a compose the HV1 honesty gate withheld does
+   not flip back *still due*. An honesty park changes nothing about the
+   row, so an immediate re-queue asks the same model the same question on
+   the next tick — forever, if it is systematically dishonest — and,
+   because ``list_due`` is ordered by ``scheduled_for`` and limited, the
+   permanently-overdue row also holds the head of the queue against newer
+   promises. So the release instant moves forward, and a park the *model*
+   caused is charged against a per-row budget whose ceiling ends the row
+   loudly instead of retrying it silently. A park caused by our own judge
+   being unreachable is delayed but never charged — see
+   :func:`_honesty_park_disposition`.
+
+   The QG4 quality gate withholding a round takes the same "delayed, not
+   charged" road (RC): its refusal also leaves the row unchanged, so the
+   next tick would re-run the identical prompt and be refused identically
+   — at two composes and two judge calls per tick, forever. It is only
+   delayed and never given up on, because giving up needs a per-row
+   attempt count and the only one that exists belongs to the honesty
+   budget, whose exhaustion alarms about a lying model. See
+   :data:`QUALITY_SKIP_RETRY_SECONDS`.
+
 Failure isolation: every step is wrapped so a single bad row does not
 break the loop. Other characters / other tick steps must keep working.
 """
@@ -40,11 +61,22 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import datetime, timezone, tzinfo
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 
 from kokoro_link.application.services.composer_tool_loop import (
     ComposedMessage,
     ComposerToolLoop,
+)
+from kokoro_link.application.services.outcome_claim_audit import (
+    OUTCOME_CLAIM_PARK_JUDGE_UNAVAILABLE,
+    OUTCOME_CLAIM_PARK_MODEL_REOFFENDED,
+    outcome_claim_audit_scope,
+    outcome_claim_audit_summary,
+    outcome_claim_park_kind,
+)
+from kokoro_link.application.services.outcome_claim_guard import (
+    OutcomeClaimGuard,
 )
 from kokoro_link.application.services.proactive_dispatcher import (
     ProactiveDispatcher,
@@ -55,6 +87,10 @@ from kokoro_link.application.services.busy_defer_policy import (
 from kokoro_link.application.services.schedule_service import ScheduleService
 from kokoro_link.contracts.dialogue_summarizer import DialogueSummarizerPort
 from kokoro_link.contracts.messaging import OutboundAttachment
+from kokoro_link.contracts.observability import (
+    TurnRecorderPort,
+    TurnRecordingDraft,
+)
 from kokoro_link.contracts.pending_follow_up import (
     PendingFollowUpRepositoryPort,
 )
@@ -96,6 +132,127 @@ the decider to skip a defer in the first place, the same floor should
 let us release it now."""
 
 
+HONESTY_PARK_ATTEMPT_LIMIT = 3
+"""How many model-caused honesty parks one row may collect before the
+promise is given up on (F1 / plan D5 「總次數上限」).
+
+Three, because a park is not one sample: each one already contains a
+blocked compose *and* a correction pass that named the exact overclaim.
+Three rows of that is nine model turns telling the same model the same
+thing, which is enough evidence that the next tick will not go
+differently. The alternative — no ceiling — is what shipped, and it means
+a systematically dishonest row re-composes forever."""
+
+HONESTY_REOFFENCE_RETRY_SECONDS = 300.0
+"""Interval floor after a park the model caused (D5 「間隔下限」).
+
+Short, because a re-offence is per-row and a fresh sample of the same
+prompt genuinely may come back honest — the player is owed this message.
+Not *zero*, because zero is the current behaviour: the row lands back on
+``queued`` still due, so the very next tick re-runs it, and the whole
+budget above would burn off in the time it takes the scheduler to loop."""
+
+HONESTY_JUDGE_OUTAGE_RETRY_SECONDS = 900.0
+"""Interval floor after a park **our judge** caused.
+
+Longer than the re-offence one on purpose: an unreachable judge is a
+deployment-wide condition, not a row-specific one, so every parked row is
+about to retry against the same dead upstream. Retrying them all on every
+tick is precisely the "豁免≠無限快速重試燒上游" D5 warns about, and it
+buys nothing — the outage counter, not the retry rate, is what gets this
+fixed."""
+
+
+QUALITY_SKIP_RETRY_SECONDS = HONESTY_JUDGE_OUTAGE_RETRY_SECONDS
+"""Interval floor after **our quality gate** withheld the composed prose (RC).
+
+Deliberately the judge-outage floor rather than the re-offence one, and
+deliberately an alias rather than a fourth number: a quality hard-skip is
+the same *shape* of park as a judge outage. Our own gate refused the
+round, nothing about the row changed, and the retry is a fresh sample of
+the identical prompt — which on the QG4 seam costs two composes and two
+judge calls every time it is taken. Before this the release instant was
+left in the past, so "every time" meant every tick, forever, for a
+composer that could not write prose this judge would accept.
+
+Note what this floor deliberately does **not** do: it never cancels the
+promise. Ending a row needs a per-row attempt count, and the only places
+to keep one are a new column (a migration this ticket may not add) or the
+HV1 honesty budget — and that budget is what
+``park_retries_exhausted`` alarms on, so lending it to a stylistic defect
+would make an alert that means "the model kept lying" fire for a message
+that was merely unreadable. Bounding the *rate* is what is available
+without either, and it is what the burn actually needed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _HonestyParkDisposition:
+    """What to do about a round the honesty gate withheld.
+
+    Computed once, *before* the audit row is written, so the audit can
+    record the decision rather than only the park that prompted it — the
+    give-up is the terminal link of the park-reason chain, and a chain
+    whose last link is missing cannot answer "how many promises did this
+    actually cost".
+    """
+
+    kind: str
+    """Which class of park (``OUTCOME_CLAIM_PARK_*``)."""
+    attempts: int
+    """The row's model-caused park count **after** this round. Unchanged
+    from the row's own value for a judge-outage park."""
+    charges_attempt: bool
+    """Whether :attr:`attempts` is a *charge* against the row's budget or
+    merely its unchanged current value. Carried as its own field so the
+    "a judge outage costs the promise nothing" rule lives in exactly one
+    place — the classifier — instead of being re-derived from
+    :attr:`kind` at every write site."""
+    give_up: bool
+    """The attempt ceiling is reached: cancel instead of re-queueing."""
+    retry_at: datetime
+    """Earliest instant the next attempt may run. Meaningless — and
+    unread — when :attr:`give_up`."""
+
+
+def _honesty_park_disposition(
+    *,
+    metadata: dict[str, object] | None,
+    row: PendingFollowUp,
+    now: datetime,
+) -> _HonestyParkDisposition | None:
+    """Classify an empty compose, or ``None`` if the gate had no part in it.
+
+    ``None`` is the important answer: it is what every pre-F1 empty
+    compose gets — a composer fail-soft, a tool that produced nothing —
+    and it routes to the untouched "back to queued, retry next tick"
+    behaviour those paths have always had.
+    """
+    kind = outcome_claim_park_kind(metadata)
+    if kind == OUTCOME_CLAIM_PARK_MODEL_REOFFENDED:
+        attempts = row.honesty_park_attempts + 1
+        return _HonestyParkDisposition(
+            kind=kind,
+            attempts=attempts,
+            charges_attempt=True,
+            give_up=attempts >= HONESTY_PARK_ATTEMPT_LIMIT,
+            retry_at=now + timedelta(seconds=HONESTY_REOFFENCE_RETRY_SECONDS),
+        )
+    if kind == OUTCOME_CLAIM_PARK_JUDGE_UNAVAILABLE:
+        return _HonestyParkDisposition(
+            kind=kind,
+            # Deliberately NOT incremented: our judge failing is not this
+            # promise's fault, and a deployment-wide outage must not be
+            # able to cancel every outstanding promise it touches.
+            attempts=row.honesty_park_attempts,
+            charges_attempt=False,
+            give_up=False,
+            retry_at=now + timedelta(
+                seconds=HONESTY_JUDGE_OUTAGE_RETRY_SECONDS,
+            ),
+        )
+    return None
+
+
 class PendingFollowUpDispatcher:
     def __init__(
         self,
@@ -113,6 +270,8 @@ class PendingFollowUpDispatcher:
         player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
         operator_profile_service=None,  # noqa: ANN001 - optional; resolves primary_language
         visible_slot_port=None,  # noqa: ANN001 - VisibleSlotPort | None (avoid import cycle)
+        turn_recorder: TurnRecorderPort | None = None,
+        outcome_claim_guard: OutcomeClaimGuard | None = None,
         local_tz: tzinfo | None = None,
         tick_limit: int = 25,
     ) -> None:
@@ -150,6 +309,18 @@ class PendingFollowUpDispatcher:
         # distributed queue exists; ``None`` — and any embedded release, leader or
         # not — runs the tool inline exactly as PF1 did.
         self._capability_enqueuer = None
+        # HV3 — write-only, fire-and-forget, mirrors ChatService /
+        # ProactiveDispatcher's own optional turn-recorder wiring. ``None``
+        # (older container wiring, most tests) makes the honesty-gate
+        # audit write in ``_record_honesty_audit`` a no-op.
+        self._turn_recorder = turn_recorder
+        # F1 — the same shared guard the tool loop asks for verdicts, held
+        # here only to raise ONE counter: the alert line for a promise that
+        # ran out of honesty retries. Reached through the container rather
+        # than through ``tool_loop`` because a counter is not the loop's to
+        # lend out, and ``None`` (no judge route) simply means no park of
+        # that class can happen in the first place.
+        self._outcome_claim_guard = outcome_claim_guard
         self._local_tz = local_tz or timezone.utc
         self._tick_limit = max(1, tick_limit)
 
@@ -275,7 +446,7 @@ class PendingFollowUpDispatcher:
             return False
 
         recent_summary = await self._safe_summarize(
-            character, conversation_id=resolving.conversation_id,
+            character, conversation_id=resolving.conversation_id, now=now,
         )
         persona_lines = await self._safe_operator_persona_lines(character.id)
         operator_language = await self._resolve_operator_language(character)
@@ -300,7 +471,7 @@ class PendingFollowUpDispatcher:
             operator_primary_language=operator_language,
         )
         try:
-            composed = await self._compose(
+            composed, outcome_claim_metadata = await self._compose(
                 character=character,
                 payload=compose_input,
                 compose=self._composer.compose,
@@ -318,19 +489,38 @@ class PendingFollowUpDispatcher:
                 resolving, error="composer crashed", now=now,
             )
             return False
+        # F1 — decided before the audit write so the audit can carry the
+        # decision, not just the park that prompted it. ``None`` for every
+        # round the gate had no part in, which is what keeps a plain
+        # composer fail-soft on its original path.
+        disposition = (
+            _honesty_park_disposition(
+                metadata=outcome_claim_metadata, row=resolving, now=now,
+            )
+            if not composed.content_text and not composed.deferred_capability
+            else None
+        )
+        # HV3 — written whenever the honesty gate looked at this round,
+        # BEFORE the deferred/empty checks below: a park is exactly the
+        # outcome that otherwise leaves no trace (neither branch reaches
+        # ``_deliver_and_resolve``), and it is the outcome a dishonesty
+        # rate most needs visible.
+        await self._record_honesty_audit(
+            character_id=character.id,
+            row=resolving,
+            metadata=outcome_claim_metadata,
+            disposition=disposition,
+        )
         if composed.deferred_capability:
             return await self._park_for_capability(
                 row=resolving, composed=composed, now=now,
             )
         body = composed.content_text
         if not body:
-            # Composer fail-soft → leave queued for the next tick (no
-            # cap on retries; if the model is fundamentally stuck the
-            # operator will see a permanently-queued row and investigate).
-            await self._fail_back_to_queued(
-                resolving, error="empty compose", now=now,
+            return await self._park_empty_compose(
+                row=resolving, disposition=disposition, now=now,
+                quality_skipped=composed.quality_skipped,
             )
-            return False
 
         return await self._deliver_and_resolve(
             row=resolving,
@@ -385,7 +575,7 @@ class PendingFollowUpDispatcher:
             return False
 
         summary = await self._safe_summarize(
-            character, conversation_id=resolving.conversation_id,
+            character, conversation_id=resolving.conversation_id, now=now,
         )
         persona_lines = await self._safe_operator_persona_lines(character.id)
         # The "promise_text" is the original user-side wording captured
@@ -412,6 +602,7 @@ class PendingFollowUpDispatcher:
             character=character,
             promise_intent=resolving.promise_intent,
             promise_text=promise_text,
+            promise_made_at=resolving.queued_at,
             scheduled_for=resolving.scheduled_for,
             current_activity=current_activity,
             just_finished_activity=just_finished,
@@ -425,7 +616,7 @@ class PendingFollowUpDispatcher:
             promise_safe_summary=promise_safe_summary,
         )
         try:
-            composed = await self._compose(
+            composed, outcome_claim_metadata = await self._compose(
                 character=character,
                 payload=compose_input,
                 compose=self._scheduled_promise_composer.compose,
@@ -443,16 +634,31 @@ class PendingFollowUpDispatcher:
                 resolving, error="composer crashed", now=now,
             )
             return False
+        # F1 — see the mirror comment in ``_maybe_release``.
+        disposition = (
+            _honesty_park_disposition(
+                metadata=outcome_claim_metadata, row=resolving, now=now,
+            )
+            if not composed.content_text and not composed.deferred_capability
+            else None
+        )
+        # HV3 — see the mirror comment in ``_maybe_release``.
+        await self._record_honesty_audit(
+            character_id=character.id,
+            row=resolving,
+            metadata=outcome_claim_metadata,
+            disposition=disposition,
+        )
         if composed.deferred_capability:
             return await self._park_for_capability(
                 row=resolving, composed=composed, now=now,
             )
         body = composed.content_text
         if not body:
-            await self._fail_back_to_queued(
-                resolving, error="empty compose", now=now,
+            return await self._park_empty_compose(
+                row=resolving, disposition=disposition, now=now,
+                quality_skipped=composed.quality_skipped,
             )
-            return False
 
         return await self._deliver_and_resolve(
             row=resolving,
@@ -476,31 +682,274 @@ class PendingFollowUpDispatcher:
         row: PendingFollowUp,
         defer_capabilities: bool,
         now: datetime,
-    ) -> ComposedMessage:
+    ) -> tuple[ComposedMessage, dict[str, object] | None]:
         """Compose the outbound body, with tools when the loop is wired.
 
         The single funnel both kinds go through, so promise fulfilment
         and busy-defer follow-up can never drift into two different
         tool protocols. Without a loop this is exactly the pre-PF1
-        single ``compose(payload)`` call."""
+        single ``compose(payload)`` call.
+
+        The second element of the return (HV3) is the HV1 honesty gate's
+        conclusion for this round, folded by
+        ``outcome_claim_audit_summary`` — ``None`` when the round never
+        reached the gate (no loop, or no tools this character may call),
+        so a caller wired without a judge records nothing extra."""
         if self._tool_loop is None:
             output = await compose(payload)
             return ComposedMessage(
                 content_text=(getattr(output, "content_text", "") or "").strip(),
-            )
+            ), None
         schedule = (
             self._capability_scheduler(row=row, now=now)
             if defer_capabilities
             else None
         )
-        return await self._tool_loop.run(
-            character=character,
-            payload=payload,
-            compose=compose,
-            conversation_id=conversation_id,
-            recent_dialogue=recent_dialogue,
-            schedule_capability=schedule,
+        with outcome_claim_audit_scope():
+            composed = await self._tool_loop.run(
+                character=character,
+                payload=payload,
+                compose=compose,
+                conversation_id=conversation_id,
+                recent_dialogue=recent_dialogue,
+                schedule_capability=schedule,
+            )
+            outcome_claim_metadata = outcome_claim_audit_summary()
+        return composed, outcome_claim_metadata
+
+    async def _park_empty_compose(
+        self,
+        *,
+        row: PendingFollowUp,
+        disposition: _HonestyParkDisposition | None,
+        now: datetime,
+        quality_skipped: bool = False,
+    ) -> bool:
+        """An empty composed body. How it is retried depends on *why*.
+
+        Four outcomes, and each split exists because the single outcome it
+        replaced was wrong for the case it splits off:
+
+        * ``disposition is None`` and no quality skip — the gates had no
+          part in this (composer fail-soft, a tool that produced nothing).
+          **Untouched**: back to ``queued``, still due, retried next tick.
+          That is also the contract the PF3 image park depends on, which is
+          why this branch is byte-identical to what it replaced.
+        * ``quality_skipped`` — the QG4 band withheld the prose (RC). Back
+          to ``queued``, but not due for a while: nothing about the row
+          changed, so the next tick would re-run the identical prompt and
+          be refused identically, at two composes and two judge calls a
+          time. Charged to nothing — see
+          :data:`QUALITY_SKIP_RETRY_SECONDS` for why this path delays but
+          never cancels.
+        * a park the judge's own unavailability caused — back to
+          ``queued``, but not due for a while. Nothing is known about this
+          row, so nothing is charged to it; the delay is about not
+          hammering a dead upstream with every parked promise on the
+          deployment, and about not letting perpetually-overdue rows hold
+          the head of ``list_due`` against newer ones.
+        * a park the model caused — same delayed re-queue, but the row's
+          attempt budget is charged, and at the ceiling the promise is
+          ended rather than re-offered forever.
+
+        Returns ``False`` throughout: nothing was delivered in any of them.
+        """
+        if disposition is None:
+            if quality_skipped:
+                return await self._park_quality_skip(row=row, now=now)
+            await self._fail_back_to_queued(
+                row, error="empty compose", now=now,
+            )
+            return False
+        if disposition.give_up:
+            return await self._give_up_after_honesty_parks(
+                row=row, disposition=disposition, now=now,
+            )
+        budget = (
+            f"attempt {disposition.attempts}/{HONESTY_PARK_ATTEMPT_LIMIT}"
+            if disposition.charges_attempt else "uncharged"
         )
+        error = f"honesty park ({disposition.kind}); {budget}"
+        wrote = await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.honesty_parked(
+                error=error,
+                retry_at=disposition.retry_at,
+                attempts=(
+                    disposition.attempts if disposition.charges_attempt
+                    else None
+                ),
+                now=now,
+            ),
+            still_ours=_a_retry_write_is_still_ours,
+        )
+        if wrote:
+            _LOGGER.info(
+                "pending-follow-up: honesty park id=%s kind=%s (%s) — next "
+                "attempt at %s",
+                row.id, disposition.kind, budget,
+                disposition.retry_at.isoformat(),
+            )
+        return False
+
+    async def _park_quality_skip(
+        self, *, row: PendingFollowUp, now: datetime,
+    ) -> bool:
+        """Back off a row whose prose the quality gate keeps withholding.
+
+        The same transition an uncharged honesty park uses
+        (:meth:`PendingFollowUp.honesty_parked` with ``attempts=None``) —
+        because "back to queued, but not before ``retry_at``" is exactly
+        what is wanted and inventing a second transition that did the same
+        thing would give the row two ways to mean one state. What it must
+        NOT do is charge ``honesty_park_attempts``: that budget cancels the
+        promise and its exhaustion is an alert line about a **lying**
+        model, and this round said nothing false — it said nothing at all.
+        ``last_error`` therefore names the quality gate, so an operator
+        reading the row is never told the honesty gate withheld it.
+
+        Returns ``False``: nothing was delivered."""
+        retry_at = now + timedelta(seconds=QUALITY_SKIP_RETRY_SECONDS)
+        wrote = await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.honesty_parked(
+                error="quality park (output_quality hard_skipped); uncharged",
+                retry_at=retry_at,
+                attempts=None,
+                now=now,
+            ),
+            still_ours=_a_retry_write_is_still_ours,
+        )
+        if wrote:
+            _LOGGER.info(
+                "pending-follow-up: quality park id=%s — the output-quality "
+                "gate withheld this round's prose; next attempt at %s "
+                "(nothing charged to the honesty budget)",
+                row.id, retry_at.isoformat(),
+            )
+        return False
+
+    async def _give_up_after_honesty_parks(
+        self,
+        *,
+        row: PendingFollowUp,
+        disposition: _HonestyParkDisposition,
+        now: datetime,
+    ) -> bool:
+        """End a promise the model lied about on every allowed attempt.
+
+        The loud half of the ceiling. A cancelled row simply stops being
+        due, so without the ``ERROR`` line and the alert-line counter the
+        only trace an operator would ever get is a promise that quietly
+        never arrived — the exact failure mode HV exists to end, re-entered
+        through our own retry policy."""
+        error = (
+            "honesty gate: model re-claimed unsupported outcomes on all "
+            f"{disposition.attempts} attempts"
+        )
+        wrote = await self._write_release_outcome(
+            row,
+            lambda fresh: fresh.honesty_retries_exhausted(
+                error=error, attempts=disposition.attempts, now=now,
+            ),
+            still_ours=_a_retry_write_is_still_ours,
+        )
+        if not wrote:
+            # Somebody else reached a decision about this promise while we
+            # composed; theirs is newer and we do not overwrite it — and we
+            # do not raise an alarm for a promise we did not actually drop.
+            return False
+        if self._outcome_claim_guard is not None:
+            self._outcome_claim_guard.record_park_retries_exhausted()
+            if row.is_honesty_repair:
+                # B-2: this row is chat's own HV4 repair promise (F5) —
+                # a caught lie the chat auditor already durably owed.
+                # Cancelling it here is the *correct*, previously
+                # ratified behaviour (a compensation that keeps lying
+                # should not ship), so this does not touch that
+                # decision. But D6's alert line counts repairs that
+                # never land, and a compensation row that gives up is
+                # exactly that: the lie was caught, and now nobody is
+                # coming back to make good on it either. Without this
+                # the D6 board would show a clean 100% while a caught
+                # lie quietly went unrepaired a second time.
+                self._outcome_claim_guard.record_chat_repair_missed()
+        _LOGGER.error(
+            "pending-follow-up: GIVING UP on id=%s character=%s kind=%s — the "
+            "honesty gate withheld %d consecutive composes because the model "
+            "kept claiming outcomes no tool produced. The promise will NOT be "
+            "delivered. Check the composer's honesty prompt rules and the "
+            "outcome_claim_judge route before assuming the model is at fault.",
+            row.id, row.character_id, row.kind.value, disposition.attempts,
+        )
+        return False
+
+    async def _record_honesty_audit(
+        self,
+        *,
+        character_id: str,
+        row: PendingFollowUp,
+        metadata: dict[str, object] | None,
+        disposition: _HonestyParkDisposition | None = None,
+    ) -> None:
+        """Fold this round's HV1 honesty-gate conclusion into a turn record.
+
+        Written whenever the gate actually looked at something this round
+        (``metadata`` non-``None``) — deliberately including a park: a
+        parked round never reaches ``_deliver_and_resolve`` (S7 made this
+        an invariant rather than a usual case — ``ComposerToolLoop._park``
+        now only records ``parked`` when the round truly sent nothing; a
+        blocked round whose tool had already produced deliverable
+        attachments ships them with a fallback line and is *not* a park,
+        so it reaches ``_deliver_and_resolve`` same as any other body),
+        so without this write the exact rounds a dishonesty rate (謊稱率)
+        most needs — the ones the gate stopped — would leave no trace at
+        all. Never
+        persists ``message_text`` or the judge's ``unsupported_claims``
+        phrases, only counts and status strings (see the log
+        de-identification rule in ``outcome_claim_audit``'s module
+        docstring). Fire-and-forget and exception-safe, same contract as
+        every other ``turn_recorder.record`` call site in this codebase.
+
+        ``disposition`` (F1) closes the park-reason chain: a park says the
+        message was withheld, and this says what that cost the promise —
+        including the one terminal outcome, giving up, which is otherwise
+        indistinguishable from a row that simply stopped being due. Counts
+        and status strings only, same redline as everything else here."""
+        if self._turn_recorder is None or metadata is None:
+            return
+        judge_metadata = dict(metadata)
+        if disposition is not None:
+            judge_metadata["park_disposition"] = {
+                "kind": disposition.kind,
+                "attempts": disposition.attempts,
+                "attempt_limit": HONESTY_PARK_ATTEMPT_LIMIT,
+                # Without this an ``attempts`` that stayed put reads
+                # identically to one that was never charged — and a
+                # dishonesty rate computed off the first would quietly
+                # count judge outages as model offences.
+                "charged": disposition.charges_attempt,
+                "gave_up": disposition.give_up,
+                "retry_at": (
+                    "" if disposition.give_up
+                    else disposition.retry_at.isoformat()
+                ),
+            }
+        try:
+            await self._turn_recorder.record(TurnRecordingDraft(
+                character_id=character_id,
+                kind="promise_fulfilment",
+                post_turn_refs={
+                    "pending_follow_up_id": row.id,
+                    "pending_follow_up_kind": row.kind.value,
+                    "outcome_claim_judge": judge_metadata,
+                },
+            ))
+        except Exception:
+            _LOGGER.exception(
+                "pending-follow-up: honesty audit record failed id=%s",
+                row.id,
+            )
 
     def _capability_scheduler(self, *, row: PendingFollowUp, now: datetime):  # noqa: ANN202
         """The hand-off closure the tool loop consults, or ``None``.
@@ -620,6 +1069,15 @@ class PendingFollowUpDispatcher:
           ``resolving``. All they carry is "this pass didn't finish", which
           has no strength to overwrite anyone's result; and if the row is
           already ``queued``, the retry they want is scheduled regardless.
+        * :meth:`_park_empty_compose` and
+          :meth:`_give_up_after_honesty_parks` — the same *retry* rule,
+          the second one despite writing a terminal status. What it
+          carries is "**our** composes kept being withheld", which is a
+          statement about this executor's passes and nothing else; if a
+          concurrent executor has meanwhile queued, resolved or cancelled
+          the row, its answer is both newer and better informed, and
+          cancelling over it would drop a promise on the strength of a
+          budget the row may no longer have spent.
 
         Returns whether the write happened, so a caller can keep its logging
         honest. It deliberately does NOT swallow ``save`` errors: a repository
@@ -812,7 +1270,7 @@ class PendingFollowUpDispatcher:
         return schedule, current, just_finished
 
     async def _safe_summarize(
-        self, character: Character, *, conversation_id: str,
+        self, character: Character, *, conversation_id: str, now: datetime,
     ) -> str | None:
         if (
             self._dialogue_summarizer is None
@@ -840,9 +1298,16 @@ class PendingFollowUpDispatcher:
         )
         if not messages:
             return None
+        # Resolved outside the try: a timezone lookup failure must not be
+        # mistaken for a summariser failure and cost us the summary — the
+        # resolver already falls back to the service default on its own.
+        local_tz = await self._resolve_operator_timezone(character)
         try:
             return await self._dialogue_summarizer.summarize(
-                character=character, messages=messages,
+                character=character,
+                messages=messages,
+                now=now,
+                local_tz=local_tz,
             )
         except Exception:
             _LOGGER.exception(

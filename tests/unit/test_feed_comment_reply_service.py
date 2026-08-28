@@ -23,12 +23,19 @@ from kokoro_link.application.services.feed_event_bus import (
     FeedCommentReplyEvent,
     FeedEventBus,
 )
+from kokoro_link.application.services.output_quality import (
+    OUTCOME_HARD_SKIPPED,
+    OUTCOME_PASS,
+    OutputQualityCounters,
+    OutputQualityOrchestrator,
+)
 from kokoro_link.contracts.embedder import EmbedderError
 from kokoro_link.contracts.feed_comment_reply import (
     FeedCommentReplyComposerPort,
     FeedCommentReplyInput,
     FeedCommentReplyOutput,
 )
+from kokoro_link.contracts.novelty_gate import NoveltyGateContext, NoveltyVerdict
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.feed_comment import (
@@ -141,6 +148,7 @@ def _build(
     character_repository=None,
     event_bus=None,
     operator_profile_service=None,
+    output_quality_orchestrator=None,
 ) -> FeedCommentReplyService:
     comment_service = FeedCommentService(
         post_repository=posts, comment_repository=comments,
@@ -157,7 +165,34 @@ def _build(
         character_repository=character_repository,
         event_bus=event_bus,
         operator_profile_service=operator_profile_service,
+        output_quality_orchestrator=output_quality_orchestrator,
     )
+
+
+# ---------- QG3 fakes ----------
+
+
+class _ScriptedGate:
+    """Answers with a scripted verdict list; records every context seen.
+
+    Mirrors ``test_output_quality_orchestrator.py``'s ``_Gate`` so this
+    suite exercises the real ``OutputQualityOrchestrator``, not a stand-in
+    for it.
+    """
+
+    def __init__(self, verdicts: list[NoveltyVerdict]) -> None:
+        self._verdicts = list(verdicts)
+        self.seen: list[NoveltyGateContext] = []
+
+    async def evaluate(self, context: NoveltyGateContext, *, character=None):
+        self.seen.append(context)
+        if not self._verdicts:
+            return NoveltyVerdict(passes=True)
+        return self._verdicts.pop(0)
+
+
+def _orchestrator(gate: _ScriptedGate) -> OutputQualityOrchestrator:
+    return OutputQualityOrchestrator(gate=gate, counters=OutputQualityCounters())
 
 
 # ---------- tests ----------
@@ -648,3 +683,147 @@ async def test_persists_reply_even_when_embedder_fails() -> None:
     assert reply.content_text == "嗨～"
     # No memory was written (embedder fail-loud, persist skipped).
     assert await memories.query(char.id, limit=10) == []
+
+
+# ---------- QG3: output-quality gate ----------
+
+
+def _build_qg3(*, gate: _ScriptedGate, composer_outputs, now: datetime):
+    posts = InMemoryFeedPostRepository()
+    comments = InMemoryFeedCommentRepository()
+    post = _make_post()
+    composer = _ScriptedReplyComposer(composer_outputs)
+    service = _build(
+        composer=composer, posts=posts, comments=comments,
+        output_quality_orchestrator=_orchestrator(gate),
+    )
+    return service, composer, posts, comments, post
+
+
+@pytest.mark.asyncio
+async def test_hard_failure_surviving_regeneration_skips_the_tick() -> None:
+    """A hard verdict that is still hard on the re-review must send
+    nothing this tick (D1's background row) — no comment is persisted,
+    and the next tick gets a fresh attempt at the same unanswered batch."""
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+    gate = _ScriptedGate([
+        NoveltyVerdict(passes=False, structural_leak=True, feedback="混入 schema 片段"),
+        NoveltyVerdict(passes=False, structural_leak=True, feedback="還是混入了"),
+    ])
+    service, composer, posts, comments, post = _build_qg3(
+        gate=gate,
+        composer_outputs=[
+            FeedCommentReplyOutput(content_text="第一版回覆"),
+            FeedCommentReplyOutput(content_text="第二版回覆"),
+        ],
+        now=now,
+    )
+    await posts.add(post)
+    char = _make_character(id_=post.character_id)
+    await comments.add(FeedComment.create(
+        post_id=post.id,
+        author_id=LOCAL_COMMENTER_ID,
+        content_text="這杯看起來好好喝",
+        created_at=now - timedelta(minutes=10),
+    ))
+
+    reply = await service.tick(char, now=now)
+    assert reply is None
+    # Composer was asked twice: the original draft, then the regeneration
+    # carrying the gate's feedback.
+    assert len(composer.inputs) == 2
+    assert composer.inputs[0].quality_feedback == ""
+    assert composer.inputs[1].quality_feedback == "混入 schema 片段"
+    # No character-authored row landed on the post.
+    rows = await comments.list_for_post(post.id, limit=10)
+    assert all(c.author_id == LOCAL_COMMENTER_ID for c in rows)
+
+
+@pytest.mark.asyncio
+async def test_passing_verdict_ships_the_reply_unchanged() -> None:
+    """A clean first verdict publishes exactly what the composer wrote —
+    one gate call, no regeneration."""
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+    gate = _ScriptedGate([NoveltyVerdict(passes=True)])
+    service, composer, posts, comments, post = _build_qg3(
+        gate=gate,
+        composer_outputs=[FeedCommentReplyOutput(content_text="謝啦～改天請你喝 ☕")],
+        now=now,
+    )
+    await posts.add(post)
+    char = _make_character(id_=post.character_id)
+    await comments.add(FeedComment.create(
+        post_id=post.id,
+        author_id=LOCAL_COMMENTER_ID,
+        content_text="這杯看起來好好喝",
+        created_at=now - timedelta(minutes=10),
+    ))
+
+    reply = await service.tick(char, now=now)
+    assert reply is not None
+    assert reply.content_text == "謝啦～改天請你喝 ☕"
+    assert len(composer.inputs) == 1
+    assert len(gate.seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_gate_context_carries_length_overrun_evidence_and_final_cap_applies() -> None:
+    """An over-cap draft is handed to the gate whole (D6 — no silent
+    truncation before review); mechanical evidence names the overrun; the
+    180-char cap still applies to whatever ships, after review."""
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+    overrun = "回" * 200  # well past the 180-char cap
+    gate = _ScriptedGate([NoveltyVerdict(passes=True)])
+    service, composer, posts, comments, post = _build_qg3(
+        gate=gate,
+        composer_outputs=[FeedCommentReplyOutput(content_text=overrun)],
+        now=now,
+    )
+    await posts.add(post)
+    char = _make_character(id_=post.character_id)
+    await comments.add(FeedComment.create(
+        post_id=post.id,
+        author_id=LOCAL_COMMENTER_ID,
+        content_text="嗨",
+        created_at=now - timedelta(minutes=10),
+    ))
+
+    reply = await service.tick(char, now=now)
+    assert reply is not None
+    # The gate saw the full, untruncated draft plus overrun evidence.
+    assert gate.seen[0].response_text == overrun
+    assert any("超過上限" in line for line in gate.seen[0].mechanical_evidence_lines)
+    # What actually shipped is capped.
+    assert len(reply.content_text) <= 180
+    assert reply.content_text.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_gate_unwired_behaves_identically_to_pre_qg3() -> None:
+    """No orchestrator wired (the default) must reproduce the exact
+    pre-QG3 contract: whatever the composer returns ships, capped at
+    180 chars, with no gate involved."""
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+    posts = InMemoryFeedPostRepository()
+    comments = InMemoryFeedCommentRepository()
+    post = _make_post()
+    await posts.add(post)
+    char = _make_character(id_=post.character_id)
+    await comments.add(FeedComment.create(
+        post_id=post.id,
+        author_id=LOCAL_COMMENTER_ID,
+        content_text="嗨",
+        created_at=now - timedelta(minutes=10),
+    ))
+    overrun = "回" * 200
+    composer = _ScriptedReplyComposer([FeedCommentReplyOutput(content_text=overrun)])
+    service = _build(
+        composer=composer, posts=posts, comments=comments,
+        output_quality_orchestrator=None,
+    )
+
+    reply = await service.tick(char, now=now)
+    assert reply is not None
+    assert len(composer.inputs) == 1
+    assert len(reply.content_text) <= 180
+    assert reply.content_text.endswith("…")

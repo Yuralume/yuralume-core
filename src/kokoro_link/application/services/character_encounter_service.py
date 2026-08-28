@@ -33,6 +33,10 @@ from kokoro_link.application.services.feature_keys import (
     FEATURE_CHARACTER_ENCOUNTER_PLAN,
     FEATURE_CHARACTER_ENCOUNTER_REFLECT,
 )
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+)
 from kokoro_link.contracts.novelty_gate import (
     NoveltyGateContext,
     NoveltyGatePort,
@@ -66,7 +70,10 @@ from kokoro_link.domain.entities.character_encounter import (
     EncounterLine,
 )
 from kokoro_link.domain.entities.character_relationship import CharacterRelationship
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_PRIVATE,
+    MemoryItem,
+)
 from kokoro_link.domain.entities.schedule import DailySchedule, ScheduleActivity
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
@@ -79,6 +86,11 @@ from kokoro_link.infrastructure.prompt.operator_language import (
 from kokoro_link.infrastructure.prompt.timing_utils import (
     format_relative_past_label,
     render_current_time_fact_lines,
+)
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
 )
 
 _DEFAULT_OPERATOR_LANGUAGE = "zh-TW"
@@ -573,6 +585,21 @@ class CharacterEncounterPlanner:
         await self._schedule_repository.save(updated)
 
 
+class EncounterOutputUnusable(Exception):
+    """A player-visible gate hard-failed an encounter draft past regeneration.
+
+    QG6: raised by ``_gate_transcript`` / ``_gate_reflection`` when the
+    shared output-quality orchestrator returns ``skipped`` — a hard axis
+    (structural leak, language mismatch, visible truncation, broken tool
+    prompt) fired twice in a row and there is nothing safe left to ship.
+    Not a new failure path: ``run()``'s existing try/except around both
+    call sites already turns any exception into ``running.fail(...)``,
+    the same fate as a character-not-found or a frozen-character abort —
+    this just gives that generic path a message worth reading in
+    ``last_error``.
+    """
+
+
 class CharacterEncounterRunner:
     def __init__(
         self,
@@ -588,7 +615,21 @@ class CharacterEncounterRunner:
         operator_profile_service: Any | None = None,
         life_context_builder: CharacterLifeContextBuilder | None = None,
         register_profiler: RegisterProfilePort | None = None,
-        novelty_gate: NoveltyGatePort | None = None,
+        # QG0 — the same three kwargs every other player-visible surface
+        # takes, under the same names. Encounter was the odd one out: it
+        # accepted the gate and nothing else, so the deployment's
+        # ``KOKORO_NOVELTY_GATE_ENABLED`` / ``_MAX_RETRIES`` knobs silently
+        # did not apply here — the gate ran even when a deployment had
+        # turned it off, and regenerated exactly once whatever the retry
+        # ceiling said.
+        reply_quality_gate: NoveltyGatePort | None = None,
+        reply_quality_gate_enabled: bool = True,
+        reply_quality_gate_max_retries: int = 1,
+        # QG0 — the shared disposal band, adopted by both quality gates
+        # below (QG6). ``None`` degrades to the pre-QG6 "gate not wired"
+        # behaviour: both gates already short-circuit on
+        # ``self._novelty_gate is None`` before ever touching this.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
     ) -> None:
         self._encounters = encounter_repository
         self._characters = character_repository
@@ -601,7 +642,15 @@ class CharacterEncounterRunner:
         self._operator_profile_service = operator_profile_service
         self._life_context_builder = life_context_builder
         self._register_profiler = register_profiler
-        self._novelty_gate = novelty_gate
+        # ``enabled`` defaults True rather than False (as it does on the
+        # surfaces that always had the flag): here the gate's presence has
+        # always been the switch, and flipping the default would turn the
+        # encounter gate off for every caller that passes only the port.
+        self._novelty_gate = (
+            reply_quality_gate if reply_quality_gate_enabled else None
+        )
+        self._novelty_gate_max_retries = max(0, int(reply_quality_gate_max_retries))
+        self._output_quality_orchestrator = output_quality_orchestrator
 
     async def run_due(
         self,
@@ -1100,60 +1149,62 @@ class CharacterEncounterRunner:
     ) -> tuple[EncounterLine, ...]:
         """Player-visible quality gate over the whole transcript.
 
-        Same shape as the proactive/feed gates: evaluate once after
-        composition, on failure regenerate once with the verdict
-        feedback, keep the original on a second failure. Always
-        fail-open — a broken judge never blocks a background encounter.
+        QG6: runs through the shared output-quality band (QG0) instead of
+        a hand-rolled evaluate-once/regenerate-once. Soft failures still
+        end up best-effort — pass through, or ship whichever draft is
+        better — exactly as before. A **hard** failure (structural leak,
+        language mismatch, visible truncation, broken tool prompt) that
+        survives its regeneration now raises :class:`EncounterOutputUnusable`
+        instead of quietly keeping the pre-gate draft: ``run()``'s
+        surrounding try/except already turns that into
+        ``running.fail(...)``, the same outcome a character-not-found or
+        a provider exception gets — no new failure path, just this one
+        finally using it instead of shipping a player-visible defect.
         """
-        if self._novelty_gate is None or not transcript:
+        orchestrator = self._output_quality_orchestrator
+        if orchestrator is None or self._novelty_gate is None or not transcript:
             return transcript
         if history is None:
             history = await self._completed_pair_history(encounter)
-        rendered = _render_transcript(transcript, char_a=char_a, char_b=char_b)
-        context = NoveltyGateContext(
-            character_id=char_a.id,
-            operator_id=getattr(char_a, "user_id", None) or "default",
-            response_text=rendered,
-            known_material=tuple(
-                speaker_contexts.get(char_a.id, [])
-                + speaker_contexts.get(char_b.id, []),
-            )[:40],
-            recent_self_lines=tuple(
-                line for line in _render_topic_history_lines(
-                    history, speaker_is_a=True, now=now,
-                )
-            ),
-            latest_user_message=(
-                f"{char_a.name} 與 {char_b.name} 在 {encounter.location} 碰面："
-                f"{encounter.trigger_reason}"
-            ),
-            register_profile=register_profile,
-            diversity_evidence=_encounter_diversity_evidence(history, now=now),
-            persona_context=(
-                _character_profile_block("A", char_a),
-                _character_profile_block("B", char_b),
-            ),
-        )
-        try:
-            verdict = await self._novelty_gate.evaluate(
-                context, character=char_a,
+        resolved_history = history
+
+        def _context_for(
+            candidate: tuple[EncounterLine, ...],
+        ) -> NoveltyGateContext:
+            return NoveltyGateContext(
+                character_id=char_a.id,
+                operator_id=getattr(char_a, "user_id", None) or "default",
+                response_text=_render_transcript(
+                    candidate, char_a=char_a, char_b=char_b,
+                ),
+                known_material=tuple(
+                    speaker_contexts.get(char_a.id, [])
+                    + speaker_contexts.get(char_b.id, []),
+                )[:40],
+                recent_self_lines=tuple(
+                    line for line in _render_topic_history_lines(
+                        resolved_history, speaker_is_a=True, now=now,
+                    )
+                ),
+                latest_user_message=(
+                    f"{char_a.name} 與 {char_b.name} 在 {encounter.location} 碰面："
+                    f"{encounter.trigger_reason}"
+                ),
+                register_profile=register_profile,
+                diversity_evidence=_encounter_diversity_evidence(
+                    resolved_history, now=now,
+                ),
+                persona_context=(
+                    _character_profile_block("A", char_a),
+                    _character_profile_block("B", char_b),
+                ),
+                operator_primary_language=language,
             )
-        except Exception:
-            _LOGGER.exception(
-                "encounter transcript gate failed encounter=%s",
-                getattr(encounter, "id", None),
-            )
-            return transcript
-        if verdict is None or verdict.passes:
-            return transcript
-        feedback = verdict.feedback or "內容與近期碰面重複或流於形式"
-        _LOGGER.info(
-            "encounter transcript gated encounter=%s feedback=%s",
-            getattr(encounter, "id", None),
-            feedback,
-        )
-        try:
-            retry = await self._generate_transcript(
+
+        async def _regenerate(
+            feedback: str,
+        ) -> tuple[EncounterLine, ...] | None:
+            return await self._generate_transcript(
                 encounter,
                 char_a,
                 char_b,
@@ -1163,13 +1214,29 @@ class CharacterEncounterRunner:
                 register_profile=register_profile,
                 retry_directive=feedback,
             )
-        except Exception:
-            _LOGGER.exception(
-                "encounter transcript regen failed encounter=%s",
+
+        review = await orchestrator.review(
+            transcript,
+            surface="encounter_transcript",
+            context_for=_context_for,
+            regenerate=_regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=char_a,
+            max_retries=self._novelty_gate_max_retries,
+            fallback_feedback="內容與近期碰面重複或流於形式",
+        )
+        if review.skipped:
+            verdict = review.final_verdict or review.first_verdict
+            _LOGGER.warning(
+                "encounter transcript hard-skipped encounter=%s feedback=%s",
                 getattr(encounter, "id", None),
+                (verdict.feedback if verdict else "") or "-",
             )
-            return transcript
-        return retry or transcript
+            raise EncounterOutputUnusable(
+                "encounter transcript hard-failed the output quality gate "
+                f"after regeneration: {(verdict.feedback if verdict else '') or '(no feedback)'}"
+            )
+        return review.final
 
     async def _gate_reflection(
         self,
@@ -1186,9 +1253,17 @@ class CharacterEncounterRunner:
     ) -> EncounterReflection:
         """Gate the player-visible summaries against recent-encounter
         repetition — the direct counter to "聊到亮亮的東西" five times in
-        a row. On failure, re-reflect once with the feedback; keep the
-        original on a second failure. Always fail-open."""
-        if self._novelty_gate is None:
+        a row.
+
+        QG6: routed through the shared output-quality band (QG0), same
+        shape as :meth:`_gate_transcript`. A hard failure surviving
+        regeneration raises :class:`EncounterOutputUnusable`, caught by
+        ``run()``'s existing try/except **before** the reflection ever
+        reaches memory writes or relationship deltas — see that
+        method's docstring for why this is not a new failure path.
+        """
+        orchestrator = self._output_quality_orchestrator
+        if orchestrator is None or self._novelty_gate is None:
             return reflection
         summary_text = "\n".join(
             part for part in (
@@ -1203,40 +1278,39 @@ class CharacterEncounterRunner:
         if not history:
             # Nothing to repeat against — first meetups always pass.
             return reflection
-        context = NoveltyGateContext(
-            character_id=char_a.id,
-            operator_id=getattr(char_a, "user_id", None) or "default",
-            response_text=summary_text,
-            known_material=tuple(
-                _render_topic_history_lines(history, speaker_is_a=True, now=now)
-                + _render_topic_history_lines(history, speaker_is_a=False, now=now),
-            ),
-            latest_user_message=(
-                f"這是 {char_a.name} 與 {char_b.name} 本次碰面的記憶摘要；"
-                "與 known_material 中近期碰面摘要高度雷同即視為缺乏新意。"
-            ),
-            diversity_evidence=_encounter_diversity_evidence(history, now=now),
-        )
-        try:
-            verdict = await self._novelty_gate.evaluate(
-                context, character=char_a,
+        resolved_history = history
+
+        def _context_for(candidate: EncounterReflection) -> NoveltyGateContext:
+            candidate_text = "\n".join(
+                part for part in (
+                    candidate.summary_for_a.strip(),
+                    candidate.summary_for_b.strip(),
+                ) if part
             )
-        except Exception:
-            _LOGGER.exception(
-                "encounter summary gate failed encounter=%s",
-                getattr(encounter, "id", None),
+            return NoveltyGateContext(
+                character_id=char_a.id,
+                operator_id=getattr(char_a, "user_id", None) or "default",
+                response_text=candidate_text,
+                known_material=tuple(
+                    _render_topic_history_lines(
+                        resolved_history, speaker_is_a=True, now=now,
+                    )
+                    + _render_topic_history_lines(
+                        resolved_history, speaker_is_a=False, now=now,
+                    ),
+                ),
+                latest_user_message=(
+                    f"這是 {char_a.name} 與 {char_b.name} 本次碰面的記憶摘要；"
+                    "與 known_material 中近期碰面摘要高度雷同即視為缺乏新意。"
+                ),
+                diversity_evidence=_encounter_diversity_evidence(
+                    resolved_history, now=now,
+                ),
+                operator_primary_language=language,
             )
-            return reflection
-        if verdict is None or verdict.passes:
-            return reflection
-        feedback = verdict.feedback or "摘要與近期碰面重複"
-        _LOGGER.info(
-            "encounter summary gated encounter=%s feedback=%s",
-            getattr(encounter, "id", None),
-            feedback,
-        )
-        try:
-            retry = await self._reflect(
+
+        async def _regenerate(feedback: str) -> EncounterReflection | None:
+            return await self._reflect(
                 encounter,
                 char_a,
                 char_b,
@@ -1245,13 +1319,29 @@ class CharacterEncounterRunner:
                 speaker_contexts=speaker_contexts,
                 retry_directive=feedback,
             )
-        except Exception:
-            _LOGGER.exception(
-                "encounter re-reflect failed encounter=%s",
+
+        review = await orchestrator.review(
+            reflection,
+            surface="encounter_reflection",
+            context_for=_context_for,
+            regenerate=_regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=char_a,
+            max_retries=self._novelty_gate_max_retries,
+            fallback_feedback="摘要與近期碰面重複",
+        )
+        if review.skipped:
+            verdict = review.final_verdict or review.first_verdict
+            _LOGGER.warning(
+                "encounter summary hard-skipped encounter=%s feedback=%s",
                 getattr(encounter, "id", None),
+                (verdict.feedback if verdict else "") or "-",
             )
-            return reflection
-        return retry
+            raise EncounterOutputUnusable(
+                "encounter summary hard-failed the output quality gate "
+                f"after regeneration: {(verdict.feedback if verdict else '') or '(no feedback)'}"
+            )
+        return review.final
 
     async def _reflect(
         self,
@@ -1570,6 +1660,10 @@ class CharacterEncounterMemoryWriter:
                 ),
                 location=encounter.location,
                 audience=reflection.summary_audience_a,
+                # KB6: an encounter runs character-to-character in the
+                # background. The player was never there, so nothing
+                # from it may be recalled as common ground.
+                player_knowledge=PLAYER_KNOWLEDGE_PRIVATE,
             ),
             MemoryItem.create(
                 character_id=char_b.id,
@@ -1591,6 +1685,7 @@ class CharacterEncounterMemoryWriter:
                 ),
                 location=encounter.location,
                 audience=reflection.summary_audience_b,
+                player_knowledge=PLAYER_KNOWLEDGE_PRIVATE,
             ),
         ]
         for entry in reflection.hearsay_for_a:
@@ -2015,6 +2110,9 @@ def _hearsay_memory(
             normalized.salience, default=0.48, lo=0.2, hi=0.7,
         ),
         tags=("hearsay", "encounter", f"encounter:{encounter.id}"),
+        # KB6: hearsay is second-hand by definition — the owner heard it
+        # from a peer, off-screen. Doubly not the player's to know.
+        player_knowledge=PLAYER_KNOWLEDGE_PRIVATE,
         created_at=encounter.scheduled_for,
         participants=(
             ParticipantRef(
@@ -2050,6 +2148,10 @@ def _peer_fact_memory(
             f"peer:{peer.id}",
             f"encounter:{encounter.id}",
         ),
+        # KB6: same station, same pathway as the summaries above — a
+        # fact learned about a peer during an encounter the player did
+        # not attend.
+        player_knowledge=PLAYER_KNOWLEDGE_PRIVATE,
         created_at=encounter.scheduled_for,
         participants=(
             ParticipantRef(
@@ -2125,19 +2227,41 @@ def _location_at(schedule: DailySchedule, moment: datetime) -> str | None:
     return None
 
 
-def _json_object(raw: str) -> dict[str, Any] | None:
-    text = raw.strip()
-    if not text:
-        return None
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly — see the identical helper's
+    docstring in ``fusion_story_critic``."""
     start = text.find("{")
     end = text.rfind("}")
-    if start >= 0 and end >= start:
-        text = text[start:end + 1]
+    if start < 0 or end <= start:
+        return False
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
+    """DH2-services: object extraction via the shared scanner.
+
+    Truncation repair is on — every prompt behind this helper
+    unconditionally asks for the JSON envelope. No fence-stripping step
+    existed here before and none is added: the scanner is fence-agnostic
+    by construction. Branch selection still mirrors the old crude
+    find/rfind slice exactly (see the helper above) so a genuinely
+    array-shaped reply is not misread as its first nested object.
+
+    FX1/DH-2: the array half of that guard is structural. Its previous
+    spelling — "the whole reply decodes and isn't a dict" — held only
+    while the reply parsed end to end, so an array with a sentence after
+    it (or a stray fence marker anywhere) disabled the guard entirely.
+    """
+    text = raw.strip()
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="character_encounter")
+    return outcome.value
 
 
 def _clean_line(raw: str) -> str:

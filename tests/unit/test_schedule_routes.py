@@ -319,3 +319,70 @@ async def test_delete_memorialized_activity_noop_returns_current() -> None:
     body = res.json()
     assert len(body["activities"]) == 1
     assert body["activities"][0]["id"] == activity.id
+
+
+@pytest.mark.asyncio
+async def test_delete_activity_marks_day_manually_adjusted() -> None:
+    """The DELETE route must stamp the day as operator-owned, or the
+    same-day weather refresh re-plans it and the activity resurrects."""
+    target = date(2026, 4, 21)
+    svc, repo = _service(target)
+    char = _character()
+    activity = ScheduleActivity.create(
+        start_at=datetime(2026, 4, 21, 9, 0, tzinfo=UTC),
+        end_at=datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
+        description="doomed", category="misc",
+    )
+    schedule = DailySchedule.create(
+        character_id="c1", date_=target, activities=[activity],
+    )
+    await repo.save(schedule)
+    client = _build_client(_StubContainer(
+        schedule_service=svc, character_service=_StubCharacterService(char),
+    ))
+
+    res = client.delete(
+        f"/api/v1/characters/c1/schedule/activities/{activity.id}"
+        f"?date={target.isoformat()}",
+    )
+
+    assert res.status_code == 200
+    persisted = await repo.get("c1", target)
+    assert persisted is not None
+    assert persisted.manually_adjusted is True
+
+
+@pytest.mark.asyncio
+async def test_add_and_update_mark_day_manually_adjusted() -> None:
+    target = date(2026, 4, 21)
+    svc, repo = _service(target)
+    char = _character()
+    client = _build_client(_StubContainer(
+        schedule_service=svc, character_service=_StubCharacterService(char),
+    ))
+
+    res = client.post(
+        f"/api/v1/characters/c1/schedule/activities?date={target.isoformat()}",
+        json={
+            "start": "10:00", "end": "11:30",
+            "description": "寫歌詞", "category": "creative",
+        },
+    )
+    assert res.status_code == 201
+    persisted = await repo.get("c1", target)
+    assert persisted is not None
+    assert persisted.manually_adjusted is True
+
+    activity_id = res.json()["activities"][0]["id"]
+    # A fresh, un-stamped row for the PATCH leg: reset the flag to prove
+    # the route itself (not the POST above) stamps it.
+    await repo.save(persisted.with_manual_adjustment(False))
+    res = client.patch(
+        f"/api/v1/characters/c1/schedule/activities/{activity_id}"
+        f"?date={target.isoformat()}",
+        json={"description": "改歌詞"},
+    )
+    assert res.status_code == 200
+    persisted = await repo.get("c1", target)
+    assert persisted is not None
+    assert persisted.manually_adjusted is True

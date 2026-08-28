@@ -10,7 +10,10 @@ from sqlalchemy.orm import sessionmaker
 
 from kokoro_link.contracts.proactive import ProactiveAttemptRepositoryPort
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
-from kokoro_link.domain.value_objects.proactive_outcome import ProactiveOutcome
+from kokoro_link.domain.value_objects.proactive_outcome import (
+    NON_COOLDOWN_ANCHOR_OUTCOMES,
+    ProactiveOutcome,
+)
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
 from kokoro_link.infrastructure.persistence.models import ProactiveAttemptRow
 
@@ -123,11 +126,13 @@ class SAProactiveAttemptRepository(ProactiveAttemptRepositoryPort):
                 select(ProactiveAttemptRow)
                 .where(
                     ProactiveAttemptRow.character_id == character_id,
+                    # Same list the in-memory repository filters on, read
+                    # from one place so the two cooldowns cannot drift.
                     ~ProactiveAttemptRow.outcome.in_(
-                        [
-                            ProactiveOutcome.DISABLED.value,
-                            ProactiveOutcome.GATE_BLOCKED.value,
-                        ],
+                        sorted(
+                            outcome.value
+                            for outcome in NON_COOLDOWN_ANCHOR_OUTCOMES
+                        ),
                     ),
                 )
                 .order_by(ProactiveAttemptRow.decided_at.desc())

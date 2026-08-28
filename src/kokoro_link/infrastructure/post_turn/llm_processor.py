@@ -8,7 +8,6 @@ extraction quality.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -30,7 +29,10 @@ from kokoro_link.contracts.post_turn import (
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.conversation import Message, MessageRole
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.schedule import (
     DailySchedule,
@@ -54,6 +56,7 @@ from kokoro_link.infrastructure.prompt.timing_utils import (
     render_date_anchor_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -132,12 +135,14 @@ class LLMPostTurnProcessor(PostTurnProcessorPort):
         peer_context_lines: list[str] | None = None,
         resolved_player_address: ResolvedAddress | None = None,
         player_persona_note: str = "",
+        disclosure_candidates: list[MemoryItem] | None = None,
     ) -> PostTurnResult:
         # Short-circuit when the operator picked the fake provider —
         # fake emits deterministic text that won't parse as the JSON
         # memory schema and would pollute storage with nothing useful.
         if await self._resolver.is_fake(character=character):
             return PostTurnResult()
+        candidates = tuple(disclosure_candidates or ())
         prompt = _build_prompt(
             character=character,
             user_message=user_message,
@@ -152,6 +157,7 @@ class LLMPostTurnProcessor(PostTurnProcessorPort):
             peer_context_lines=peer_context_lines or [],
             resolved_player_address=resolved_player_address,
             player_persona_note=player_persona_note,
+            disclosure_candidates=candidates,
         )
         try:
             raw = await self._resolver.generate(prompt, character=character)
@@ -176,6 +182,10 @@ class LLMPostTurnProcessor(PostTurnProcessorPort):
             known_activity_ids=known_ids,
             known_beat_ids=known_beat_ids,
             known_peer_lines=peer_context_lines or [],
+            # KB8 — the candidate set is the ceiling on the verdict, and
+            # it is enforced here rather than only at the call site so
+            # the port can never hand back an id the prompt never showed.
+            known_disclosure_ids={item.id for item in candidates},
         )
 
 def _build_prompt(
@@ -193,6 +203,7 @@ def _build_prompt(
     peer_context_lines: list[str] | None = None,
     resolved_player_address: ResolvedAddress | None = None,
     player_persona_note: str = "",
+    disclosure_candidates: "tuple[MemoryItem, ...]" = (),
 ) -> str:
     state = character.state
     ref_now = ensure_utc(now) if now is not None else datetime.now(timezone.utc)
@@ -254,6 +265,9 @@ def _build_prompt(
         history_section=history_section,
         schedule_section=schedule_section,
         arc_section=arc_section,
+        disclosure_section="\n".join(
+            _render_disclosure_section(disclosure_candidates),
+        ),
         user_message=user_message,
         assistant_message=assistant_message,
         kinds_hint=", ".join(sorted(_ALLOWED_KINDS)),
@@ -264,6 +278,49 @@ def _build_prompt(
     if peer_context_lines:
         prompt += _peer_meet_intent_extension(character_name=character.name)
     return prompt
+
+
+_MAX_DISCLOSURE_CANDIDATES = 8
+"""Ceiling on the candidate list. The chat prompt injects at most
+``_MEMORY_PROMPT_TOP_K`` memories in the first place, so this is a
+belt-and-braces bound rather than a real filter — it exists so a caller
+that ever hands over an unfiltered pool can't turn this section into the
+longest part of the prompt."""
+
+_MAX_DISCLOSURE_CONTENT_CHARS = 120
+"""Enough to recognise which memory a line refers to. The model is
+matching the reply against these, not reasoning from them, so a
+truncated tail costs nothing and a full one would crowd out the
+dialogue this pass is actually here to read."""
+
+
+def _render_disclosure_section(
+    candidates: "tuple[MemoryItem, ...]",
+) -> list[str]:
+    """KB8 — the private memories this turn's reply prompt carried.
+
+    Returns ``[]`` when there are none, which renders the template
+    placeholder as an empty string: the field's rules stay in the
+    template (so they are reviewable and overridable like every other
+    rule) while the *data* only appears on turns that have any. An
+    always-present empty list would be an invitation to populate it.
+
+    Ids are printed verbatim because the model's whole job here is to
+    hand a subset of them back. Content is included — abbreviated —
+    because an id alone gives it nothing to match the reply against.
+    """
+    if not candidates:
+        return []
+    lines = [
+        "",
+        "玩家還不知道的記憶（本輪已放進角色的回想區；id 供 disclosed_memory_ids 引用）：",
+    ]
+    for item in candidates[:_MAX_DISCLOSURE_CANDIDATES]:
+        content = (item.content or "").strip()
+        if len(content) > _MAX_DISCLOSURE_CONTENT_CHARS:
+            content = content[:_MAX_DISCLOSURE_CONTENT_CHARS] + "…"
+        lines.append(f"- id={item.id}｜{content}")
+    return lines
 
 
 def _render_player_persona_note_context(note: str) -> list[str]:
@@ -474,8 +531,18 @@ def _parse_response(
     known_activity_ids: set[str] | None = None,
     known_beat_ids: set[str] | None = None,
     known_peer_lines: list[str] | None = None,
+    known_disclosure_ids: set[str] | None = None,
 ) -> PostTurnResult:
-    obj = _extract_object(raw)
+    # This processor asks for the single largest JSON object any prompt
+    # in the codebase requests — memories, state, schedule, arc and
+    # promises in one reply — which makes it the site most likely to be
+    # cut off by ``max_tokens``. Truncation repair therefore buys back
+    # the fields that *did* arrive instead of dropping the whole turn's
+    # extraction; the per-field validation below is unchanged and still
+    # discards anything half-formed.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="post_turn.llm_processor")
+    obj = outcome.value
     if obj is None:
         return PostTurnResult()
 
@@ -498,6 +565,10 @@ def _parse_response(
     )
     emotion_events = _parse_emotion_events(obj.get("emotion_events"))
     address_changes = _parse_address_changes(obj.get("address_changes"))
+    disclosed_memory_ids = _parse_disclosed_memory_ids(
+        obj.get("disclosed_memory_ids"),
+        known_ids=known_disclosure_ids or set(),
+    )
     return PostTurnResult(
         memories=memories,
         state_suggestion=state_suggestion,
@@ -507,7 +578,43 @@ def _parse_response(
         peer_meet_intents=peer_meet_intents,
         emotion_events=emotion_events,
         address_changes=address_changes,
+        disclosed_memory_ids=disclosed_memory_ids,
     )
+
+
+def _parse_disclosed_memory_ids(
+    raw: Any, *, known_ids: set[str],
+) -> list[str]:
+    """KB8 — read the disclosure verdict, bounded by what was injected.
+
+    Two rules, both of which exist because the value being written is
+    hard to walk back (a ``disclosed`` memory stops being introduced):
+
+    * **allow-list, not validation.** An id outside ``known_ids`` is
+      dropped without a lookup. Anything else — including "check whether
+      it exists and flip it if so" — lets a hallucinated but real id
+      mark an untold memory as told.
+    * **order and uniqueness from the caller's set, not the model's
+      reply.** Duplicates collapse; the result is a plain list so the
+      caller can log exactly what it is about to flip.
+
+    A non-list reply (a bare string, an object, an absent field) yields
+    ``[]`` — the shape was wrong, so there is no verdict, and no verdict
+    means no flip.
+    """
+    if not isinstance(raw, list) or not known_ids:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        item_id = entry.strip()
+        if item_id in seen or item_id not in known_ids:
+            continue
+        seen.add(item_id)
+        out.append(item_id)
+    return out
 
 
 _MAX_MESSAGE_PROMISES = 2
@@ -839,41 +946,6 @@ def _trim(raw: Any, limit: int) -> str:
     return ""
 
 
-def _extract_object(text: str) -> dict[str, Any] | None:
-    """Extract the first top-level JSON object from possibly noisy text."""
-    start = text.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
-
-
 # ------------------------------------------------------------------
 # Memory parsing (mirrors llm_extractor logic)
 # ------------------------------------------------------------------
@@ -925,6 +997,12 @@ def _payload_to_item(
             participants=participants,
             location=location,
             audience=audience,
+            # KB6: post-turn runs after a message actually reached the
+            # player — a chat reply, a proactive push, a busy-defer
+            # follow-up, a scheduled promise. Every one of those means
+            # the player saw the exchange this memory summarises, so
+            # the pathway (not the model) stamps ``shared``.
+            player_knowledge=PLAYER_KNOWLEDGE_SHARED,
         )
     except ValueError:
         return None

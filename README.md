@@ -205,6 +205,7 @@ uv run python scripts/llm_capacity_probe.py core-chat --core-url http://127.0.0.
 | `KOKORO_USAGE_PRICE_CATALOG_PATH` | Optional local JSON price catalog for the generation usage ledger. The bundled `usage-prices.openai.json` covers OpenAI Standard LLM token pricing and GPT Image token-detail pricing when the provider returns image usage tokens; when omitted, usage is still recorded with zero/unknown estimated cost. |
 | `PERSONA_CURIOSITY_ENABLED` / `PERSONA_CURIOSITY_PROACTIVE_ENABLED` | Optional rollout flags for conversational persona discovery. They let the LLM curiosity planner contribute low-pressure discovery hints to chat / proactive prompts without adding player-facing profile forms or bypassing the persona extraction pipeline. |
 | `KOKORO_PROMPT_MATERIAL_DIGEST_ENABLED` / `KOKORO_NOVELTY_GATE_ENABLED` / `KOKORO_REGISTER_PROFILE_ENABLED` / `KOKORO_NOVELTY_GATE_MAX_RETRIES` | Prompt-quality flags. Defaults enable material digest, register profiling, and the reply quality gate: chat compresses recent poetic material into factual bullets, profiles the turn's register, and only buffers high-risk replies for LLM quality review before sending. Low-risk streaming remains incremental. |
+| `KOKORO_DIALOGUE_CHECKPOINT_ENABLED` / `KOKORO_DIALOGUE_CHECKPOINT_WINDOW_MESSAGES` / `KOKORO_DIALOGUE_CHECKPOINT_PROMPT_BUDGET_TOKENS` / `KOKORO_DIALOGUE_CHECKPOINT_BACKLOG_TRIGGER_TOKENS` | Cumulative dialogue checkpoint, **off by default**. On, everything older than the loaded window is represented by one summary that keeps growing in coverage without growing in length, updated in the background after a turn rather than re-derived on every turn in front of the player's reply; the loaded window widens from 8 messages to `WINDOW_MESSAGES` under an estimated-token budget, and the newest three turns are always verbatim. Off, the chat prompt is byte-for-byte what it was before the flag existed. The two token numbers are estimates (CJK ≈1 token/char, everything else ≈len/4, ±30%) used only to compare text against text — they are not any upstream's context limit. |
 | `YURALUME_STORY_SCENE_IDLE_TIMEOUT_SECONDS` | Optional idle window before an abandoned **Start a Scene** story scene wraps itself up and lands as canon, default `86400` (24h). The only configurable number in the feature — pacing has no hard-coded ceiling. |
 | `NSFW_MODE_TTL_SECONDS` / `KOKORO_NSFW_MODE_TTL_SECONDS` | Optional self-host NSFW mode idle TTL, default `1800` seconds. The mode is manual per user, uses an Admin-configured community LLM/image target, and is locked in hosted cloud mode. |
 | `TAVILY_API_KEY` | Optional; enables the `web_search` tool. |
@@ -246,6 +247,7 @@ src/kokoro_link/
   contracts/      # Port interfaces (provider-agnostic)
   domain/         # Entities, value objects
   infrastructure/ # Repositories, LLM adapters, persistence
+  llm_output/     # Shared "model reply text -> JSON" extraction (no domain deps)
 frontend/         # Vue 3 + Vite + Ant Design Vue
 alembic/          # Database migrations
 docker/           # Local infra Dockerfiles

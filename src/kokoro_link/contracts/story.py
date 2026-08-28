@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Protocol
 
 from kokoro_link.domain.entities.story_event import StoryEvent
@@ -149,6 +149,18 @@ class StoryEventRepositoryPort(Protocol):
     async def mark_memorialized(self, event_id: str) -> None: ...
 
     async def delete_for_character(self, character_id: str) -> int: ...
+
+    async def delete_arc_beat_realizations_since(
+        self, character_id: str, since: datetime,
+    ) -> int:
+        """Delete arc-beat-realization events for ``character_id`` created
+        at-or-after ``since``. Returns the number removed.
+
+        Scoped to ``arc_beat_id IS NOT NULL`` only — gacha-rolled events
+        (``seed_id`` set) regenerate daily via ``ensure_today`` and are
+        deliberately out of scope for undo. An arc-beat realization is a
+        one-shot record of a beat having been played; nothing regenerates
+        it, so turn-undo is the only thing that can put it back."""
 
 
 class StoryEventExpanderPort(Protocol):

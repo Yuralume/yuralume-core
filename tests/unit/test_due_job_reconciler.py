@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from kokoro_link.application.services.due_job_reconciler import DueJobReconciler
 from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.background_jobs import COORDINATOR_LEASE_NAME
-from kokoro_link.contracts.due_jobs import character_chain_kinds, kind_spec
+from kokoro_link.contracts.due_jobs import (
+    PROACTIVE_EVALUATE_KIND,
+    character_chain_kinds,
+    kind_spec,
+)
 from kokoro_link.domain.value_objects.account_runtime_profile import (
     DEFAULT_ACCOUNT_RUNTIME_PROFILE,
     AccountRuntimeProfile,
@@ -38,7 +42,7 @@ class _FakeCharacter:
     frozen: bool = False
     subscription_locked: bool = False
     proactive_enabled: bool = True
-    created_at: datetime = BASE
+    created_at: datetime | None = BASE
     state: _State = field(default_factory=_State)
 
 
@@ -221,12 +225,18 @@ _EXEMPT = tuple(
     kind for kind in character_chain_kinds() if kind_spec(kind).dormancy_exempt
 )
 
+#: Old enough that the TR2 first-contact grace has closed, so "never
+#: interacted" means dormant for every non-exempt kind including proactive.
+#: The grace's own reseed behaviour is pinned separately below.
+_LONG_AGO = BASE - timedelta(days=30)
+
 
 async def test_dormant_character_is_reseeded_only_for_exempt_kinds() -> None:
     """Dormancy reaches the reseeder through the calculator, exactly as
     freeze does — the reconciler needs no dormancy knowledge of its own."""
     queue, reconciler, _ = await _wiring(
-        [_FakeCharacter("c1")],  # never interacted → dormant from creation
+        # Never interacted, and created long ago → dormant, grace closed.
+        [_FakeCharacter("c1", created_at=_LONG_AGO)],
         ownership=await _distributed_ownership(),
         profile=_DORMANT_TIER,
     )
@@ -237,11 +247,30 @@ async def test_dormant_character_is_reseeded_only_for_exempt_kinds() -> None:
     assert await queue.active_chain_keys() == {(kind, "c1") for kind in _EXEMPT}
 
 
+async def test_fresh_character_is_reseeded_for_first_contact_too() -> None:
+    """TR2. The same never-interacted character, inside its first-contact
+    window: the reconciler must seed the proactive chain as well, or the free
+    tier's first contact has no tick to happen on. Everything else still
+    stops — the grace is one kind wide, not a second exemption list."""
+    queue, reconciler, _ = await _wiring(
+        # Created 8 h ago — TR2-B's delay window has elapsed, the 72 h
+        # first-contact grace has not.
+        [_FakeCharacter("c1", created_at=BASE - timedelta(hours=8))],
+        ownership=await _distributed_ownership(),
+        profile=_DORMANT_TIER,
+    )
+    result = await reconciler.run_once(now=BASE)
+
+    expected = {*_EXEMPT, PROACTIVE_EVALUATE_KIND}
+    assert result.reseeded == len(expected)
+    assert await queue.active_chain_keys() == {(kind, "c1") for kind in expected}
+
+
 async def test_foreground_interaction_relinks_every_chain() -> None:
     """恢復 reuses the thaw path verbatim (cf. ``test_thaw_relinks_chain``): the
     foreground turn moves ``last_active_at``, and the next reconcile pass — the
     same one that reseeds after an unfreeze — brings the whole chain set back."""
-    character = _FakeCharacter("c1")
+    character = _FakeCharacter("c1", created_at=_LONG_AGO)
     queue, reconciler, _ = await _wiring(
         [character],
         ownership=await _distributed_ownership(),

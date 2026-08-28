@@ -62,9 +62,14 @@ class ActiveTurn:
     """One counted in-flight turn. :meth:`release` is idempotent.
 
     Handed out by :meth:`DrainState.try_enter_turn`. Idempotence is not decoration:
-    the streaming chat path releases from the finalizer *and* from the route's
-    ``finally``, exactly like the conversation lease it travels with, so a second
-    release is the normal case rather than a bug.
+    the streaming chat path may release from the finalizer's ``finish`` *and*
+    from the relay's unfinished-turn ``finally``, exactly like the conversation
+    lease it travels with, so a second release is the normal case rather than a
+    bug.
+
+    Note the drain contract this preserves: a turn whose client disconnected is
+    still a counted turn, because it is still writing. Drain waits for the turn
+    to end, not for the socket to close.
 
     An instance built with ``None`` counts nothing — that is the shape a service
     with no drain wiring (bare test containers) gets, so callers never branch.

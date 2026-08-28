@@ -610,6 +610,7 @@ export const messages: MessageSchema = {
   },
   chat: {
     priceChanged: 'Lume prices were just updated — nothing was spent. Please send again.',
+    conversationBusy: 'Your character is still answering the previous message — wait for this turn to finish, then send again.',
     header: {
       noCharacter: 'Create or pick a character on the left to start chatting',
       talkingTo: 'Chatting with {name}',
@@ -650,13 +651,19 @@ export const messages: MessageSchema = {
       loadOlder: 'Load earlier messages',
       loadingOlder: 'Loading earlier messages…',
       scrollToLatest: 'Jump to latest message',
-      streamingHint: 'May be using tools (image generation can take 30–60s)',
+    },
+    toolActivity: {
+      generateImage: 'Drawing a picture…',
+      webSearch: 'Looking something up…',
+      webFetch: 'Reading a page…',
+      generic: 'Busy with something…',
     },
     onboarding: {
       title: 'Start with one line to {name}',
       stageHint: 'Stage works like speaking face to face; {name} answers from whatever their day and situation happen to be right now.',
       dmHint: 'Phone mode is for messaging {name}, especially when you are not sure meeting now feels natural.',
       lifeHint: 'After a few turns, {name}’s Life and Memories sections start filling in with the day you are building together.',
+      nudgeOption: 'Not sure what to say? Let {name} speak first',
       startersAria: 'Starter messages',
       starters: {
         stageGreeting: '{name}, how has your day been?',
@@ -720,6 +727,8 @@ export const messages: MessageSchema = {
       title: 'Let {name} speak first',
       placeholder: 'Add context for this moment (optional), e.g. "I walk through the door"',
       confirm: 'Speak',
+      tip: 'This button lets {name} speak first — it stays right here whenever you want it.',
+      tipDismiss: 'Got it',
     },
     actions: {
       undo: 'Undo last turn',
@@ -898,11 +907,11 @@ export const messages: MessageSchema = {
           schedule: 'Every character has a daily schedule: commuting, working, eating, sleeping. Ask what they are doing and the answer follows the schedule; even on a day you never open the chat, what they went through becomes memory. You can adjust their day in plain words under Life.',
           busyDefer: 'When they truly cannot step away, they say so first and then really do come back to it later. If you message again while waiting, they cancel the deferred reply and answer you directly instead of leaving it stranded. And if those messages contained something they had to look up or do before they could answer, they do that first and report back.',
           promise: 'Tell them to wake you at seven tomorrow and they note it down, then message you at seven. Promises like "I will look that up later" or "I will send you a photo" work the same way: when the time comes they actually look it up or take the picture, then send you the result. If they cannot find it, they say so rather than making up something that merely sounds right.',
-          proactive: 'They can reach out when you have not said anything. You can switch that off, or pick Quiet / Balanced / Lively in their settings to change how often they open their mouth. Whether a message actually goes out still depends on their life at that moment and your recent conversation — Lively is not a fixed quota per day. The permission and preferred cadence you set at creation can also be adjusted again under "Relationship settings" in the character settings.',
+          proactive: 'They can reach out when you have not said anything. You can switch that off, or pick Quiet / Balanced / Lively in their settings to change how often they open their mouth. Whether a message actually goes out still depends on their life at that moment and your recent conversation — Lively is not a fixed quota per day. "They may reach out first" comes pre-checked when you create a character, and you can clear it right there; if you leave it on they still will not write immediately — there is a gap after creation, and they pick their own moment after that. That permission and the preferred cadence can both be adjusted again later under "Relationship settings" in the character settings.',
           noReply: 'If you keep not answering, they do not resend the same message every day. Their attitude shifts the way a person’s would: concerned first, then sulking, then giving you space.',
           drift: 'Leave them alone long enough and their tone when you come back depends on their personality — some make a scene about it, the cool ones may genuinely not mind.',
           encounter: 'Characters also meet each other. Their schedules and relationships are used to arrange a meeting and play it out as a short conversation, and afterwards they may bring up who they ran into yesterday.',
-          world: 'They live in real time: they know whether it is raining today and which day of the long weekend it is, and they mention recent news naturally. Ask about a news item they brought up and they read the original before answering rather than guessing from memory. This layer needs outside topics switched on under "What this character tends to follow".',
+          world: 'They live in real time: they know whether it is raining today and which day of the long weekend it is, and they mention recent news naturally. Ask about a news item they brought up and they read the original before answering rather than guessing from memory. Modern-world characters have this layer on by default; fantasy/school-set characters default it off — either way you can flip it yourself under "What this character tends to follow".',
         },
       },
       lumegram: {
@@ -964,6 +973,7 @@ export const messages: MessageSchema = {
         lead: 'The character is yours and can leave with you. Sharing one with someone else and moving one yourself are two different files — do not reach for the wrong one.',
         items: {
           card: '".lumecard" is the sharing format: it carries the persona, the appearance, the stage art and any story series you wrote for them, but no memories, no conversations and none of your relationship. Whoever imports it gets a brand new character who has to get to know them from scratch.',
+          identityCard: '"Player identity cards" do not save the character itself — they save the set of answers to "how the two of you relate": how you address each other, how close you keep things, whether they may reach out first, your persona note, and so on. The character-creation wizard lets you bring one in to fill those fields in one go; every field stays editable afterward, and nothing you change flows back into the card — the card is a snapshot from that moment, and it does not drift with whichever character you later create from it. The wizard also lets you save whatever you just filled in as a new card, ready to bring in next time you create someone. An existing character’s settings page can likewise save its current relationship setup as a new card, so you can carry it over to the next character. Every saved card lives under "Player identity cards" on the Personal tab of settings — rename, delete, and preview every field there; the first version has no in-place editing yet. A duplicate name asks whether to overwrite, and there is a cap on how many you can keep — once full, delete one before saving another.',
           backup: '".lumebackup" is the moving format: every conversation, memory, schedule, story line, album and LumeGram media packed whole into one encrypted file, which you can carry to another site of your own (self-hosted and cloud, in both directions) or simply keep offline. On the cloud version, how many exports you may run is counted per account rather than per character: exporting again and again in a short stretch is turned away for a while, so leave it a little and try again.',
           backupSelfHost: '".lumebackup" is the moving format: every conversation, memory, schedule, story line, album and LumeGram media packed whole into one encrypted file, which you can carry to another site of your own (self-hosted and cloud, in both directions) or simply keep offline.',
           password: 'When you export a backup you set a password used for nothing but that file. Keep it somewhere safe: if you forget it, the backup can never be opened again, and we cannot recover it for you.',
@@ -2729,6 +2739,8 @@ export const messages: MessageSchema = {
         sharedAllowed: 'They may plan shared daily life I explicitly allow',
       },
       proactivePermission: 'After creation, they may reach out before I message first',
+      proactivePermissionHint: 'On by default — uncheck it if you would rather they waited. They will not write the moment you finish: there is a quiet gap after creation, then they pick their own timing, and late hours are skipped. Messages on the web only show up when you come back; link the official LINE account and they can actually reach you.',
+      proactiveCadenceLabel: 'How often they should reach out',
       proactiveCadencePlaceholder: 'e.g. at most once per day, only when something matters',
       proactiveCadenceHint: 'Optional — leave blank and they will judge the frequency and timing themselves',
       profileInterests: 'Interests they may know',
@@ -2790,6 +2802,72 @@ export const messages: MessageSchema = {
       label: 'Your persona',
       filledHint: 'You have told {name} who you are. Click to change it.',
       emptyHint: 'Tell {name} who you are.',
+    },
+  },
+  identityCard: {
+    picker: {
+      label: 'Start from an identity card',
+      placeholder: 'Start from a blank form',
+      hint: 'Pick one of your saved identity cards to fill in the fields below in one go. Every field stays editable afterwards, and editing it here never changes the card.',
+    },
+    personaNote: {
+      label: 'Your persona (optional)',
+      placeholder: 'e.g. I can see the colour of what people feel, and you are the only one who knows.',
+      hint: 'Tell {name} who you are: your identity, your background, the premise of your world. Leave it empty if you would rather write it later.',
+    },
+    save: {
+      checkbox: 'Save what I filled in as an identity card',
+      nameLabel: 'Identity card name',
+      namePlaceholder: 'e.g. Office-worker me',
+      hint: 'Next time you create a character you can load this whole set in one go. Up to {max} characters; a name you already used will ask before overwriting.',
+    },
+    overwrite: {
+      title: 'Overwrite the existing identity card?',
+      content: 'You already have an identity card named "{name}". Overwriting replaces its contents with what you filled in here. Characters already created from it are unaffected.',
+      ok: 'Overwrite',
+    },
+    followUp: {
+      cardSaved: 'Identity card saved',
+      personaNoteFailed: 'Your persona was not saved',
+      cardSaveFailed: 'The identity card was not saved',
+      bothFailed: 'Neither your persona nor the identity card was saved',
+      characterStillCreated: 'The character was created. Only this last step did not go through, so you can simply retry it.',
+      limitReached: 'You have reached the limit of {limit} identity cards. Delete one in settings before saving another.',
+    },
+    saveFromCharacter: {
+      action: 'Save this set as an identity card',
+      hint: 'Save {name}\'s current relationship settings and persona as an identity card you can load next time you create a character. This uses what is already saved — unsaved edits are not included.',
+      loadFailed: 'Could not read the current settings. Please try again later.',
+      empty: 'There is nothing saved for this character yet — fill in some relationship settings or your persona above, then come back to save it as an identity card.',
+    },
+    manage: {
+      title: 'Identity cards',
+      hint: 'Templates saved from the character wizard or a character\'s settings page. You can rename, delete, and preview every field here — editing content is not yet available in this first version.',
+      loading: 'Loading…',
+      loadFailed: 'Could not load your identity cards. Please try again later.',
+      empty: 'No identity cards yet. Save your first one from the character wizard or a character\'s settings page.',
+      count: '{count} / {limit}',
+      limitNote: 'You have reached the limit — delete one below before adding another.',
+      updatedAtLabel: 'Updated {time}',
+      previewAction: 'Preview',
+      renameAction: 'Rename',
+      rename: {
+        namePlaceholder: 'Identity card name',
+        hint: 'Up to {max} characters.',
+        conflict: 'You already have an identity card with that name. Try a different one.',
+        failed: 'Could not rename it. Please try again later.',
+        saved: 'Renamed',
+      },
+      delete: {
+        confirmTitle: 'Delete this identity card?',
+        confirmContent: 'Deleting "{name}" will not affect characters already created from it — only the card itself disappears.',
+        done: 'Identity card deleted',
+        failed: 'Could not delete it. Please try again later.',
+      },
+      preview: {
+        enabled: 'Allowed',
+        disabled: 'Not allowed',
+      },
     },
   },
   characterBackup: {
@@ -3112,6 +3190,7 @@ export const messages: MessageSchema = {
       arc_template_translate: 'Arc template translation',
       story_seed_translate: 'Story seed translation',
       showcase_review: 'Public showcase pre-review',
+      showcase_image_review: 'Public showcase image consistency pre-review',
       showcase_translate: 'Public showcase translation',
       official_card_translate: 'Official card pre-translation',
       sillytavern_normalize: 'SillyTavern card import normalization',
@@ -3127,11 +3206,15 @@ export const messages: MessageSchema = {
       persona_projection: 'Operator persona: player-facing projection',
       persona_curiosity: 'Operator persona: natural discovery planning',
       address_preference_observer: 'Register observer: address / formality preference',
+      relationship_coherence: 'Relationship address-coherence self-heal',
       experiment_analysis: 'A/B experiment: manual analysis report',
       character_encounter_plan: 'Character encounter: natural meetup planning',
+      character_encounter_beats: 'Character encounter: topic beat planning',
       character_encounter_dialogue: 'Character encounter: short dialogue',
       character_encounter_reflect: 'Character encounter: memory reflection',
       peer_knowledge_consolidate: 'Character social knowledge consolidation',
+      outcome_claim_judge: 'Outbound outcome-claim consistency check',
+      player_knowledge_disclosure: 'Proactive-push disclosure judge (player knowledge ledger)',
     },
     reasoning: {
       title: 'Reasoning settings',
@@ -3140,7 +3223,7 @@ export const messages: MessageSchema = {
       disableLabel: 'Disable reasoning (thinking)',
       effortLabel: 'Reasoning effort (OpenAI-compatible; value range depends on provider)',
       effortPlaceholder: 'e.g. low / medium / high',
-      budgetLabel: 'Thinking budget tokens (Anthropic)',
+      budgetLabel: 'Thinking budget tokens (Anthropic / OpenRouter connections only — ignored on others)',
       budgetPlaceholder: 'e.g. 4096',
     },
     vision: {
@@ -3269,6 +3352,12 @@ export const messages: MessageSchema = {
       configured: 'Configured',
       unconfigured: 'Not configured',
     },
+    options: {
+      imageGenerationOff: 'Disable image generation',
+    },
+    hints: {
+      imageDisabled: 'Disabled: while NSFW mode is active, image generation replies "currently unavailable" right away instead of routing to a normal image profile.',
+    },
     empty: {
       providers: 'No providers available',
       models: 'No models available',
@@ -3283,7 +3372,7 @@ export const messages: MessageSchema = {
     errors: {
       loadFailed: 'Failed to load NSFW mode routing target',
       modelsLoadFailed: 'Failed to load model list',
-      targetRequired: 'Choose an LLM provider, model, and image profile first.',
+      targetRequired: 'Choose an LLM provider, a model, and an image profile (or disable image generation) first.',
       saveFailed: 'Failed to save NSFW mode routing target',
     },
   },
@@ -4430,6 +4519,8 @@ export const messages: MessageSchema = {
       brand: 'Admin',
       warn: 'Technical area',
       warnHint: 'This is the technical admin area; changes can cause character memory drift.',
+      toggleNav: 'Toggle navigation menu',
+      backToOverview: 'Overview',
     },
     home: {
       title: 'Admin home',
@@ -4769,7 +4860,7 @@ export const messages: MessageSchema = {
         reasoning_effort: { label: 'Reasoning effort (provider-specific value, leave blank for default)', placeholder: 'e.g. low / medium / high' },
         extra_request_params: { label: 'Extra request params (raw JSON object, merged into request payload)', placeholder: 'Advanced: per-provider params, e.g. {\'{\'}"top_k": 40{\'}\'}' },
         strip_think_tags: { label: 'Strip <think>...</think> tags from replies' },
-        thinking_budget_tokens: { label: 'Thinking budget tokens (blank = extended thinking off)', placeholder: 'e.g. 4096' },
+        thinking_budget_tokens: { label: 'Thinking budget tokens', placeholder: 'e.g. 4096' },
         server: { label: 'ComfyUI server URL', placeholder: 'http://127.0.0.1:8188' },
         checkpoint: { label: 'Checkpoint (model file)', placeholder: 'waiNSFWIllustrious_v140.safetensors' },
         workflow_file: { label: 'Workflow JSON path (blank = built-in default)', placeholder: '/path/to/workflow_api.json' },
@@ -4778,6 +4869,26 @@ export const messages: MessageSchema = {
           label: 'Connection slug (blank for your first connection of this provider)',
           placeholder: 'e.g. relay-b',
           hint: 'Only needed when you keep several connections of this same provider — e.g. a relay vendor whose API keys each serve a different model line-up. The slug becomes part of the id you pick in the model selector (custom_openai_compatible__relay-b), so keep it short, ASCII, and do not rename it afterwards: settings that point at the old id fall back to the default.',
+        },
+        // Per-preset overrides for field keys that are DELIBERATELY
+        // shared across providers with different wire semantics — see
+        // catalogLabels.ts providerFieldLabel/providerFieldHint. Each
+        // sub-key here wins over the flat entry above when the admin
+        // page passes the connection's preset id.
+        anthropic: {
+          thinking_budget_tokens: {
+            hint: 'Leave blank to turn extended thinking off (the parameter is not sent at all, so the model does not think).',
+          },
+        },
+        openrouter: {
+          thinking_budget_tokens: {
+            hint: 'Sent as reasoning.max_tokens. Mutually exclusive with "Reasoning effort" — when both are filled in, this budget wins. Leaving it blank means the parameter is not sent at all, so the upstream model falls back to its own default — it does NOT turn thinking off.',
+          },
+        },
+        custom_openai_compatible: {
+          disable_reasoning: {
+            hint: 'This checkbox sends the vLLM / llama.cpp convention chat_template_kwargs (enable_thinking: false). If this connection actually points at an aggregator endpoint such as OpenRouter, the checkbox will most likely be a no-op — use "Extra request params" to hand-fill whatever reasoning object that aggregator expects instead, or switch to the dedicated OpenRouter connection type.',
+          },
         },
       },
       runtimeIdHint: 'The id this connection appears under in the model selector',

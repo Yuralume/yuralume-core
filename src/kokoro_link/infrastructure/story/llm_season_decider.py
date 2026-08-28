@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
 
 from kokoro_link.application.services.model_resolver import ModelResolver
@@ -16,9 +14,9 @@ from kokoro_link.contracts.story_arc import (
     StoryArcSeasonDecision,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
-_FENCE_RE = re.compile(r"```(?:\w+)?\n?")
 
 
 class NullStoryArcSeasonDecider(StoryArcSeasonDeciderPort):
@@ -129,16 +127,10 @@ def _arc_history_block(arc_history: tuple[str, ...]) -> str:
 
 
 def _parse_decision(raw: str) -> StoryArcSeasonDecision | None:
-    text = _FENCE_RE.sub("", raw or "").replace("```", "").strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    log_parse_outcome(_LOGGER, outcome, site="story.season_decider")
+    data = outcome.value
+    if data is None:
         return None
     should_start = data.get("should_start")
     if not isinstance(should_start, bool):

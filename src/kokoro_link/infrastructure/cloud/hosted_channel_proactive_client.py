@@ -83,6 +83,23 @@ class ChannelAcceptResult:
     delivery_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EligibilityVerdict:
+    """Result of :meth:`get_eligibility` — the channel's verdict AND its reason.
+
+    ``reason`` is the channel's own decline reason (``no_active_endpoint`` /
+    ``not_opted_in`` / ``quota_character_monthly_exhausted`` / ...), collapsed
+    to one line and clamped (LQ-F2) so a buggy or verbose peer cannot forge log
+    lines or corrupt whatever surface renders it downstream (the LINE
+    reactivation candidate listing shows it verbatim to an operator). ``None``
+    when eligible, or when the channel answered without a usable ``reason``
+    field — callers apply their own fallback text for that case.
+    """
+
+    eligible: bool
+    reason: str | None = None
+
+
 class HostedChannelProactiveClient:
     def __init__(
         self,
@@ -103,16 +120,17 @@ class HostedChannelProactiveClient:
         tenant_id: str,
         account_id: str,
         character_id: str,
-    ) -> bool:
+    ) -> EligibilityVerdict:
         """Non-authoritative cost preflight.
 
         ``200`` means "the channel answered", NOT "yes" — the verdict is the
-        body's ``eligible`` field (LH7-D). ``False`` therefore comes from either
-        a ``200`` decline (e.g. this character is not opted in) or a ``404`` (no
-        endpoint at all); both mean "do not spend decider/generation budget on
-        this character now". Any other status, a network error, or a timeout
-        raises :class:`ChannelDeliveryTransientError` so the adapter can answer
-        "not eligible, but for a retryable reason" and cache it only briefly.
+        body's ``eligible`` field (LH7-D). A negative verdict therefore comes
+        from either a ``200`` decline (e.g. this character is not opted in, or
+        LQ-F2's ``quota_character_monthly_exhausted``) or a ``404`` (no endpoint
+        at all); both mean "do not spend decider/generation budget on this
+        character now". Any other status, a network error, or a timeout raises
+        :class:`ChannelDeliveryTransientError` so the adapter can answer "not
+        eligible, but for a retryable reason" and cache it only briefly.
         """
         if not self._base_url:
             raise ChannelDeliveryConfigurationError("channel base URL is empty")
@@ -133,7 +151,7 @@ class HostedChannelProactiveClient:
         if response.status_code == 200:
             return _verdict_from_body(response)
         if response.status_code == 404:
-            return False
+            return EligibilityVerdict(eligible=False, reason=None)
         raise ChannelDeliveryTransientError(
             f"channel eligibility returned {response.status_code}",
         )
@@ -182,15 +200,22 @@ class HostedChannelProactiveClient:
         return outbound_headers(self._service_credential)
 
 
-def _verdict_from_body(response: httpx.Response) -> bool:
+def _verdict_from_body(response: httpx.Response) -> EligibilityVerdict:
     """Read the eligibility verdict out of a ``200`` body (LH7-D).
 
     A missing / non-boolean ``eligible`` keeps the pre-LH7-D status-only
-    semantics (``True``) instead of failing closed: during a mixed-version
-    deployment (new Core, old Channel) a contract gap must not silently stop
-    every proactive push. Arbitration re-checks every gate at send time and
-    still drops what must be dropped, so the cost is wasted generation — not a
-    wrong send — and the warning names the mismatch loudly.
+    semantics (``True``, no reason) instead of failing closed: during a
+    mixed-version deployment (new Core, old Channel) a contract gap must not
+    silently stop every proactive push. Arbitration re-checks every gate at
+    send time and still drops what must be dropped, so the cost is wasted
+    generation — not a wrong send — and the warning names the mismatch loudly.
+
+    On a decline, the body's ``reason`` string (LQ-F2) rides along on the
+    returned :class:`EligibilityVerdict` — collapsed/clamped the same way the
+    log line is — so a caller that surfaces *why* to an operator (the LINE
+    reactivation candidate listing) does not have to re-derive a generic
+    "no active channel endpoint" when the channel already said more (e.g.
+    ``quota_character_monthly_exhausted``).
 
     Identifiers stay OUT of these log lines on purpose — this module's logging
     discipline is "only the event id and transport status reach the log", and
@@ -205,23 +230,31 @@ def _verdict_from_body(response: httpx.Response) -> bool:
             "assuming eligible; Core and Channel contract versions may be "
             "mismatched",
         )
-        return True
+        return EligibilityVerdict(eligible=True, reason=None)
     if eligible:
-        return True
+        return EligibilityVerdict(eligible=True, reason=None)
+    assert body is not None  # narrowed: eligible came from body.get(...)
+    reason = _reason_text(body)
     _LOGGER.info(
         "channel eligibility declined reason=%s — skipping proactive "
         "generation for this tick",
-        _reason_text(body),
+        reason or _REASON_UNSPECIFIED,
     )
-    return False
+    return EligibilityVerdict(eligible=False, reason=reason)
 
 
-def _reason_text(body: dict[str, Any]) -> str:
+def _reason_text(body: dict[str, Any]) -> str | None:
+    """Collapse/clamp the body's ``reason`` for both logging and propagation.
+
+    ``None`` means "the channel did not supply one" — distinct from an empty
+    or whitespace-only string, which also collapses to ``None`` so a caller's
+    own fallback text (rather than an empty string) reaches the operator.
+    """
     value = body.get("reason")
     if value is None:
-        return _REASON_UNSPECIFIED
+        return None
     text = " ".join(str(value).split())[:_REASON_MAX_CHARS]
-    return text or _REASON_UNSPECIFIED
+    return text or None
 
 
 def _delivery_id(response: httpx.Response) -> str | None:

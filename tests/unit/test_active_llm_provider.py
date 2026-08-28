@@ -1151,6 +1151,289 @@ async def test_nsfw_mode_skips_routing_reasoning_override() -> None:
     assert model.bound_overrides is None
 
 
+# ---- active_model reasoning layer (D2 eligibility) --------------------
+
+
+@pytest.mark.asyncio
+async def test_active_model_reasoning_binds_without_feature_key() -> None:
+    """The primary pick's posture applies to plain resolution (no
+    feature_key) — the path that previously never bound reasoning."""
+    provider, prefs, lmstudio = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+
+    model = await provider.resolve()
+
+    assert model is not lmstudio
+    assert model.bound_overrides == ReasoningOverrides(reasoning_effort="high")
+    assert lmstudio.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_active_model_reasoning_binds_for_unpinned_feature() -> None:
+    """A feature with no feature/group pin resolves through active_model
+    — its posture rides along with its model."""
+    provider, prefs, lmstudio = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "shared",
+            "reasoning": {"disable_reasoning": True},
+        },
+    )
+
+    model = await provider.resolve("post_turn")
+
+    assert await provider.resolve_model_id("post_turn") == "shared"
+    assert model.bound_overrides == ReasoningOverrides(disable_reasoning=True)
+
+
+@pytest.mark.asyncio
+async def test_feature_pin_without_reasoning_blocks_active_reasoning() -> None:
+    """D2: a feature entry pinning provider/model but carrying no
+    reasoning means "connection defaults for MY model" — the
+    active_model posture describes a different model and must not be
+    borrowed downward."""
+    provider, prefs, lmstudio = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+    await prefs.set(
+        "feature_models",
+        {
+            "post_turn": {
+                "provider_id": None,
+                "model_id": "feature-pinned",
+            },
+        },
+    )
+
+    model = await provider.resolve("post_turn")
+
+    assert model is lmstudio
+    assert model.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_group_pin_without_reasoning_blocks_active_reasoning() -> None:
+    provider, prefs, lmstudio = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+    await prefs.set(
+        "feature_model_groups",
+        {
+            "core_structured_memory": {
+                "provider_id": "lmstudio",
+                "model_id": "group-pinned",
+            },
+        },
+    )
+
+    model = await provider.resolve("post_turn")
+
+    assert model is lmstudio
+    assert model.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_character_pin_blocks_active_model_reasoning() -> None:
+    """Same rule at the highest model-supplying layer: a per-character
+    pin routes the call away from active_model, so the primary posture
+    stays off the character-pinned adapter."""
+    provider, prefs, lmstudio = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+    character = Character.create(
+        name="Yuki", summary="",
+        personality=[], interests=[], speaking_style="", boundaries=[],
+        state=CharacterState(
+            emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
+        ),
+        feature_models=[
+            FeatureModelOverride(
+                feature_key="chat",
+                provider_id="lmstudio",
+                model_id="char-pinned",
+            ),
+        ],
+    )
+
+    model = await provider.resolve("chat", character=character)
+
+    assert model is lmstudio
+    assert model.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_feature_reasoning_wins_over_active_model_reasoning() -> None:
+    provider, prefs, _ = _wire_reasoning()
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "low"},
+        },
+    )
+    await prefs.set(
+        "feature_models",
+        {
+            "post_turn": {
+                "provider_id": None,
+                "model_id": None,
+                "reasoning": {"reasoning_effort": "high"},
+            },
+        },
+    )
+
+    model = await provider.resolve("post_turn")
+
+    assert model.bound_overrides == ReasoningOverrides(reasoning_effort="high")
+
+
+def _wire_nsfw_reasoning() -> tuple[
+    PreferenceBackedActiveLLMProvider,
+    NsfwModeService,
+    InMemoryPreferencesRepository,
+    _ReasoningCapableModel,
+    _ReasoningCapableModel,
+]:
+    registry = InMemoryChatModelRegistry(default_provider_id="lmstudio")
+    lmstudio = _ReasoningCapableModel("lmstudio", reply='{"memories": []}')
+    nsfw_target = _ReasoningCapableModel("community", reply="ok")
+    registry.register(lmstudio)
+    registry.register(nsfw_target)
+    prefs = InMemoryPreferencesRepository()
+    nsfw = NsfwModeService(preferences=prefs, ttl_seconds=60)
+    provider = PreferenceBackedActiveLLMProvider(
+        registry=registry,
+        preferences=prefs,
+        default_provider_id="lmstudio",
+        nsfw_mode_service=nsfw,
+    )
+    return provider, nsfw, prefs, lmstudio, nsfw_target
+
+
+def _nsfw_character(user_id: str = "alice") -> Character:
+    return Character.create(
+        name="Yuki", summary="", user_id=user_id,
+        personality=[], interests=[], speaking_style="", boundaries=[],
+        state=CharacterState(
+            emotion="neutral", affection=50, fatigue=0, trust=50, energy=100,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_nsfw_mode_reroute_binds_target_own_reasoning() -> None:
+    """The NSFW target carries its OWN optional posture — the reroute
+    binds that (and only that), never the normal route's entries."""
+    provider, nsfw, prefs, _, nsfw_target = _wire_nsfw_reasoning()
+    await nsfw.set_global_target(
+        llm_provider_id="community",
+        llm_model_id="community-nsfw",
+        image_profile_id=None,
+        reasoning=ReasoningOverrides(disable_reasoning=True),
+    )
+    await nsfw.enable(user_id="alice")
+    # A normal-route posture that must NOT win over the target's own.
+    await prefs.set(
+        "feature_model_groups",
+        {
+            "player_facing_voice": {
+                "provider_id": None,
+                "model_id": None,
+                "reasoning": {"reasoning_effort": "high"},
+            },
+        },
+    )
+
+    model = await provider.resolve("chat", character=_nsfw_character())
+
+    assert model is not nsfw_target
+    assert model.provider_id == "community"
+    assert model.bound_overrides == ReasoningOverrides(disable_reasoning=True)
+    assert nsfw_target.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_nsfw_content_tolerance_binds_target_own_reasoning() -> None:
+    """The community-tolerance reroute (mode not active, configured
+    target required) binds the target's posture the same way."""
+    from kokoro_link.domain.value_objects.content_flow import (
+        CONTENT_TOLERANCE_COMMUNITY,
+    )
+
+    provider, nsfw, _, _, nsfw_target = _wire_nsfw_reasoning()
+    await nsfw.set_global_target(
+        llm_provider_id="community",
+        llm_model_id="community-nsfw",
+        image_profile_id=None,
+        reasoning=ReasoningOverrides(reasoning_effort="high"),
+    )
+
+    model = await provider.resolve(
+        "chat",
+        character=_nsfw_character(),
+        content_tolerance=CONTENT_TOLERANCE_COMMUNITY,
+    )
+
+    assert model.provider_id == "community"
+    assert model.bound_overrides == ReasoningOverrides(reasoning_effort="high")
+    assert nsfw_target.bound_overrides is None
+
+
+@pytest.mark.asyncio
+async def test_nsfw_reroute_without_target_reasoning_keeps_defaults() -> None:
+    """Target without a posture = today's behaviour: the adapter comes
+    back unbound, keeping its connection defaults — even when
+    active_model carries a posture of its own."""
+    provider, nsfw, prefs, _, nsfw_target = _wire_nsfw_reasoning()
+    await nsfw.set_global_target(
+        llm_provider_id="community",
+        llm_model_id="community-nsfw",
+        image_profile_id=None,
+    )
+    await nsfw.enable(user_id="alice")
+    await prefs.set(
+        "active_model",
+        {
+            "provider_id": "lmstudio",
+            "model_id": "m",
+            "reasoning": {"reasoning_effort": "high"},
+        },
+    )
+
+    model = await provider.resolve("chat", character=_nsfw_character())
+
+    assert model is nsfw_target
+    assert model.bound_overrides is None
+
+
 # ---- routing-level vision overrides -----------------------------------
 
 

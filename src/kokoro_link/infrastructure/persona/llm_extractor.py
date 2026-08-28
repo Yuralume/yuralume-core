@@ -19,11 +19,17 @@ Why a dedicated call (instead of folding into post-turn):
 LLM-first rules: NO keyword matching, NO regex special cases inside
 this module. Validation is statistical (confidence threshold,
 substring guard, layer-eligibility) — never semantic.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the candidate-schema validation above. The extraction
+used to share a non-string-aware brace scanner with
+``persona/llm_consolidator.py`` (a real bug — a ``}`` inside a quoted
+string value could truncate the region); the shared layer's
+string-aware scan fixes that as a side effect of the migration.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -44,6 +50,7 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -249,7 +256,12 @@ def _parse_response(
     user_message: str,
     recent_user_messages: tuple[str, ...],
 ) -> list[CandidateField]:
-    obj = _extract_object(raw)
+    # The prompt unconditionally asks for one JSON object (an empty
+    # ``candidates`` list is a valid answer), so a cut reply is worth
+    # repairing and any non-clean parse is worth a log line.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="persona.llm_extractor")
+    obj = outcome.value
     if obj is None:
         return []
     raw_candidates = obj.get("candidates")
@@ -364,44 +376,3 @@ def _parse_candidate(
         )
     except ValueError:
         return None
-
-
-def _extract_object(raw: str) -> dict | None:
-    """Pull the first valid JSON object out of an LLM response. The
-    model occasionally wraps output in ```json fences or adds a stray
-    preamble; this scan tolerates both."""
-    if not raw:
-        return None
-    text = raw.strip()
-    # Strip code fences.
-    if text.startswith("```"):
-        # Drop opening fence line.
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1 :]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-    # Find the first '{' and the matching '}'.
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    end = -1
-    for i, ch in enumerate(text[start:], start=start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-    if end == -1:
-        return None
-    try:
-        obj = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if isinstance(obj, dict):
-        return obj
-    return None

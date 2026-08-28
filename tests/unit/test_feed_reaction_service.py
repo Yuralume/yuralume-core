@@ -143,6 +143,58 @@ async def test_state_for_reflects_current_like_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_like_backfills_viewed_at_as_fallback_read_receipt() -> None:
+    """KB11: a like is only possible while the player is looking at the
+    post, so it counts as read-proof even if the frontend's exposure
+    batch never reported it (network drop, tab closed early)."""
+    service, posts, _ = _make_service()
+    post = await _seed_post(posts)
+    assert post.viewed_at is None
+
+    await service.like(post_id=post.id)
+
+    stored = await posts.get(post.id)
+    assert stored is not None
+    assert stored.viewed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_like_does_not_move_an_earlier_viewed_at() -> None:
+    """First read wins — a like landing after the frontend already
+    reported the exposure must not overwrite that earlier timestamp."""
+    from datetime import datetime, timezone
+
+    service, posts, _ = _make_service()
+    post = await _seed_post(posts)
+    earlier = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    await posts.save(post.mark_viewed(when=earlier))
+
+    await service.like(post_id=post.id)
+
+    stored = await posts.get(post.id)
+    assert stored is not None
+    assert stored.viewed_at == earlier
+
+
+@pytest.mark.asyncio
+async def test_unlike_also_backfills_viewed_at() -> None:
+    from dataclasses import replace
+
+    service, posts, _ = _make_service()
+    post = await _seed_post(posts)
+    # Reset viewed_at between like and unlike to isolate the unlike path.
+    await service.like(post_id=post.id)
+    liked = await posts.get(post.id)
+    await posts.save(replace(liked, viewed_at=None))
+
+    await service.unlike(post_id=post.id)
+
+    stored = await posts.get(post.id)
+    assert stored is not None
+    assert stored.viewed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_distinct_likers_accumulate_count() -> None:
     """Forward-compat: multi-user mode should count distinct likers
     independently. Single-user routes today only stamp ``LOCAL_LIKER_ID``,

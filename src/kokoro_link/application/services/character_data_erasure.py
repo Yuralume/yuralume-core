@@ -218,6 +218,7 @@ CHARACTER_ERASURE_REPOSITORY_SLOTS: tuple[str, ...] = (
     "character_peer_profile",
     "character_encounter",
     "character_encounter_intent",
+    "dialogue_checkpoint",
     "pending_follow_up",
     "conversation",
 )
@@ -247,7 +248,13 @@ own. ``pending_follow_up`` before ``conversation`` is the case that bit.
 
 ``story_seed`` is absent on purpose: its in-memory twin has no
 ``delete_for_character`` (the SA path reaches private seeds through the
-registry instead)."""
+registry instead).
+
+``dialogue_checkpoint`` arrives as ``None`` on every deployment with
+``FEATURE_DIALOGUE_CHECKPOINT`` off — which is what the ``None``
+tolerance is for. Claiming the slot regardless is the point: the wiring
+decision is "this boundary includes checkpoints", and it must not depend
+on whether a flag happened to be on when somebody read the list."""
 
 
 class UnknownErasureRepositorySlotError(LookupError):

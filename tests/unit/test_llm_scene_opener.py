@@ -200,6 +200,35 @@ async def test_an_unjudged_position_asks_the_model_to_derive_one() -> None:
     assert "沒有人標記過" in model.prompts[0]
 
 
+# ── KB3 / KB4: the opener's own knowledge + date rails ───────────────
+
+
+async def test_the_opening_prompt_bans_assumed_player_knowledge() -> None:
+    """KB3 — the material discipline already told the *narration* to
+    introduce what it names; nothing covered the character's first line,
+    which is where 「你也知道那個…」 actually gets spoken."""
+    model = _ScriptedModel(_GOOD_JSON)
+
+    await _opener(model).write_opening(_context())
+
+    prompt = model.prompts[0]
+    assert "不得預設玩家已經知道" in prompt
+    assert "你也知道那個" in prompt
+
+
+async def test_the_opening_prompt_anchors_stale_material_dates_to_today() -> None:
+    """KB4 — ``delay_beat`` moves a beat's schedule without rewriting its
+    summary, so material pulled into 起幕 can name a day that is no longer
+    the day this scene is being played on."""
+    model = _ScriptedModel(_GOOD_JSON)
+
+    await _opener(model).write_opening(_context())
+
+    prompt = model.prompts[0]
+    assert "這場戲真正發生的日子就是上面的「今天」" in prompt
+    assert "不要照唸" in prompt
+
+
 async def test_the_operator_note_reaches_the_opening_prompt() -> None:
     model = _ScriptedModel(_GOOD_JSON)
 

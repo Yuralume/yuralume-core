@@ -9,7 +9,12 @@ Coordinates a single evaluation pass for one character:
    is nowhere to push, so we log and return.
 4. Hand a ``ProactiveContext`` to the decider (LLM or stub). If it
    says no, log and return.
-5. Append the generated message to the binding's conversation as an
+5. Run whatever tools the decision asked for, then put the composed text
+   past the outbound honesty gate (HV2). A message that claims a
+   completed external action the tools did not perform is withheld —
+   see :meth:`ProactiveDispatcher._resolve_outbound_honesty` for why
+   this surface needs the gate more than the promise loop does.
+6. Append the generated message to the binding's conversation as an
    ``assistant`` turn and push to the platform. Failures are logged
    as ``ERRORED`` attempts so the operator can see them in the UI.
 
@@ -22,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date as date_type, datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -38,6 +43,7 @@ from kokoro_link.contracts.initial_relationship import (
 )
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.contracts.novelty_gate import (
+    ALL_AXES,
     NoveltyGateContext,
     NoveltyGatePort,
     NoveltyVerdict,
@@ -52,7 +58,10 @@ from kokoro_link.contracts.messaging import (
     MessagingAccountRepositoryPort,
     OutboundAttachment,
 )
-from kokoro_link.contracts.prompt import PromptToolDescriptor
+from kokoro_link.contracts.prompt import (
+    PromptToolDescriptor,
+    ToolOutcomeMessage,
+)
 from kokoro_link.contracts.register_profile import (
     RegisterProfileContext,
     RegisterProfilePort,
@@ -66,6 +75,7 @@ from kokoro_link.domain.entities.character_event_mention import (
     CharacterEventMention,
 )
 from kokoro_link.contracts.proactive import (
+    GateVerdict,
     ProactiveAttemptRepositoryPort,
     ProactiveContext,
     ProactiveDecision,
@@ -80,12 +90,24 @@ from kokoro_link.contracts.repositories import (
     CharacterRepositoryPort,
     ConversationRepositoryPort,
 )
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    OutputQualityReview,
+    fired_axes,
+)
 from kokoro_link.application.services.proactive_event_bus import (
     ProactiveEvent,
     ProactiveEventBus,
 )
 from kokoro_link.application.services.persona_disclosure_gate import (
     persona_safe_for_account,
+)
+from kokoro_link.application.services.pre_message_proactive_budget import (
+    PRE_MESSAGE_BUDGET_UNAVAILABLE_REASON,
+    PRE_MESSAGE_PROACTIVE_CAP,
+    evaluate_pre_message_proactive_budget,
+    evaluate_pre_message_proactive_delay,
 )
 from kokoro_link.application.services.proactive_delivery.eligible_binding import (
     ResolvedProactiveSink,
@@ -124,8 +146,33 @@ from kokoro_link.application.services.location_context import (
 from kokoro_link.application.services.persona_curiosity_observability import (
     persona_curiosity_plan_summary,
 )
+from kokoro_link.application.services.outcome_claim_audit import (
+    PARK_PROACTIVE_CORRECTION_OVERCLAIMED_AGAIN,
+    PARK_PROACTIVE_CORRECTION_RAISED,
+    PARK_PROACTIVE_CORRECTION_SILENT,
+    PARK_PROACTIVE_JUDGE_UNAVAILABLE,
+    PARK_PROACTIVE_OVERCLAIMED_AFTER_TOOLS,
+    outcome_claim_audit_scope,
+    outcome_claim_audit_summary,
+)
+from kokoro_link.application.services.outcome_claim_guard import (
+    OutcomeClaimGuard,
+)
 from kokoro_link.application.services.tool_attachment_delivery import (
     to_outbound_attachments,
+)
+from kokoro_link.contracts.outcome_claim import OutcomeClaimEvidence
+from kokoro_link.contracts.player_knowledge_disclosure import (
+    DisclosureCandidate,
+    PlayerKnowledgeDisclosureJudgePort,
+)
+from kokoro_link.application.services.memory_disclosure_service import (
+    MemoryDisclosureService,
+    select_private_candidates,
+)
+from kokoro_link.infrastructure.prompt.outcome_claim_honesty import (
+    CORRECTION_ZERO_CALL,
+    render_honesty_correction,
 )
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.character_goal import CharacterGoal
@@ -171,9 +218,17 @@ from kokoro_link.domain.value_objects.timezone import timezone_for_id
 from kokoro_link.infrastructure.prompt.initial_relationship import (
     render_initial_relationship_seed_lines,
 )
+from kokoro_link.infrastructure.prompt.memory_lines import format_memory_line
+from kokoro_link.infrastructure.dialogue.llm_summarizer import (
+    render_dialogue_line,
+)
 from kokoro_link.infrastructure.prompt.timing_utils import (
     format_civil_days_ago_label,
-    format_relative_past_label,
+)
+from kokoro_link.infrastructure.prompt.temporal_evidence import (
+    TemporalEvent,
+    quoted_event,
+    render_temporal_context_lines,
 )
 
 if TYPE_CHECKING:
@@ -228,10 +283,35 @@ _SEED_OR_OBSERVED_PROVENANCE = frozenset(
 # itself only quotes the first few verbatim to bound length.
 _RECENT_SENT_LIMIT = 8
 
+#: How many raw turns ride along under the dialogue summary as the
+#: deterministic time anchor. Three is enough to show the last exchange
+#: plus its lead-in without turning the decider prompt back into a
+#: transcript — the summary is still what carries the wider thread.
+_FRESH_DIALOGUE_TAIL_TURNS = 3
+
+# How many recalled memories reach the decider / composer prompt. Named
+# because KB8 needs the *rendered* set, not the fetched one: the query
+# limit and the render slice used to be two separate literal 6s, and a
+# disclosure candidate list built from the wrong one would offer the
+# judge memories the message was never written against.
+_MEMORY_RECALL_LIMIT = 6
+
 # The hosted proactive path records its assistant turn on the character's
 # ``source="line"`` conversation — the same thread the inbound external-chat
 # turn machine (DR-LH0-004) drives, so proactive + reply share one timeline.
 _SOURCE_LINE = "line"
+
+#: Counter / log label for this surface's output-quality outcomes. One
+#: word, fixed: it is a Prometheus label value and the string an operator
+#: greps the structured log for.
+_QUALITY_SURFACE = "proactive"
+
+#: The human-readable half of a withheld tick's audit row. The machine
+#: half is ``ProactiveOutcome.QUALITY_WITHHELD`` — this string explains,
+#: it does not classify, so nothing may branch on it. "The character chose
+#: not to message" and "the gate withheld a broken message" are opposite
+#: problems and the outcome is what keeps them apart.
+_QUALITY_HARD_SKIP_REASON = "output quality gate withheld the message"
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +335,92 @@ class _ClaimedEventSeed:
 _NO_EVENT_SEED = _ClaimedEventSeed()
 
 
+@dataclass(frozen=True, slots=True)
+class _ProactiveToolRun:
+    """What the decision's tool calls actually produced.
+
+    ``attachments`` is what will *ship* — already through the delivery
+    filter, so a render whose URL was dropped for want of a public base
+    URL is absent here even though the GPU ran. ``outcomes`` is what
+    *happened*, failures included. The honesty gate needs both and they
+    disagree often enough to be worth two fields: 「照片傳給你了」 is a
+    lie the player can check against the first, not the second.
+    """
+
+    attachments: tuple[OutboundAttachment, ...] = ()
+    outcomes: tuple[ToolOutcomeMessage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _HonestyResolution:
+    """What the outbound honesty gate decided about this tick.
+
+    ``decision is None`` is the withhold: nothing goes out. Otherwise the
+    decision and the run are the ones that should ship — which may be the
+    *corrected* pair rather than the ones handed in, so callers must use
+    what comes back instead of what they passed.
+    """
+
+    decision: "ProactiveDecision | None" = None
+    run: _ProactiveToolRun = field(default_factory=_ProactiveToolRun)
+
+
+@dataclass(frozen=True, slots=True)
+class _RecentDialogue:
+    """What one dialogue load yielded for this tick.
+
+    ``summary`` is the decider-facing block (LLM summary + verbatim tail).
+    ``last_player_text`` is the player's own most recent line, kept
+    separately because the quality gate's 時間座標 block needs the *quote*
+    and not a summary of it: 「玩家最後一次說話」 dated sixteen hours ago
+    tells the judge how stale the material is, but only the words tell it
+    whether the concern expired with the gap (「我要回家了」) or did not
+    (「下週要搬家」). Both come out of the same load, so the quote costs
+    no extra query.
+
+    ``last_player_at`` is **that line's own** ``created_at``, and it
+    travels with the text as one unit for the reason the pairing was got
+    wrong once already: the anchor used to quote this turn while dating
+    it from ``idle_minutes``, which is derived from ``last_active_at`` —
+    a field that in cloud mode is also advanced by 分歧劇場／起幕／融合
+    故事, none of which write a ``USER`` message. A player who spent the
+    week in the drama surface after saying 「我要回家了」 three days ago
+    therefore had those words stamped 「約 5 分鐘前」, and the
+    ``temporal_inconsistency`` axis was handed manufactured evidence that
+    the concern was fresh — it *passed* 「回家了嗎？」 on the strength of
+    it. Quote and instant come from the same message or neither is
+    rendered.
+
+    Empty text with a ``None`` instant is the honest absence — no
+    summariser wired, no messages, everything filtered — and every
+    consumer already treats it as "this block does not render".
+    """
+
+    summary: str = ""
+    last_player_text: str = ""
+    last_player_at: datetime | None = None
+
+
+_NO_RECENT_DIALOGUE = _RecentDialogue()
+
+
+@dataclass(frozen=True, slots=True)
+class _QualityGateResolution:
+    """What the output-quality band decided about this tick's draft.
+
+    ``withheld`` is not derivable from ``decision`` and cannot be inferred
+    from its ``reason`` string: a decision arriving with ``should_send=False``
+    may equally be the *character's* own choice to stay quiet, and the two
+    take different audit outcomes — only one of them is allowed to anchor
+    the cooldown. Carrying the bit explicitly is what keeps the caller from
+    sniffing prose to tell them apart.
+    """
+
+    decision: "ProactiveDecision"
+    metadata: dict[str, object] = field(default_factory=dict)
+    withheld: bool = False
+
+
 class ProactiveDispatcher:
     def __init__(
         self,
@@ -270,6 +436,7 @@ class ProactiveDispatcher:
         intention_judge: ProactiveIntentionJudgePort | None = None,
         schedule_resolver: "ScheduleResolver | None" = None,
         memory_repository: MemoryRepositoryPort | None = None,
+        disclosure_judge: "PlayerKnowledgeDisclosureJudgePort | None" = None,
         goal_repository: GoalRepositoryPort | None = None,
         story_event_service: "StoryEventService | None" = None,
         story_arc_service: "StoryArcService | None" = None,
@@ -311,6 +478,13 @@ class ProactiveDispatcher:
         reply_quality_gate: NoveltyGatePort | None = None,
         reply_quality_gate_enabled: bool = False,
         reply_quality_gate_max_retries: int = 1,
+        # QG0 — the shared review→regenerate→dispose band, which this
+        # surface runs its composed push through
+        # (:meth:`_gate_proactive_decision`). ``None`` leaves the gate
+        # inert: no review, no regeneration, and the decider's message
+        # ships exactly as it did before QG.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
+        outcome_claim_guard: OutcomeClaimGuard | None = None,
         subscription_access_guard: SubscriptionAccessGuard | None = None,
         visible_slot_port: "VisibleSlotPort | None" = None,
         external_delivery: ExternalProactiveDeliveryPort | None = None,
@@ -336,6 +510,18 @@ class ProactiveDispatcher:
         self._adapters = {p.value: a for p, a in adapters.items()}
         self._schedule_resolver = schedule_resolver
         self._memories = memory_repository
+        # KB8 — the judge is optional (no judge ⇒ no proactive-side
+        # disclosure, the pre-KB8 behaviour every existing test gets),
+        # but the ledger writer is not injected: it needs only the
+        # memory repository this dispatcher already holds, and making it
+        # a second optional argument would let a deployment wire the
+        # judge without a writer and lose every verdict in silence.
+        self._disclosure_judge = disclosure_judge
+        self._memory_disclosure = (
+            MemoryDisclosureService(memories=memory_repository)
+            if memory_repository is not None
+            else None
+        )
         self._goals = goal_repository
         self._story_event_service = story_event_service
         self._story_arc_service = story_arc_service
@@ -343,6 +529,13 @@ class ProactiveDispatcher:
         self._rest_recovery_refresher = rest_recovery_refresher
         self._tool_registry = tool_registry
         self._tool_orchestrator = tool_orchestrator
+        # HV2. ``None`` = no gate, and every exit below then behaves
+        # exactly as it did before — which is what a deployment with no
+        # judge route, and every existing test, gets. Deliberately the
+        # *same* guard instance the promise loop holds: the honesty rate
+        # and the outage streak are one number about one deployment, and
+        # a second guard would split both in half without saying so.
+        self._outcome_claim_guard = outcome_claim_guard
         self._event_bus = event_bus
         self._dialogue_summarizer = dialogue_summarizer
         self._event_seed_dispenser = event_seed_dispenser
@@ -379,12 +572,17 @@ class ProactiveDispatcher:
         self._notification_service = notification_service
         self._register_profiler = register_profiler
         self._register_profile_enabled = bool(register_profile_enabled)
+        # RA: the *judging* runs through ``output_quality_orchestrator``,
+        # which the container builds around this very object. Kept as the
+        # "was a gate wired at all" answer — do not drop it from the
+        # wiring as redundant, the gate goes inert without it.
         self._reply_quality_gate = reply_quality_gate
         self._reply_quality_gate_enabled = bool(reply_quality_gate_enabled)
         self._reply_quality_gate_max_retries = max(
             0,
             int(reply_quality_gate_max_retries),
         )
+        self._output_quality_orchestrator = output_quality_orchestrator
         self._subscription_access_guard = subscription_access_guard
         self._visible_slot_port = visible_slot_port
         # §8.3 — only the *external* sink is routed through the port; the web /
@@ -507,15 +705,55 @@ class ProactiveDispatcher:
         if (
             _requires_user_started_interaction(trigger)
             and not await self._has_user_started_interaction(character)
-            and not _seed_allows_pre_message_proactive(relationship_seed)
         ):
-            return await self._log(
-                character_id=character_id,
-                trigger=trigger,
-                outcome=ProactiveOutcome.GATE_BLOCKED,
-                reason="waiting for first user message",
-                now=when,
+            if not _seed_allows_pre_message_proactive(relationship_seed):
+                return await self._log(
+                    character_id=character_id,
+                    trigger=trigger,
+                    outcome=ProactiveOutcome.GATE_BLOCKED,
+                    reason="waiting for first user message",
+                    now=when,
+                )
+            # TR2-B — "you may find me first" is now the creation form's
+            # default rather than a deliberate tick, so the deliberate
+            # part is carried here instead: nothing goes out while the
+            # character is still hours old. Cheapest gate in the branch
+            # (a field already on the loaded entity, no repository read),
+            # so it runs before the budget lookup. Only a lower bound —
+            # once the window lapses, *whether and when* to speak is
+            # still the decider's semantic call under quiet hours.
+            pre_message_delay = evaluate_pre_message_proactive_delay(
+                character.created_at, now=when,
             )
+            if not pre_message_delay.passed:
+                return await self._log(
+                    character_id=character_id,
+                    trigger=trigger,
+                    outcome=ProactiveOutcome.GATE_BLOCKED,
+                    reason=pre_message_delay.reason,
+                    now=when,
+                )
+            # TR2-A — the seed said "you may find me first", not "you may
+            # keep finding me forever". Everything below that normally
+            # restrains a chatty character reads a conversation that does
+            # not exist yet: the unanswered-streak signal is hard-wired to
+            # 0 while ``idle_minutes`` is None, and cooldown / daily limit
+            # are per-day rhythms, not a total. So the pre-message window
+            # gets its own ceiling here, in the cheap band, before rest
+            # recovery and before any model call. It stops applying the
+            # moment the player speaks — from then on the normal cadence
+            # has real signal to work with.
+            pre_message_budget = await self._check_pre_message_budget(
+                character_id=character_id, now=when,
+            )
+            if not pre_message_budget.passed:
+                return await self._log(
+                    character_id=character_id,
+                    trigger=trigger,
+                    outcome=ProactiveOutcome.GATE_BLOCKED,
+                    reason=pre_message_budget.reason,
+                    now=when,
+                )
 
         # Rest recovery is lazy in the chat path — without this the
         # scheduler would keep seeing stale fatigue/energy and the gate
@@ -628,8 +866,8 @@ class ProactiveDispatcher:
             )
         binding, account = eligible if eligible else (None, None)
 
-        recent_memories_text = await self._load_recent_memories_text(
-            character_id, when,
+        recent_memories_text, disclosure_candidates = (
+            await self._load_recent_memories(character_id, when)
         )
         active_goals_text = await self._load_active_goals_text(
             character_id, when, operator_tz,
@@ -637,7 +875,10 @@ class ProactiveDispatcher:
         available_tools = self._describe_tools(character)
         story_events = await self._load_story_events(character, when)
         recent_sent_attempts = await self._load_recent_sent_attempts(character_id)
-        recent_dialogue_summary = await self._summarize_recent_dialogue(character)
+        recent_dialogue = await self._summarize_recent_dialogue(
+            character, now=when, local_tz=operator_tz,
+        )
+        recent_dialogue_summary = recent_dialogue.summary
         persona_curiosity_plan = await self._load_persona_curiosity_plan(
             character=character,
             operator=operator,
@@ -804,19 +1045,33 @@ class ProactiveDispatcher:
             )
 
         quality_metadata: dict[str, object] = {}
+        quality_withheld = False
         if decision.should_send and decision.message:
-            decision, quality_metadata = await self._gate_proactive_decision(
+            gated = await self._gate_proactive_decision(
                 context=context,
                 decision=decision,
                 character=character,
+                recent_dialogue=recent_dialogue,
             )
+            decision = gated.decision
+            quality_metadata = gated.metadata
+            quality_withheld = gated.withheld
 
         if not decision.should_send or not decision.message:
             await self._release_event_seed(character_id, seed_item_id)
             return await self._log(
                 character_id=character_id,
                 trigger=trigger,
-                outcome=ProactiveOutcome.DECIDER_SKIPPED,
+                # Two very different silences share this exit. The
+                # character choosing not to speak is a decision the
+                # cooldown should honour; a quality gate refusing the
+                # prose it wrote is not, and tagging both
+                # ``DECIDER_SKIPPED`` let one broken draft mute the whole
+                # window (the 2026-08-26 defect).
+                outcome=(
+                    ProactiveOutcome.QUALITY_WITHHELD if quality_withheld
+                    else ProactiveOutcome.DECIDER_SKIPPED
+                ),
                 reason=decision.reason,
                 metadata={
                     "persona_curiosity": persona_curiosity_metadata,
@@ -844,11 +1099,54 @@ class ProactiveDispatcher:
             )
         else:
             tool_conversation_id = None
-        attachments = await self._execute_decision_tools(
+        run = await self._execute_decision_tools(
             character=character,
             decision=decision,
             conversation_id=tool_conversation_id,
         )
+        # HV2 — the last gate before anything reaches a player. The proactive
+        # decider writes its message in the *same* JSON that requests the
+        # tool, so the prose is composed before the tool has run and cannot
+        # know whether it worked: 「拍了張照片給你」 is true only if the render
+        # succeeded *and* the file survived the delivery filter. That makes
+        # the mismatch shape structural here rather than accidental.
+        #
+        # Scoped so this tick's verdicts land in HV3's per-round trail
+        # rather than only in the process-wide counters. Without the
+        # scope the calls below are still made and still counted — they
+        # just leave no row, so a 謊稱率 computed from the audit table
+        # would silently exclude the highest-volume outbound surface.
+        with outcome_claim_audit_scope():
+            reviewed = await self._resolve_outbound_honesty(
+                character=character,
+                context=context,
+                decision=decision,
+                run=run,
+                conversation_id=tool_conversation_id,
+            )
+            honesty_audit = outcome_claim_audit_summary()
+        # ``None`` when the gate never reached the judge (no guard
+        # wired), so an ungated deployment's attempt metadata stays
+        # exactly the shape it was.
+        honesty_metadata: dict[str, object] = (
+            {"outcome_claim": honesty_audit} if honesty_audit else {}
+        )
+        if reviewed.decision is None:
+            await self._release_event_seed(character_id, seed_item_id)
+            return await self._log(
+                character_id=character_id,
+                trigger=trigger,
+                outcome=ProactiveOutcome.DECIDER_SKIPPED,
+                reason="outbound honesty gate withheld the message",
+                metadata={
+                    "persona_curiosity": persona_curiosity_metadata,
+                    **quality_metadata,
+                    **honesty_metadata,
+                },
+                now=when,
+            )
+        decision = reviewed.decision
+        attachments = reviewed.run.attachments
 
         # Fan out: web (if opted in) + messaging binding (if any).
         # A failure on one target must not block the other — e.g. a
@@ -931,6 +1229,7 @@ class ProactiveDispatcher:
                 metadata={
                     "persona_curiosity": persona_curiosity_metadata,
                     **quality_metadata,
+                    **honesty_metadata,
                 },
                 now=when,
             )
@@ -952,6 +1251,16 @@ class ProactiveDispatcher:
             web_delivered=web_delivered,
             external_delivered=external_delivered,
         )
+        # KB8 — only now, and only on this branch. Everything above this
+        # line can still end the tick without the player having read a
+        # word; here at least one channel has accepted the message, so
+        # asking "what did it tell him" is a question about something
+        # that happened.
+        await self._flip_disclosed_memories(
+            character=character,
+            message_text=decision.message,
+            candidates=disclosure_candidates,
+        )
 
         return await self._log(
             character_id=character_id,
@@ -963,6 +1272,7 @@ class ProactiveDispatcher:
             metadata={
                 "persona_curiosity": persona_curiosity_metadata,
                 **quality_metadata,
+                **honesty_metadata,
             },
             # Only the send path carries the prompt into the turn record:
             # skip / gate-blocked ticks fire every few minutes and would
@@ -980,48 +1290,93 @@ class ProactiveDispatcher:
         context: ProactiveContext,
         decision: ProactiveDecision,
         character: Character,
-    ) -> tuple[ProactiveDecision, dict[str, object]]:
+        recent_dialogue: _RecentDialogue = _NO_RECENT_DIALOGUE,
+    ) -> _QualityGateResolution:
+        """RA — run the composed push through the shared QG band (D7).
+
+        This surface used to *ask* for a verdict and then throw it away:
+        the retry fired on any failure, and whatever came back was kept
+        the moment it was non-empty, so a second draft that still leaked
+        a schema tag or answered in the wrong language shipped exactly
+        like the first. Background policy fixes both halves — the
+        regenerated draft is re-reviewed, and a hard defect that survives
+        that review ends the tick.
+
+        "End the tick" is spelled ``should_send=False`` rather than a new
+        refusal path: the caller already releases the event seed on that
+        branch, and nothing on it counts towards the daily quota (only
+        ``SENT`` rows do). The audit row is **not** the decider's, though
+        — ``withheld=True`` sends it out as ``QUALITY_WITHHELD``, which is
+        the one skip outcome the cooldown does not anchor on. A machine
+        refusing broken prose must not also cost the character its next
+        window; that is the difference between skipping a tick and going
+        quiet for an hour.
+        """
+        orchestrator = self._output_quality_orchestrator
         if (
             not self._reply_quality_gate_enabled
+            or orchestrator is None
+            or orchestrator.gate is None
+            # The same judge instance the container hands the band; asked
+            # about here too, exactly as the encounter surface does, so
+            # "this deployment wired no gate" is one answer rather than
+            # two that can disagree.
             or self._reply_quality_gate is None
         ):
-            return decision, {}
+            return _QualityGateResolution(decision=decision)
+        # Both cost a model call / query, so they are gathered only once
+        # the gate is known to be live — and hoisted out of ``context_for``
+        # so the re-review reuses them instead of profiling twice.
         profile = await self._profile_proactive_register(context, character)
         diversity = _proactive_diversity_evidence(context)
-        verdict = await self._evaluate_proactive_quality_gate(
-            context=context,
-            decision=decision,
-            character=character,
-            register_profile=profile,
-            diversity_evidence=diversity,
-        )
-        retry_count = 0
-        selected = decision
-        if (
-            verdict is not None
-            and not verdict.passes
-            and self._reply_quality_gate_max_retries > 0
-        ):
-            retry_count = 1
+
+        def context_for(draft: ProactiveDecision) -> NoveltyGateContext:
+            return self._proactive_gate_context(
+                context=context,
+                decision=draft,
+                character=character,
+                register_profile=profile,
+                diversity_evidence=diversity,
+                recent_dialogue=recent_dialogue,
+            )
+
+        async def regenerate(feedback: str) -> ProactiveDecision | None:
             retry_context = replace(
                 context,
                 recent_dialogue_summary=(
                     f"{context.recent_dialogue_summary}\n"
-                    f"上一輪主動訊息品質問題：{verdict.feedback}"
+                    f"上一輪主動訊息品質問題：{feedback}"
                 ).strip(),
             )
             try:
                 retry_decision = await self._decider.decide(retry_context)
             except Exception:
                 _LOGGER.exception("proactive quality retry decider crashed")
-            else:
-                if retry_decision.should_send and retry_decision.message:
-                    selected = retry_decision
-        return selected, {
+                return None
+            if not retry_decision.should_send or not retry_decision.message:
+                # Shown the verdict, the decider chose silence. That is not
+                # a second draft, so ``None``: the band must fall back to
+                # its disposal table rather than treat "nothing" as a fix.
+                return None
+            return retry_decision
+
+        review = await orchestrator.review(
+            decision,
+            surface=_QUALITY_SURFACE,
+            context_for=context_for,
+            regenerate=regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=character,
+            max_retries=self._reply_quality_gate_max_retries,
+            enabled=self._reply_quality_gate_enabled,
+        )
+        verdict = _reportable_verdict(review)
+        metadata: dict[str, object] = {
             "reply_quality_gate": _quality_gate_metadata(
                 verdict,
                 enabled=True,
-                retry_count=retry_count,
+                retry_count=1 if review.regen_attempted else 0,
+                outcome=review.outcome,
             ),
             "register_profile": _register_profile_metadata(
                 profile,
@@ -1029,6 +1384,29 @@ class ProactiveDispatcher:
             ),
             "diversity": _diversity_metadata(diversity),
         }
+        if review.final is None:
+            _LOGGER.warning(
+                "proactive: hard output-quality failure survived regeneration "
+                "character=%s axes=%s feedback=%s — nothing sent this tick",
+                character.id,
+                ",".join(fired_axes(verdict)) or "-",
+                (verdict.feedback if verdict else "") or "-",
+            )
+            return _QualityGateResolution(
+                decision=replace(
+                    decision,
+                    should_send=False,
+                    # Cleared as well as switched off: the defective prose
+                    # is what the gate refused, and leaving it on the
+                    # returned decision is one careless read away from
+                    # being delivered anyway.
+                    message=None,
+                    reason=_QUALITY_HARD_SKIP_REASON,
+                ),
+                metadata=metadata,
+                withheld=True,
+            )
+        return _QualityGateResolution(decision=review.final, metadata=metadata)
 
     async def _profile_proactive_register(
         self,
@@ -1063,7 +1441,7 @@ class ProactiveDispatcher:
             _LOGGER.exception("proactive register profiler failed open")
             return None
 
-    async def _evaluate_proactive_quality_gate(
+    def _proactive_gate_context(
         self,
         *,
         context: ProactiveContext,
@@ -1071,10 +1449,20 @@ class ProactiveDispatcher:
         character: Character,
         register_profile,
         diversity_evidence: ReplyDiversityEvidence,
-    ) -> NoveltyVerdict | None:
-        if self._reply_quality_gate is None:
-            return None
-        gate_context = NoveltyGateContext(
+        recent_dialogue: _RecentDialogue = _NO_RECENT_DIALOGUE,
+    ) -> NoveltyGateContext:
+        """Everything the judge sees about one draft push.
+
+        Rebuilt per draft (the band calls it again for the re-review), so
+        ``response_text`` **and** ``tool_prompt_lines`` always describe the
+        candidate actually being judged rather than the one that failed.
+
+        ``recent_dialogue`` arrives whole rather than as a loose quote: the
+        時間座標 anchor needs the player's words *and* the instant those
+        words are true at, and the two are only trustworthy while they
+        travel together.
+        """
+        return NoveltyGateContext(
             character_id=character.id,
             operator_id=getattr(character, "user_id", DEFAULT_OPERATOR_ID),
             response_text=decision.message or "",
@@ -1102,15 +1490,18 @@ class ProactiveDispatcher:
                 f"說話風格：{character.speaking_style}",
                 *context.initial_relationship_lines,
             ),
+            # Without this the judge's rubric pins ``language_mismatch``
+            # false, which left 晶晶體 unjudgeable on the surface that
+            # produces the most player-visible prose. Already fail-soft to
+            # ``"zh-TW"`` where the context is built.
+            operator_primary_language=context.operator_primary_language,
+            tool_prompt_lines=_decision_tool_prompt_lines(decision),
+            temporal_context_lines=_proactive_temporal_lines(
+                context,
+                last_player_message=recent_dialogue.last_player_text,
+                last_player_at=recent_dialogue.last_player_at,
+            ),
         )
-        try:
-            return await self._reply_quality_gate.evaluate(
-                gate_context,
-                character=character,
-            )
-        except Exception as exc:
-            _LOGGER.exception("proactive reply quality gate failed open")
-            return NoveltyVerdict.pass_open(repr(exc))
 
     async def _apply_rest_recovery(
         self, character: Character, now: datetime,
@@ -1564,16 +1955,181 @@ class ProactiveDispatcher:
             for t in tools
         )
 
+    # -- the outbound honesty gate (HV2) ----------------------------------
+
+    def _claim_evidence(
+        self, context: ProactiveContext, run: _ProactiveToolRun,
+    ) -> OutcomeClaimEvidence:
+        """Everything that actually happened on this tick, and nothing else.
+
+        ``offered_tools`` earns its place next to ``outcomes``: "you were
+        handed a camera and did not pick it up" is the zero-call case, and
+        a judge that saw only an empty outcome list could not tell it from
+        a deployment that has no camera at all.
+        """
+        return OutcomeClaimEvidence(
+            offered_tools=tuple(
+                tool.name for tool in context.available_tools
+            ),
+            outcomes=run.outcomes,
+            delivered_attachments=len(run.attachments),
+        )
+
+    async def _resolve_outbound_honesty(
+        self,
+        *,
+        character: Character,
+        context: ProactiveContext,
+        decision: ProactiveDecision,
+        run: _ProactiveToolRun,
+        conversation_id: str | None,
+    ) -> _HonestyResolution:
+        """May this push go out? An empty ``decision`` = send nothing.
+
+        Two exits, mirroring the promise loop's, because the honest way out
+        of each is different:
+
+        **Zero tool calls.** Nothing ran, so any claim of a completed
+        external action is unsupported — and the judge's whole job is to
+        tell that apart from a promise about later, an action inside the
+        fiction, and the player's own material read back. One corrected
+        re-decide follows, and it may legitimately come back either as an
+        honest message *or* as the tool call it should have asked for the
+        first time; both are the gate working.
+
+        **Tools ran.** No re-decide, deliberately. The decider composes its
+        message in the same JSON that orders the tool, so it has never seen
+        a tool result and a second pass would be writing just as blind as
+        the first — while being free to order a *second* render. Until
+        ``ProactiveContext`` can carry ``tool_results``, the honest move is
+        to spend nothing more and send nothing. A tick costs one tick.
+
+        Never raises. A gate that can throw would turn a model hiccup into
+        an ``ERRORED`` attempt, which is strictly worse than the
+        dishonesty it exists to stop.
+        """
+        guard = self._outcome_claim_guard
+        if guard is None:
+            return _HonestyResolution(decision=decision, run=run)
+        verdict = await guard.review(
+            message_text=decision.message or "",
+            evidence=self._claim_evidence(context, run),
+            character=character,
+            operator_primary_language=context.operator_primary_language,
+        )
+        if verdict.consistent:
+            return _HonestyResolution(decision=decision, run=run)
+        if verdict.unavailable:
+            guard.record_parked(
+                reason=PARK_PROACTIVE_JUDGE_UNAVAILABLE.phrase,
+                park_kind=PARK_PROACTIVE_JUDGE_UNAVAILABLE.kind,
+            )
+            _LOGGER.warning(
+                "proactive: no honesty verdict character=%s — failing "
+                "closed, nothing sent this tick", character.id,
+            )
+            return _HonestyResolution()
+        after_tools = bool(run.outcomes)
+        guard.record_block(after_tools=after_tools)
+        if after_tools:
+            guard.record_parked(
+                reason=PARK_PROACTIVE_OVERCLAIMED_AFTER_TOOLS.phrase,
+                park_kind=PARK_PROACTIVE_OVERCLAIMED_AFTER_TOOLS.kind,
+            )
+            _LOGGER.warning(
+                "proactive: the message claimed %d outcome(s) the tools did "
+                "not deliver character=%s — withholding the push (the "
+                "decider writes before the tool runs, so there is nothing "
+                "to rewrite from)",
+                len(verdict.unsupported_claims), character.id,
+            )
+            return _HonestyResolution()
+        _LOGGER.warning(
+            "proactive: pass 1 called no tool but claimed %d completed "
+            "outcome(s) character=%s — re-deciding once with a correction",
+            len(verdict.unsupported_claims), character.id,
+        )
+        retry_context = replace(
+            context,
+            honesty_correction=render_honesty_correction(
+                CORRECTION_ZERO_CALL, verdict.unsupported_claims,
+                # The decider's output is one JSON object carrying
+                # ``should_send``/``message``/``tool_calls`` together — the
+                # composer-shaped "output only tool JSON, no message text"
+                # road makes ``LLMProactiveDecider`` downgrade to
+                # should_send=False before the tool call is ever read
+                # (F3). This variant keeps the same two honest roads but
+                # phrases road 1 for the decider's single-JSON contract.
+                single_json_contract=True,
+            ),
+        )
+        try:
+            retry = await self._decider.decide(retry_context)
+        except Exception:
+            _LOGGER.exception("proactive honesty re-decide crashed")
+            guard.record_parked(
+                reason=PARK_PROACTIVE_CORRECTION_RAISED.phrase,
+                park_kind=PARK_PROACTIVE_CORRECTION_RAISED.kind,
+            )
+            return _HonestyResolution()
+        if not retry.should_send or not retry.message:
+            # Shown its own overclaim, the character chose silence. That is
+            # one of the two honest roads, not a failure — but nothing goes
+            # out, so it is still a park as far as the counters go.
+            guard.record_parked(
+                reason=PARK_PROACTIVE_CORRECTION_SILENT.phrase,
+                park_kind=PARK_PROACTIVE_CORRECTION_SILENT.kind,
+            )
+            return _HonestyResolution()
+        retry_run = await self._execute_decision_tools(
+            character=character,
+            decision=retry,
+            conversation_id=conversation_id,
+        )
+        second = await guard.review(
+            message_text=retry.message,
+            evidence=self._claim_evidence(context, retry_run),
+            character=character,
+            operator_primary_language=context.operator_primary_language,
+        )
+        if second.consistent:
+            guard.record_corrected()
+            _LOGGER.info(
+                "proactive: the correction produced an honest message "
+                "character=%s — shipping the second draft", character.id,
+            )
+            return _HonestyResolution(decision=retry, run=retry_run)
+        guard.record_parked(
+            reason=PARK_PROACTIVE_CORRECTION_OVERCLAIMED_AGAIN.phrase,
+            park_kind=PARK_PROACTIVE_CORRECTION_OVERCLAIMED_AGAIN.kind,
+        )
+        _LOGGER.warning(
+            "proactive: the correction re-decide claimed an outcome again "
+            "character=%s — withholding the push", character.id,
+        )
+        return _HonestyResolution()
+
     async def _execute_decision_tools(
         self,
         *,
         character: Character,
         decision,  # ProactiveDecision (avoid re-import)
         conversation_id: str | None,
-    ) -> tuple[OutboundAttachment, ...]:
+    ) -> _ProactiveToolRun:
+        """Run the calls the decision asked for, keeping what happened.
+
+        A failure is still not fatal here — it does not abort the tick, and
+        a message that never mentioned the picture still ships without it.
+        What changed with HV2 is that the failure is *recorded* rather than
+        only logged. The decision's prose was written before the tool ran,
+        so whether it is still true depends entirely on this list; the
+        caller that has to answer that question could not, while the only
+        trace of a dead renderer was a log line nobody reads mid-tick.
+        """
         if not decision.tool_calls or self._tool_orchestrator is None:
-            return ()
+            return _ProactiveToolRun()
         collected: list[OutboundAttachment] = []
+        outcomes: list[ToolOutcomeMessage] = []
         public_base_url = await self._resolve_public_base_url()
         for call in decision.tool_calls:
             try:
@@ -1582,24 +2138,49 @@ class ProactiveDispatcher:
                     call=call,
                     conversation_id=conversation_id,
                 )
-            except Exception:
+            except Exception as exc:
                 _LOGGER.exception(
                     "proactive tool %s crashed", call.name,
+                )
+                outcomes.append(
+                    ToolOutcomeMessage(
+                        tool_name=call.name,
+                        ok=False,
+                        output_text="",
+                        error=f"tool crashed: {exc}",
+                    ),
                 )
                 continue
             if not result.ok:
                 _LOGGER.info(
                     "proactive tool %s failed: %s", call.name, result.error,
                 )
+                outcomes.append(
+                    ToolOutcomeMessage(
+                        tool_name=call.name,
+                        ok=False,
+                        output_text="",
+                        error=result.error or "unknown error",
+                    ),
+                )
                 continue
-            collected.extend(
-                to_outbound_attachments(
-                    result.attachments,
-                    public_base_url=public_base_url,
-                    surface="proactive",
+            delivered = to_outbound_attachments(
+                result.attachments,
+                public_base_url=public_base_url,
+                surface="proactive",
+            )
+            collected.extend(delivered)
+            outcomes.append(
+                ToolOutcomeMessage(
+                    tool_name=call.name,
+                    ok=True,
+                    output_text=result.output_text,
+                    attachment_urls=tuple(item.url for item in delivered),
                 ),
             )
-        return tuple(collected)
+        return _ProactiveToolRun(
+            attachments=tuple(collected), outcomes=tuple(outcomes),
+        )
 
     async def _resolve_public_base_url(self) -> str:
         if self._public_base_url_provider is None:
@@ -1627,17 +2208,96 @@ class ProactiveDispatcher:
             _LOGGER.exception("proactive schedule resolver crashed")
             return None, [], None, None
 
-    async def _load_recent_memories_text(
+    async def _load_recent_memories(
         self, character_id: str, now: datetime | None = None,
-    ) -> str:
+    ) -> "tuple[str, tuple[MemoryItem, ...]]":
+        """The recall block, plus the memories the player hasn't been told.
+
+        Returns both from one query rather than letting the caller
+        re-derive the second: KB8's flip is only defensible if the
+        candidate set is *exactly* what this tick put in front of the
+        composer, and a second query — even one issued microseconds
+        later — is a different set the moment anything writes a memory.
+        """
         if self._memories is None:
-            return ""
+            return "", ()
         try:
-            items = await self._memories.query(character_id, limit=6)
+            items = await self._memories.query(
+                character_id, limit=_MEMORY_RECALL_LIMIT,
+            )
         except Exception:
             _LOGGER.exception("proactive: memory repository query failed")
-            return ""
-        return _format_memories(items, now=now)
+            return "", ()
+        # The renderer takes the same slice, so the candidates are the
+        # memories that were rendered — not the ones that were fetched.
+        return (
+            _format_memories(items, now=now),
+            select_private_candidates(items[:_MEMORY_RECALL_LIMIT]),
+        )
+
+    async def _flip_disclosed_memories(
+        self,
+        *,
+        character: Character,
+        message_text: str,
+        candidates: "tuple[MemoryItem, ...]",
+    ) -> tuple[str, ...]:
+        """Ask what the delivered push actually told the player (KB8).
+
+        The one added model call in this ticket, and it buys the thing
+        the free alternatives cannot: a push is composed from several
+        recalled memories and says one thing, so "it was in the prompt"
+        is not evidence it was said. D10 weighed a small per-send call
+        against a ledger that marks untold facts as told and chose the
+        call.
+
+        Every way this can go wrong ends in "nothing flipped": no judge
+        wired, no candidates, an unparseable reply, an upstream outage, a
+        repository error. That direction is the point — the character
+        re-introducing something costs a repeated sentence, while the
+        inverse writes a falsehood into a ledger with no reverse
+        transition.
+
+        Never raises: it runs after delivery, so an exception here would
+        turn a message the player already has into a failed tick.
+        """
+        if (
+            self._disclosure_judge is None
+            or self._memory_disclosure is None
+            or not candidates
+            or not (message_text or "").strip()
+        ):
+            return ()
+        try:
+            verdict = await self._disclosure_judge.judge(
+                message_text=message_text,
+                candidates=tuple(
+                    DisclosureCandidate(
+                        memory_id=item.id, content=item.content,
+                    )
+                    for item in candidates
+                ),
+                character=character,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive disclosure judge crashed character=%s",
+                character.id,
+            )
+            return ()
+        if verdict.unavailable or not verdict.disclosed_ids:
+            return ()
+        # Re-bound the verdict here as well as inside the adapter. The
+        # port allows any implementation, and this is the last point
+        # before a write that cannot be undone.
+        allowed = {item.id for item in candidates}
+        return await self._memory_disclosure.disclose(
+            character_id=character.id,
+            memory_ids=[
+                item_id for item_id in verdict.disclosed_ids
+                if item_id in allowed
+            ],
+        )
 
     async def _load_upcoming_day_schedules(
         self, character_id: str, when: datetime, local_tz: tzinfo,
@@ -1939,7 +2599,13 @@ class ProactiveDispatcher:
             )
             return ""
 
-    async def _summarize_recent_dialogue(self, character: Character) -> str:
+    async def _summarize_recent_dialogue(
+        self,
+        character: Character,
+        *,
+        now: datetime,
+        local_tz: tzinfo,
+    ) -> _RecentDialogue:
         """Condense the character's latest dialogue for the decider.
 
         Pulls messages merged across every source (web / telegram /
@@ -1947,9 +2613,35 @@ class ProactiveDispatcher:
         the decider sees the same unified timeline as the chat prompt.
         Returns empty string when the summariser is unwired, no
         messages exist, or summarisation fails — the decider treats
-        empty as "no dialogue context" and skips the section."""
+        empty as "no dialogue context" and skips the section.
+
+        **Two anchors, not one.** The summary itself is now built from a
+        time-anchored transcript (see ``LLMDialogueSummarizer``), but a
+        summary is still model output: it can blur or drop the anchor
+        however the template is worded. So the last few turns are also
+        appended verbatim with their timestamps, assembled in Python —
+        nothing between ``Message.created_at`` and the decider prompt.
+        If the summary ever misdates an event again, the raw tail sits
+        directly beneath it saying otherwise.
+
+        The tail rides the existing ``recent_dialogue_summary`` field
+        rather than a new ``ProactiveContext`` slot plus template
+        placeholder: ``decider_instructions.txt`` is shadowed by a hosted
+        tuned overlay, and a new placeholder would need both copies kept
+        in lockstep forever. Same idiom the quality-gate retry already
+        uses to fold feedback into this field.
+
+        Returns the summary **and** the player's last line with its own
+        ``created_at`` (G2-3): the quality gate's time anchor wants the
+        quote, and this is the only place in the tick that already holds
+        the messages — which is also the only place that holds the
+        instant that quote is true at. Every early return yields the empty
+        dialogue rather than reaching for a second query; a missing quote
+        drops the speech anchor and leaves the interaction anchor
+        standing, which is the honest degradation.
+        """
         if self._dialogue_summarizer is None:
-            return ""
+            return _NO_RECENT_DIALOGUE
         try:
             messages = await self._conversations.recent_messages_for_character(
                 character.id, limit=40, exclude_tool_only=True,
@@ -1958,24 +2650,43 @@ class ProactiveDispatcher:
             _LOGGER.exception(
                 "proactive: dialogue load failed character=%s", character.id,
             )
-            return ""
+            return _NO_RECENT_DIALOGUE
         if not messages:
-            return ""
+            return _NO_RECENT_DIALOGUE
         messages = sanitize_messages_for_tolerance(
             messages,
             content_tolerance=CONTENT_TOLERANCE_FRONTIER,
         )
         if not messages:
-            return ""
+            return _NO_RECENT_DIALOGUE
         try:
-            return await self._dialogue_summarizer.summarize(
-                character=character, messages=messages,
+            summary = await self._dialogue_summarizer.summarize(
+                character=character,
+                messages=messages,
+                now=now,
+                local_tz=local_tz,
             )
         except Exception:
             _LOGGER.exception(
                 "proactive: dialogue summarise failed character=%s", character.id,
             )
-            return ""
+            summary = ""
+        fresh_tail = _render_fresh_dialogue_tail(
+            character, messages, now=now, local_tz=local_tz,
+        )
+        last_player = _last_player_turn(messages)
+        return _RecentDialogue(
+            summary="\n\n".join(
+                part for part in ((summary or "").strip(), fresh_tail) if part
+            ),
+            last_player_text=(
+                (last_player.content or "").strip() if last_player else ""
+            ),
+            last_player_at=(
+                getattr(last_player, "created_at", None)
+                if last_player else None
+            ),
+        )
 
     async def _has_user_started_interaction(self, character: Character) -> bool:
         if character.state.last_active_at is not None:
@@ -1990,6 +2701,43 @@ class ProactiveDispatcher:
                 character.id,
             )
             return False
+
+    async def _check_pre_message_budget(
+        self, *, character_id: str, now: datetime,
+    ) -> GateVerdict:
+        """TR2-A — how much of the pre-message push budget is left.
+
+        Only ever called while the player has not spoken, which is what
+        makes the audit log sufficient on its own: every SENT row this
+        character has is, by construction, a pre-message push. (The two
+        promise-fulfilment triggers that could send without a prior
+        player turn cannot exist here — a promise is lodged from a chat
+        turn, and a chat turn is what "the player has spoken" means.)
+
+        Fetching ``cap`` rows is enough for both questions: at ``cap``
+        rows the ceiling already answers, and below it the fetch is the
+        complete history whose newest row carries the spacing.
+
+        A repository failure blocks rather than sends. The read is one
+        indexed lookup and the cost of getting it wrong is asymmetric:
+        an over-strict tick delays a push that the decider was free to
+        skip anyway, while an over-permissive one is the exact unbounded
+        nagging this gate exists to prevent.
+        """
+        try:
+            sent = await self._attempts.list_recent_sent(
+                character_id, limit=max(PRE_MESSAGE_PROACTIVE_CAP, 1),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "proactive: pre-message budget lookup failed character=%s",
+                character_id,
+            )
+            return GateVerdict(
+                passed=False,
+                reason=PRE_MESSAGE_BUDGET_UNAVAILABLE_REASON,
+            )
+        return evaluate_pre_message_proactive_budget(tuple(sent), now=now)
 
     async def _claim_event_seed(
         self, character: Character, when: datetime,
@@ -2811,33 +3559,87 @@ def _language_for_operator(operator: OperatorProfile | None) -> str:
     return lang or "zh-TW"
 
 
+def _last_player_turn(messages: list[Message]) -> Message | None:
+    """The player's own most recent message, or ``None``.
+
+    Returns the message rather than its text so the caller cannot date the
+    quote from anything but the turn it came out of — the defect this
+    signature exists to make unrepresentable (see ``_RecentDialogue``).
+
+    Read off the same sanitised list the summariser saw — quoting text the
+    tolerance filter removed would put back, in the judge's prompt, exactly
+    what was taken out of the decider's.
+
+    Only ``USER`` turns qualify: the character's own last line is already
+    dated separately in the same block, and a system notice was never
+    something the player said. Whether the turn carries a usable
+    ``created_at`` is *not* a search criterion — an undated newest turn
+    must cost the block its quote, not silently promote an older line into
+    the 「最後一次說話」 slot it does not occupy.
+    """
+    for message in reversed(messages):
+        if message.role is not MessageRole.USER:
+            continue
+        if not (message.content or "").strip():
+            continue
+        return message
+    return None
+
+
+def _render_fresh_dialogue_tail(
+    character: Character,
+    messages: list[Message],
+    *,
+    now: datetime,
+    local_tz: tzinfo,
+) -> str:
+    """The last few turns verbatim, each stamped with when it happened.
+
+    Deterministic on purpose — this block is the control against which
+    the LLM summary above it can be checked, so it must not itself pass
+    through a model. Rendering goes through the summariser's own
+    ``render_dialogue_line`` so both blocks quote the same clock.
+
+    Kept to a handful of turns: the point is to pin *recency* (「這句是十
+    分鐘前說的，不是昨天」), and the summary already carries the wider
+    thread. Returns ``""`` when nothing has text, so the caller can
+    concatenate unconditionally.
+    """
+    tail = [
+        message for message in messages if (message.content or "").strip()
+    ][-_FRESH_DIALOGUE_TAIL_TURNS:]
+    if not tail:
+        return ""
+    lines = [
+        render_dialogue_line(character, message, now=now, local_tz=local_tz)
+        for message in tail
+    ]
+    return (
+        "最近幾則對話原文（含實際發生時間；時間一律以這裡的標註為準，"
+        "不要自行推測是哪一天）：\n" + "\n".join(lines)
+    )
+
+
 def _format_memories(
     items: list[MemoryItem], *, now: datetime | None = None,
 ) -> str:
+    """Recall block for the proactive decider / composer.
+
+    KB7: this used to hand-roll ``- [{kind}] {content}{time}`` — its own
+    time-tag helper, no participant tag, and (once the disclosure ledger
+    existed) no way to tell the character's private week from a shared
+    one. Proactive is the main channel of the 2026-08-25 incident family
+    — she reaches out unprompted, so a memory the player never witnessed
+    is exactly what gets opened with — so the renderer converges on the
+    shared one. The kind bucket survives as ``include_kind``: the decider
+    weighs 「[semantic] 他住淡水」 differently from 「[episodic] 昨天一起去」.
+    """
     if not items:
         return ""
-    lines: list[str] = []
-    for item in items[:6]:
-        kind = item.kind.value if hasattr(item.kind, "value") else str(item.kind)
-        lines.append(f"- [{kind}] {item.content}{_memory_recall_time_tag(item, now)}")
-    return "\n".join(lines)
-
-
-def _memory_recall_time_tag(item: MemoryItem, now: datetime | None) -> str:
-    """Coarse "how long ago" suffix so the proactive judge knows whether
-    a recalled fact is fresh enough to act on. Empty without a reference
-    clock or on clock skew, leaving the line exactly as before."""
-    if now is None:
-        return ""
-    created = getattr(item, "created_at", None)
-    if created is None:
-        return ""
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    elapsed_min = (now - created).total_seconds() / 60.0
-    if elapsed_min < 0:
-        return ""
-    return f"（{format_relative_past_label(elapsed_min)}）"
+    return "\n".join(
+        format_memory_line(item, now=now, include_kind=True)
+        for item in items[:_MEMORY_RECALL_LIMIT]
+    )
 
 
 def _goal_age_tag(
@@ -2848,7 +3650,7 @@ def _goal_age_tag(
     Goals are written in the moment ("陪使用者**明早**一起出門吃刨冰") and
     then live for weeks; without an age the decider has no way to tell a
     promise made this morning from one whose 「明早」 passed three days ago.
-    Sibling of :func:`_memory_recall_time_tag`, but counted in civil days
+    Sibling of ``memory_lines.memory_time_tag``, but counted in civil days
     rather than elapsed hours — commitments expire on calendar boundaries.
     Empty when the reference clock or the stamp is missing, leaving the
     line exactly as before.
@@ -2951,6 +3753,13 @@ def _seed_allows_pre_message_proactive(
 
 
 def _proactive_event_valence(outcome: ProactiveOutcome) -> float:
+    """How this tick coloured the character's mood, if at all.
+
+    ``QUALITY_WITHHELD`` is absent on purpose and falls to the neutral
+    default: the character wrote its message and, as far as it knows, has
+    no idea a machine refused the prose. Giving it the decider's own
+    ``-0.05`` would teach the character to feel bad about our bug.
+    """
     values = {
         ProactiveOutcome.SENT: 0.15,
         ProactiveOutcome.ERRORED: -0.2,
@@ -3005,22 +3814,156 @@ def _proactive_diversity_evidence(
     )
 
 
+def _proactive_temporal_lines(
+    context: ProactiveContext,
+    *,
+    last_player_message: str = "",
+    last_player_at: datetime | None = None,
+) -> tuple[str, ...]:
+    """The 時間座標 block for one push: now, plus what it is answering.
+
+    Proactive is the surface where a stale concern is most likely to
+    surface as a fresh one — nobody wrote to the character, so the draft
+    is built entirely out of material that already happened. The player's
+    last turn is the anchor that matters (the 2026-08-27 incident was a
+    「要回家了」 from sixteen hours earlier answered as if it were
+    minutes), and the character's own last push is second: re-asking the
+    same question a few hours apart is the same defect seen from the
+    other side.
+
+    Two *different* facts about the player, deliberately kept apart:
+
+    * **說話** — ``last_player_message`` with ``last_player_at``, both read
+      off the same ``Message`` by the dialogue load this tick already did
+      (G2-3). This is the material a stale push is built out of, so it is
+      the anchor the ``temporal_inconsistency`` rubric actually reads:
+      「我要回家了」 sixteen hours ago is a concern that expired with the
+      gap, 「下週要搬家」 is one that did not, and no timestamp alone
+      separates them. The quote renders **only** with its own instant;
+      dating it from anything else is the defect this parameter pair
+      replaced (see ``_RecentDialogue``).
+    * **互動** — ``idle_minutes``, i.e. ``last_active_at``. In cloud mode
+      分歧劇場／起幕／融合故事 advance it without a ``USER`` message, so it
+      answers "is the player around", never "when did they last speak".
+      Kept because it is the only reading available at all when no
+      summariser is wired (self-host, where the two coincide anyway), and
+      labelled for what it is so the judge cannot read it as speech.
+
+    ``idle_minutes is None`` means the pair never interacted; the block
+    then simply omits that anchor, and the rubric pins the axis false on a
+    block holding nothing but 現在 — the correct failure mode.
+    """
+    events: list[TemporalEvent] = []
+    if last_player_message.strip() and last_player_at is not None:
+        events.append(quoted_event(
+            "玩家最後一次說話", last_player_message, last_player_at,
+        ))
+    if context.idle_minutes is not None:
+        events.append((
+            "玩家最後一次互動（不一定是說話）",
+            context.now - timedelta(minutes=max(context.idle_minutes, 0.0)),
+        ))
+    last_push = next(
+        (
+            attempt for attempt in context.recent_sent_attempts
+            if attempt.message and attempt.message.strip()
+        ),
+        None,
+    )
+    if last_push is not None:
+        events.append(
+            quoted_event("你上次主動說", last_push.message or "", last_push.decided_at),
+        )
+    return render_temporal_context_lines(
+        now=context.now,
+        local_tz=context.local_tz,
+        events=events,
+    )
+
+
+def _decision_tool_prompt_lines(
+    decision: ProactiveDecision,
+) -> tuple[str, ...]:
+    """The tool prompts this draft ships with, labelled by their source.
+
+    Without them the judge is shown an empty 「隨附工具 prompt」 column while
+    the prose says 「拍了張照片給你」 — which is clause (a) of the
+    ``tool_prompt_defect`` rubric read literally, so *every* push carrying a
+    ``generate_image`` call hard-failed and, under background policy, was
+    withheld. The gate was systematically deleting exactly the messages it
+    was least entitled to.
+
+    Every call is rendered, not just the visual ones: the dispatcher cannot
+    ask a ``ToolCall`` what it renders (the capability lives on the tool, not
+    the call), and guessing from the name is the inference the tool contract
+    explicitly forbids. Showing a labelled ``web_search query: …`` line costs
+    the judge one line it can identify and dismiss; hiding a real image
+    prompt behind a wrong guess costs the player the message.
+
+    One line per argument rather than one per call, following the feed's
+    ``"image_prompt: …"`` idiom: the rubric also has to be able to see a
+    prompt that is malformed, and a JSON blob squashed onto a single line
+    reads as structure noise instead of as the prompt it is.
+    """
+    lines: list[str] = []
+    for call in decision.tool_calls:
+        for key, value in (call.arguments or {}).items():
+            rendered = "" if value is None else str(value).strip()
+            if not rendered:
+                continue
+            lines.append(f"{call.name} {key}: {rendered}")
+    return tuple(lines)
+
+
+def _reportable_verdict(
+    review: "OutputQualityReview[ProactiveDecision]",
+) -> NoveltyVerdict | None:
+    """Which of the band's two verdicts the audit row should describe.
+
+    The re-review's, because that is the draft that shipped — unless it
+    fired nothing, in which case it has nothing to say and the first
+    verdict is the only record of *why* this tick regenerated at all. The
+    same "hard explains the disposal, the rest explains the feedback"
+    rule the orchestrator's own log line follows, and what keeps a
+    ``soft_recovered`` row still naming the axis that forced the retry
+    instead of reading like an untouched pass.
+    """
+    final = review.final_verdict
+    if final is not None and fired_axes(final):
+        return final
+    return review.first_verdict or final
+
+
 def _quality_gate_metadata(
     verdict: NoveltyVerdict | None,
     *,
     enabled: bool,
     retry_count: int,
+    outcome: str = "",
 ) -> dict[str, object]:
+    """The gate's own row on the attempt / turn record.
+
+    ``outcome`` and the four hard axes are what make this row answer the
+    question an operator actually arrives with — *did this tick send, and
+    if not, why* — rather than only "which soft axis was unhappy". Without
+    them a ``hard_skipped`` push and a soft best-effort one look alike in
+    the audit trail, which is how the 2026-08-26 defect stayed invisible.
+    """
     metadata = dict(verdict.gate_metadata) if verdict is not None else {}
     return {
         "enabled": enabled,
         "evaluated": verdict is not None,
+        "outcome": outcome,
         "passes": True if verdict is None else verdict.passes,
-        "lacks_novelty": False if verdict is None else verdict.lacks_novelty,
-        "imagery_relapse": False if verdict is None else verdict.imagery_relapse,
-        "register_mismatch": False if verdict is None else verdict.register_mismatch,
-        "over_warm": False if verdict is None else verdict.over_warm,
-        "formulaic": False if verdict is None else verdict.formulaic,
+        # Every axis the contract declares, soft and hard alike. Written by
+        # iteration rather than by hand because this row is silent on
+        # omission: an axis the judge fires but this dict forgot simply
+        # never reaches the audit trail, and nothing goes red.
+        **{
+            axis: False if verdict is None else getattr(verdict, axis)
+            for axis in ALL_AXES
+        },
+        "hard_fail": False if verdict is None else verdict.hard_fail,
         "feedback": "" if verdict is None else verdict.feedback,
         "retry_count": retry_count,
         "provider_id": metadata.get("provider_id", ""),

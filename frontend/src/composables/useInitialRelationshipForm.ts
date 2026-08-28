@@ -21,6 +21,21 @@ export interface InitialRelationshipForm {
   profile_life_goals: string
 }
 
+/**
+ * TR2-B — 「可以主動找我」在**創角流程**的預設值。
+ *
+ * 從 opt-in 翻成 opt-out：試用數據顯示漏最大的一段是啟用（20 建角 18 發
+ * 話、新 cohort 只有 7/18 開聊），而角色先開口正是把「建了角卻不知道說
+ * 什麼」接回來的工具。翻的是**預設**不是授權——勾選框照樣在創角表單上、
+ * 照樣可以當場取消，取消就寫 `false`。
+ *
+ * 刻意只在前端的創角路徑生效：後端 `proactive_permission` 的預設仍是
+ * `false`，所以既有角色、既有 seed、角色卡備份還原、任何沒帶這個欄位的
+ * API 呼叫都不會被回填成「允許」——「存量不回填」是拍板紅線。
+ */
+export const CREATE_DEFAULT_PROACTIVE_PERMISSION = true
+
+/** 全欄位空白的中性表單（編輯既有 seed 用；創角請用 {@link newCharacterInitialRelationshipForm}）。 */
 export function emptyInitialRelationshipForm(): InitialRelationshipForm {
   return {
     relationship_label: '',
@@ -37,6 +52,20 @@ export function emptyInitialRelationshipForm(): InitialRelationshipForm {
     profile_interests: '',
     profile_routine: '',
     profile_life_goals: '',
+  }
+}
+
+/**
+ * 建立新角色時的起始表單：中性空表單 + 創角預設值（TR2-B）。
+ *
+ * 與 {@link emptyInitialRelationshipForm} 分開存在，是為了讓「創角預設」
+ * 與「空表單」不再是同一件事——後編輯路徑（IR2 的設定頁）載入的是既有
+ * seed，seed 不存在時用的是中性空表單，兩邊都不該被創角預設污染。
+ */
+export function newCharacterInitialRelationshipForm(): InitialRelationshipForm {
+  return {
+    ...emptyInitialRelationshipForm(),
+    proactive_permission: CREATE_DEFAULT_PROACTIVE_PERMISSION,
   }
 }
 

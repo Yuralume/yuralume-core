@@ -19,6 +19,7 @@ from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.background_jobs import COORDINATOR_LEASE_NAME
 from kokoro_link.contracts.due_jobs import (
     FEED_COMPOSE_KIND,
+    FIRST_CONTACT_GRACE_HOURS,
     GOAL_REVIEW_KIND,
     PROACTIVE_EVALUATE_KIND,
     STORY_SCENE_TIMEOUT_KIND,
@@ -52,7 +53,7 @@ class _FakeCharacter:
     frozen: bool = False
     subscription_locked: bool = False
     proactive_enabled: bool = True
-    created_at: datetime = BASE
+    created_at: datetime | None = BASE
     state: _State = field(default_factory=_State)
 
 
@@ -364,13 +365,18 @@ async def _resolved(value):  # noqa: ANN001, ANN202
 
 _DORMANT_TIER = AccountRuntimeProfile(name="free", background_dormancy_days=7)
 
+#: Created long enough ago that the TR2 first-contact grace has closed, so
+#: "never interacted" is the long-absent case these tests are about rather than
+#: the brand-new one (pinned in ``test_due_job_scheduler``).
+_LONG_AGO = BASE - timedelta(days=30)
+
 
 async def test_scheduled_job_runs_no_step_once_dormancy_applies() -> None:
     """The owner flips the knob; the jobs seeded under the old policy are
     still queued and come due. They must break their chains without running."""
     ownership = InMemoryRuntimeOwnership()
     await ownership.flip("distributed", 0, now=BASE)
-    char = _FakeCharacter()  # never interacted
+    char = _FakeCharacter(created_at=_LONG_AGO)  # never interacted, long ago
     queue, _, reconciler, _ = await _harness([char], ownership=ownership)
     seeded = await reconciler.run_once(now=BASE)
     assert seeded.reseeded == len(character_chain_kinds())  # knob still NULL
@@ -402,10 +408,54 @@ async def test_scheduled_job_runs_no_step_once_dormancy_applies() -> None:
 
 async def test_dormant_character_step_and_chain_both_stop() -> None:
     queue, handler, _, executor = await _harness(
-        [_FakeCharacter()], profile=_DORMANT_TIER,
+        [_FakeCharacter(created_at=_LONG_AGO)], profile=_DORMANT_TIER,
     )
     result = await handler.handle(
-        _FakeCharacter(), FEED_COMPOSE_KIND, now=BASE, logical_slot="b",
+        _FakeCharacter(created_at=_LONG_AGO), FEED_COMPOSE_KIND,
+        now=BASE, logical_slot="b",
+    )
+    assert result.executed is False
+    assert result.chain_stopped is True
+    assert executor.calls == []
+    assert await queue.active_chain_keys() == set()
+
+
+async def test_first_contact_grace_runs_the_proactive_step_and_chains() -> None:
+    """TR2 end to end through the handler: for a brand-new character on a
+    dormant tier the proactive step actually runs and its chain advances, while
+    the background kinds around it stay stopped. The pre-flight and the advance
+    have to agree — a step that runs but never chains would fire exactly once
+    and then go silent, which looks identical to working."""
+    fresh = _FakeCharacter(created_at=BASE)  # never interacted, brand new
+    now = BASE + timedelta(hours=8)
+    queue, handler, _, executor = await _harness([fresh], profile=_DORMANT_TIER)
+
+    proactive = await handler.handle(
+        fresh, PROACTIVE_EVALUATE_KIND, now=now, logical_slot="a",
+    )
+    assert proactive.executed is True
+    assert proactive.next_enqueued is True
+
+    feed = await handler.handle(
+        fresh, FEED_COMPOSE_KIND, now=now, logical_slot="b",
+    )
+    assert feed.executed is False
+    assert feed.chain_stopped is True
+
+    assert {kind for kind, _ in executor.calls} == {PROACTIVE_EVALUATE_KIND}
+    assert await queue.active_chain_keys() == {(PROACTIVE_EVALUATE_KIND, fresh.id)}
+
+
+async def test_first_contact_grace_stops_once_the_window_closes() -> None:
+    """…and the same character past the window is dormant for proactive too:
+    the handler stops the step, not just the chain."""
+    fresh = _FakeCharacter(created_at=BASE)
+    queue, handler, _, executor = await _harness([fresh], profile=_DORMANT_TIER)
+
+    result = await handler.handle(
+        fresh, PROACTIVE_EVALUATE_KIND,
+        now=BASE + timedelta(hours=FIRST_CONTACT_GRACE_HOURS),
+        logical_slot="a",
     )
     assert result.executed is False
     assert result.chain_stopped is True

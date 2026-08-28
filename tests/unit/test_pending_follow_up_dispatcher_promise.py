@@ -230,6 +230,31 @@ async def test_scheduled_promise_releases_through_promise_composer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduled_promise_composer_receives_promise_made_at() -> None:
+    """SP1: the composer needs when the promise was recorded (row's
+    ``queued_at``), not just when it's due (``scheduled_for``) — those
+    differ whenever the release happens later than the row's own promised
+    moment. ``_promise_row`` records the row 8h before ``_now()``."""
+    repo = InMemoryPendingFollowUpRepository()
+    row = _promise_row()
+    await repo.add(row)
+    char = _character()
+    promise_composer = _StubPromiseComposer()
+    dispatcher = PendingFollowUpDispatcher(
+        repository=repo,
+        composer=_StubBusyComposer(),
+        proactive_dispatcher=_StubProactiveDispatcher(),
+        character_repository=_StubCharacterRepo({char.id: char}),
+        schedule_service=_StubScheduleService(current_activity=None),
+        scheduled_promise_composer=promise_composer,
+    )
+
+    assert await dispatcher.tick(now=_now()) == 1
+    assert promise_composer.calls[0].promise_made_at == row.queued_at
+    assert promise_composer.calls[0].promise_made_at == _now() - timedelta(hours=8)
+
+
+@pytest.mark.asyncio
 async def test_scheduled_promise_releases_even_when_busy() -> None:
     """The user asked for THIS time — busy_score must not gate."""
     repo = InMemoryPendingFollowUpRepository()

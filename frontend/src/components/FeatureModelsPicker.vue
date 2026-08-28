@@ -59,6 +59,10 @@ const activeModelId = ref<string | null>(null)
 /** Tri-state vision override on the active/default model — null inherits
  * the connection flag, true/false pin it. */
 const activeSupportsVision = ref<boolean | null>(null)
+/** Reasoning posture on the active/default model — applies only to
+ * calls that actually resolve through active_model (feature/group pins
+ * never borrow it). null = connection defaults. */
+const activeReasoning = ref<FeatureReasoningOverride | null>(null)
 
 /** Model lists cached per provider so each row's model dropdown can
  * populate without spamming /models on every keystroke. */
@@ -128,6 +132,7 @@ async function loadPreferences() {
     activeProviderId.value = activePref?.provider_id ?? null
     activeModelId.value = activePref?.model_id ?? null
     activeSupportsVision.value = activePref?.supports_vision ?? null
+    activeReasoning.value = activePref?.reasoning ?? null
     knownKeys.value = prefs.known_keys
     labels.value = prefs.labels
     // Ensure every known key has an entry (blank) so the UI shows a
@@ -207,6 +212,10 @@ function onActiveModelChange(modelId: string) {
 
 function onActiveVisionChange(value: boolean | null) {
   activeSupportsVision.value = value
+}
+
+function onActiveReasoningChange(reasoning: FeatureReasoningOverride | null) {
+  activeReasoning.value = reasoning
 }
 
 function onProviderChange(key: string, providerId: string) {
@@ -405,10 +414,14 @@ async function handleSave() {
         provider_id: activeProviderId.value,
         model_id: activeProviderId.value ? activeModelId.value : null,
         supports_vision: activeSupportsVision.value,
+        reasoning: hasReasoningOverride(activeReasoning.value)
+          ? activeReasoning.value
+          : null,
       })
       activeProviderId.value = activeResult.provider_id
       activeModelId.value = activeResult.model_id
       activeSupportsVision.value = activeResult.supports_vision ?? null
+      activeReasoning.value = activeResult.reasoning ?? null
 
       const payloadGroups: Record<string, FeatureModelEntry> = {}
       for (const [key, entry] of Object.entries(groupOverrides.value)) {
@@ -554,6 +567,10 @@ watch(() => props.providers, () => {
             @update:model-value="onActiveModelChange"
           />
         </div>
+        <ReasoningOverrideFields
+          :model-value="activeReasoning"
+          @update:model-value="onActiveReasoningChange"
+        />
         <VisionOverrideSelect
           :model-value="activeSupportsVision"
           @update:model-value="onActiveVisionChange"

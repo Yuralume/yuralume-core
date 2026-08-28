@@ -1,0 +1,16 @@
+misconfigurations:
+  - id: AVD-DS-0002
+    paths:
+      - "docker/postgres/Dockerfile"
+    expired_at: 2026-11-27
+    statement: >-
+      The official PostgreSQL entrypoint starts as root only to prepare mounted
+      data ownership, then drops privileges through the patched gosu helper.
+  - id: AVD-DS-0002
+    paths:
+      - "docker/storage-local/Dockerfile"
+    expired_at: 2026-11-27
+    statement: >-
+      Self-host operators may bind an existing media directory with arbitrary
+      host ownership, so this image retains the documented storage-local
+      ownership compatibility exception.

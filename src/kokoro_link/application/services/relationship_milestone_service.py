@@ -36,6 +36,7 @@ from kokoro_link.bootstrap.settings import HumanizationSettings
 from kokoro_link.contracts.memory import MemoryRepositoryPort
 from kokoro_link.domain.entities.memory_item import (
     MEMORY_AUDIENCE_PRIVATE,
+    PLAYER_KNOWLEDGE_SHARED,
     MemoryItem,
 )
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
@@ -136,6 +137,12 @@ class RelationshipMilestoneService:
             # but never a public post (also gated by kind at the feed
             # collector; marked here so the row is honest at rest).
             audience=MEMORY_AUDIENCE_PRIVATE,
+            # KB6 — and the clearest case of the two axes diverging: the
+            # milestone is ``audience=private`` (never a public post) yet
+            # ``player_knowledge=shared``, because the band only moved by
+            # the player's own messages. They were the other half of
+            # every interaction that earned it.
+            player_knowledge=PLAYER_KNOWLEDGE_SHARED,
         )
 
         try:

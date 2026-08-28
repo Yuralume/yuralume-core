@@ -8,7 +8,7 @@ per-character isolation that's the whole point of the table shape).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -470,3 +470,96 @@ async def test_list_characters_with_pending_returns_distinct_pairs(
 
     pairs = await repo.list_characters_with_pending()
     assert set(pairs) == {(char_a, _OP_ID), (char_b, _OP_ID)}
+
+
+async def _confirm(
+    repo: SAOperatorPersonaRepository, char_id: str, value: str,
+) -> ProfileField:
+    return await repo.upsert_field(
+        char_id, _OP_ID,
+        ProfileField(
+            character_id=char_id,
+            field_key="name",
+            layer=1,
+            value=value,
+            confidence=0.85,
+            evidence_refs=(_evidence(value),),
+            last_updated=datetime.now(timezone.utc),
+            update_count=1,
+            source="extraction",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_revert_field_write_rejects_the_insert_and_revives_the_supersede(
+    session_factory: sessionmaker,
+) -> None:
+    """The undo counterpart of ``set_explicit_field_for_operator``.
+
+    Exercised against PostgreSQL because the ``updated_at >= since``
+    window is the load-bearing clause and this is the store that keeps
+    the offset — SQLite (the self-host store, covered by the TU5 unit
+    suite) drops it and could agree by accident.
+    """
+    char_id = await _setup(session_factory)
+    repo = SAOperatorPersonaRepository(session_factory)
+    old = await _confirm(repo, char_id, "小明")
+    since = datetime.now(timezone.utc)
+    # The forward write: supersede, then insert.
+    await repo.mark_field_state(old.field_id, "superseded")
+    await _confirm(repo, char_id, "森森")
+    assert (await repo.get(char_id, _OP_ID)).layer1_identity["name"].value == "森森"
+
+    reverted = await repo.revert_field_write_since(
+        character_id=char_id, operator_id=_OP_ID,
+        field_key="name", value="森森", since=since,
+    )
+
+    assert reverted is True
+    persona = await repo.get(char_id, _OP_ID)
+    assert persona.layer1_identity["name"].value == "小明"
+
+
+@pytest.mark.asyncio
+async def test_revert_field_write_ignores_a_different_value_in_the_window(
+    session_factory: sessionmaker,
+) -> None:
+    """Time alone does not identify the write being reversed.
+
+    A row written inside the same window by something else keeps its
+    place, and nothing older is resurrected in its stead.
+    """
+    char_id = await _setup(session_factory, character_id="char-revert-B")
+    repo = SAOperatorPersonaRepository(session_factory)
+    since = datetime.now(timezone.utc)
+    await _confirm(repo, char_id, "阿丹")
+
+    reverted = await repo.revert_field_write_since(
+        character_id=char_id, operator_id=_OP_ID,
+        field_key="name", value="森森", since=since,
+    )
+
+    assert reverted is False
+    persona = await repo.get(char_id, _OP_ID)
+    assert persona.layer1_identity["name"].value == "阿丹"
+
+
+@pytest.mark.asyncio
+async def test_revert_field_write_leaves_rows_from_before_the_window(
+    session_factory: sessionmaker,
+) -> None:
+    """A matching value that predates the turn is not the turn's write."""
+    char_id = await _setup(session_factory, character_id="char-revert-C")
+    repo = SAOperatorPersonaRepository(session_factory)
+    await _confirm(repo, char_id, "森森")
+    since = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    reverted = await repo.revert_field_write_since(
+        character_id=char_id, operator_id=_OP_ID,
+        field_key="name", value="森森", since=since,
+    )
+
+    assert reverted is False
+    persona = await repo.get(char_id, _OP_ID)
+    assert persona.layer1_identity["name"].value == "森森"

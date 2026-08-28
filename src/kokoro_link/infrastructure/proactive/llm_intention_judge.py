@@ -4,11 +4,15 @@ The cheap gate answers "is a proactive push allowed?". This judge answers
 "does the character have a meaningful reason to spend a proactive slot
 right now?". It deliberately asks for inner motive, conversation purpose,
 and expected reply before the message composer gets a chance to write.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the field validation above. Unlike the decider,
+truncation repair stays off here (see ``judge`` below —
+``judge_unavailable`` must stay distinguishable from a real verdict).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone, tzinfo
 
@@ -50,6 +54,7 @@ from kokoro_link.infrastructure.prompt.role_boundary import (
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
+    format_elapsed_ago_label,
     format_local_current_time,
     render_subjective_time_topical_hint,
 )
@@ -57,9 +62,34 @@ from kokoro_link.infrastructure.prompt.weather_freshness import (
     render_weather_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import ParseReason, extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_REASON_CHARS = 160
+
+# G2-1 — the reactivation bar, stated for the judge rather than for the
+# character. The ordinary rubric asks "is there a reason worth spending a
+# slot on"; on a deliberate reunion push that bar is wrong, because the
+# reason *is* the reunion. It is relaxed, not removed: the whole point of
+# D3 keeping the four semantic gates on is that a recall message with
+# nothing behind it is a second injury, so the skip verdict stays
+# available and is spelled out here.
+#
+# Rides ``interaction_block`` (assembled in Python, right after the
+# trigger line it qualifies) rather than a new template placeholder:
+# ``proactive/intention_judge`` is a baseline pack file with a hosted
+# tuned overlay, and a new slot would need both copies kept in lockstep
+# forever.
+_ADMIN_REACTIVATION_JUDGE_LINES = (
+    "",
+    "本次評估來自久別重逢的重新聯繫（角色久違地想重新搭上話）：",
+    "- 判準放寬：只要能自然地重新開啟一段對話，就值得消耗這次額度——"
+    "不必額外要求有特別新鮮、重大或緊急的理由。",
+    "- 放寬不是取消：若素材與角色當下狀態完全撐不起一個自然的開場"
+    "（沒有任何可談的東西、只能硬擠出空洞寒暄），仍然應該 skip。",
+    "- 開場定位是 catch-up，不是把舊話題硬接回來；"
+    "也不要假設角色知道對方這段期間發生了什麼。",
+)
 
 
 class NullProactiveIntentionJudge(ProactiveIntentionJudgePort):
@@ -123,25 +153,24 @@ class LLMProactiveIntentionJudge(ProactiveIntentionJudgePort):
                 judge_unavailable=True,
             )
 
-        payload = _extract_json_object(raw)
-        if payload is None:
-            return ProactiveIntentionDecision(
-                should_consume_slot=False,
-                reason="intention judge output contained no JSON object",
-                judge_unavailable=True,
+        # Unlike the decider, a fail-soft skip here must stay
+        # distinguishable from a real "not now" verdict (F2-3:
+        # ``judge_unavailable`` is what lets the dispatcher decide
+        # whether to give a spent revisit alarm back) — so truncation
+        # repair stays off. Guessing at a half-arrived verdict would
+        # turn a judge outage into a confident-looking real answer.
+        outcome = extract_object_outcome(raw, repair_truncated=False)
+        log_parse_outcome(_LOGGER, outcome, site="proactive.llm_intention_judge")
+        parsed = outcome.value
+        if parsed is None:
+            reason = (
+                "intention judge JSON unparseable"
+                if outcome.reason is ParseReason.DECODE_ERROR
+                else "intention judge output contained no JSON object"
             )
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError as exc:
             return ProactiveIntentionDecision(
                 should_consume_slot=False,
-                reason=f"intention judge JSON unparseable: {exc.msg}",
-                judge_unavailable=True,
-            )
-        if not isinstance(parsed, dict):
-            return ProactiveIntentionDecision(
-                should_consume_slot=False,
-                reason="intention judge JSON was not an object",
+                reason=reason,
                 judge_unavailable=True,
             )
 
@@ -512,8 +541,8 @@ def _optional_deferred_intents_block(context: ProactiveContext) -> str:
                 f"{local_revisit.strftime('%m/%d %H:%M')}（{arrived}）",
             )
         parts.append(
-            f"  · 已等候 {_format_elapsed_minutes(elapsed_minutes)}，"
-            f"距離自然遺忘還有約 {_format_elapsed_minutes(remaining_minutes)}",
+            f"  · 已等候 {format_elapsed_ago_label(elapsed_minutes)}，"
+            f"距離自然遺忘還有約 {format_elapsed_ago_label(remaining_minutes)}",
         )
         body.append("\n".join(parts))
     return _section(
@@ -561,6 +590,8 @@ def _interaction_lines(context: ProactiveContext) -> list[str]:
         elapsed = (context.now - context.last_proactive_at).total_seconds() / 60.0
         lines.append(f"- 上次通過主動評估約 {elapsed:.0f} 分鐘前")
     lines.append(f"- 觸發來源：{context.trigger.value}")
+    if context.trigger == ProactiveTrigger.ADMIN_REACTIVATION:
+        lines.extend(_ADMIN_REACTIVATION_JUDGE_LINES)
     return lines
 
 
@@ -611,7 +642,7 @@ def _recent_sent_lines(context: ProactiveContext) -> list[str]:
         else:
             reply_tag = "（對方還沒回）"
         lines.append(
-            f"- {_format_elapsed_minutes(elapsed)}{reply_tag}："
+            f"- {format_elapsed_ago_label(elapsed)}{reply_tag}："
             f"{(attempt.message or '').strip()[:240] or '(無內容)'}",
         )
     return lines
@@ -629,15 +660,6 @@ def _describe_activity(
     desc = activity.description.strip() or activity.category
     loc = f" @ {activity.location}" if activity.location else ""
     return f"{head}{start}-{end} {desc}（{activity.category}，busy={activity.busy_score:.2f}{loc}）"
-
-
-def _format_elapsed_minutes(minutes: float) -> str:
-    if minutes < 60:
-        return f"{int(round(minutes))} 分鐘前"
-    hours = minutes / 60.0
-    if hours < 24:
-        return f"{hours:.1f} 小時前"
-    return f"{hours / 24.0:.1f} 天前"
 
 
 def _is_promise_fulfilment(trigger: ProactiveTrigger) -> bool:
@@ -659,34 +681,6 @@ def _clamp(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[:limit].rstrip() + "..."
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
 
 
 _ = (datetime, timezone)

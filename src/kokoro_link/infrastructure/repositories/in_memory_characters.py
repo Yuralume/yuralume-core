@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -73,6 +74,21 @@ class InMemoryCharacterRepository(CharacterRepositoryPort):
 
     async def get(self, character_id: str) -> Character | None:
         return self._characters.get(character_id)
+
+    async def list_names(
+        self, character_ids: Sequence[str],
+    ) -> dict[str, str]:
+        """Single-process twin of the two-column bulk lookup.
+
+        Unknown ids are omitted rather than mapped to ``None`` — same
+        contract as the SA adapter, so a caller's missing-name fallback
+        is exercised identically on both."""
+        found = {}
+        for character_id in character_ids:
+            character = self._characters.get(character_id)
+            if character is not None:
+                found[character_id] = character.name
+        return found
 
     async def save(self, character: Character) -> None:
         existing = self._characters.get(character.id)

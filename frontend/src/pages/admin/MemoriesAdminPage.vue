@@ -120,6 +120,11 @@ const activeTab = ref<Tab>('memory')
   display: flex;
   gap: var(--space-1);
   border-bottom: 1px solid var(--color-border);
+  /* Three tabs at narrow widths: scroll the row rather than wrap it —
+     wrapped tabs read as a broken layout, a horizontally-scrolling tab
+     bar is the standard mobile affordance (matches the table overflow-x
+     convention in CharacterFreezeAdminPage). */
+  overflow-x: auto;
 }
 .memories-admin__tab {
   background: transparent;
@@ -130,6 +135,7 @@ const activeTab = ref<Tab>('memory')
   font-size: var(--font-sm);
   font-weight: 500;
   cursor: pointer;
+  flex-shrink: 0;
   transition: color 0.15s, border-color 0.15s;
 }
 .memories-admin__tab:hover {

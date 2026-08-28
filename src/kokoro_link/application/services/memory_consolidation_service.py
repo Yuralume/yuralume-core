@@ -40,6 +40,7 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.memory_item import (
     MEMORY_AUDIENCE_PRIVATE,
     MemoryItem,
+    merge_player_knowledge,
 )
 from kokoro_link.infrastructure.memory.clustering import (
     cluster_by_similarity,
@@ -211,6 +212,14 @@ class MemoryConsolidationService:
             else ""
         )
 
+        # KB6: this station is a rewriter, not a write station — it
+        # never mints a player-knowledge verdict of its own, it only
+        # propagates the cluster's most conservative one. The rule lives
+        # in the domain entity beside the field it governs.
+        merged_player_knowledge = merge_player_knowledge(
+            item.player_knowledge for item in cluster
+        )
+
         replacement = MemoryItem.create(
             character_id=oldest.character_id,
             kind=proposal.kind,
@@ -220,6 +229,7 @@ class MemoryConsolidationService:
             tags=tags,
             created_at=_as_utc(oldest.created_at),
             audience=merged_audience,
+            player_knowledge=merged_player_knowledge,
         )
         # ``access_count`` isn't a create-kwarg — patch it via dataclass
         # replace so the merged item keeps its usage history.

@@ -302,6 +302,50 @@ async def test_fallback_still_blocks_on_other_missing_fields_alongside_cadence_n
 
 
 @pytest.mark.asyncio
+async def test_prechecked_proactive_permission_alone_is_not_relationship_intent(
+) -> None:
+    """TR2-B: an untouched creation form must not be interrogated.
+
+    ``proactive_permission`` now arrives pre-checked, so it stopped being
+    evidence that the player set up a relationship. If it still counted,
+    everyone who left the whole section blank would be asked what the two
+    of them already know and whether they live together — questions about
+    a relationship they never claimed to have — and told they cannot
+    create yet.
+    """
+    service = CharacterCreationIntakeService(model=_CrashingModel())
+
+    result = await service.analyze(
+        draft=CharacterCreationDraftContext(name="澪"),
+        relationship=InitialRelationshipPayload(proactive_permission=True),
+    )
+
+    assert result.can_create is True
+    assert result.missing_required == ()
+    # The cadence nudge is asked on its own terms, and never blocks.
+    assert [question.field for question in result.questions] == [
+        "proactive_cadence_hint",
+    ]
+    assert result.questions[0].blocking is False
+
+
+@pytest.mark.asyncio
+async def test_unchecking_proactive_permission_still_leaves_create_open(
+) -> None:
+    """The opt-out path: nothing filled, box cleared, nothing to ask."""
+    service = CharacterCreationIntakeService(model=_CrashingModel())
+
+    result = await service.analyze(
+        draft=CharacterCreationDraftContext(name="澪"),
+        relationship=InitialRelationshipPayload(proactive_permission=False),
+    )
+
+    assert result.can_create is True
+    assert result.missing_required == ()
+    assert result.questions == ()
+
+
+@pytest.mark.asyncio
 async def test_fallback_asks_living_arrangement_for_relationship_intent() -> None:
     service = CharacterCreationIntakeService(model=_CrashingModel())
 

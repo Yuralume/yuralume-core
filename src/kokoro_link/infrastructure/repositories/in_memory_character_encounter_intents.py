@@ -88,3 +88,19 @@ class InMemoryCharacterEncounterIntentRepository(
         for item_id in target:
             del self._items[item_id]
         return len(target)
+
+    async def delete_by_turn_record(
+        self, character_id: str, turn_record_id: str,
+    ) -> int:
+        if not turn_record_id:
+            # No anchor is not a wildcard: an empty argument here would
+            # otherwise sweep every anchorless row the character owns.
+            return 0
+        target = [
+            item_id for item_id, item in self._items.items()
+            if item.character_id == character_id
+            and item.turn_record_id == turn_record_id
+        ]
+        for item_id in target:
+            del self._items[item_id]
+        return len(target)

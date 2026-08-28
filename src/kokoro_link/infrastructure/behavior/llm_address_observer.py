@@ -8,11 +8,13 @@ prior persisted row.
 
 LLM-first: we do not regex / count honorifics; the model judges. Python
 side only enforces output bounds and known band names.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the field bounds and band-name validation.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Final
 
@@ -23,6 +25,7 @@ from kokoro_link.contracts.operator_address_preference import (
     AddressObservationCandidate,
     OperatorAddressObserverPort,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MIN_MESSAGES: Final = 4
@@ -97,19 +100,14 @@ def _build_prompt(messages: list[str]) -> str:
 
 
 def _parse_response(raw: str) -> AddressObservationCandidate | None:
-    if not raw:
-        return None
-    body = raw.strip()
-    if body.startswith("```"):
-        body = body.strip("`")
-        if body.lower().startswith("json"):
-            body = body[4:]
-    try:
-        data = json.loads(body)
-    except (TypeError, ValueError):
-        _LOGGER.warning("address observer returned unparseable JSON: %s", raw[:200])
-        return None
-    if not isinstance(data, dict):
+    # The prompt unconditionally asks for one JSON object (blank fields
+    # when unsure, never prose), so a truncated reply is worth repairing
+    # and any non-clean parse is worth a log line — there is no "the
+    # model answered in prose and that's fine" branch here.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="behavior.llm_address_observer")
+    data = outcome.value
+    if data is None:
         return None
     salutation = str(data.get("salutation") or "").strip()[:64]
     formality_raw = str(data.get("formality_level") or "").strip().lower()

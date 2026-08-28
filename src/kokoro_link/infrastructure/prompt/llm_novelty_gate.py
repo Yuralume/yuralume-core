@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -10,6 +9,8 @@ from kokoro_link.application.services.model_resolver import ModelResolver
 from kokoro_link.contracts.active_llm import ActiveLLMProviderPort
 from kokoro_link.contracts.llm import ChatModelPort
 from kokoro_link.contracts.novelty_gate import (
+    ALL_AXES as _VERDICT_AXES,
+    HARD_AXES as _HARD_AXES,
     NoveltyGateContext,
     NoveltyGatePort,
     NoveltyVerdict,
@@ -21,6 +22,7 @@ from kokoro_link.infrastructure.observability.llm_metadata_wrapper import (
     LLMCallMetadata,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +30,20 @@ _MAX_LINE_CHARS = 260
 _MAX_LINES = 16
 _MAX_RESPONSE_CHARS = 1600
 _MAX_FEEDBACK_CHARS = 260
+# Tool prompts (image/video) are tag soup and get judged as a whole; a
+# 260-char clip would hide the very tail that leaked into the body.
+_MAX_TOOL_PROMPT_CHARS = 480
+_MAX_LANGUAGE_CHARS = 60
+_MAX_EVIDENCE_ITEMS = 6
+"""How many items of one statistical-evidence kind the block names.
+
+Evidence competes for prompt budget with the material the reply is
+actually about, so each kind gets the same small allowance rather than
+whatever its producer happened to hand over."""
+_MAX_EVIDENCE_ITEM_CHARS = 180
+
+_MAX_TEMPORAL_LINES = 8
+"""The 時間座標 block is a short list of anchors, not a timeline dump."""
 
 
 class LLMNoveltyGate(NoveltyGatePort):
@@ -55,7 +71,10 @@ class LLMNoveltyGate(NoveltyGatePort):
             character=routed_character,
             content_tolerance=context.content_tolerance,
         ):
-            return NoveltyVerdict.pass_open("fake provider")
+            # Not ``pass_open``: that spells "a judge exists and broke" and
+            # the orchestrator counts it as a fail-open. No routable judge
+            # is "no review happened" — uncounted, like an unwired gate.
+            return NoveltyVerdict.pass_unrouted()
         prompt = _build_prompt(context)
         try:
             captured, provider_id = await self._resolver.generate_with_metadata(
@@ -102,44 +121,65 @@ def _build_prompt(context: NoveltyGateContext) -> str:
         register_profile=_render_register_profile(context.register_profile),
         diversity_evidence=_render_diversity_evidence(context.diversity_evidence),
         persona_context=_render_lines(context.persona_context),
+        operator_primary_language=(
+            _clip(context.operator_primary_language, _MAX_LANGUAGE_CHARS) or "（無）"
+        ),
+        tool_prompts=_render_lines(
+            context.tool_prompt_lines,
+            limit=_MAX_TOOL_PROMPT_CHARS,
+        ),
+        mechanical_evidence=_render_lines(context.mechanical_evidence_lines),
+        # Kept out of ``mechanical_evidence`` on purpose: the rubric pins
+        # ``temporal_inconsistency`` false when this block is empty, which
+        # only works if "the caller supplied no time anchors" stays
+        # distinguishable from "the caller supplied a length warning".
+        temporal_context=_render_lines(
+            context.temporal_context_lines,
+            max_lines=_MAX_TEMPORAL_LINES,
+        ),
     )
 
 
-def _render_lines(lines: tuple[str, ...]) -> str:
+def _render_lines(
+    lines: tuple[str, ...],
+    *,
+    limit: int = _MAX_LINE_CHARS,
+    max_lines: int = _MAX_LINES,
+) -> str:
     cleaned = [line.strip() for line in lines if line and line.strip()]
     if not cleaned:
         return "- （無）"
-    return "\n".join(
-        f"- {_clip(line, _MAX_LINE_CHARS)}" for line in cleaned[:_MAX_LINES]
-    )
+    return "\n".join(f"- {_clip(line, limit)}" for line in cleaned[:max_lines])
 
 
 def _parse_verdict(raw: str) -> NoveltyVerdict | None:
-    obj = _extract_object(raw or "")
+    outcome = extract_object_outcome(raw or "")
+    log_parse_outcome(_LOGGER, outcome, site="prompt.llm_novelty_gate")
+    obj = outcome.value
     if obj is None:
         return None
     passes = obj.get("passes")
     if not isinstance(passes, bool):
         return None
-    lacks_novelty = obj.get("lacks_novelty")
-    imagery_relapse = obj.get("imagery_relapse")
-    register_mismatch = obj.get("register_mismatch")
-    over_warm = obj.get("over_warm")
-    formulaic = obj.get("formulaic")
     return NoveltyVerdict(
         passes=passes,
-        lacks_novelty=lacks_novelty if isinstance(lacks_novelty, bool) else False,
-        imagery_relapse=imagery_relapse if isinstance(imagery_relapse, bool) else False,
-        register_mismatch=(
-            register_mismatch if isinstance(register_mismatch, bool) else False
-        ),
-        over_warm=over_warm if isinstance(over_warm, bool) else False,
-        formulaic=formulaic if isinstance(formulaic, bool) else False,
         feedback=_clip(
             obj.get("feedback") if isinstance(obj.get("feedback"), str) else "",
             _MAX_FEEDBACK_CHARS,
         ),
+        **{axis: _flag(obj, axis) for axis in _VERDICT_AXES},
     )
+
+
+def _flag(obj: dict[str, Any], key: str) -> bool:
+    """A missing or non-boolean axis reads as ``False``.
+
+    An older judge (or an older tuned overlay that has not grown the hard
+    axes yet) simply omits them; treating that as "not fired" keeps the
+    gate fail-soft instead of turning a pack lag into a blocked surface.
+    """
+    value = obj.get(key)
+    return value if isinstance(value, bool) else False
 
 
 def _with_metadata(
@@ -150,15 +190,12 @@ def _with_metadata(
 ) -> NoveltyVerdict:
     return NoveltyVerdict(
         passes=verdict.passes,
-        lacks_novelty=verdict.lacks_novelty,
-        imagery_relapse=verdict.imagery_relapse,
-        register_mismatch=verdict.register_mismatch,
-        over_warm=verdict.over_warm,
-        formulaic=verdict.formulaic,
         feedback=verdict.feedback,
         gate_metadata={
             "enabled": True,
             "passes": verdict.passes,
+            "hard_fail": verdict.hard_fail,
+            **{axis: getattr(verdict, axis) for axis in _HARD_AXES},
             "provider_id": provider_id,
             "model_id": metadata.model_id,
             "latency_ms": metadata.latency_ms,
@@ -166,6 +203,7 @@ def _with_metadata(
             "completion_tokens": metadata.completion_tokens,
             "error": metadata.error,
         },
+        **{axis: getattr(verdict, axis) for axis in _VERDICT_AXES},
     )
 
 
@@ -193,6 +231,16 @@ def _render_register_profile(profile: RegisterProfile | None) -> str:
 
 
 def _render_diversity_evidence(evidence: ReplyDiversityEvidence | None) -> str:
+    """The 統計多樣性證據 block, from every field the evidence carries.
+
+    Both item kinds are rendered, and that is the whole point of doing it
+    here: ``language_mix_lines`` is the deterministic material the
+    ``language_mismatch`` axis is supposed to weigh, and dropping it made
+    this channel half-wired. Chat did not notice because it also ships the
+    same lines through ``mechanical_evidence_lines``; any surface that
+    fills only the diversity field had its evidence discarded silently
+    between the context and the prompt.
+    """
     if evidence is None:
         return "- （無統計證據）"
     lines = [
@@ -202,48 +250,24 @@ def _render_diversity_evidence(evidence: ReplyDiversityEvidence | None) -> str:
         "- self_repetition_hint: "
         + (_clip(evidence.self_repetition_hint, 360) or "（無）"),
     ]
-    for item in evidence.phrase_frequency_lines[:6]:
-        if item.strip():
-            lines.append(f"- frequency: {_clip(item, 180)}")
+    lines.extend(_render_evidence_items("frequency", evidence.phrase_frequency_lines))
+    lines.extend(_render_evidence_items("language_mix", evidence.language_mix_lines))
     return "\n".join(lines)
+
+
+def _render_evidence_items(label: str, items: tuple[str, ...]) -> list[str]:
+    """One labelled bullet per item, capped the same way for every kind."""
+    return [
+        f"- {label}: {_clip(item, _MAX_EVIDENCE_ITEM_CHARS)}"
+        for item in items[:_MAX_EVIDENCE_ITEMS]
+        if item.strip()
+    ]
 
 
 def _fmt_optional(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.3f}"
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    parsed = json.loads(text[start:index + 1])
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _clip(raw: str, limit: int) -> str:

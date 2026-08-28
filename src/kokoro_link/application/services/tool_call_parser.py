@@ -8,11 +8,11 @@ Tolerant of:
   we told it not to
 - **truncated output** — when the model's response was cut short mid
   tool-call (max_tokens hit, stream dropped, model decided to stop),
-  the JSON can end without closing braces. Rather than bailing out and
+  the JSON can end without its closers. Rather than bailing out and
   leaking a half-formed ``{"tool": ...`` blob to the user, we
-  auto-close open strings + braces and retry ``json.loads``. Covers
-  the most common truncation shapes without becoming a full JSON5
-  parser.
+  auto-close the open string and every open bracket, then retry
+  ``json.loads``. Covers the most common truncation shapes without
+  becoming a full JSON5 parser.
 
 Also exposes ``looks_like_tool_call_attempt`` so the chat loop can
 recognise "model tried to call a tool but we couldn't parse" and
@@ -38,23 +38,31 @@ the width is the caller's choice, not a detail to blur together:
 Returns ``None`` whenever the reply clearly isn't structured as a tool
 call — the caller should then treat the reply as the user-facing
 answer.
+
+The text-level work (balance scanning, fence stripping, truncation
+repair) now lives in ``kokoro_link.llm_output``; what stays here is the
+*policy* — which shapes count as a call, and when we are allowed to
+rescue a truncated one.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import re
-from collections.abc import Iterator
 from typing import Any, Final
 
 from kokoro_link.domain.value_objects.tool_call import ToolCall
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    iter_embedded_json,
+    log_parse_outcome,
+    strip_fences,
+)
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _TOOL_CALL_HINT_RE = re.compile(r'\{\s*"tool"\s*:\s*"', re.DOTALL)
-
-_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_+-]*\s*|\s*```$")
-
-_CLOSERS: Final[dict[str, str]] = {"{": "}", "[": "]"}
 
 _MAX_SHAPE_SCAN_CHARS: Final = 8000
 """Ceiling on the text we scan for embedded structures. A composer reply
@@ -66,10 +74,20 @@ quadratic walk."""
 def parse_tool_call(raw: str) -> ToolCall | None:
     if not raw or not raw.strip():
         return None
-    obj = _extract_first_object(raw)
+    # Truncation repair is gated on the reply looking like *our* call
+    # contract. Without the gate we would be inventing dicts out of
+    # random curly-brace soup, which is how a prose reply with a stray
+    # brace turns into a phantom tool call.
+    attempted = looks_like_tool_call_attempt(raw)
+    outcome = extract_object_outcome(raw, repair_truncated=attempted)
+    obj = outcome.value
     if obj is None:
-        obj = _repair_truncated_object(raw)
-    if obj is None:
+        # A prose reply has no JSON and that is the normal case on most
+        # turns — logging it would drown the signal. Only a reply that
+        # announced itself as a call and then failed to parse is a
+        # failure worth a line.
+        if attempted:
+            log_parse_outcome(_LOGGER, outcome, site="chat.tool_call_parser")
         return None
     name = obj.get("tool")
     if not isinstance(name, str) or not name.strip():
@@ -125,7 +143,7 @@ def looks_like_object_literal(raw: str) -> bool:
     """
     if not raw:
         return False
-    text = _FENCE_RE.sub("", raw.strip()).strip()
+    text = strip_fences(raw).strip()
     if len(text) < 2:
         return False
     if text.startswith("{") and text.endswith("}"):
@@ -160,8 +178,8 @@ def looks_like_tool_call_shape(raw: str) -> bool:
         return False
     if looks_like_object_literal(raw):
         return True
-    text = _FENCE_RE.sub("", raw.strip())[:_MAX_SHAPE_SCAN_CHARS]
-    return any(_is_call_shaped(value) for value in _iter_embedded_json(text))
+    text = strip_fences(raw)[:_MAX_SHAPE_SCAN_CHARS]
+    return any(_is_call_shaped(value) for value in iter_embedded_json(text))
 
 
 def _is_call_shaped(value: Any) -> bool:
@@ -179,159 +197,3 @@ def _is_container(value: Any) -> bool:
     return isinstance(value, list) and bool(value) and all(
         isinstance(item, dict) for item in value
     )
-
-
-def _iter_embedded_json(text: str) -> Iterator[Any]:
-    """Yield every top-level ``{…}`` / ``[…]`` region of ``text`` that
-    parses as JSON, in order, skipping the ones that don't.
-
-    Skipping rather than bailing is what keeps roleplay markers from
-    hiding a real call behind them: ``{微笑}好，我查一下：{"name": …}``
-    has to reach the second region.
-    """
-    index = 0
-    length = len(text)
-    while index < length:
-        if text[index] not in _CLOSERS:
-            index += 1
-            continue
-        end = _balanced_end(text, index)
-        if end is None:
-            index += 1
-            continue
-        try:
-            yield json.loads(text[index : end + 1])
-        except json.JSONDecodeError:
-            pass
-        index = end + 1
-
-
-def _balanced_end(text: str, start: int) -> int | None:
-    """Index of the bracket closing the one at ``start``, or ``None``
-    when the region never closes (truncated output, stray brace)."""
-    stack: list[str] = []
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char in _CLOSERS:
-            stack.append(_CLOSERS[char])
-        elif char in ("}", "]"):
-            if not stack or stack[-1] != char:
-                return None
-            stack.pop()
-            if not stack:
-                return index
-    return None
-
-
-def _extract_first_object(text: str) -> dict[str, Any] | None:
-    """Find the first top-level ``{...}`` JSON object in ``text``.
-
-    Shares the idea (but not the code) with ``post_turn.llm_processor``
-    so tweaks there don't inadvertently change chat tool-call parsing.
-    """
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
-
-
-def _repair_truncated_object(text: str) -> dict[str, Any] | None:
-    """Best-effort recovery for a truncated ``{...}`` tool-call blob.
-
-    Scenario: the model started emitting a valid JSON tool call but the
-    response cut off before the final ``}`` (or mid-string). Without
-    this, ``_extract_first_object`` returns ``None`` and the loop
-    leaks the raw JSON to the user. We append just enough closing
-    characters to rebalance the structure, then retry ``json.loads``.
-
-    Only runs when the text *looks* like a tool call — we don't want to
-    silently rescue random curly-brace soup into dicts.
-    """
-    if not looks_like_tool_call_attempt(text):
-        return None
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    last_key_comma = -1  # position AFTER last safe comma at depth==1 inside outer obj
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-    if depth <= 0 and not in_string:
-        return None  # structurally fine — real parse would have worked
-    suffix = ""
-    if in_string:
-        # Close the dangling string. If the last char before the cutoff
-        # was a backslash we also need to drop the escape so the closer
-        # isn't itself escaped.
-        if text.endswith("\\"):
-            suffix += "\\"
-        suffix += '"'
-    # After closing the string, assume the cut happened mid-value — drop
-    # any trailing comma we couldn't have reached yet.
-    candidate = text[start:] + suffix
-    # Strip trailing comma at the end (e.g. ``"foo": "bar",`` with value
-    # never arriving) — json.loads rejects those.
-    candidate = candidate.rstrip()
-    if candidate.endswith(","):
-        candidate = candidate[:-1]
-    candidate += "}" * depth
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        _ = last_key_comma  # silence unused — reserved for future trims
-        return None
-    return parsed if isinstance(parsed, dict) else None

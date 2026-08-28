@@ -20,6 +20,11 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.character_peer_profile import CharacterPeerProfile
 from kokoro_link.domain.entities.character_relationship import CharacterRelationship
 from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_MEMORIES = 12
@@ -170,19 +175,56 @@ def _latest_memory_time(memories: list[MemoryItem]) -> datetime | None:
     return max((memory.created_at for memory in memories), default=None)
 
 
-def _json_object(raw: str) -> dict[str, Any] | None:
-    text = (raw or "").strip()
-    if not text:
-        return None
+def _crude_object_span_decodes(text: str) -> bool:
+    """Old behaviour, preserved exactly — see the identical helper's
+    docstring in ``fusion_story_critic``."""
     start = text.find("{")
     end = text.rfind("}")
-    if start < 0 or end < start:
-        return None
+    if start < 0 or end <= start:
+        return False
     try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
+        json.loads(text[start: end + 1])
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
+    """DH2-services: object extraction via the shared scanner.
+
+    Near-duplicate of ``character_encounter_service._json_object``
+    (same signature, near-identical body) — migrated as one unit.
+    Branch selection still mirrors the old crude find/rfind slice
+    exactly (see the helper above) so a genuinely array-shaped reply is
+    not misread as its first nested object.
+
+    **Truncation repair is off**, unlike its encounter-service twin, and
+    the difference is what the two do with the result. The encounter
+    service reads a payload; this one *replaces* a record. The prompt
+    above says so in as many words — 「整份改寫，不是逐次追加」,
+    「你的輸出會**整份取代**現有 profile」 — so every field here is
+    written over whatever the observer knew about this peer before.
+    Repair would close a reply cut mid-``summary`` into an ordinary
+    ``str``, and that half-sentence becomes the profile: the previous,
+    complete summary is gone and nothing downstream can tell.
+
+    Failing closed skips one consolidation pass. The memories that
+    triggered it are still there, the existing profile is still there,
+    and the next pass rewrites it properly.
+
+    FX1/DH-2: this is the site the array confusion was proved on, and
+    the array guard is structural because of it. The consolidator asks
+    for one peer's profile; a model that answers with a list of peers
+    and then adds a sentence used to slip past the old whole-string
+    guard, and the object extractor would reach into the list and write
+    **peer A's** profile onto whichever peer this call was about.
+    """
+    text = (raw or "").strip()
+    if not _crude_object_span_decodes(text) and first_region_is_array(text):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    outcome = extract_object_outcome(raw, repair_truncated=False)
+    log_parse_outcome(_LOGGER, outcome, site="peer_knowledge_consolidator")
+    return outcome.value
 
 
 def _str(raw: Any) -> str:

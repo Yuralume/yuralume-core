@@ -19,6 +19,10 @@ export interface ActiveModelPreference {
    * provider connection's flag, ``true`` / ``false`` override it (one
    * aggregator connection fronts both vision and text-only models). */
   supports_vision?: boolean | null
+  /** Reasoning posture for calls that actually resolve through
+   * active_model — feature/group pins route elsewhere and never borrow
+   * it. ``null`` = keep the connection's reasoning defaults. */
+  reasoning?: FeatureReasoningOverride | null
 }
 
 export type RoutingPreferenceScope = 'user' | 'global'
@@ -234,7 +238,11 @@ export async function setVisualGenerationStylePreference(
 export interface NsfwModeTarget {
   llm_provider_id: string
   llm_model_id: string
-  image_profile_id: string
+  /** null = image generation explicitly disabled while the mode is active. */
+  image_profile_id: string | null
+  /** Reasoning posture bound onto the NSFW target while the reroute is
+   * in effect; ``null`` keeps the target connection's defaults. */
+  reasoning?: FeatureReasoningOverride | null
 }
 
 export interface NsfwModePreference {

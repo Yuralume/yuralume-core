@@ -131,3 +131,62 @@ async def test_sa_persona_curiosity_marks_status(
     listed = await repo.list_recent("char-A", DEFAULT_OPERATOR_ID, limit=1)
     assert listed[0].status == PERSONA_CURIOSITY_STATUS_ANSWERED
     assert listed[0].response_turn_id == "turn-2"
+
+
+@pytest.mark.asyncio
+async def test_sa_persona_curiosity_delete_created_since_scopes_by_conversation(
+    session_factory: sessionmaker,
+) -> None:
+    """Turn-undo's window delete: only the attempt in *this* conversation
+    at-or-after ``since`` goes — an earlier attempt and one recorded in a
+    different conversation both survive."""
+    await _ensure_operator(session_factory)
+    await _ensure_character(session_factory, "char-A")
+    repo = SAPersonaCuriosityRepository(session_factory)
+
+    stale = await repo.add(
+        PersonaCuriosityAttempt.new(
+            character_id="char-A",
+            operator_id=DEFAULT_OPERATOR_ID,
+            surface=PERSONA_CURIOSITY_SURFACE_CHAT,
+            target_layer=1,
+            target_topic="stale",
+            question_intent="predates the turn",
+            created_at=_NOW - timedelta(hours=1),
+            conversation_id="conv-1",
+        ),
+    )
+    this_turn = await repo.add(
+        PersonaCuriosityAttempt.new(
+            character_id="char-A",
+            operator_id=DEFAULT_OPERATOR_ID,
+            surface=PERSONA_CURIOSITY_SURFACE_CHAT,
+            target_layer=2,
+            target_topic="this turn",
+            question_intent="asked this turn",
+            created_at=_NOW,
+            conversation_id="conv-1",
+        ),
+    )
+    other_conversation = await repo.add(
+        PersonaCuriosityAttempt.new(
+            character_id="char-A",
+            operator_id=DEFAULT_OPERATOR_ID,
+            surface=PERSONA_CURIOSITY_SURFACE_CHAT,
+            target_layer=3,
+            target_topic="other conversation",
+            question_intent="asked elsewhere",
+            created_at=_NOW,
+            conversation_id="conv-2",
+        ),
+    )
+
+    deleted = await repo.delete_created_since("char-A", "conv-1", _NOW)
+
+    assert deleted == 1
+    remaining_ids = {
+        a.id for a in await repo.list_recent("char-A", DEFAULT_OPERATOR_ID, limit=10)
+    }
+    assert stale.id in remaining_ids
+    assert other_conversation.id in remaining_ids
+    assert this_turn.id not in remaining_ids

@@ -36,6 +36,12 @@ from kokoro_link.application.services.chat_service import (
     ChatRuntimeLimitExceeded,
     ChatSubscriptionFrozen,
 )
+from kokoro_link.application.services.chat_stream_relay import (
+    TurnCompleted,
+    TurnFrame,
+    TurnStreamRelay,
+    TurnToken,
+)
 from kokoro_link.application.services.chat_turn_lease import (
     CONVERSATION_BUSY_CODE,
     ConversationBusyError,
@@ -226,21 +232,45 @@ def _safe_user_dir(user_id: str) -> str:
 
 
 class UndoTurnResponse(BaseModel):
-    """Summary of what the turn-undo operation reversed."""
+    """Summary of what the turn-undo operation reversed.
+
+    Every field the whole TU series reports is declared here at once,
+    each with a default, so a client can be written against the final
+    shape today: a subsystem whose rollback has not shipped yet answers
+    ``0`` / ``false``, which is also exactly what it answers when the
+    subsystem is not wired on this deployment. Fields are additive and a
+    reader must not assume the set is closed.
+    """
 
     conversation_id: str
     turn_index: int
-    reverted_messages: int
-    deleted_memories: int
-    deleted_state_snapshots: int
-    rejected_persona_fields: int
-    restored_goals: bool
-    restored_arc: bool
-    restored_schedule: bool
-    restored_character_state: bool
+    reverted_messages: int = 0
+    deleted_memories: int = 0
+    deleted_state_snapshots: int = 0
+    rejected_persona_fields: int = 0
+    restored_goals: bool = False
+    restored_arc: bool = False
+    restored_schedule: bool = False
+    restored_character_state: bool = False
+    recorded_tombstone: bool = False
+    deleted_emotion_events: int = 0
+    deleted_follow_ups: int = 0
+    restored_follow_ups: int = 0
+    cancelled_follow_up_jobs: int = 0
+    restored_address_preference: bool = False
+    reverted_address_log_entries: int = 0
+    restored_scene_session: bool = False
+    deleted_created_arc: bool = False
+    deleted_encounter_intents: int = 0
+    deleted_curiosity_attempts: int = 0
+    deleted_story_events: int = 0
+    marked_checkpoint_stale: bool = False
 
     @classmethod
     def from_result(cls, result: UndoResult) -> "UndoTurnResponse":
+        # Field-for-field with ``UndoResult``; copied by name rather than
+        # by ``**asdict`` so a field added on one side and forgotten on
+        # the other is a missing key here, not a silently dropped number.
         return cls(
             conversation_id=result.conversation_id,
             turn_index=result.turn_index,
@@ -252,6 +282,19 @@ class UndoTurnResponse(BaseModel):
             restored_arc=result.restored_arc,
             restored_schedule=result.restored_schedule,
             restored_character_state=result.restored_character_state,
+            recorded_tombstone=result.recorded_tombstone,
+            deleted_emotion_events=result.deleted_emotion_events,
+            deleted_follow_ups=result.deleted_follow_ups,
+            restored_follow_ups=result.restored_follow_ups,
+            cancelled_follow_up_jobs=result.cancelled_follow_up_jobs,
+            restored_address_preference=result.restored_address_preference,
+            reverted_address_log_entries=result.reverted_address_log_entries,
+            restored_scene_session=result.restored_scene_session,
+            deleted_created_arc=result.deleted_created_arc,
+            deleted_encounter_intents=result.deleted_encounter_intents,
+            deleted_curiosity_attempts=result.deleted_curiosity_attempts,
+            deleted_story_events=result.deleted_story_events,
+            marked_checkpoint_stale=result.marked_checkpoint_stale,
         )
 
 
@@ -496,87 +539,80 @@ async def send_chat_message_stream(
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
-    async def event_generator() -> AsyncIterator[str]:
-        collected: list[str] = []
-        # Once ``finish`` has been handed the turn it owns the lease release,
-        # even when the client disconnect below unblocks us early — the
-        # shielded finalize keeps running and must still hold the conversation
-        # until the assistant message lands.
-        finalize_started = False
+    # The turn runs in its own task from here. This generator is a *forwarder*
+    # and owns nothing: a client that goes away cancels the forwarding and
+    # leaves the turn to finish, because a disconnect means the audience left,
+    # not that the performance was cancelled. Everything about releasing the
+    # lease / charge / drain slot lives in the relay, which is also what makes
+    # the release single-owner — the double-release window between this
+    # ``finally`` and a shielded finalize no longer exists.
+    relay = TurnStreamRelay(token_stream, finalizer).start()
 
+    async def event_generator() -> AsyncIterator[str]:
         try:
             # Send conversation_id immediately so frontend can track it.
             #
-            # Inside the ``try`` on purpose. A client that goes away while this
+            # Inside the ``try`` on purpose: a client that goes away while this
             # very first frame is in flight closes the generator *at this yield
-            # point*, and a yield sitting above the ``try`` means the close
-            # unwinds without ever reaching the ``finally`` below: the turn
-            # lease strands until its 180s TTL, the action charge stays
-            # reserved until a sweeper finds it, and the in-memory
-            # ``active_turns`` slot is stuck for the life of the process — so
-            # every later drain burns its whole 180s budget waiting for a turn
-            # that ended long ago. The window is small (one frame) but it is a
-            # disconnect at exactly the moment disconnects cluster: the user
-            # hitting send and immediately navigating away.
+            # point*, and a yield sitting above the ``try`` would skip the
+            # ``detach`` below — leaving the turn running with nothing bounding
+            # it. The window is small (one frame) but it is a disconnect at
+            # exactly the moment disconnects cluster: the user hitting send and
+            # immediately navigating away.
             yield f"data: {json.dumps({'conversation_id': finalizer.conversation_id})}\n\n"
 
-            async for token in token_stream:
-                collected.append(token)
-                yield f"data: {json.dumps({'token': token})}\n\n"
-
-            full_text = "".join(collected)
-            # ``shield`` so a late client disconnect (user navigated away
-            # right as the LLM finished) doesn't abort the DB save
-            # half-way through SQLAlchemy's greenlet — otherwise uvicorn
-            # logs the CancelledError traceback from inside
-            # ``_concurrency_py3k.greenlet_spawn``. Data integrity wins:
-            # the assistant reply always lands in the DB.
-            finalize_started = True
-            response = await asyncio.shield(finalizer.finish(full_text))
-            # mode='json' so datetime/UUID fields become primitives; otherwise json.dumps
-            # raises TypeError mid-stream, the connection closes without the final event,
-            # and the client is left waiting with no way to unstick its UI state.
-            yield f"data: {json.dumps({'done': True, 'response': response.model_dump(mode='json')})}\n\n"
-            yield "data: [DONE]\n\n"
-        except Exception as error:
-            # The 200 + SSE headers are already on the wire, so an
-            # out-of-credits refusal cannot become a 402 status here — it
-            # travels as a terminal ``error`` frame instead, mirroring the
-            # sync route's structured detail. Everything else keeps the old
-            # behaviour (propagate, no final event).
-            detail = insufficient_credits_detail(error)
-            if detail is None:
-                raise
-            _LOGGER.info(
-                "chat stream stopped: insufficient credits (conversation %s)",
-                finalizer.conversation_id,
-            )
-            yield f"data: {json.dumps({'error': detail})}\n\n"
-            yield "data: [DONE]\n\n"
+            # Ordered by frequency: every reply is mostly tokens.
+            async for event in relay.frames():
+                if isinstance(event, TurnToken):
+                    yield f"data: {json.dumps({'token': event.text})}\n\n"
+                elif isinstance(event, TurnFrame):
+                    # Tool-activity and friends: forwarded verbatim.
+                    yield f"data: {json.dumps(event.payload)}\n\n"
+                elif isinstance(event, TurnCompleted):
+                    # mode='json' so datetime/UUID fields become primitives;
+                    # otherwise json.dumps raises TypeError mid-stream, the
+                    # connection closes without the final event, and the client
+                    # is left waiting with no way to unstick its UI state.
+                    yield (
+                        "data: "
+                        f"{json.dumps({'done': True, 'response': event.response.model_dump(mode='json')})}"
+                        "\n\n"
+                    )
+                    yield "data: [DONE]\n\n"
+                else:
+                    # ``TurnFailed``. The 200 + SSE headers are already on the
+                    # wire, so an out-of-credits refusal cannot become a 402
+                    # status here — it travels as a terminal ``error`` frame
+                    # instead, mirroring the sync route's structured detail.
+                    # Everything else keeps the old behaviour (propagate, no
+                    # final event); the relay has already released the turn by
+                    # the time it publishes this.
+                    detail = insufficient_credits_detail(event.error)
+                    if detail is None:
+                        raise event.error
+                    _LOGGER.info(
+                        "chat stream stopped: insufficient credits "
+                        "(conversation %s)",
+                        finalizer.conversation_id,
+                    )
+                    yield f"data: {json.dumps({'error': detail})}\n\n"
+                    yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
-            # Browser closed the tab / navigated away mid-generation.
-            # User turn is already persisted (send_message_stream saved
-            # it pre-LLM); the shielded finalize above will complete
-            # regardless. Nothing else to do — re-raise so uvicorn can
-            # unwind the task cleanly.
+            # Browser closed the tab / navigated away mid-generation. The user
+            # turn is already persisted (send_message_stream saved it pre-LLM)
+            # and the turn task keeps going, so the assistant reply still lands
+            # and the player sees it when they reload. Re-raise so uvicorn can
+            # unwind the request task cleanly.
             _LOGGER.info(
                 "chat stream cancelled by client for conversation %s",
                 finalizer.conversation_id,
             )
             raise
         finally:
-            # Covers the streams that never reach ``finish`` (upstream error
-            # mid-generation, client disconnect before the final token) so the
-            # next turn on this conversation is accepted immediately rather
-            # than after the lease TTL. Never allowed to mask the real error.
-            if not finalize_started:
-                try:
-                    await finalizer.release_turn_lease()
-                except Exception:  # pragma: no cover - defensive
-                    _LOGGER.exception(
-                        "chat turn lease release failed for conversation %s",
-                        finalizer.conversation_id,
-                    )
+            # Whether we finished, failed or were cancelled, nobody is reading
+            # after this point. ``detach`` stops publishing and — if the turn is
+            # still running — starts the watchdog that bounds it.
+            relay.detach()
 
     return StreamingResponse(
         event_generator(),

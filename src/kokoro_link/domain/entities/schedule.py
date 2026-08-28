@@ -151,6 +151,23 @@ class ScheduleActivity:
 
     Same status as ``scene_privacy``: produced by the planner, consumed
     by chat-assist's schedule snapshot, retained as narrative material."""
+    source_beat_id: str | None = None
+    """KB2 — this block is a story beat's slot in the day, not a lived hour.
+
+    The schedule planner is told about the arc beat scheduled for the day
+    and reserves a block for it (a solo scene it may stage, or a slot held
+    open for a scene that needs the player). Such a block is a *plan for a
+    scene*, and the scene's own record is written when the beat is
+    realized — so it must never become an episodic memory of its own
+    (:mod:`kokoro_link.application.services.schedule_memorializer` skips
+    it). Without this lineage the memorializer had nothing to test on, and
+    a beat the player was central to became a day the character
+    "remembered" living through alone.
+
+    ``None`` = an ordinary activity (including preparation *for* a beat,
+    which is a real experience and is memorialised normally). The id is
+    stamped by code from the day's beat — the planner model only marks
+    *which* block is the slot, so a hallucinated id can never enter."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "busy_score", _clamp_busy(self.busy_score))
@@ -183,6 +200,7 @@ class ScheduleActivity:
         participant_refs: tuple[ParticipantRef, ...] | list[ParticipantRef] | None = None,
         scene_privacy: ScenePrivacy | str | None = None,
         meeting_affordance: MeetingAffordance | str | None = None,
+        source_beat_id: str | None = None,
     ) -> "ScheduleActivity":
         desc = description.strip()
         if not desc:
@@ -227,6 +245,7 @@ class ScheduleActivity:
             participant_refs=_dedupe_participant_refs(participant_refs or ()),
             scene_privacy=_coerce_scene_privacy(scene_privacy),
             meeting_affordance=_coerce_meeting_affordance(meeting_affordance),
+            source_beat_id=(source_beat_id or "").strip() or None,
         )
 
     def with_memorialized(self, flag: bool = True) -> "ScheduleActivity":
@@ -462,6 +481,14 @@ class DailySchedule:
     the next block, or the weather turned mid-block) re-opens the gate.
     It is never a semantic input — the judgement itself always compares
     the full schedule text against the full weather fact block."""
+    manually_adjusted: bool = False
+    """``True`` once the operator has edited this day by hand (add /
+    modify / delete via the manual schedule routes). Such a day is
+    operator-owned: the same-day weather refresh
+    (:meth:`ScheduleService._is_stale_current_day_plan`) must not rebuild
+    it, or the deleted activity silently resurrects. The explicit
+    regenerate route re-plans regardless and yields a fresh row with the
+    flag cleared. LLM post-turn adjustments never set this."""
 
     @classmethod
     def create(
@@ -486,6 +513,11 @@ class DailySchedule:
 
     def with_is_planned(self, flag: bool = True) -> "DailySchedule":
         return replace(self, is_planned=flag)
+
+    def with_manual_adjustment(self, flag: bool = True) -> "DailySchedule":
+        """Stamp (or clear) operator ownership of this day — see
+        :attr:`manually_adjusted`."""
+        return replace(self, manually_adjusted=flag)
 
     def with_weather_vet(
         self, activity_id: str | None, condition: str | None,

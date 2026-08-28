@@ -77,11 +77,12 @@ class ModelPreferenceValidator:
             return
         provider_id = _coerce_str(raw.get("provider_id"))
         model_id = _coerce_str(raw.get("model_id"))
-        # Preserve any routing-level vision pin across a rewrite — like
-        # reasoning on the mapping entries, it is route metadata the
-        # repair must not silently drop. A vision-only active_model (no
-        # provider/model) returns early below and is left untouched.
+        # Preserve any routing-level vision pin and reasoning posture
+        # across a rewrite — route metadata the repair must not silently
+        # drop. A metadata-only active_model (no provider/model) returns
+        # early below and is left untouched.
         vision = parse_vision_override(raw)
+        reasoning = reasoning_pref_value(parse_reasoning_override(raw))
         if provider_id is None and model_id is None:
             return
 
@@ -95,7 +96,7 @@ class ModelPreferenceValidator:
             )
             await self._preferences.set(
                 _ACTIVE_MODEL_KEY,
-                _active_model_value(fallback_provider_id, None, vision),
+                _active_model_value(fallback_provider_id, None, vision, reasoning),
             )
             return
 
@@ -110,7 +111,7 @@ class ModelPreferenceValidator:
         )
         await self._preferences.set(
             _ACTIVE_MODEL_KEY,
-            _active_model_value(provider_id, None, vision),
+            _active_model_value(provider_id, None, vision, reasoning),
         )
 
     # ---- feature_models ----------------------------------------------
@@ -287,11 +288,15 @@ def _active_model_value(
     provider_id: str | None,
     model_id: str | None,
     vision: bool | None,
+    reasoning: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Rebuild an ``active_model`` value, carrying the vision pin only
-    when one was set so unrelated rewrites stay byte-identical to before
-    this feature (existing repair tests assert exact 2-key dicts)."""
+    """Rebuild an ``active_model`` value, carrying the vision pin and
+    reasoning posture only when set so unrelated rewrites stay
+    byte-identical to before these features (existing repair tests
+    assert exact 2-key dicts)."""
     value: dict[str, Any] = {"provider_id": provider_id, "model_id": model_id}
     if vision is not None:
         value[VISION_ENTRY_KEY] = vision
+    if reasoning is not None:
+        value[REASONING_ENTRY_KEY] = reasoning
     return value

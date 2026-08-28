@@ -14,7 +14,11 @@ from kokoro_link.contracts.memory import (
     ScoredMemory,
     WorldScope,
 )
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_DISCLOSED,
+    PLAYER_KNOWLEDGE_PRIVATE,
+    MemoryItem,
+)
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.infrastructure.persistence.models import MemoryItemRow
 from kokoro_link.infrastructure.persistence.sa_memory_mapping import (
@@ -425,6 +429,44 @@ class SAMemoryRepository(MemoryRepositoryPort):
             await session.commit()
             await session.refresh(row)
             return row_to_item(row)
+
+    async def mark_disclosed(
+        self, character_id: str, item_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """KB8 flip — see :meth:`MemoryRepositoryPort.mark_disclosed`.
+
+        One conditional UPDATE, and the condition is the whole point:
+        ``player_knowledge == 'private'`` in the WHERE clause makes the
+        transition atomic against a concurrent flip from another channel
+        (the same memory can be told in chat and shown on a viewed feed
+        post in the same minute). Whichever statement lands first matches
+        the predicate and reports the id; the loser matches nothing and
+        reports nothing, so the returned ids are the real transitions
+        rather than both callers each claiming one.
+
+        ``RETURNING`` gives that answer without a second read. It is
+        supported by Postgres (production) and by SQLite ≥ 3.35 (the
+        test/self-host path), which are the only two backends this
+        repository is wired against.
+        """
+        wanted = [item_id for item_id in item_ids if item_id]
+        if not wanted:
+            return ()
+        async with self._session_factory() as session:
+            stmt = (
+                update(MemoryItemRow)
+                .where(
+                    MemoryItemRow.id.in_(wanted),
+                    MemoryItemRow.character_id == character_id,
+                    MemoryItemRow.player_knowledge == PLAYER_KNOWLEDGE_PRIVATE,
+                )
+                .values(player_knowledge=PLAYER_KNOWLEDGE_DISCLOSED)
+                .returning(MemoryItemRow.id)
+            )
+            result = await session.execute(stmt)
+            flipped = tuple(result.scalars().all())
+            await session.commit()
+            return flipped
 
     async def touch(self, item_id: str) -> None:
         async with self._session_factory() as session:

@@ -125,6 +125,7 @@ async def test_chat_agreement_becomes_planned_peer_encounter() -> None:
     await chat_service._persist_peer_meet_intents(  # noqa: SLF001
         character_id=a.id,
         intents=post_turn.peer_meet_intents,
+        turn_record_id="turn-1",
     )
     schedule_service = ScheduleService(
         repository=schedule_repo,

@@ -802,3 +802,39 @@ async def test_instructions_separate_own_story_from_user_reality() -> None:
     assert "公司名" in prompt
     # …and the legitimate quote-back hook survives the rule.
     assert "你之前不是說有個工作要簽約" in prompt
+
+
+# --- TR3: health follow-up hint (code-side addendum, not a pack edit) --
+
+
+@pytest.mark.asyncio
+async def test_health_follow_up_hint_appears_when_memory_material_exists() -> None:
+    model = _StubModel('{"should_send": false, "reason": "ok"}')
+    decider = LLMProactiveDecider(model=model)
+    await decider.decide(
+        _context(recent_memories_text="- [semantic] 使用者提到這幾天一直胸悶"),
+    )
+    prompt = model.captured_prompt or ""
+
+    assert "健康關懷加分項" in prompt
+    assert "上次說的胸悶後來好點了嗎" in prompt  # positive example survives
+    # Same discipline as the chat-side health_care section, restated for
+    # the decider's own voice.
+    assert "不要切成衛教口吻" in prompt
+    assert "不要條列式問診" in prompt
+    assert "不要診斷或建議吃什麼藥" in prompt
+    assert "不要貼求助專線" in prompt
+
+
+@pytest.mark.asyncio
+async def test_health_follow_up_hint_is_absent_with_no_material_at_all() -> None:
+    model = _StubModel('{"should_send": false, "reason": "ok"}')
+    decider = LLMProactiveDecider(model=model)
+    # Default context: empty recent_memories_text and (via the
+    # ProactiveContext default) empty recent_dialogue_summary.
+    await decider.decide(_context())
+    prompt = model.captured_prompt or ""
+
+    # Nothing to gate the hint on, so it must not print an empty
+    # "check the material above" instruction into every ordinary tick.
+    assert "健康關懷加分項" not in prompt

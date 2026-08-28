@@ -302,6 +302,27 @@ async def test_prompt_includes_role_knowledge_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_includes_feed_player_knowledge_boundary() -> None:
+    """KB9: a post can name someone/something the player hasn't heard of
+    (an arc snippet, a memory from a beat he wasn't in) — pin the
+    first-time-sharing rider, not just role_boundary's separate concern."""
+    from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+        render_feed_post_knowledge_line,
+    )
+
+    provider = _StaticActiveLLM(json.dumps({
+        "content_text": "今天發生了一件有趣的事。",
+        "image_prompt": "",
+    }))
+    composer = LLMFeedComposer(provider=provider, video_enabled=False)
+
+    await composer.compose(_input())
+
+    prompt = provider.captured_prompt or ""
+    assert render_feed_post_knowledge_line() in prompt
+
+
+@pytest.mark.asyncio
 async def test_prompt_includes_world_event_locale_and_user_location() -> None:
     provider = _StaticActiveLLM(json.dumps({
         "content_text": "我看到這件事了，先觀望一下。",

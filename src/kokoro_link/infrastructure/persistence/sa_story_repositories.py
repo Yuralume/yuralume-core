@@ -271,6 +271,21 @@ class SAStoryEventRepository(StoryEventRepositoryPort):
             await session.commit()
         return count
 
+    async def delete_arc_beat_realizations_since(
+        self, character_id: str, since: datetime,
+    ) -> int:
+        moment = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(StoryEventRow).where(
+                    StoryEventRow.character_id == character_id,
+                    StoryEventRow.arc_beat_id.is_not(None),
+                    StoryEventRow.created_at >= moment,
+                ),
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
 
 def _event_to_row(event: StoryEvent) -> StoryEventRow:
     return StoryEventRow(

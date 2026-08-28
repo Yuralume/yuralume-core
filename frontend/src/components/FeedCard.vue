@@ -7,7 +7,7 @@
  * 才展開、避免一次拉每張卡片的留言）。樂觀更新：點擊先 flip，
  * 失敗 rollback 並把錯誤往上層丟。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { UiImage, UiLightbox } from '@/components/ui'
@@ -24,6 +24,7 @@ import {
   listFeedComments,
   unlikeFeedPost,
 } from '@/utils/api/feed'
+import { observeFeedPostView } from '@/utils/feedViewObserver'
 import { useAuth } from '@/composables/useAuth'
 import { useLocale } from '@/composables/useLocale'
 import { useTimezone } from '@/composables/useTimezone'
@@ -54,6 +55,7 @@ const emit = defineEmits<{
   (e: 'reaction-changed', value: FeedReactionState): void
   (e: 'reaction-error', message: string): void
   (e: 'comment-count-changed', value: { post_id: string; comments: number }): void
+  (e: 'viewed', postId: string): void
 }>()
 
 const { t } = useI18n()
@@ -80,6 +82,30 @@ function openProfile() {
 const liked = ref(props.post.liked)
 const likes = ref(props.post.reactions.likes)
 const pending = ref(false)
+
+// ---------------------------------------------------------------- 已讀回報
+// KB11: root element visibility drives the read-receipt. Skip entirely for
+// a post the server already knows was viewed (`FeedPanel` also skips
+// re-observing a card it has just optimistically marked viewed via its own
+// prop update, but the guard belongs here too so this component is correct
+// in isolation). The dwell/threshold decision itself lives in
+// `feedViewObserver.ts` — this is only the mount/unmount wiring.
+const cardEl = ref<HTMLElement | null>(null)
+let stopObservingView: (() => void) | null = null
+
+onMounted(() => {
+  if (props.post.viewed_at) return
+  if (!cardEl.value) return
+  stopObservingView = observeFeedPostView(cardEl.value, props.post.id, (postId) => {
+    emit('viewed', postId)
+    stopObservingView = null
+  })
+})
+
+onBeforeUnmount(() => {
+  stopObservingView?.()
+  stopObservingView = null
+})
 
 // ---------------------------------------------------------------- 放大檢視
 // LB4：貼文圖從「開新分頁」改成浮窗放大。集合固定只有一張（這則貼文自己的
@@ -308,7 +334,7 @@ function formatRelative(iso: string): string {
 </script>
 
 <template>
-  <article class="feed-card">
+  <article ref="cardEl" class="feed-card">
     <!-- IG 風 character header — 只在 characterName 有給時渲染。全局牆
          會把 onOpenProfile 傳進來讓整列可點，點擊跳該角色的個人 stage。 -->
     <header

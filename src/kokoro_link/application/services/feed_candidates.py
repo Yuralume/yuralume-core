@@ -48,6 +48,9 @@ from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
 from kokoro_link.domain.value_objects.feed_source import FeedSource
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
+from kokoro_link.infrastructure.prompt.memory_lines import (
+    memory_participants_tag,
+)
 from kokoro_link.infrastructure.prompt.timing_utils import (
     format_relative_past_label,
 )
@@ -375,13 +378,27 @@ class FeedCandidateCollector:
             # already gets current time) doesn't narrate a stale fact as if
             # it just happened.
             elapsed_min = max(0.0, age.total_seconds() / 60.0)
+            # KB7: carry the same 「[與 X 一起]」 fact chat and the proactive
+            # decider render, from the same helper. Without it the composer
+            # reads a solo line and a shared one identically and can write
+            # "我們那天…" about an evening the player never had. No
+            # player-knowledge frame here on purpose (plan §3.2): a post is
+            # how she *tells* him things, so a private memory is publishable
+            # material rather than a hazard — the feed's own first-person
+            # rider (``render_feed_post_knowledge_line``, wired into the
+            # composer) covers introducing whoever it names.
+            participants = memory_participants_tag(item)
+            memory_snippet = (
+                f"記憶：{participants} {content[:240]}"
+                if participants else f"記憶：{content[:240]}"
+            )
             out.append(FeedCandidate(
                 kind=FeedKind.REFLECTION,
                 source=FeedSource.memory(item.id),
                 hint=hint,
                 score=score,
                 context_snippets=(
-                    f"記憶：{content[:240]}",
+                    memory_snippet,
                     f"記憶時間：{format_relative_past_label(elapsed_min)}",
                     f"類型：{item.kind.value}",
                 ),

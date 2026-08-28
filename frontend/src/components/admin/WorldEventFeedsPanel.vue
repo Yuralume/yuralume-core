@@ -168,44 +168,46 @@ onMounted(load)
     <p v-else-if="feeds.length === 0" class="field-hint">
       {{ t('admin.worldFeeds.empty') }}
     </p>
-    <table v-else class="world-feeds__table">
-      <thead>
-        <tr>
-          <th>{{ t('admin.worldFeeds.colId') }}</th>
-          <th>{{ t('admin.worldFeeds.colUrl') }}</th>
-          <th>{{ t('admin.worldFeeds.colCategory') }}</th>
-          <th>{{ t('admin.worldFeeds.colRegion') }}</th>
-          <th>{{ t('admin.worldFeeds.colStatus') }}</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="feed in feeds" :key="feed.id">
-          <td>{{ feed.id }}</td>
-          <td class="world-feeds__url">{{ feed.feed_url }}</td>
-          <td>{{ feed.category }}</td>
-          <td>
-            <input
-              class="field-input world-feeds__region"
-              type="text"
-              :value="feed.region ?? ''"
-              :placeholder="t('admin.worldFeeds.regionGlobal')"
-              :disabled="busy[feed.id]"
-              @change="saveRegion(feed, ($event.target as HTMLInputElement).value)"
-            />
-          </td>
-          <td>{{ feed.health_status }}</td>
-          <td class="world-feeds__actions">
-            <UiButton size="sm" variant="ghost" :loading="busy[feed.id]" @click="toggle(feed)">
-              {{ feed.enabled ? t('admin.worldFeeds.disable') : t('admin.worldFeeds.enable') }}
-            </UiButton>
-            <UiButton size="sm" variant="danger" :loading="busy[feed.id]" @click="remove(feed)">
-              {{ t('admin.worldFeeds.delete') }}
-            </UiButton>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else class="world-feeds__table-wrap">
+      <table class="world-feeds__table">
+        <thead>
+          <tr>
+            <th>{{ t('admin.worldFeeds.colId') }}</th>
+            <th>{{ t('admin.worldFeeds.colUrl') }}</th>
+            <th>{{ t('admin.worldFeeds.colCategory') }}</th>
+            <th>{{ t('admin.worldFeeds.colRegion') }}</th>
+            <th>{{ t('admin.worldFeeds.colStatus') }}</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="feed in feeds" :key="feed.id">
+            <td>{{ feed.id }}</td>
+            <td class="world-feeds__url">{{ feed.feed_url }}</td>
+            <td>{{ feed.category }}</td>
+            <td>
+              <input
+                class="field-input world-feeds__region"
+                type="text"
+                :value="feed.region ?? ''"
+                :placeholder="t('admin.worldFeeds.regionGlobal')"
+                :disabled="busy[feed.id]"
+                @change="saveRegion(feed, ($event.target as HTMLInputElement).value)"
+              />
+            </td>
+            <td>{{ feed.health_status }}</td>
+            <td class="world-feeds__actions">
+              <UiButton size="sm" variant="ghost" :loading="busy[feed.id]" @click="toggle(feed)">
+                {{ feed.enabled ? t('admin.worldFeeds.disable') : t('admin.worldFeeds.enable') }}
+              </UiButton>
+              <UiButton size="sm" variant="danger" :loading="busy[feed.id]" @click="remove(feed)">
+                {{ t('admin.worldFeeds.delete') }}
+              </UiButton>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </UiSection>
 </template>
 
@@ -216,6 +218,13 @@ onMounted(load)
   gap: var(--space-3);
   align-items: end;
   margin-bottom: var(--space-4);
+}
+.world-feeds__table-wrap {
+  /* Matches the table overflow-x convention in CharacterFreezeAdminPage /
+     MemoriesAdminPage: at 390px this table (six columns, one holding a
+     truncated URL) overflows the admin content column. Scroll the table
+     itself rather than letting the page body scroll horizontally. */
+  overflow-x: auto;
 }
 .world-feeds__table {
   width: 100%;

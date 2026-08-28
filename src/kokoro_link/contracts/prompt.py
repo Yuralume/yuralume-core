@@ -68,6 +68,7 @@ class PromptContextBuilderPort(Protocol):
         available_tools: list[PromptToolDescriptor] | None = None,
         tool_outcomes: list[ToolOutcomeMessage] | None = None,
         forced_tool_name: str | None = None,
+        character_tool_names: tuple[str, ...] | None = None,
         story_events: list[StoryEvent] | None = None,
         story_arc: StoryArc | None = None,
         upcoming_arc_beats: list[StoryArcBeat] | None = None,
@@ -111,6 +112,16 @@ class PromptContextBuilderPort(Protocol):
         while" naturally without the caller having to craft prose.
         Both default to ``None`` which the builder treats as "no such
         signal available" rather than fabricating zeros.
+
+        ``character_tool_names`` (HV2) is every tool this character can
+        actually invoke this turn — the *capability set*, as opposed to
+        ``available_tools``, which is what the current hop is allowed to
+        emit a call for and is deliberately emptied on the last hop. The
+        honesty section reads it to decide whether it may state that the
+        character has no way to reach the web. Tri-state: ``None`` means
+        the caller did not declare one, and an undeclared capability set
+        must never be read as an absent one — a character wrongly told it
+        cannot browse stops searching when it should.
 
         ``calendar_context`` is the same pre-rendered natural-language
         block the schedule planner sees, describing today's real-world

@@ -24,6 +24,14 @@ Lifecycle:
   ``queued`` → (tick sees busy_score drop) → ``resolving`` → success
   → ``resolved`` (terminal). Failure during resolve flips back to
   ``queued`` so the next tick retries.
+
+  One kind of failure does not simply flip back: a compose the HV1
+  honesty gate withheld (:meth:`PendingFollowUp.honesty_parked` /
+  :meth:`PendingFollowUp.honesty_retries_exhausted`). An unbounded,
+  un-delayed retry there is a model that keeps lying being asked to lie
+  again every tick, forever, from the head of the due queue — so the
+  release instant moves forward, and a model that re-offends through its
+  whole budget ends the row instead of owning it silently.
 """
 
 from __future__ import annotations
@@ -150,6 +158,34 @@ class PendingFollowUpKind:
 PendingFollowUpKind.BUSY_DEFER = PendingFollowUpKind("busy_defer")
 PendingFollowUpKind.SCHEDULED_PROMISE = PendingFollowUpKind("scheduled_promise")
 
+SCHEDULED_PROMISE_DEFER_REASON: str = "scheduled_promise"
+"""``defer_reason`` of a promise the *character* made to the player."""
+
+HONESTY_REPAIR_DEFER_REASON: str = "honesty_repair"
+"""``defer_reason`` of a row the HV4 chat audit minted for itself (F5).
+
+A repair row is a ``SCHEDULED_PROMISE`` in every way that matters
+downstream — same composer, same release job, same honesty gate on the
+re-compose — so it deliberately does **not** get a ``kind`` of its own;
+a third kind would have to be taught to every ``kind ==
+SCHEDULED_PROMISE`` branch in the dispatcher and would be wrong in all
+of them.
+
+What it does need is to be **recognisable to its own writer**, because
+that writer has to find the row it wrote two minutes ago and merge the
+next caught lie into it rather than opening a second one (F5). This
+constant is that recognition: a discriminator the machine stamps at mint
+time, checked by equality. It is emphatically *not* a reading of the
+row's prose — matching on what ``promise_intent`` says would be exactly
+the keyword special-casing the project's first principle forbids, and
+would also break the moment the composer's wording changed.
+
+Collision-free by construction: ``defer_reason`` is otherwise either the
+busy-decider's free-text label (only ever on ``BUSY_DEFER`` rows, which
+this predicate excludes) or the fixed
+:data:`SCHEDULED_PROMISE_DEFER_REASON`.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class PendingFollowUp:
@@ -212,6 +248,37 @@ class PendingFollowUp:
     ``BUSY_DEFER``. The composer reads this to write the actual message
     — the persona + intent + current context drive content, no
     templating."""
+    turn_record_id: str | None = None
+    """Id of the ``turn_records`` row for the turn that wrote this — the
+    anchor turn-undo deletes by (TU4).
+
+    Only a ``SCHEDULED_PROMISE`` row carries one, because only that row
+    is written by the background post-turn, whose clock has nothing to do
+    with the turn's. Undoing a *later* turn used to hard-delete such a
+    row purely because it landed inside that turn's time window, killing
+    a promise the character made in a message still on screen.
+
+    ``None`` on a ``BUSY_DEFER`` row is permanent and correct: that
+    branch runs no post-turn and mints no turn record, and its row is
+    written inline during the turn, which is the one case the window is
+    exact for. ``None`` on a promise row also covers rows written before
+    the anchor existed — every reader must treat it as "no anchor
+    available", never as an error."""
+    honesty_park_attempts: int = 0
+    """How many times the HV1 honesty gate has withheld this row's
+    composed reply because the **model** re-claimed an outcome it had no
+    evidence for (F1).
+
+    Only that class of park counts. A park caused by our own judge being
+    unreachable says nothing about the row and must never be allowed to
+    spend its budget — losing the judge would otherwise cancel every
+    outstanding promise on the deployment.
+
+    Bounded because the alternative is unbounded: a park releases the row
+    back to ``queued`` with nothing else changed, so a row the model lies
+    about systematically would re-compose on every tick forever. At the
+    cap the row goes ``cancelled`` with ``last_error`` saying so, loudly
+    (ERROR log + an alert-line counter) — never silently."""
 
     @classmethod
     def new(
@@ -258,6 +325,8 @@ class PendingFollowUp:
         source_message_content: str = "",
         source_content_mode: MessageContentMode | str = MessageContentMode.NORMAL,
         source_safe_summary: str = "",
+        turn_record_id: str | None = None,
+        defer_reason: str = SCHEDULED_PROMISE_DEFER_REASON,
         now: datetime | None = None,
     ) -> "PendingFollowUp":
         """Create a ``SCHEDULED_PROMISE`` row.
@@ -270,6 +339,22 @@ class PendingFollowUp:
           can echo specifics back to the user
         - ``promise_intent`` carries the character's interpretation of
           what to do at the scheduled time
+        - ``turn_record_id`` names the turn whose post-turn extracted the
+          promise, so undoing *that* turn (and only that turn) takes the
+          row back with it
+
+        ``turn_record_id`` defaults to ``None`` rather than being
+        required because the entity has no way to invent one, but the
+        production write point always passes it: without an anchor the
+        row falls back to being identified by a time window that its own
+        background writer races.
+
+        ``defer_reason`` is the row's *provenance* discriminator, not a
+        busy reason — a promise row has no busy activity behind it. It
+        exists so the one writer that has to find its own earlier rows
+        (the HV4 chat audit, F5) can do so by a stamped mark rather than
+        by reading the prose it wrote; see
+        :data:`HONESTY_REPAIR_DEFER_REASON`.
         """
         timestamp = now or _utcnow()
         intent = (promise_intent or "").strip()
@@ -294,13 +379,16 @@ class PendingFollowUp:
             status=PendingFollowUpStatus.QUEUED,
             messages=(first,),
             brief_reply="(scheduled-promise; no inline ack)",
-            defer_reason="scheduled_promise",
+            defer_reason=(
+                (defer_reason or "").strip() or SCHEDULED_PROMISE_DEFER_REASON
+            ),
             activity_id=None,
             scheduled_for=scheduled_for,
             queued_at=timestamp,
             updated_at=timestamp,
             kind=PendingFollowUpKind.SCHEDULED_PROMISE,
             promise_intent=intent[:500],
+            turn_record_id=turn_record_id,
         )
 
     @property
@@ -310,6 +398,20 @@ class PendingFollowUp:
     @property
     def is_scheduled_promise(self) -> bool:
         return self.kind == PendingFollowUpKind.SCHEDULED_PROMISE
+
+    @property
+    def is_honesty_repair(self) -> bool:
+        """Whether the HV4 chat audit minted this row for itself (F5).
+
+        Two equality checks over stamped fields — no reading of
+        ``promise_intent``. See :data:`HONESTY_REPAIR_DEFER_REASON` for
+        why the mark rides ``defer_reason`` rather than a ``kind`` of its
+        own or a column of its own.
+        """
+        return (
+            self.kind == PendingFollowUpKind.SCHEDULED_PROMISE
+            and self.defer_reason == HONESTY_REPAIR_DEFER_REASON
+        )
 
     @property
     def latest_user_message(self) -> PendingFollowUpMessage:
@@ -380,6 +482,76 @@ class PendingFollowUp:
             self,
             status=PendingFollowUpStatus.QUEUED,
             last_error=(error or "").strip()[:200] or None,
+            updated_at=timestamp,
+        )
+
+    def honesty_parked(
+        self,
+        *,
+        error: str,
+        retry_at: datetime,
+        attempts: int | None = None,
+        now: datetime | None = None,
+    ) -> "PendingFollowUp":
+        """Back to ``QUEUED``, but **not before** ``retry_at`` (F1).
+
+        The difference from :meth:`marked_failed` is the whole point of
+        this transition existing: a plain failure leaves ``scheduled_for``
+        in the past, which means the very next tick re-reads the row, and
+        ``list_due`` — ordered by ``scheduled_for``, limited — hands back
+        the same oldest rows every time. A row the honesty gate keeps
+        withholding therefore both re-burns a compose per tick and sits at
+        the head of the queue starving newer promises. Moving the release
+        instant forward is the same lever the row already uses to mean
+        "not yet" and fixes both.
+
+        ``attempts`` is passed only by the caller that decided this park
+        was the model's fault; leaving it ``None`` keeps the counter
+        exactly where it was, which is what a judge outage must do.
+        """
+        from dataclasses import replace
+
+        timestamp = now or _utcnow()
+        if retry_at.tzinfo is None:
+            raise ValueError("PendingFollowUp retry_at must be tz-aware")
+        return replace(
+            self,
+            status=PendingFollowUpStatus.QUEUED,
+            scheduled_for=retry_at,
+            last_error=(error or "").strip()[:200] or None,
+            honesty_park_attempts=(
+                self.honesty_park_attempts if attempts is None
+                else max(0, attempts)
+            ),
+            updated_at=timestamp,
+        )
+
+    def honesty_retries_exhausted(
+        self,
+        *,
+        error: str,
+        attempts: int,
+        now: datetime | None = None,
+    ) -> "PendingFollowUp":
+        """Terminal: the model re-claimed on every allowed retry (F1).
+
+        Deliberately ``CANCELLED`` rather than another queued retry.
+        Every honest option was already spent — the gate blocked, a
+        correction naming the exact overclaim was given, and it re-offended
+        anyway, ``attempts`` times over. Keeping the row alive past that
+        buys no fulfilment and costs a compose per tick forever; keeping
+        the row *silently* alive is worse still, which is why this records
+        ``error`` and the caller raises an alert line rather than letting
+        the row simply stop appearing.
+        """
+        from dataclasses import replace
+
+        timestamp = now or _utcnow()
+        return replace(
+            self,
+            status=PendingFollowUpStatus.CANCELLED,
+            last_error=(error or "").strip()[:200] or None,
+            honesty_park_attempts=max(0, attempts),
             updated_at=timestamp,
         )
 

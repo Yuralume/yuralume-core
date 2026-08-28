@@ -290,3 +290,33 @@ class MemoryRepositoryPort(Protocol):
         Returns the updated item, or ``None`` when the id does not
         exist.
         """
+
+    async def mark_disclosed(
+        self,
+        character_id: str,
+        item_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Flip ``player_knowledge`` from ``private`` to ``disclosed`` (KB8).
+
+        Deliberately **not** a parameter on :meth:`update_fields`. That
+        method is the memory-editing surface — it takes any value the
+        caller hands it — whereas this one implements a single legal
+        transition and nothing else. The narrower signature is what makes
+        the ledger trustworthy: there is no call shape that walks a
+        ``disclosed`` row back to ``private``, downgrades a ``shared``
+        row, or mints a verdict on a row nobody classified (``""``), so
+        the "she told him, and telling cannot be untold" invariant is a
+        property of the port rather than a discipline every call site has
+        to remember.
+
+        Idempotent and replay-safe: an id already ``disclosed`` is a
+        no-op, and so is one whose value is anything other than
+        ``private``. Ids that do not exist, or belong to a different
+        character, are ignored — ``character_id`` scopes the write so a
+        caller can only flip rows for the character it already resolved
+        ownership of.
+
+        Returns the ids that were actually flipped by *this* call (never
+        the ones that were already disclosed), so the caller can log a
+        real transition instead of an attempt.
+        """

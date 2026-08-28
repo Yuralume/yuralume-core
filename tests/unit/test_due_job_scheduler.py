@@ -11,6 +11,7 @@ from kokoro_link.application.services.due_job_scheduler import NextDueCalculator
 from kokoro_link.contracts.due_jobs import (
     BEAT_DUE_KIND,
     CHARACTER_UPKEEP_KIND,
+    FIRST_CONTACT_GRACE_HOURS,
     FEED_COMMENT_REPLY_KIND,
     FEED_COMPOSE_KIND,
     GOAL_REVIEW_KIND,
@@ -45,7 +46,7 @@ class _FakeCharacter:
     frozen: bool = False
     subscription_locked: bool = False
     proactive_enabled: bool = True
-    created_at: datetime = BASE
+    created_at: datetime | None = BASE
     state: _State = field(default_factory=_State)
 
 
@@ -236,11 +237,131 @@ async def test_null_dormancy_is_bit_identical_to_today() -> None:
 async def test_never_interacted_character_schedules_no_background() -> None:
     """互動前不啟動背景: a character the player has never spoken to has no
     ``last_active_at`` at all, and is dormant from creation — the anchor does
-    NOT fall back to ``created_at`` the way the idle down-shift's does."""
+    NOT fall back to ``created_at`` the way the idle down-shift's does.
+
+    Sampled past the TR2 first-contact grace so this states the steady-state
+    rule; the window itself is pinned by the ``first_contact`` tests below."""
+    calc = _calc(_dormancy_profile())
+    fresh = _FakeCharacter(
+        created_at=BASE - timedelta(days=30), state=_State(last_active_at=None),
+    )
+    for kind in _DORMANCY_COVERED_KINDS:
+        assert await calc.compute(fresh, kind, now=BASE) is None, kind
+
+
+# --- TR2 first-contact grace: the bounded hole in NF4 --------------------- #
+#
+# NF4 reads "never spoken to" as dormant from creation. That is right for every
+# chain that runs BECAUSE a relationship exists, and fatal for the one chain
+# whose job is to START one: on a tier with the knob set, the free-tier player
+# who creates a character and does not know what to say would never be spoken
+# to first, because the proactive chain stops before its first tick.
+
+_GRACE = timedelta(hours=FIRST_CONTACT_GRACE_HOURS)
+
+
+async def test_first_contact_grace_keeps_proactive_only() -> None:
+    """free tier, never active, inside the window: the chain that can start a
+    relationship survives; every chain that presumes one still stops."""
+    calc = _calc(_dormancy_profile())
+    fresh = _FakeCharacter(created_at=BASE, state=_State(last_active_at=None))
+    inside = BASE + timedelta(hours=8)  # TR2-B's delay window
+
+    n = await calc.compute(fresh, PROACTIVE_EVALUATE_KIND, now=inside)
+    assert n is not None
+    assert n.due_at == inside + timedelta(seconds=300)  # ordinary cadence
+
+    for kind in _DORMANCY_COVERED_KINDS:
+        if kind == PROACTIVE_EVALUATE_KIND:
+            continue
+        assert await calc.compute(fresh, kind, now=inside) is None, kind
+
+
+async def test_first_contact_grace_closes_on_its_own() -> None:
+    """The whole difference from ``dormancy_exempt``: the hole shuts. A
+    character nobody ever answered is dormant for proactive too, on schedule,
+    and stays that way — the window is anchored to ``created_at`` and nothing
+    renews it."""
     calc = _calc(_dormancy_profile())
     fresh = _FakeCharacter(created_at=BASE, state=_State(last_active_at=None))
     for kind in _DORMANCY_COVERED_KINDS:
-        assert await calc.compute(fresh, kind, now=BASE) is None, kind
+        assert await calc.compute(fresh, kind, now=BASE + _GRACE) is None, kind
+        assert await calc.compute(
+            fresh, kind, now=BASE + _GRACE + timedelta(days=90),
+        ) is None, kind
+
+
+async def test_first_contact_grace_does_not_touch_a_player_who_spoke() -> None:
+    """Condition 2 stated as a test: once ``last_active_at`` exists the ordinary
+    "idle for N days" rule is the only one in play, even for a character created
+    minutes ago. Otherwise a brand-new character would get a proactive chain
+    that outlives its own dormancy."""
+    spoke_then_left = _FakeCharacter(
+        created_at=BASE,
+        state=_State(last_active_at=BASE + timedelta(minutes=5)),
+    )
+    # Still inside the 72 h creation window, but idle past a 1-day dormancy
+    # window: the creation anchor does not rescue it.
+    now = BASE + timedelta(hours=48)
+    assert await _calc(_dormancy_profile(days=1)).compute(
+        spoke_then_left, PROACTIVE_EVALUATE_KIND, now=now,
+    ) is None
+    # …and the same instant under a 7-day window schedules, for the same
+    # reason: ``last_active_at`` is the only thing being read.
+    assert await _calc(_dormancy_profile(days=7)).compute(
+        spoke_then_left, PROACTIVE_EVALUATE_KIND, now=now,
+    ) is not None
+
+
+async def test_first_contact_grace_needs_a_creation_anchor() -> None:
+    """No ``created_at`` (an entity that never round-tripped through the DB) =
+    no computable bound, and an unbounded grace is exactly the exemption this
+    is not. Conservative answer: NF4's."""
+    calc = _calc(_dormancy_profile())
+    anchorless = _FakeCharacter(created_at=None, state=_State(last_active_at=None))
+    assert await calc.compute(
+        anchorless, PROACTIVE_EVALUATE_KIND, now=BASE,
+    ) is None
+
+
+async def test_first_contact_grace_is_inert_without_the_knob() -> None:
+    """self-host / any tier with the knob unset: dormancy never applied, so the
+    grace changes nothing — both kinds compute exactly as before."""
+    calc = _calc()
+    fresh = _FakeCharacter(created_at=BASE, state=_State(last_active_at=None))
+    for kind in (PROACTIVE_EVALUATE_KIND, FEED_COMPOSE_KIND):
+        for now in (BASE, BASE + _GRACE + timedelta(days=1)):
+            assert await calc.compute(fresh, kind, now=now) is not None, kind
+
+
+async def test_first_contact_grace_agrees_with_the_handler_preflight() -> None:
+    """The pre-flight guard and the chain-advance stop must answer the same
+    question, or the chain advances into a step that then refuses to run (or
+    worse, the reverse)."""
+    calc = _calc(_dormancy_profile())
+    fresh = _FakeCharacter(created_at=BASE, state=_State(last_active_at=None))
+    inside, outside = BASE + timedelta(hours=8), BASE + _GRACE
+
+    assert await calc.is_chain_dormant(
+        fresh, PROACTIVE_EVALUATE_KIND, now=inside,
+    ) is False
+    assert await calc.is_chain_dormant(
+        fresh, FEED_COMPOSE_KIND, now=inside,
+    ) is True
+    assert await calc.is_chain_dormant(
+        fresh, PROACTIVE_EVALUATE_KIND, now=outside,
+    ) is True
+
+
+async def test_first_contact_grace_is_declared_by_exactly_one_kind() -> None:
+    """The blast radius, pinned from the registry side. Widening this list means
+    letting a chain spend on a character nobody has ever spoken to — the case
+    NF4 exists for — so it has to come here and be argued."""
+    graced = {
+        kind for kind in character_chain_kinds()
+        if kind_spec(kind).first_contact_grace_hours is not None
+    }
+    assert graced == {PROACTIVE_EVALUATE_KIND}
 
 
 async def test_idle_beyond_dormancy_window_stops_the_chain() -> None:

@@ -1,8 +1,9 @@
 """Routing-level reasoning override — shared parse/serialise rules.
 
-LLM routing preference entries (global ``feature_models[feature_key]``
-and ``feature_model_groups[group_key]``) may carry an optional
-``reasoning`` object next to ``provider_id`` / ``model_id``::
+LLM routing preference entries (global ``feature_models[feature_key]``,
+``feature_model_groups[group_key]``, the ``active_model`` fallback and
+the ``nsfw_mode_target``) may carry an optional ``reasoning`` object
+next to ``provider_id`` / ``model_id``::
 
     {
       "provider_id": "openai",

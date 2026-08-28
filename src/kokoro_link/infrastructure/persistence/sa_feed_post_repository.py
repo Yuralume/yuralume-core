@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import date, datetime, time, timezone, tzinfo
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -48,6 +48,7 @@ def _row_to_domain(row: FeedPostRow) -> FeedPost:
             comments=int(row.comments_count or 0),
         ),
         reactions_seen_at=_ensure_utc(row.reactions_seen_at),
+        viewed_at=_ensure_utc(row.viewed_at),
         created_at=_ensure_utc(row.created_at) or datetime.now(timezone.utc),
     )
 
@@ -66,6 +67,7 @@ def _domain_to_row(post: FeedPost, row: FeedPostRow) -> None:
     row.likes_count = max(0, int(post.reactions.likes))
     row.comments_count = max(0, int(post.reactions.comments))
     row.reactions_seen_at = post.reactions_seen_at
+    row.viewed_at = post.viewed_at
     row.created_at = post.created_at
 
 
@@ -221,6 +223,30 @@ class SAFeedPostRepository(FeedPostRepositoryPort):
                 raise ValueError(f"feed post {post.id!r} not found")
             _domain_to_row(post, row)
             await session.commit()
+
+    async def mark_viewed(
+        self,
+        character_id: str,
+        post_ids: "Iterable[str]",
+        *,
+        when: datetime | None = None,
+    ) -> int:
+        ids = [pid for pid in dict.fromkeys(post_ids) if pid]
+        if not ids:
+            return 0
+        stamp = when or datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(FeedPostRow)
+                .where(
+                    FeedPostRow.character_id == character_id,
+                    FeedPostRow.id.in_(ids),
+                    FeedPostRow.viewed_at.is_(None),
+                )
+                .values(viewed_at=stamp),
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
     async def delete(self, post_id: str) -> bool:
         async with self._session_factory() as session:

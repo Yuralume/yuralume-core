@@ -18,7 +18,9 @@ post-hoc worker-side filter.
   interaction with it for that long — or has never had one at all — schedules no
   background work whatsoever. This is a *stop*, evaluated before the multiplier, not a
   fourth way to stretch the cadence, and it covers ``KnobGate.NONE`` kinds too; only
-  kinds marked ``dormancy_exempt`` in the registry survive it. Recovery reuses the
+  kinds marked ``dormancy_exempt`` in the registry survive it — plus, for a character
+  that has *never* been spoken to, the one kind declaring
+  ``first_contact_grace_hours`` (TR2), and only until that window closes. Recovery reuses the
   thaw path exactly: a foreground turn moves ``last_active_at``, the character stops
   computing ``None``, and the next reconcile pass reseeds every missing chain.
   For a chain scheduled on behalf of more than one character (an encounter
@@ -136,6 +138,14 @@ async def _default_dormancy_resolver(
     borrowing ``created_at`` would turn that into "yes, N days ago" and run a
     full background stack for a character nobody has said a word to. Never
     interacted ⇒ dormant is the whole point of the knob, not an edge case.
+
+    That answer is still this function's answer for every kind. The one chain
+    that must survive it while the character is brand new —
+    ``proactive_evaluate``, whose job is to produce the very first turn — is
+    handled a level up in
+    :meth:`NextDueCalculator._in_first_contact_grace`, per-kind and bounded by
+    ``created_at``, precisely so this rule does not have to grow an exception
+    that would then apply everywhere.
 
     ``None`` days (self-host, and any hosted tier that has not set the knob)
     returns ``False`` before anything else is read, so the caller's behaviour is
@@ -324,7 +334,11 @@ class NextDueCalculator:
         chain-advance time, that the character is dormant.
 
         Any dormant subject answers ``True`` (see ``co_characters`` on
-        :meth:`compute`); a ``dormancy_exempt`` kind always answers ``False``.
+        :meth:`compute`); a ``dormancy_exempt`` kind always answers ``False``,
+        and so does a kind inside its first-contact grace for a character
+        nobody has spoken to yet (:meth:`_in_first_contact_grace`) — the
+        handler's pre-flight and the chain-advance stop must agree, or the
+        chain would advance into a step that then refuses to run.
         """
         spec = kind_spec(kind)
         if spec is None:
@@ -378,8 +392,17 @@ class NextDueCalculator:
         blip must never silently switch off every hosted character's background
         — the cost of a wrong ``False`` is one extra cadence, the cost of a
         wrong ``True`` is a dead deployment that nobody gets an error about.
+
+        The first-contact grace (TR2) is answered *here* rather than inside the
+        resolver on purpose: it is a property of the **kind** — which is what
+        keeps it from becoming a hole in every chain — and the resolver is
+        injectable and knows nothing about kinds. Deciding it above the
+        resolver also means a deployment that swaps in its own dormancy rule
+        cannot accidentally lose the one chain that starts relationships.
         """
         if profile is None or spec.dormancy_exempt:
+            return False
+        if self._in_first_contact_grace(character, spec, now):
             return False
         try:
             return await self._dormancy_resolver(character, profile, now)
@@ -388,6 +411,52 @@ class NextDueCalculator:
                 "due-job dormancy resolve failed character=%s", character.id,
             )
             return False
+
+    @staticmethod
+    def _in_first_contact_grace(
+        character: Character,
+        spec: KindSpec,
+        now: datetime,
+    ) -> bool:
+        """TR2: a never-spoken-to character's bounded exemption for ONE kind.
+
+        Three conditions, all required, none of them renewable:
+
+        1. the kind declares ``first_contact_grace_hours`` (only
+           ``proactive_evaluate`` does — the rest keep NF4 verbatim);
+        2. ``last_active_at`` is still ``None``. The instant the player says
+           anything, this returns ``False`` forever after and the ordinary
+           "idle for N days" rule is the only one in play — the semantics of a
+           character that HAS been spoken to are untouched by this method;
+        3. ``now`` is still inside ``created_at + grace``. Missing
+           ``created_at`` (an entity that has not round-tripped through the DB)
+           answers ``False``: with no bound to compute, the conservative answer
+           is the NF4 one, because an unbounded grace is the exemption this is
+           specifically not.
+
+        **Cost bound.** The grace buys ticks, not sends. Inside the window the
+        proactive chain advances at its ordinary 300 s × proactive-multiplier
+        cadence, and each occurrence is a cheap-band evaluation
+        (:class:`ProactiveDispatcher`'s DB-only gates — enabled flags, cooldown,
+        daily cap, quiet hours, and the TR2-A pre-message send cap) which only
+        reaches a decider call when those all pass. TR2-A caps pre-message sends
+        at 2, so once they are spent the cheap band rejects every remaining
+        occurrence in the window without a provider call. Worst case for a
+        character nobody ever answers is therefore: ≤72 h of indexed reads, plus
+        the bounded handful of decider calls that the send cap allows — after
+        which the window closes and the chain stops for good.
+        """
+        grace_hours = spec.first_contact_grace_hours
+        if grace_hours is None:
+            return False
+        state = getattr(character, "state", None)
+        last_active = getattr(state, "last_active_at", None) if state is not None else None
+        if last_active is not None:
+            return False
+        created_at = getattr(character, "created_at", None)
+        if created_at is None:
+            return False
+        return now - ensure_utc(created_at) < timedelta(hours=grace_hours)
 
     async def _multiplier(
         self,

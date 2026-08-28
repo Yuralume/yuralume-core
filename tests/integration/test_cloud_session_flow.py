@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from kokoro_link.api.app import create_app
+from tests.integration._cloud_app import create_cloud_app
 
 _INTERNAL_TOKEN = "hosted-play-internal-secret"
 
@@ -116,7 +116,7 @@ def test_hosted_play_code_enters_game_and_reentry_reuses_operator(
     user_service_calls: list[dict[str, Any]] = []
     _install_fake_user_service(monkeypatch, user_service_calls)
 
-    app = create_app()
+    app = create_cloud_app()
     _quiet_background_services(app)
 
     with TestClient(app) as client:

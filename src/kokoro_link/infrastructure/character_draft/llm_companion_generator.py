@@ -14,7 +14,6 @@ discard before persisting.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -31,6 +30,7 @@ from kokoro_link.contracts.character_draft import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import extract_array_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,7 +169,9 @@ def _build_instruction(
 
 
 def _parse(raw: str, *, max_items: int) -> list[CompanionDraft]:
-    array = _extract_array(raw)
+    outcome = extract_array_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="character_draft.llm_companion_generator")
+    array = outcome.value
     if array is None:
         return []
     out: list[CompanionDraft] = []
@@ -197,39 +199,6 @@ def _parse(raw: str, *, max_items: int) -> list[CompanionDraft]:
         if len(out) >= max_items:
             break
     return out
-
-
-def _extract_array(text: str) -> list[Any] | None:
-    start = text.find("[")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "[":
-            depth += 1
-        elif char == "]":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : index + 1]
-                try:
-                    parsed = json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, list) else None
-    return None
 
 
 def _coerce_str(value: Any, max_chars: int) -> str:

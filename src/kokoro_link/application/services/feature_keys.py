@@ -100,6 +100,33 @@ keyword-templated), fail-soft when it errors. Sibling of ``chat_assist``
 — a short UI aid for the player, not the character's canonical reply.
 """
 
+FEATURE_OUTCOME_CLAIM_JUDGE = "outcome_claim_judge"
+"""Outbound-message outcome-claim consistency judge.
+
+Runs on the background composition path after generation: reads a
+player-visible outbound message's stated action outcome (e.g. "我已經幫你訂好
+了") against what the turn's actual tool calls delivered, and flags claims the
+tools never fulfilled. Semantic judgement, never keyword-templated. Cheap,
+short context — sibling of ``story_scene_chips`` and the other light
+observers, not the character's canonical reply."""
+
+FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE = "player_knowledge_disclosure"
+"""Proactive-push disclosure judge (KB8).
+
+Runs **after** a proactive message has been delivered, never before —
+it decides nothing about what ships. Reads the delivered text against
+the memories the player had never been told that went into composing it,
+and answers which of them the message actually told him, so the
+disclosure ledger can stop introducing those as news. Background /
+offline by construction: nobody is waiting on it, and a failure simply
+leaves the memories marked unknown-to-the-player.
+
+Chat gets the same answer as one extra section of its post-turn
+extraction (``post_turn``) rather than through this key — a proactive
+push has no post-turn pass to ride on, which is the only reason this is
+its own call. Short context, one-field answer: a light observer, sibling
+of ``outcome_claim_judge``."""
+
 FEATURE_STORY_EXPAND = "story_expand"
 """Daily gacha → first-person narrative expansion."""
 
@@ -669,6 +696,8 @@ GLOBAL_FEATURE_KEYS: tuple[str, ...] = (
     FEATURE_CHARACTER_ENCOUNTER_DIALOGUE,
     FEATURE_CHARACTER_ENCOUNTER_REFLECT,
     FEATURE_PEER_KNOWLEDGE_CONSOLIDATE,
+    FEATURE_OUTCOME_CLAIM_JUDGE,
+    FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE,
 )
 
 
@@ -777,6 +806,8 @@ FEATURE_LABELS: dict[str, str] = {
     FEATURE_CHARACTER_ENCOUNTER_DIALOGUE: "角色互動：短對話",
     FEATURE_CHARACTER_ENCOUNTER_REFLECT: "角色互動：記憶反思",
     FEATURE_PEER_KNOWLEDGE_CONSOLIDATE: "角色社交知識整理",
+    FEATURE_OUTCOME_CLAIM_JUDGE: "出站成果聲稱一致性驗證",
+    FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE: "主動訊息揭露判定（玩家知識帳本）",
     FEATURE_IMAGE_CHAT_TOOL: "生圖：聊天工具",
     FEATURE_IMAGE_PORTRAIT: "生圖：角色頭像",
     FEATURE_IMAGE_FEED: "生圖：動態貼文",
@@ -935,6 +966,8 @@ FEATURE_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
         FEATURE_ADDRESS_PREFERENCE_OBSERVER,
         FEATURE_CHAT_ASSIST,
         FEATURE_STORY_SCENE_CHIPS,
+        FEATURE_OUTCOME_CLAIM_JUDGE,
+        FEATURE_PLAYER_KNOWLEDGE_DISCLOSURE,
         FEATURE_PROMPT_MATERIAL_DIGEST,
         FEATURE_REGISTER_PROFILE,
         FEATURE_SILLYTAVERN_NORMALIZE,

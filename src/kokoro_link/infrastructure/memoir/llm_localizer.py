@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -18,6 +17,7 @@ from kokoro_link.domain.entities.memoir import (
     MemoirView,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,26 +111,18 @@ def _view_payload(view: MemoirView) -> dict[str, Any]:
     }
 
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
-
-
 def _parse_json_object(raw: str) -> Mapping[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        return {}
-    text = _FENCE_RE.sub("", text).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return {}
-    return data if isinstance(data, Mapping) else {}
+    """Best-effort object extraction; ``{}`` (not ``None``) on any failure —
+    ``_merge_view`` treats a falsy ``parsed`` as "keep the original view".
+
+    Truncation repair off (FX1/DH-3): a chapter title cut mid-sentence
+    is still a ``str`` and would replace a complete one. See
+    ``character_card/llm_translator._parse_json_object`` for the
+    reasoning the five translator sites share.
+    """
+    outcome = extract_object_outcome(raw, repair_truncated=False)
+    log_parse_outcome(_LOGGER, outcome, site="memoir.llm_localizer")
+    return outcome.value if outcome.value is not None else {}
 
 
 def _merge_view(view: MemoirView, parsed: Mapping[str, Any]) -> MemoirView:

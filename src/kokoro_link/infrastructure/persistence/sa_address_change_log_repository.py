@@ -6,12 +6,15 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from kokoro_link.contracts.address_change_log import AddressChangeLogRepositoryPort
-from kokoro_link.domain.value_objects.address_change_event import AddressChangeEvent
+from kokoro_link.domain.value_objects.address_change_event import (
+    SOURCE_OBSERVED,
+    AddressChangeEvent,
+)
 from kokoro_link.infrastructure.persistence.models import OperatorAddressChangeLogRow
 
 
@@ -78,6 +81,33 @@ class SAAddressChangeLogRepository(AddressChangeLogRepositoryPort):
                 )
             ).scalars().all()
             return [_row_to_domain(row) for row in rows]
+
+    async def delete_observed_since(
+        self, *, character_id: str, operator_id: str, since: datetime,
+    ) -> list[AddressChangeEvent]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(OperatorAddressChangeLogRow)
+                    .where(
+                        OperatorAddressChangeLogRow.character_id == character_id,
+                        OperatorAddressChangeLogRow.operator_id == operator_id,
+                        OperatorAddressChangeLogRow.source == SOURCE_OBSERVED,
+                        OperatorAddressChangeLogRow.effective_at >= since,
+                    )
+                )
+            ).scalars().all()
+            if not rows:
+                return []
+            events = [_row_to_domain(row) for row in rows]
+            ids = [row.id for row in rows]
+            await session.execute(
+                delete(OperatorAddressChangeLogRow).where(
+                    OperatorAddressChangeLogRow.id.in_(ids),
+                )
+            )
+            await session.commit()
+            return events
 
 
 def _row_to_domain(row: OperatorAddressChangeLogRow) -> AddressChangeEvent:

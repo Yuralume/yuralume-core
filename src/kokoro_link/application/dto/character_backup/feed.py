@@ -27,6 +27,7 @@ class FeedPostBackupRecord(BackupRecord):
     likes_count: int = 0
     comments_count: int = 0
     reactions_seen_at: datetime | None = None
+    viewed_at: datetime | None = None
     created_at: datetime
 
 

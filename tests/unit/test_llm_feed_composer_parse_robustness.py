@@ -27,7 +27,10 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.feed_kind import FeedKind
 from kokoro_link.domain.value_objects.feed_source import FeedSource
-from kokoro_link.infrastructure.feed.llm_composer import LLMFeedComposer
+from kokoro_link.infrastructure.feed.llm_composer import (
+    MAX_BODY_CHARS,
+    LLMFeedComposer,
+)
 
 
 class _StaticActiveLLM:
@@ -196,15 +199,47 @@ async def test_non_object_or_invalid_content_field_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_salvaged_caption_respects_body_cap() -> None:
-    """A recovered caption is still clamped to the published-body cap."""
-    long_caption = "字" * 400
-    payload = f'{{"content_text":"{long_caption}","#tag",'
+@pytest.mark.parametrize(
+    "payload_for",
+    [
+        pytest.param(
+            lambda body: json.dumps({"content_text": body, "image_prompt": "x"}),
+            id="well-formed",
+        ),
+        pytest.param(
+            lambda body: f'{{"content_text":"{body}","#tag",',
+            id="salvaged",
+        ),
+    ],
+)
+async def test_an_overlong_body_is_no_longer_cut_here(payload_for) -> None:
+    """QG2/D6: the parser stopped clamping to the published cap.
+
+    A body that runs long is the loudest evidence there is that something
+    which is not prose ended up in ``content_text`` — and it is a payload
+    no type check can reject. Slicing it here produced the 2026-08-26 post:
+    a caption cut mid-word, no picture, and nothing in the logs. The whole
+    body now travels to the quality gate; the cap is applied by the service
+    after the gate has had its say.
+    """
+    body = "字" * 400
+    composer = LLMFeedComposer(provider=_StaticActiveLLM(payload_for(body)))
+
+    out = await composer.compose(_input())
+
+    assert out.content_text == body
+
+
+@pytest.mark.asyncio
+async def test_a_pathological_body_still_hits_the_defensive_ceiling() -> None:
+    """Not clamping is not the same as unbounded — a runaway generation
+    must not carry a megabyte through the gate prompt."""
+    payload = json.dumps({"content_text": "字" * 5000, "image_prompt": "x"})
     composer = LLMFeedComposer(provider=_StaticActiveLLM(payload))
 
     out = await composer.compose(_input())
 
-    assert out.content_text == "字" * 280
+    assert len(out.content_text) == MAX_BODY_CHARS * 4
 
 
 @pytest.mark.asyncio

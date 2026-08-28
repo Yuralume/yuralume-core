@@ -378,6 +378,33 @@ class SABackgroundJobQueue:
             await session.commit()
             return result.rowcount == 1
 
+    async def withdraw_queued(
+        self, idempotency_key: str, *, now: datetime,
+    ) -> int:
+        now = ensure_utc(now)
+        async with self._session_factory() as session:
+            # Conditional UPDATE, no row lock: ``status == queued`` in the
+            # WHERE clause is what makes this lose the race against a
+            # concurrent ``claim`` instead of stealing a job out of a
+            # worker's hands. A row that got claimed first stays claimed and
+            # the handler's own subject re-verification skips it.
+            result = await session.execute(
+                update(BackgroundJobRow)
+                .where(
+                    BackgroundJobRow.idempotency_key == idempotency_key,
+                    BackgroundJobRow.status == JobStatus.QUEUED.value,
+                )
+                .values(
+                    status=JobStatus.SUPERSEDED.value,
+                    lease_owner=None,
+                    lease_until=None,
+                    finished_at=now,
+                    updated_at=now,
+                ),
+            )
+            await session.commit()
+            return result.rowcount or 0
+
     async def fail(
         self,
         job_id: str,

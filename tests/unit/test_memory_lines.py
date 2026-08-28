@@ -14,6 +14,8 @@ from kokoro_link.domain.entities.memory_item import MemoryItem
 from kokoro_link.domain.value_objects.actor import ParticipantRef
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.infrastructure.prompt.memory_lines import (
+    PLAYER_DISCLOSED_FRAME,
+    PLAYER_UNAWARE_FRAME,
     format_memory_line,
     memory_time_tag,
 )
@@ -105,3 +107,93 @@ def test_default_builder_uses_shared_helpers() -> None:
     from kokoro_link.infrastructure.prompt import default as default_mod
 
     assert default_mod._memory_time_tag is memory_time_tag
+
+
+# --- KB7: the player-knowledge frame ---------------------------------
+
+
+def _judged(value: str, **kwargs: object) -> MemoryItem:
+    return MemoryItem.create(
+        character_id="char-a",
+        kind=MemoryKind.EPISODIC,
+        content="一個人走進林道，回來時手上全是擦傷",
+        salience=0.5,
+        player_knowledge=value,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_private_memory_is_framed_as_something_the_player_never_saw() -> None:
+    """The incident line: recall handed the model a solo rescue with no
+    marking, and it came back as 「你是不是又去了山區」."""
+    line = format_memory_line(_judged("private"))
+
+    assert PLAYER_UNAWARE_FRAME in line
+    assert line.endswith("一個人走進林道，回來時手上全是擦傷")
+
+
+def test_disclosed_memory_is_marked_as_already_told() -> None:
+    line = format_memory_line(_judged("disclosed"))
+
+    assert PLAYER_DISCLOSED_FRAME in line
+    assert PLAYER_UNAWARE_FRAME not in line
+
+
+def test_shared_and_legacy_memories_render_byte_identically() -> None:
+    """``shared`` and the unjudged ``""`` must stay pre-ledger output —
+    this is what makes the frozen chat goldens (and the whole unjudged
+    back catalogue) unaffected by KB5/KB6 landing."""
+    now = datetime.now(timezone.utc)
+    shared = _judged("shared", created_at=now - timedelta(days=1))
+    legacy = _judged("", created_at=now - timedelta(days=1))
+
+    rendered = format_memory_line(shared, now=now)
+
+    assert rendered == format_memory_line(legacy, now=now)
+    assert rendered.startswith("- 一個人走進林道")
+    assert "【" not in rendered
+
+
+def test_unknown_ledger_value_degrades_to_no_frame() -> None:
+    """A value outside the domain normalises to ``""`` at the entity
+    boundary, so a future write station that mislabels can only lose the
+    frame, never invent one."""
+    assert "【" not in format_memory_line(_judged("kind-of-private"))
+
+
+def test_the_frame_is_off_for_surfaces_that_are_not_about_the_player() -> None:
+    """Peer-knowledge consolidation reasons about what another character
+    knows — an axis this ledger does not describe (plan §3.2)."""
+    line = format_memory_line(_judged("private"), knowledge_frame=False)
+
+    assert line == "- 一個人走進林道，回來時手上全是擦傷"
+
+
+def test_kind_who_and_knowledge_render_in_one_stable_order() -> None:
+    """The proactive decider needs its kind bucket back after converging
+    on this renderer; it has to coexist with the other two prefixes."""
+    item = MemoryItem.create(
+        character_id="char-a",
+        kind=MemoryKind.EPISODIC,
+        content="在林道遇到巡山員",
+        salience=0.5,
+        player_knowledge="private",
+        participants=(
+            ParticipantRef(
+                actor_kind="character",
+                actor_id="char-b",
+                display_name="巡山員",
+                role="peer",
+            ),
+        ),
+    )
+
+    line = format_memory_line(item, include_kind=True)
+
+    assert line == (
+        f"- [episodic] [與 巡山員 一起] {PLAYER_UNAWARE_FRAME} 在林道遇到巡山員"
+    )
+
+
+def test_kind_tag_is_opt_in() -> None:
+    assert "[episodic]" not in format_memory_line(_judged(""))

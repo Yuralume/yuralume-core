@@ -104,6 +104,38 @@ async def test_list_returns_newest_first() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_backfills_viewed_at_as_fallback_read_receipt() -> None:
+    """KB11: commenting requires having read the post, so it counts as
+    read-proof even if the frontend's exposure batch never landed."""
+    service, posts, _ = _make_service()
+    post = await _seed_post(posts)
+    assert post.viewed_at is None
+
+    await service.add(post_id=post.id, content_text="nice!")
+
+    stored = await posts.get(post.id)
+    assert stored is not None
+    assert stored.viewed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_add_does_not_move_an_earlier_viewed_at() -> None:
+    from dataclasses import replace
+    from datetime import datetime, timezone
+
+    service, posts, _ = _make_service()
+    post = await _seed_post(posts)
+    earlier = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    await posts.save(replace(post, viewed_at=earlier))
+
+    await service.add(post_id=post.id, content_text="nice!")
+
+    stored = await posts.get(post.id)
+    assert stored is not None
+    assert stored.viewed_at == earlier
+
+
+@pytest.mark.asyncio
 async def test_remove_drops_comment_and_decrements_count() -> None:
     service, posts, _ = _make_service()
     post = await _seed_post(posts)

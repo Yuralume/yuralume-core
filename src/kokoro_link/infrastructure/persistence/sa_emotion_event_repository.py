@@ -103,6 +103,29 @@ class SAEmotionEventRepository(EmotionEventRepositoryPort):
             )
             return [_row_to_domain(r) for r in result.scalars().all()]
 
+    async def delete_by_cause(
+        self,
+        *,
+        character_id: str,
+        cause_ref_kind: str,
+        cause_ref_id: str,
+    ) -> int:
+        # An empty component means the caller has no addressable cause
+        # (a busy-defer turn mints no turn record). Deleting on a
+        # partial key would take every event with a NULL reference.
+        if not character_id or not cause_ref_kind or not cause_ref_id:
+            return 0
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(EmotionEventRow).where(
+                    EmotionEventRow.character_id == character_id,
+                    EmotionEventRow.cause_ref_kind == cause_ref_kind,
+                    EmotionEventRow.cause_ref_id == cause_ref_id,
+                ),
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
     async def delete_for_character(self, character_id: str) -> int:
         async with self._session_factory() as session:
             result = await session.execute(

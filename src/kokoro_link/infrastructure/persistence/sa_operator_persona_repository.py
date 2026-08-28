@@ -328,6 +328,66 @@ class SAOperatorPersonaRepository(OperatorPersonaRepositoryPort):
                 await session.commit()
             return changed
 
+    async def revert_field_write_since(
+        self,
+        *,
+        character_id: str,
+        operator_id: str,
+        field_key: str,
+        value: str,
+        since: datetime,
+    ) -> bool:
+        """Reject the row the write inserted and un-retire the row it
+        superseded, in one transaction.
+
+        Order matters for the same reason it does in the forward
+        direction: the unique
+        ``(character_id, operator_id, layer, field_key, state='confirmed')``
+        constraint tolerates exactly one confirmed row, so the inserted
+        row leaves ``confirmed`` before the superseded one comes back.
+        Both happen in a single session, so a crash between them cannot
+        leave the pair with two confirmed rows or none.
+
+        Revival is per layer and takes the *most recently* retired row —
+        the one the reverted write pushed aside. Older supersedes of the
+        same key are history and stay history.
+        """
+        now = datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            stmt = select(OperatorProfileFieldRow).where(
+                OperatorProfileFieldRow.character_id == character_id,
+                OperatorProfileFieldRow.operator_id == operator_id,
+                OperatorProfileFieldRow.field_key == field_key,
+                OperatorProfileFieldRow.updated_at >= since,
+                OperatorProfileFieldRow.state.in_(
+                    ("confirmed", "superseded"),
+                ),
+            )
+            rows = list((await session.execute(stmt)).scalars())
+            inserted = [
+                row for row in rows
+                if row.state == "confirmed" and row.value == value
+            ]
+            if not inserted:
+                return False
+            layers = set()
+            for row in inserted:
+                row.state = "rejected"
+                row.updated_at = now
+                layers.add(row.layer)
+            retired: dict[int, OperatorProfileFieldRow] = {}
+            for row in rows:
+                if row.state != "superseded" or row.layer not in layers:
+                    continue
+                standing = retired.get(row.layer)
+                if standing is None or row.updated_at > standing.updated_at:
+                    retired[row.layer] = row
+            for row in retired.values():
+                row.state = "confirmed"
+                row.updated_at = now
+            await session.commit()
+            return True
+
     async def _mark(self, row_id: str, state: str) -> None:
         now = datetime.now(timezone.utc)
         async with self._session_factory() as session:

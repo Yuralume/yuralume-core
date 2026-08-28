@@ -196,7 +196,7 @@ class _FakeConversations:
 
 
 class _FakeSummarizer:
-    async def summarize(self, *, character, messages):
+    async def summarize(self, *, character, messages, now=None, local_tz=None):
         return "主人最近在準備搬家，聊了紙箱跟新窗簾"
 
 

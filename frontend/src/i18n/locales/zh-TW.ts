@@ -609,6 +609,7 @@ export const messages = {
   },
   chat: {
     priceChanged: '螢火價格剛更新了，這次沒有扣點——請再送出一次。',
+    conversationBusy: '角色還在回覆上一句——等這一輪說完再送出。',
     header: {
       noCharacter: '先在左側建立或選擇一位角色開始聊天',
       talkingTo: '正在與 {name} 對話',
@@ -649,13 +650,19 @@ export const messages = {
       loadOlder: '載入更早的訊息',
       loadingOlder: '載入更早的訊息中…',
       scrollToLatest: '回到最新訊息',
-      streamingHint: '可能正在使用工具（生圖等待 30–60 秒）',
+    },
+    toolActivity: {
+      generateImage: '正在畫圖…',
+      webSearch: '正在查資料…',
+      webFetch: '正在看網頁…',
+      generic: '正在忙些什麼…',
     },
     onboarding: {
       title: '先跟 {name} 說一句話',
       stageHint: '同場像面對面開口；{name} 會照自己現在的行程與處境自然回應。',
       dmHint: '手機模式就是傳訊息給 {name}，適合先問近況或不確定方不方便見面時。',
       lifeHint: '聊一兩輪後，可以到「{name} 的生活」和「回憶與相簿」看日常慢慢累積。',
+      nudgeOption: '不知道說什麼？讓 {name} 先開口',
       startersAria: '開場訊息',
       starters: {
         stageGreeting: '{name}，今天過得怎麼樣？',
@@ -719,6 +726,8 @@ export const messages = {
       title: '讓 {name} 先開口',
       placeholder: '補充現在的場景（可留空），例：我推開門進來',
       confirm: '開口',
+      tip: '這顆按鈕能讓 {name} 先開口，之後想用隨時點這裡。',
+      tipDismiss: '知道了',
     },
     actions: {
       undo: '撤回最近一輪',
@@ -897,11 +906,11 @@ export const messages = {
           schedule: '每個角色每天都有自己的行程：通勤、上班、吃飯、睡覺。你問他在幹嘛，他會照當下的行程回答；就算你整天沒打開聊天室，那些已經過完的事也會變成他的記憶。想微調的話，「角色生活」裡可以用白話改他的一天。',
           busyDefer: '碰上他真的走不開的時段，他會先說一聲等等再好好回你，之後真的補回來。你在等待期間又傳訊息的話，他會取消原本的補回直接回你，不會讓訊息石沉大海。如果當初那些訊息裡有需要他去查、去做才答得出來的部分，補回之前他會真的去做再回報。',
           promise: '跟他約「明天七點叫我」，他會記下來，到點主動傳訊息。答應「晚點幫你查」「等等傳張照片給你」也一樣：到點時他會先真的去查、去拍，再把結果傳給你。查不到就照實說，不會編一個聽起來很合理的答案充數。',
-          proactive: '他可以在你沒開口的時候主動找你。這是可以關掉的，也可以在他的設定裡選「安靜／適中／熱絡」調整他多常開口。真的會不會傳還要看他當下的生活與你們最近的對話——選「熱絡」不等於每天固定幾則。創角時填的主動訊息授權與怎麼提及頻率，也可以在角色設定的「關係與相處設定」裡重新調整。',
+          proactive: '他可以在你沒開口的時候主動找你。這是可以關掉的，也可以在他的設定裡選「安靜／適中／熱絡」調整他多常開口。真的會不會傳還要看他當下的生活與你們最近的對話——選「熱絡」不等於每天固定幾則。創角時的「可以主動找你」預設是打開的，建角當下就能取消；沒取消的話，他也不會馬上找你——會先隔一段時間，再自己挑時機開口。這個授權與怎麼提及頻率，之後都可以在角色設定的「關係與相處設定」裡重新調整。',
           noReply: '你連續不回的時候，他不會每天重發一樣的訊息，而是像真人面對已讀不回那樣態度慢慢變：先在意、然後賭氣、再給你一點空間。',
           drift: '太久沒理他，再回來時的口吻會依他的個性變——會鬧的鬧，冷淡型的可能真的沒什麼感覺。',
           encounter: '角色之間也會自己碰面。系統依雙方的行程與關係安排他們見面、演成一段短對話，之後你跟他聊天時，他可能自己提起昨天遇到誰。',
-          world: '他活在真實的時間裡：知道今天下不下雨、現在是連假第幾天，也會自然提到最近的新聞。你追問他提過的那則新聞，他會去讀原文再回答，而不是憑印象瞎掰。這一層需要在「角色平常會關注的事」裡開著外界話題。',
+          world: '他活在真實的時間裡：知道今天下不下雨、現在是連假第幾天，也會自然提到最近的新聞。你追問他提過的那則新聞，他會去讀原文再回答，而不是憑印象瞎掰。現代背景的角色預設就開著這一層；奇幻／校園等背景的角色預設關著，兩種都能在「角色平常會關注的事」裡自己切換。',
         },
       },
       lumegram: {
@@ -963,6 +972,7 @@ export const messages = {
         lead: '角色是你的，可以帶走。分享給別人和自己搬家是兩種不同的檔案，別拿錯。',
         items: {
           card: '「.lumecard」是分享用的：帶著人設、外觀、舞台圖，還有你替他寫的劇情系列，但不帶記憶、對話與你們之間的關係。別人匯入會得到一位全新角色，從陌生開始重新認識他。',
+          identityCard: '「玩家身分卡」存的不是角色本身，而是創角時「你和他要怎麼相處」那一組設定：稱呼、相處距離、要不要主動找你、你的人設等等。建立新角色的精靈裡可以選一張身分卡帶入，把這些欄位一次填好；填進來之後每一欄照樣能改，怎麼改都不會回寫到卡片上——卡片是那一刻的快照，不會因為之後的角色跟著變。精靈裡也能把剛填好的這組設定另存一張新卡，下次建角直接帶入就好；已經建好的角色也能在角色設定頁把它目前的關係設定另存一張新卡，方便套用到下一位角色。所有存過的卡片都在設定頁「個人」分頁的「玩家身分卡」裡管理——改名、刪除、逐欄預覽，第一版還不能直接在那裡編輯內容；同名會先問你要不要覆蓋，張數有上限，滿了要先刪一張才能再存。',
           backup: '「.lumebackup」是搬家用的：連同全部對話、記憶、行程、故事線、相簿與動態牆的媒體整隻打包成一個加密檔，可以帶到你自己的另一個站（自架與雲端兩個方向都行），也可以就這樣離線保存。雲端版的匯出次數是以帳號計、不是每個角色各自算：短時間內連續匯出會被暫時擋下，過一陣子再試就行。',
           backupSelfHost: '「.lumebackup」是搬家用的：連同全部對話、記憶、行程、故事線、相簿與動態牆的媒體整隻打包成一個加密檔，可以帶到你自己的另一個站（自架與雲端兩個方向都行），也可以就這樣離線保存。',
           password: '匯出備份時你會自己設一組只給這個檔案用的密碼。請務必記住這組密碼：忘記密碼會導致備份檔案永久無法解開，我們也無法為你救援。',
@@ -2728,6 +2738,8 @@ export const messages = {
         sharedAllowed: '可以安排我明確允許的共同日常',
       },
       proactivePermission: '創好後，他/她可以在你先開口前主動找你',
+      proactivePermissionHint: '預設幫你打開了，不想要就取消勾選。他/她不會馬上找你——建立後會先隔一段時間，再自己挑時機開口，深夜也會避開。網頁上的訊息要你回站才看得到；綁定官方 LINE，他/她才真的找得到你。',
+      proactiveCadenceLabel: '主動找你的頻率提示',
       proactiveCadencePlaceholder: '例：一天最多一次、只有想到重要事情時',
       proactiveCadenceHint: '選填；不填則由角色自行拿捏頻率與時機',
       profileInterests: '他/她可以知道的興趣',
@@ -2789,6 +2801,72 @@ export const messages = {
       label: '你的人設',
       filledHint: '你已經告訴 {name} 你是誰；點一下可以修改。',
       emptyHint: '告訴 {name} 你是誰。',
+    },
+  },
+  identityCard: {
+    picker: {
+      label: '帶入身分卡',
+      placeholder: '不帶入，從空白開始',
+      hint: '選一張存過的身分卡就能把下面的欄位一次填好；填進來之後每一欄照樣可以改，改了也不會動到卡片本身。',
+    },
+    personaNote: {
+      label: '你的人設（可留空）',
+      placeholder: '例：我是看得見別人情緒顏色的超能力者，這件事只有你知道。',
+      hint: '告訴 {name} 你是誰——身分、背景、世界觀設定都可以，{name} 會接住你的設定演出。留空也沒關係，之後隨時能補。',
+    },
+    save: {
+      checkbox: '把這次填的存成身分卡',
+      nameLabel: '身分卡名稱',
+      namePlaceholder: '例：上班族的我',
+      hint: '下次創角可以直接帶入這一整組設定。最多 {max} 個字；名稱重複會先問你要不要覆蓋。',
+    },
+    overwrite: {
+      title: '覆蓋既有的身分卡？',
+      content: '你已經有一張叫「{name}」的身分卡。覆蓋會用這次填的內容取代它；已經用那張卡建好的角色不受影響。',
+      ok: '覆蓋',
+    },
+    followUp: {
+      cardSaved: '身分卡已儲存',
+      personaNoteFailed: '你的人設沒有寫進去',
+      cardSaveFailed: '身分卡沒有存成功',
+      bothFailed: '你的人設與身分卡都沒有存成功',
+      characterStillCreated: '角色已經建好了，只有這一步沒完成，可以直接重試。',
+      limitReached: '身分卡數量已達上限（{limit} 張），先到設定裡刪掉一張再存。',
+    },
+    saveFromCharacter: {
+      action: '把目前這組設定存成身分卡',
+      hint: '把「{name}」現在的關係設定與人設存成一張身分卡，下次創角可以直接帶入；用的是目前已經存檔的內容，還沒儲存的編輯不會被帶進去。',
+      loadFailed: '讀不到目前的設定，稍後再試。',
+      empty: '這個角色還沒有可存的設定——先在上面填一些關係設定或你的人設，再回來存成身分卡。',
+    },
+    manage: {
+      title: '玩家身分卡',
+      hint: '在創角精靈或角色設定頁存下的整組關係與人設範本，這裡可以改名、刪除、預覽全部欄位——第一版還不能直接在這裡編輯內容。',
+      loading: '讀取中…',
+      loadFailed: '讀不到你的身分卡列表，稍後再試。',
+      empty: '還沒有存過身分卡。創角精靈或角色設定頁都能存下第一張。',
+      count: '{count} / {limit} 張',
+      limitNote: '已達上限，要新增請先在下面刪除一張。',
+      updatedAtLabel: '更新於 {time}',
+      previewAction: '預覽',
+      renameAction: '改名',
+      rename: {
+        namePlaceholder: '身分卡名稱',
+        hint: '最多 {max} 個字。',
+        conflict: '已經有一張同名的身分卡，換個名稱。',
+        failed: '改名失敗，稍後再試。',
+        saved: '已改名',
+      },
+      delete: {
+        confirmTitle: '刪除這張身分卡？',
+        confirmContent: '刪除「{name}」不會影響已經用這張卡建立的角色，只是這張卡本身消失。',
+        done: '身分卡已刪除',
+        failed: '刪除失敗，稍後再試。',
+      },
+      preview: {
+        enabled: '已授權',
+        disabled: '未授權',
+      },
     },
   },
   characterBackup: {
@@ -3111,6 +3189,7 @@ export const messages = {
       arc_template_translate: '劇本範本翻譯',
       story_seed_translate: '故事種子翻譯',
       showcase_review: '公開櫥窗內容預審',
+      showcase_image_review: '公開櫥窗配圖一致性預審',
       showcase_translate: '公開櫥窗翻譯',
       official_card_translate: '官方卡預翻譯',
       sillytavern_normalize: 'SillyTavern 卡匯入正規化',
@@ -3126,11 +3205,15 @@ export const messages = {
       persona_projection: '使用者畫像：玩家敘事投影',
       persona_curiosity: '使用者畫像：自然探索規劃',
       address_preference_observer: '語用觀察：稱呼 / 語體偏好',
+      relationship_coherence: '關係稱呼一致性自癒',
       experiment_analysis: 'A/B 實驗：手動分析報告',
       character_encounter_plan: '角色互動：自然碰面規劃',
+      character_encounter_beats: '角色互動：話題節拍規劃',
       character_encounter_dialogue: '角色互動：短對話',
       character_encounter_reflect: '角色互動：記憶反思',
       peer_knowledge_consolidate: '角色社交知識整理',
+      outcome_claim_judge: '出站成果聲稱一致性驗證',
+      player_knowledge_disclosure: '主動訊息揭露判定（玩家知識帳本）',
     },
     reasoning: {
       title: '推理設定',
@@ -3139,7 +3222,7 @@ export const messages = {
       disableLabel: '關閉推理（thinking）',
       effortLabel: '推理強度（OpenAI 相容系，值域依 provider）',
       effortPlaceholder: '例：low / medium / high',
-      budgetLabel: 'Thinking 預算 tokens（Anthropic）',
+      budgetLabel: 'Thinking 預算 tokens（僅 Anthropic／OpenRouter 連線生效，其他類型會被忽略）',
       budgetPlaceholder: '例：4096',
     },
     vision: {
@@ -3268,6 +3351,12 @@ export const messages = {
       configured: '已設定',
       unconfigured: '未設定',
     },
+    options: {
+      imageGenerationOff: '關閉圖片生成',
+    },
+    hints: {
+      imageDisabled: '已選擇關閉：NSFW 模式期間，圖片生成會立即回覆「目前不可用」，不會改走一般圖片 profile。',
+    },
     empty: {
       providers: '沒有可用 provider',
       models: '沒有可用 model',
@@ -3282,7 +3371,7 @@ export const messages = {
     errors: {
       loadFailed: '載入 NSFW mode 路由目標失敗',
       modelsLoadFailed: '載入模型清單失敗',
-      targetRequired: '請先選擇 LLM provider、model 與圖片 profile。',
+      targetRequired: '請先選擇 LLM provider、model，以及圖片 profile（或選擇關閉圖片生成）。',
       saveFailed: '儲存 NSFW mode 路由目標失敗',
     },
   },
@@ -4429,6 +4518,8 @@ export const messages = {
       brand: '管理後台',
       warn: '技術管理區',
       warnHint: '此區為技術管理介面，修改可能造成角色記憶漂移',
+      toggleNav: '開合導覽選單',
+      backToOverview: '總覽',
     },
     home: {
       title: '管理後台首頁',
@@ -4768,7 +4859,7 @@ export const messages = {
         reasoning_effort: { label: 'Reasoning effort（provider 專屬值，留空用預設）', placeholder: '例如 low / medium / high' },
         extra_request_params: { label: '額外 request 參數（純 JSON 物件，會合併進 request payload）', placeholder: '進階：依各 provider 文件填寫，例如 {\'{\'}"top_k": 40{\'}\'}' },
         strip_think_tags: { label: '從回覆移除 <think>...</think> 標籤' },
-        thinking_budget_tokens: { label: 'Thinking budget tokens（留空＝關閉 extended thinking）', placeholder: '例如 4096' },
+        thinking_budget_tokens: { label: 'Thinking budget tokens', placeholder: '例如 4096' },
         server: { label: 'ComfyUI server URL', placeholder: 'http://127.0.0.1:8188' },
         checkpoint: { label: 'Checkpoint（模型檔）', placeholder: 'waiNSFWIllustrious_v140.safetensors' },
         workflow_file: { label: 'Workflow JSON 路徑（留空＝內建預設）', placeholder: '/path/to/workflow_api.json' },
@@ -4777,6 +4868,26 @@ export const messages = {
           label: '連線代號（同一個 provider 的第一組留空即可）',
           placeholder: '例如 relay-b',
           hint: '只有當你要同時保留同一個 provider 的多組連線時才需要填——例如中轉商的不同 API key 各自對應不同模型。代號會成為 model 選單裡那個 id 的一部分（custom_openai_compatible__relay-b），所以請用簡短英數字，且存檔後不要再改名：指向舊 id 的設定會退回預設。',
+        },
+        // Per-preset overrides for field keys that are DELIBERATELY
+        // shared across providers with different wire semantics — see
+        // catalogLabels.ts providerFieldLabel/providerFieldHint. Each
+        // sub-key here wins over the flat entry above when the admin
+        // page passes the connection's preset id.
+        anthropic: {
+          thinking_budget_tokens: {
+            hint: '留空＝關閉 extended thinking（不傳送這個參數，模型完全不思考）。',
+          },
+        },
+        openrouter: {
+          thinking_budget_tokens: {
+            hint: '會以 reasoning.max_tokens 送出。與「推理強度（Reasoning effort）」擇一設定，兩者都填時以此欄位的預算為準；留空＝不送這個參數＝沿用上游模型的預設行為，並不是關閉 thinking。',
+          },
+        },
+        custom_openai_compatible: {
+          disable_reasoning: {
+            hint: '這個開關送的是 vLLM／llama.cpp 慣例的 chat_template_kwargs（enable_thinking: false）。若這組連線其實指向 OpenRouter 之類的聚合商端點，此開關多半不會生效——請改用「額外 request 參數」自行填入該聚合商認得的 reasoning 物件，或直接改用專屬的 OpenRouter 連線類型。',
+          },
         },
       },
       runtimeIdHint: '這組連線在 model 選單裡的 id',

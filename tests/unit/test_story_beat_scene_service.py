@@ -194,6 +194,32 @@ async def test_play_beat_writes_scene_event_memory_and_realizes_beat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_play_beat_never_claims_the_player_was_in_the_room() -> None:
+    """F2/KB6: this service plays a beat with nobody watching — the
+    unattended ``BeatDueChecker`` tick and the operator-only ``/simulate``
+    route are its only callers — so it must not stamp ``shared``. With
+    the beat's ``operator_position`` unset the verdict stays *unjudged*
+    (``""``): "nobody ruled", not "the player does not know"."""
+    today = date(2026, 6, 1)
+    now = datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc)
+    writer = _RecordingWriter()
+    scene_service, arc_service, _arc_repo, _event_repo, memory_repo = _services(
+        today, writer,
+    )
+    character = _character()
+    arc = await arc_service.start_new_arc(character, today=today)
+    assert arc.beats[0].operator_position is None
+
+    await scene_service.play_beat(character, beat_id=arc.beats[0].id, now=now)
+
+    memories = await memory_repo.query(character.id)
+    scene_memory = next(
+        m for m in memories if m.content == writer.draft.narrative
+    )
+    assert scene_memory.player_knowledge == ""
+
+
+@pytest.mark.asyncio
 async def test_play_beat_passes_no_user_policy_and_companion_context() -> None:
     today = date(2026, 6, 1)
     writer = _RecordingWriter()

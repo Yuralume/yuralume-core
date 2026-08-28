@@ -14,11 +14,13 @@ parses/bounds the JSON and requires each repair to cite the authoritative
 source it contradicts. The service applies a second structural check
 before mutating anything, so a hallucinated repair id or a value that does
 not actually collide is dropped.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the repair-schema validation above.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Final
 
@@ -34,6 +36,7 @@ from kokoro_link.contracts.relationship_coherence import (
     RelationshipCoherenceDetectorPort,
     SalutationRepair,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,19 +165,15 @@ def _build_prompt(facts: CoherenceFacts, suspects: CoherenceSuspects) -> str:
 
 
 def _parse_plan(raw: str, suspects: CoherenceSuspects) -> CoherenceRepairPlan:
-    if not raw:
-        return CoherenceRepairPlan()
-    body = raw.strip()
-    if body.startswith("```"):
-        body = body.strip("`")
-        if body.lower().startswith("json"):
-            body = body[4:]
-    try:
-        data = json.loads(body)
-    except (TypeError, ValueError):
-        _LOGGER.warning("coherence detector returned unparseable JSON: %s", raw[:200])
-        return CoherenceRepairPlan()
-    if not isinstance(data, dict):
+    # The prompt unconditionally asks for one JSON object (empty
+    # arrays / null when nothing is contaminated), so a cut reply is
+    # worth repairing and any non-clean parse is worth a log line. A
+    # failure degrades to the empty plan — never ``None`` — same as
+    # before.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="persona.llm_relationship_coherence_detector")
+    data = outcome.value
+    if data is None:
         return CoherenceRepairPlan()
 
     known_field_ids = {f.field_id for f in suspects.persona_fields}

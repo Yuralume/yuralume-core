@@ -14,7 +14,7 @@ actually changes its opening or topic remains the model's call.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.infrastructure.localization.fallback_texts import (
@@ -208,6 +208,127 @@ def format_relative_past_label(minutes: float) -> str:
     if minutes < 2:
         return "剛剛"
     return f"{format_gap_duration_label(minutes)}前"
+
+
+def format_hours_days_label(
+    hours: float,
+    *,
+    prefix: str = "",
+    suffix: str = "",
+) -> str:
+    """Shared ``>=1 hour`` tail: ``{prefix}{hours:.1f} 小時{suffix}`` /
+    ``{prefix}{days:.1f} 天{suffix}``.
+
+    SP2 (HUMANIZATION_ROADMAP timing-formatter consolidation): the
+    proactive decider, intention judge, dialogue feed-digest, emotion
+    section, and busy follow-up composer each hand-rolled a "how long
+    ago" formatter. Every one of them computed the hour/day tail this
+    exact way once past the 1-hour mark — one-decimal precision, no
+    week/month bucket — and differed only in whether a 「約」 prefix or
+    「前」 suffix wraps the number, and in what they do *below* 1 hour.
+    Centralising just this tail is what let those formatters collapse to
+    thin (or zero) local wrappers instead of five near-identical copies.
+    """
+    if hours < 24:
+        return f"{prefix}{hours:.1f} 小時{suffix}"
+    days = hours / 24.0
+    return f"{prefix}{days:.1f} 天{suffix}"
+
+
+def format_elapsed_ago_label(minutes: float) -> str:
+    """Render an elapsed-minutes "N 分鐘/小時/天前" label.
+
+    Minutes round to the nearest integer below the 1-hour mark; hours and
+    days beyond that use :func:`format_hours_days_label`. This is the
+    exact formatter the proactive decider, the proactive intention judge,
+    and the dialogue feed-digest station each hand-rolled identically —
+    they now all call this one function instead.
+
+    No sub-minute wording and no 「約」 hedge: callers that want either
+    (e.g. a "剛剛" edge case, or a duration reading rather than an "ago"
+    reading) keep their own thin wrapper around
+    :func:`format_hours_days_label` instead of this function.
+    """
+    if minutes < 60:
+        return f"{int(round(minutes))} 分鐘前"
+    return format_hours_days_label(minutes / 60.0, suffix="前")
+
+
+def format_datetime_ago_phrase(*, past: datetime, now: datetime) -> str:
+    """Coarse floor-bucketed "剛剛 / N 小時前 / N 天前" phrase for two instants.
+
+    Sibling to :func:`format_elapsed_ago_label` (minutes-based input,
+    round-to-one-decimal hour/day tail) but for callers that already hold
+    two datetimes, want floor (not round) buckets, and have no minute
+    tier at all — used to describe how long ago a character raised a
+    world-event mention, where the phrasing is deliberately coarse: the
+    character is recalling that it said something, not quoting a
+    timestamp.
+
+    Naive inputs are read as UTC (the storage convention). A ``past``
+    stamped in the future — clock skew between a worker and the API —
+    degrades to 「剛剛」 rather than rendering negative time.
+    """
+    left = past if past.tzinfo else past.replace(tzinfo=timezone.utc)
+    right = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    delta = right - left
+    if delta < timedelta(hours=1):
+        return "剛剛"
+    if delta < timedelta(days=1):
+        return f"約 {int(delta.total_seconds() // 3600)} 小時前"
+    return f"{delta.days} 天前"
+
+
+def format_event_time_anchor(
+    moment: datetime | None,
+    now: datetime | None,
+    *,
+    local_tz: tzinfo,
+    include_civil_day: bool = False,
+) -> str:
+    """Render one past event's full time anchor: absolute clock ｜ how long ago.
+
+    Composes the two formatters this module already owns —
+    :func:`format_local_current_time` for the operator-local civil clock
+    (plus its 時段 hint) and :func:`format_relative_past_label` for the
+    coarse "距今" reading — into the single label that per-turn
+    transcripts want: ``2026-08-26 07:46（清晨）｜約 10 分鐘前``.
+
+    Why both halves: the absolute clock alone leaves a small model to do
+    date arithmetic it demonstrably gets wrong, and the relative label
+    alone gives it nothing to place an event on the calendar with. The
+    2026-08-26 proactive incident (a question asked ten minutes earlier
+    resurfacing as 「昨天」) was a transcript with *neither*.
+
+    ``include_civil_day`` adds a third reading — the *calendar* distance
+    from :func:`format_civil_days_ago_label`, appended only when it
+    disagrees with 「今天」 — giving ``…｜約 16 小時前（1 天前）``. Duration
+    and calendar come apart exactly at the boundary that matters for
+    staleness: 「昨天下午說要回家」 read the next morning is a mere "16
+    hours" by duration while being a different *day* to both people in
+    the conversation, and it is the day boundary that makes 「回家了嗎？」
+    absurd rather than merely late. Off by default so the shipped
+    transcript line (:func:`render_dialogue_line`) keeps rendering
+    byte-identically; the quality gate's 時間座標 block opts in.
+
+    Returns ``""`` when either instant is missing, so callers can append
+    it unconditionally and simply get an un-anchored line rather than a
+    crash. Naive stamps are read as UTC (the persistence convention); a
+    stamp in the future — worker/API clock skew — clamps to zero elapsed
+    rather than rendering negative time.
+    """
+    if moment is None or now is None:
+        return ""
+    past = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    right = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    elapsed_minutes = max((right - past).total_seconds() / 60.0, 0.0)
+    absolute = format_local_current_time(past, local_tz, include_timezone=False)
+    elapsed = format_relative_past_label(elapsed_minutes)
+    if include_civil_day:
+        civil = format_civil_days_ago_label(past, right, local_tz=local_tz)
+        if civil and civil != "今天":
+            elapsed = f"{elapsed}（{civil}）"
+    return f"{absolute}｜{elapsed}"
 
 
 def format_civil_days_ago_label(

@@ -7,9 +7,11 @@ import pytest
 from kokoro_link.application.services.nsfw_mode import (
     CONTENT_MODE_NORMAL,
     CONTENT_MODE_NSFW,
+    NSFW_MODE_TARGET_PREFERENCE_KEY,
     NsfwModeService,
     NsfwModeTargetError,
 )
+from kokoro_link.contracts.llm import ReasoningOverrides
 from kokoro_link.infrastructure.repositories.in_memory_preferences import (
     InMemoryPreferencesRepository,
 )
@@ -50,6 +52,119 @@ async def test_global_target_requires_complete_values() -> None:
             llm_model_id="community-model",
             image_profile_id="community-image",
         )
+
+
+@pytest.mark.asyncio
+async def test_global_target_accepts_explicit_image_disable() -> None:
+    prefs = InMemoryPreferencesRepository()
+    service = NsfwModeService(
+        preferences=prefs,
+        ttl_seconds=600,
+        clock=_Clock(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+    )
+
+    await service.set_global_target(
+        llm_provider_id="lmstudio",
+        llm_model_id="local-nsfw",
+        image_profile_id=None,
+    )
+
+    # Persisted as null — no sentinel string that could leak into
+    # registry lookups.
+    stored = await prefs.get(NSFW_MODE_TARGET_PREFERENCE_KEY)
+    assert stored["image_profile_id"] is None
+
+    target = await service.get_global_target()
+    assert target is not None
+    assert target.llm_provider_id == "lmstudio"
+    assert target.image_profile_id is None
+
+    status = await service.enable(user_id="alice")
+    assert status.active is True
+    assert status.configured is True
+    assert status.target is not None
+    assert status.target.image_profile_id is None
+
+
+@pytest.mark.asyncio
+async def test_global_target_reasoning_roundtrips_and_reaches_active_target() -> None:
+    """The target's optional reasoning posture persists, reads back and
+    survives the status→target reconstruction the resolver consumes."""
+    prefs = InMemoryPreferencesRepository()
+    service = NsfwModeService(
+        preferences=prefs,
+        ttl_seconds=600,
+        clock=_Clock(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+    )
+
+    await service.set_global_target(
+        llm_provider_id="lmstudio",
+        llm_model_id="local-nsfw",
+        image_profile_id=None,
+        reasoning=ReasoningOverrides(reasoning_effort="high"),
+    )
+
+    stored = await prefs.get(NSFW_MODE_TARGET_PREFERENCE_KEY)
+    assert stored["reasoning"] == {"reasoning_effort": "high"}
+
+    target = await service.get_global_target()
+    assert target is not None
+    assert target.reasoning == ReasoningOverrides(reasoning_effort="high")
+
+    await service.enable(user_id="alice")
+    active = await service.active_target(user_id="alice")
+    assert active is not None
+    assert active.reasoning == ReasoningOverrides(reasoning_effort="high")
+
+
+@pytest.mark.asyncio
+async def test_target_without_reasoning_key_reads_as_none() -> None:
+    """Zero-regression guard: pre-AM2 stored targets (no ``reasoning``
+    key) and new writes without a posture read back as None, and the
+    stored shape stays byte-identical to before the field existed."""
+    prefs = InMemoryPreferencesRepository()
+    service = NsfwModeService(
+        preferences=prefs,
+        ttl_seconds=600,
+        clock=_Clock(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+    )
+
+    await service.set_global_target(
+        llm_provider_id="lmstudio",
+        llm_model_id="local-nsfw",
+        image_profile_id=None,
+    )
+
+    stored = await prefs.get(NSFW_MODE_TARGET_PREFERENCE_KEY)
+    assert stored == {
+        "llm": {"provider_id": "lmstudio", "model_id": "local-nsfw"},
+        "image_profile_id": None,
+    }
+    target = await service.get_global_target()
+    assert target is not None
+    assert target.reasoning is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_target_raw_without_image_key_reads_as_disabled() -> None:
+    """Pre-AM3 rows always carried all three keys, so a missing key can
+    only come from hand-edited prefs — read it as the explicit-off value
+    rather than dropping the whole configured target."""
+    prefs = InMemoryPreferencesRepository()
+    await prefs.set(NSFW_MODE_TARGET_PREFERENCE_KEY, {
+        "llm": {"provider_id": "lmstudio", "model_id": "local-nsfw"},
+    })
+    service = NsfwModeService(
+        preferences=prefs,
+        ttl_seconds=600,
+        clock=_Clock(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)),
+    )
+
+    target = await service.get_global_target()
+
+    assert target is not None
+    assert target.llm_model_id == "local-nsfw"
+    assert target.image_profile_id is None
 
 
 @pytest.mark.asyncio

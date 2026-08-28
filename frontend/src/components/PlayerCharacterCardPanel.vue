@@ -19,6 +19,8 @@ import {
   type CharacterCardPackSummary,
 } from '@/utils/api/characters'
 import { canInstallCard } from '@/utils/characterCardSource'
+import { useCharacterCreationFollowUp } from '@/composables/useCharacterCreationFollowUp'
+import type { CharacterCreationFollowUp } from '@/utils/characterCreationFollowUp'
 import { UiButton } from '@/components/ui'
 
 const props = defineProps<{
@@ -31,6 +33,9 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const { pt } = usePlayerCopy()
+// 建角成功「之後」才做得到的兩件事：寫玩家人設補充、把這次填的存成身分卡
+// （IC2）。失敗不回滾角色，由這顆 composable 統一提示重試。
+const characterCreationFollowUp = useCharacterCreationFollowUp()
 
 const packs = ref<CharacterCardPackSummary[]>([])
 const loadingPacks = ref(false)
@@ -288,6 +293,7 @@ async function installPack(card: CharacterCardPreview) {
 async function runInstallPack(
   card: CharacterCardPreview,
   initialRelationship: InitialRelationshipPayload | null,
+  followUp: CharacterCreationFollowUp,
 ) {
   if (!card.pack_id) return
   installingId.value = card.pack_id
@@ -299,6 +305,10 @@ async function runInstallPack(
         initialRelationship,
       },
     )
+    // 在 notifyCharacterCreated 之前跑：那一步會讓呼叫端選中新角色並進聊
+    // 天，而 PP 首彈窗的條件（note 為空且零訊息）就在那時判斷——人設要先
+    // 寫進去，玩家才不會被問一次剛剛已經填過的東西。
+    await characterCreationFollowUp.run(result.character.id, followUp)
     notifyCharacterCreated(result.character, result.landed_arc_template_ids.length)
     resetBrowseModal()
     resetRelationshipWizard()
@@ -337,6 +347,7 @@ async function confirmPreviewImport(_card?: CharacterCardPreview) {
 
 async function runPreviewImport(
   initialRelationship: InitialRelationshipPayload | null,
+  followUp: CharacterCreationFollowUp,
 ) {
   if (!pendingImportFile.value) return
   importing.value = true
@@ -348,6 +359,9 @@ async function runPreviewImport(
         initialRelationship,
       },
     )
+    // 同 runInstallPack：人設先寫，才輪到 notifyCharacterCreated 把玩家送
+    // 進聊天（PP 首彈窗的條件在那時判斷）。
+    await characterCreationFollowUp.run(result.character.id, followUp)
     notifyCharacterCreated(result.character, result.landed_arc_template_ids.length)
     closePreview()
     resetRelationshipWizard()
@@ -363,14 +377,15 @@ async function runPreviewImport(
 
 async function confirmRelationshipWizard(
   initialRelationship: InitialRelationshipPayload | null,
+  followUp: CharacterCreationFollowUp,
 ) {
   const action = pendingRelationshipAction.value
   if (!action) return
   if (action.kind === 'pack') {
-    await runInstallPack(action.card, initialRelationship)
+    await runInstallPack(action.card, initialRelationship, followUp)
     return
   }
-  await runPreviewImport(initialRelationship)
+  await runPreviewImport(initialRelationship, followUp)
 }
 
 function closeRelationshipWizard() {

@@ -307,7 +307,15 @@ async def test_streaming_turn_settles_when_the_reply_lands() -> None:
 
 
 async def test_abandoned_stream_releases_rather_than_stranding_credits() -> None:
-    """The route's only hook for a client that disconnected mid-generation."""
+    """A turn that never reaches ``finish`` must not strand its reservation.
+
+    This is the shape of every path that ends without an assistant message —
+    upstream error, refusal, the detach watchdog's timeout — where the relay's
+    ``finally`` releases the charge instead of settling it. It is no longer the
+    *disconnect* path: a client that walks away leaves the turn running and the
+    reply lands, so that story is pinned in
+    ``tests/unit/test_chat_stream_detached_completion.py``.
+    """
     fixture = _Fixture(model=_ScopeWatchingModel())
     chat = fixture.chat()
     character_id = await fixture.character_id()

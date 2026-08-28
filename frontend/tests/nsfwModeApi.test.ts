@@ -89,6 +89,27 @@ describe('NSFW mode system API', () => {
       target,
     )
   })
+
+  it('round-trips a null image profile (image generation explicitly off)', async () => {
+    const target = {
+      ...nsfwModePreference().target!,
+      image_profile_id: null,
+    }
+    const response = {
+      configured: true,
+      locked: false,
+      target,
+    }
+    mockedAxios.put.mockResolvedValueOnce({ data: response })
+
+    await expect(setAdminNsfwModeTarget(target)).resolves.toEqual(response)
+
+    // The payload carries JSON null — never a sentinel string.
+    expect(mockedAxios.put).toHaveBeenCalledWith(
+      '/api/v1/admin/system/preferences/nsfw-mode-target',
+      expect.objectContaining({ image_profile_id: null }),
+    )
+  })
 })
 
 describe('TTS disabled mapping', () => {

@@ -46,6 +46,7 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import balanced_end, extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -267,18 +268,45 @@ def _companion_block(context: StorySceneOpeningContext) -> str:
 
 
 def _parse_payload(raw: str) -> dict | None:
-    payload = _extract_json_object(raw)
+    # Shared layer first: strict decode, with truncation repair — this is
+    # a pure widening over the old algorithm (which never repaired a cut
+    # reply) and covers every case the old strict-mode decode did.
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    if outcome.value is not None:
+        return outcome.value
+
+    # Fall back to the old tolerance: models writing multi-paragraph
+    # narration sometimes put *literal* newlines inside a JSON string
+    # value instead of ``\n`` escapes, which the shared layer's strict
+    # ``json.loads`` rejects (DECODE_ERROR, not a truncation the repair
+    # step can fix). This is call-site policy that predates the shared
+    # layer and has no equivalent there — see the module's audit note —
+    # so it is preserved here explicitly rather than silently dropped.
+    # Reuses the shared balanced-brace scanner only for locating the
+    # object span; the lenient decode stays local.
+    payload = _locate_object_span(raw)
     if payload is None:
+        log_parse_outcome(_LOGGER, outcome, site="story.scene_opener")
         return None
     try:
-        # ``strict=False``: models asked for multi-paragraph narration
-        # often put *literal* newlines inside the JSON string instead of
-        # \n escapes. Strict parsing rejects those control characters,
-        # and a failed parse here fails the whole paid action.
         parsed = json.loads(payload, strict=False)
     except json.JSONDecodeError:
+        log_parse_outcome(_LOGGER, outcome, site="story.scene_opener")
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict):
+        log_parse_outcome(_LOGGER, outcome, site="story.scene_opener")
+        return None
+    return parsed
+
+
+def _locate_object_span(raw: str) -> str | None:
+    start = raw.find("{")
+    if start == -1:
+        return None
+    end = balanced_end(raw, start)
+    if end is None:
+        return None
+    return raw[start : end + 1]
 
 
 def _clean(value: object, max_chars: int) -> str:
@@ -312,31 +340,3 @@ def _clean_prose(value: object, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "…"
     return text
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:index + 1]
-    return None

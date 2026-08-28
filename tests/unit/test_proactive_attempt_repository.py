@@ -95,3 +95,39 @@ async def test_scopes_to_character() -> None:
     result = await repo.list_recent_sent("c1")
 
     assert [a.message for a in result] == ["mine"]
+
+
+# --- the cooldown anchor --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_quality_withhold_does_not_become_the_cooldown_anchor() -> None:
+    """FA — the player received nothing, so the clock must not restart.
+
+    ``QUALITY_WITHHELD`` spent real budget, which is why it does not join
+    the gate-blocked rows for the "it was cheap" reason. It joins them
+    because the tick produced no message: anchoring on it would let one
+    broken draft silence the whole cooldown window.
+    """
+    repo = InMemoryProactiveAttemptRepository()
+    await repo.add(_attempt(ProactiveOutcome.SENT, 90, "上一次真的發出去的"))
+    await repo.add(_attempt(ProactiveOutcome.QUALITY_WITHHELD, 5))
+
+    anchor = await repo.latest_passing_gate_for_character("c1")
+
+    assert anchor is not None
+    assert anchor.outcome == ProactiveOutcome.SENT
+
+
+@pytest.mark.asyncio
+async def test_the_characters_own_skip_is_still_the_cooldown_anchor() -> None:
+    """The half that must not move: silence the character chose is a
+    decision the cooldown is meant to honour."""
+    repo = InMemoryProactiveAttemptRepository()
+    await repo.add(_attempt(ProactiveOutcome.SENT, 90))
+    await repo.add(_attempt(ProactiveOutcome.DECIDER_SKIPPED, 5))
+
+    anchor = await repo.latest_passing_gate_for_character("c1")
+
+    assert anchor is not None
+    assert anchor.outcome == ProactiveOutcome.DECIDER_SKIPPED

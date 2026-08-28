@@ -14,6 +14,7 @@ import {
   priceChangedFromBody,
   priceChangedFromStreamFrame,
 } from '@/utils/api/priceChanged'
+import { conversationBusyFromBody } from '@/utils/api/conversationBusy'
 import {
   ACTION_CHAT,
   ACTION_IMAGE_CHAT_TOOL,
@@ -58,6 +59,60 @@ export class ChatStreamProtocolError extends Error {
     this.name = 'ChatStreamProtocolError'
     this.code = code
   }
+}
+
+/**
+ * The caller walked away from the turn — a character switch, or the panel
+ * unmounting — and the stream was cancelled on purpose.
+ *
+ * Deliberately *not* a `ChatStreamProtocolError`: nothing went wrong. The
+ * server keeps working and lands the turn as an ordinary message, so the
+ * only correct client behaviour is to drop everything this turn owns on
+ * screen and say nothing. Typed so the display boundary can tell this apart
+ * from a stream that genuinely broke — an error bubble here would blame the
+ * player for their own tap.
+ */
+export class ChatStreamAbortedError extends Error {
+  code: string
+
+  constructor(message = 'Chat stream aborted by the caller') {
+    super(message)
+    this.name = 'ChatStreamAbortedError'
+    this.code = 'stream_aborted'
+  }
+}
+
+export function isChatStreamAbortedError(
+  error: unknown,
+): error is ChatStreamAbortedError {
+  return error instanceof ChatStreamAbortedError
+}
+
+/** Per-call knobs for the streaming send. */
+export interface ChatStreamOptions {
+  /**
+   * Cancels the request *and* the reader. Aborting is an expected path, not
+   * a failure: the call rejects with `ChatStreamAbortedError` and stops
+   * delivering tokens the moment the signal fires.
+   */
+  signal?: AbortSignal
+}
+
+/**
+ * A rejection that is really "we aborted", whatever shape the platform
+ * chose. `fetch` rejects with a `DOMException{name: 'AbortError'}`, a
+ * cancelled reader can reject with the same, and some environments reject
+ * with the signal's `reason` instead — which may be anything at all. The
+ * signal's own `aborted` flag is the authority; the name check only covers
+ * the case where the caller passed no signal but an outer one fired.
+ */
+function isAbortRejection(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true
+  return (
+    typeof error === 'object'
+    && error !== null
+    && (error as { name?: unknown }).name === 'AbortError'
+  )
 }
 
 /**
@@ -137,6 +192,12 @@ export async function uploadChatAttachments(files: File[]): Promise<string[]> {
  * Summary returned by the undo-last-turn endpoint. The frontend only
  * surfaces ``reverted_messages`` + ``restored_character_state`` in
  * toasts; the rest is logged for debugging.
+ *
+ * Mirrors the server DTO field-for-field, including the subsystems
+ * whose rollback is still landing — those answer 0 / false today, the
+ * same value they answer when the subsystem is not wired on this
+ * deployment. Every field is optional here because the server may be
+ * older than the client during a rolling deploy.
  */
 export interface UndoTurnResponse {
   conversation_id: string
@@ -144,10 +205,31 @@ export interface UndoTurnResponse {
   reverted_messages: number
   deleted_memories: number
   deleted_state_snapshots: number
+  rejected_persona_fields?: number
   restored_goals: boolean
   restored_arc: boolean
   restored_schedule: boolean
   restored_character_state: boolean
+  recorded_tombstone?: boolean
+  deleted_emotion_events?: number
+  deleted_follow_ups?: number
+  restored_follow_ups?: number
+  cancelled_follow_up_jobs?: number
+  restored_address_preference?: boolean
+  reverted_address_log_entries?: number
+  restored_scene_session?: boolean
+  deleted_created_arc?: boolean
+  deleted_encounter_intents?: number
+  deleted_curiosity_attempts?: number
+  deleted_story_events?: number
+  /**
+   * The cumulative dialogue checkpoint was flagged for a from-scratch
+   * rebuild (DH3). Only ever true when the reversed turn was found
+   * inside the summary's coverage — which the design says cannot
+   * happen. Nothing in the UI reads it; it is declared so the type
+   * keeps mirroring the server DTO field-for-field.
+   */
+  marked_checkpoint_stale?: boolean
 }
 
 /**
@@ -236,17 +318,36 @@ export async function sendChatMessage(req: SendChatMessageRequest): Promise<Chat
  * Send a chat message and receive streaming SSE tokens.
  * Calls onToken for each incremental text chunk.
  * Returns the full ChatReplyResponse once the stream ends.
+ *
+ * Pass `options.signal` to be able to walk away: the fetch is cancelled, the
+ * reader is closed, no further token reaches `onToken`, and the call rejects
+ * with `ChatStreamAbortedError`. The turn itself is *not* cancelled — the
+ * server finishes it and stores it as an ordinary message.
  */
 export async function sendChatMessageStream(
   req: SendChatMessageRequest,
   onToken: (token: string) => void,
   onConversationId?: (id: string) => void,
+  onToolActivity?: (activity: { tool: string; status: string }) => void,
+  options: ChatStreamOptions = {},
 ): Promise<ChatReplyResponse> {
-  const res = await authedFetch('/api/v1/chat/messages/stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(withQuotedPrices(req)),
-  })
+  const signal = options.signal
+  // Already gone before we spent a request on it (a switch that landed
+  // between composing the turn and sending it).
+  if (signal?.aborted) throw new ChatStreamAbortedError()
+
+  let res: Response
+  try {
+    res = await authedFetch('/api/v1/chat/messages/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(withQuotedPrices(req)),
+      ...(signal ? { signal } : {}),
+    })
+  } catch (error) {
+    if (isAbortRejection(error, signal)) throw new ChatStreamAbortedError()
+    throw error
+  }
   if (!res.ok) {
     throw await chatErrorFromResponse(res, 'Stream chat request failed')
   }
@@ -291,6 +392,18 @@ export async function sendChatMessageStream(
       if (parsed.conversation_id && onConversationId) {
         onConversationId(parsed.conversation_id)
       }
+      // Tool-activity frames — the backend interleaves these while a
+      // tool cycle runs so the UI can show what the character is busy
+      // with. Shape-guarded: a malformed frame is ignored, never fatal.
+      if (
+        onToolActivity
+        && parsed.tool_activity
+        && typeof parsed.tool_activity === 'object'
+        && typeof parsed.tool_activity.tool === 'string'
+        && typeof parsed.tool_activity.status === 'string'
+      ) {
+        onToolActivity(parsed.tool_activity)
+      }
       if (parsed.token) {
         onToken(parsed.token)
       }
@@ -302,21 +415,42 @@ export async function sendChatMessageStream(
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    const lines = buffer.split('\n')
-    buffer = lines.pop()!
-
-    for (const line of lines) processLine(line)
+  // Cancelling the reader is what actually stops the transfer once the body
+  // is streaming — and it is the only lever that exists when the response
+  // came from somewhere `fetch`'s own abort cannot reach. A `read()` that is
+  // already pending resolves as `done` the moment the reader is cancelled.
+  const cancelReader = () => {
+    void reader.cancel().catch(() => { /* already closed */ })
   }
+  signal?.addEventListener('abort', cancelReader, { once: true })
+  try {
+    while (true) {
+      if (signal?.aborted) throw new ChatStreamAbortedError()
+      const { done, value } = await reader.read()
+      // Re-checked after the await, not only before it: whatever arrived
+      // belongs to a turn the caller has already walked away from and must
+      // never reach `onToken` — that is the "animation bleeds into the next
+      // character" bug in its smallest form.
+      if (signal?.aborted) throw new ChatStreamAbortedError()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
 
-  // Flush any trailing bytes (e.g. last event without final "\n").
-  buffer += decoder.decode()
-  if (buffer.length > 0) {
-    for (const line of buffer.split('\n')) processLine(line)
+      const lines = buffer.split('\n')
+      buffer = lines.pop()!
+
+      for (const line of lines) processLine(line)
+    }
+
+    // Flush any trailing bytes (e.g. last event without final "\n").
+    buffer += decoder.decode()
+    if (buffer.length > 0) {
+      for (const line of buffer.split('\n')) processLine(line)
+    }
+  } catch (error) {
+    if (isAbortRejection(error, signal)) throw new ChatStreamAbortedError()
+    throw error
+  } finally {
+    signal?.removeEventListener('abort', cancelReader)
   }
 
   // A deliberate refusal outranks the generic "no final event" diagnosis —
@@ -356,6 +490,13 @@ async function chatErrorFromResponse(
   // the panel asks the player to resend at the refreshed price.
   const priceError = priceChangedFromBody({ detail }, response.status)
   if (priceError) return priceError
+  // A turn is still in flight on this conversation (409). Shares the status
+  // with `price_changed` above and is separated by `code`, never by status.
+  // Routine rather than exotic since the client learned to abandon streams:
+  // the server finishes the abandoned turn, so switching away and straight
+  // back can land a send inside that window.
+  const busyError = conversationBusyFromBody({ detail }, response.status)
+  if (busyError) return busyError
   if (response.status === 429 && isSessionMessageLimit(detail)) {
     return new ChatRuntimeLimitError({
       code: 'max_messages_per_session',

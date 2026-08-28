@@ -67,7 +67,7 @@ def _two_profile_registry() -> ImageProfileRegistry:
 async def _set_nsfw_target(
     nsfw: NsfwModeService,
     *,
-    image_profile_id: str = "openai_hi",
+    image_profile_id: str | None = "openai_hi",
 ) -> None:
     await nsfw.set_global_target(
         llm_provider_id="lmstudio",
@@ -223,6 +223,38 @@ async def test_stale_nsfw_image_profile_refuses_runtime_fallback() -> None:
     nsfw = NsfwModeService(preferences=prefs, ttl_seconds=60)
     await prefs.set("active_image_profile", {"profile_id": "anime_local"})
     await _set_nsfw_target(nsfw, image_profile_id="ghost_profile")
+    await nsfw.enable(user_id="alice")
+    provider = PreferenceBackedActiveImageProvider(
+        registry=registry,
+        preferences=prefs,
+        nsfw_mode_service=nsfw,
+    )
+    char = Character(
+        id="c1", name="Yui", summary="", user_id="alice",
+        personality=[], interests=[], speaking_style="", boundaries=[],
+        state=CharacterState(
+            emotion="calm", affection=50, fatigue=20, trust=50, energy=60,
+        ),
+    )
+
+    assert await provider.resolve_profile_id(
+        FEATURE_IMAGE_PORTRAIT, character=char,
+    ) is None
+    assert await provider.resolve(
+        FEATURE_IMAGE_PORTRAIT, character=char,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_nsfw_mode_with_image_disabled_refuses_fallback() -> None:
+    """Operator chose "no image generation during NSFW mode" (target
+    image_profile_id is null) — resolution must return None immediately,
+    never fall back to the normal profile chain."""
+    registry = _two_profile_registry()
+    prefs = InMemoryPreferencesRepository()
+    nsfw = NsfwModeService(preferences=prefs, ttl_seconds=60)
+    await prefs.set("active_image_profile", {"profile_id": "anime_local"})
+    await _set_nsfw_target(nsfw, image_profile_id=None)
     await nsfw.enable(user_id="alice")
     provider = PreferenceBackedActiveImageProvider(
         registry=registry,

@@ -35,6 +35,30 @@ class InMemoryEmotionEventRepository(EmotionEventRepositoryPort):
         matches.sort(key=lambda r: r.created_at, reverse=True)
         return matches[:limit]
 
+    async def delete_by_cause(
+        self,
+        *,
+        character_id: str,
+        cause_ref_kind: str,
+        cause_ref_id: str,
+    ) -> int:
+        # Mirrors the SQL adapter exactly, including the refusal to act
+        # on a partial key — this store is what the undo tests run
+        # against, so a laxer rule here would test a repository that
+        # does not exist in production.
+        if not character_id or not cause_ref_kind or not cause_ref_id:
+            return 0
+        before = len(self._rows)
+        self._rows = [
+            r for r in self._rows
+            if not (
+                r.character_id == character_id
+                and r.cause_ref_kind == cause_ref_kind
+                and r.cause_ref_id == cause_ref_id
+            )
+        ]
+        return before - len(self._rows)
+
     async def delete_for_character(self, character_id: str) -> int:
         before = len(self._rows)
         self._rows = [r for r in self._rows if r.character_id != character_id]

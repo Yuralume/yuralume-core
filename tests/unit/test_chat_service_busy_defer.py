@@ -14,57 +14,34 @@ Exercises the happy paths the user-facing flow promises:
 
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from kokoro_link.application.dto.character import CreateCharacterRequest
 from kokoro_link.application.dto.chat import SendChatMessageRequest
-from kokoro_link.application.services.character_service import CharacterService
 from kokoro_link.application.services.chat_service import ChatService
 from kokoro_link.contracts.busy_reply_decider import (
     BusyDecision,
     BusyReplyMode,
 )
 from kokoro_link.domain.entities.pending_follow_up import (
+    PendingFollowUp,
+    PendingFollowUpMessage,
     PendingFollowUpStatus,
-)
-from kokoro_link.domain.entities.character_operator_relationship_seed import (
-    CharacterOperatorRelationshipSeed,
-)
-from kokoro_link.domain.entities.operator_persona import (
-    InteractionStrength,
-    OperatorPersona,
 )
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.entities.player_persona_note import PlayerPersonaNote
 from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
-from kokoro_link.domain.value_objects.familiarity import Familiarity
-from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.proactive_outcome import ProactiveOutcome
 from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
 from kokoro_link.infrastructure.busy.llm_decider import (
     _build_prompt as build_busy_decider_prompt,
 )
-from kokoro_link.infrastructure.llm.fake import FakeChatModel
-from kokoro_link.infrastructure.llm.registry import InMemoryChatModelRegistry
-from kokoro_link.infrastructure.memory.in_memory import InMemoryMemoryRepository
-from kokoro_link.infrastructure.post_turn.null_processor import (
-    NullPostTurnProcessor,
-)
-from kokoro_link.infrastructure.prompt.default import DefaultPromptContextBuilder
 from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
     PLAYER_PERSONA_NOTE_HEADER,
-)
-from kokoro_link.infrastructure.repositories.in_memory_characters import (
-    InMemoryCharacterRepository,
-)
-from kokoro_link.infrastructure.repositories.in_memory_conversations import (
-    InMemoryConversationRepository,
 )
 from kokoro_link.infrastructure.repositories.in_memory_pending_follow_ups import (
     InMemoryPendingFollowUpRepository,
@@ -78,210 +55,24 @@ from kokoro_link.infrastructure.repositories.in_memory_proactive_attempts import
 from kokoro_link.infrastructure.repositories.in_memory_turn_journals import (
     InMemoryTurnJournalRepository,
 )
-from kokoro_link.infrastructure.state.simple import SimpleStateEngine
+from tests.unit.busy_defer_harness import (
+    ScriptedDecider,
+    SpyReleaseEnqueuer,
+    StubOperatorPersonaService,
+    StubOperatorProfileService,
+    StubPersonaExtractionService,
+    StubRelationshipSeedRepository,
+    StubScheduleService,
+    build_chat_service,
+    busy_activity,
+)
 
-
-def _busy_activity(busy: float = 0.9) -> ScheduleActivity:
-    now = datetime.now(timezone.utc)
-    return ScheduleActivity.create(
-        start_at=now - timedelta(minutes=30),
-        end_at=now + timedelta(minutes=30),
-        description="跟客戶開會",
-        category="meeting",
-        busy_score=busy,
-    )
-
-
-class _StubScheduleService:
-    """Minimal stand-in: ``ensure_schedule`` returns a sentinel,
-    ``resolve_current`` returns whatever current_activity we configured."""
-
-    def __init__(self, *, current_activity: ScheduleActivity | None) -> None:
-        self.current_activity = current_activity
-
-    async def ensure_schedule(self, character):
-        # Truthy placeholder carrying the ``.date`` attribute the chat
-        # path reads when threading the pending-invite / upcoming window.
-        return SimpleNamespace(date=datetime.now(timezone.utc).date())
-
-    def resolve_current(self, schedule, *, now=None):
-        return self.current_activity, [], None
-
-    def resolve_completed_today(
-        self, schedule, *, now=None, local_tz=None, limit=8,
-    ):
-        return []
-
-    def resolve_pending_invites_from_schedules(
-        self, schedules, *, now=None, limit=1,
-    ):
-        return []
-
-    async def get_schedule(self, character_id, *, date_=None):
-        return None
-
-    async def current_activity_response(self, character):  # pragma: no cover
-        return None
-
-
-class _ScriptedDecider:
-    def __init__(self, decisions: list[BusyDecision]) -> None:
-        self.decisions = decisions
-        self.calls: list[dict[str, Any]] = []
-
-    async def decide(
-        self,
-        *,
-        character,
-        user_message,
-        current_activity,
-        recent_dialogue_summary=None,
-        recent_proactive_attempts=(),
-        relationship_context_lines=(),
-        interaction_context_lines=(),
-        now,
-        local_tz=None,
-        operator_primary_language="zh-TW",
-    ):
-        self.calls.append({
-            "user_message": user_message,
-            "current_activity": current_activity,
-            "local_tz": local_tz,
-            "recent_proactive_attempts": recent_proactive_attempts,
-            "relationship_context_lines": relationship_context_lines,
-            "interaction_context_lines": interaction_context_lines,
-            "operator_primary_language": operator_primary_language,
-        })
-        if not self.decisions:
-            return BusyDecision()
-        return self.decisions.pop(0)
-
-
-class _StubOperatorProfileService:
-    async def get_current(self) -> OperatorProfile:
-        return OperatorProfile(
-            id="default",
-            display_name="操作者",
-            timezone_id="Asia/Taipei",
-        )
-
-    async def get_for_user(self, user_id: str) -> OperatorProfile:
-        return OperatorProfile(
-            id=user_id,
-            display_name="操作者",
-            timezone_id="Asia/Taipei",
-        )
-
-
-class _StubPersonaExtractionService:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    async def run_after_turn(self, **kwargs):
-        self.calls.append(kwargs)
-
-
-class _StubOperatorPersonaService:
-    async def get_current(self, character_id: str, operator_id: str):
-        return OperatorPersona.empty(character_id, operator_id)
-
-    def render_for_prompt(self, persona: OperatorPersona) -> list[str]:
-        return []
-
-    async def get_interaction_strength(
-        self,
-        character_id: str,
-        operator_id: str,
-    ) -> InteractionStrength:
-        return InteractionStrength(
-            character_id=character_id,
-            operator_id=operator_id,
-            first_message_at=None,
-            total_user_messages=0,
-            days_since_first_contact=0,
-            messages_last_7_days=0,
-            messages_last_30_days=0,
-            longest_session_minutes=0,
-            shared_arc_realized_count=0,
-            shared_drama_count=0,
-            familiarity_band=Familiarity.STRANGER,
-            computed_at=datetime.now(timezone.utc),
-        )
-
-
-class _StubRelationshipSeedRepository:
-    async def get(
-        self,
-        character_id: str,
-        operator_id: str,
-    ) -> CharacterOperatorRelationshipSeed:
-        return CharacterOperatorRelationshipSeed(
-            character_id=character_id,
-            operator_id=operator_id,
-            relationship_label="老朋友",
-        )
-
-
-def _build_chat_service(
-    *,
-    decider,
-    schedule_service,
-    pending_repo,
-    persona_extraction_service=None,
-    journal_repository=None,
-    operator_profile_service=None,
-    proactive_attempt_repository=None,
-    operator_persona_service=None,
-    relationship_seed_repository=None,
-    release_enqueuer=None,
-    player_persona_note_repository=None,
-):
-    character_repository = InMemoryCharacterRepository()
-    conversation_repository = InMemoryConversationRepository()
-    memory_repository = InMemoryMemoryRepository()
-    registry = InMemoryChatModelRegistry(default_provider_id="fake")
-    registry.register(FakeChatModel(provider_id="fake"))
-    chat_service = ChatService(
-        character_repository=character_repository,
-        conversation_repository=conversation_repository,
-        memory_repository=memory_repository,
-        post_turn_processor=NullPostTurnProcessor(),
-        prompt_context_builder=DefaultPromptContextBuilder(),
-        model_registry=registry,
-        state_engine=SimpleStateEngine(),
-        schedule_service=schedule_service,
-        busy_reply_decider=decider,
-        pending_follow_up_repository=pending_repo,
-        proactive_attempt_repository=proactive_attempt_repository,
-        operator_profile_service=(
-            operator_profile_service
-            if operator_profile_service is not None
-            else (
-                _StubOperatorProfileService()
-                if persona_extraction_service is not None else None
-            )
-        ),
-        persona_extraction_service=persona_extraction_service,
-        operator_persona_service=operator_persona_service,
-        relationship_seed_repository=relationship_seed_repository,
-        journal_repository=journal_repository,
-        player_persona_note_repository=player_persona_note_repository,
-    )
-    if release_enqueuer is not None:
-        chat_service.set_pending_follow_up_release_enqueuer(release_enqueuer)
-    character_service = CharacterService(
-        character_repository,
-        conversation_repository=conversation_repository,
-        memory_repository=memory_repository,
-        pending_follow_up_repository=pending_repo,
-    )
-    return chat_service, character_service, conversation_repository
 
 
 @pytest.mark.asyncio
 async def test_brief_defer_persists_inline_reply_and_pending_row() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等會議結束我再好好回你",
@@ -290,8 +81,8 @@ async def test_brief_defer_persists_inline_reply_and_pending_row() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, conversation_repository = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, conversation_repository = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -321,8 +112,8 @@ async def test_brief_defer_persists_inline_reply_and_pending_row() -> None:
 
 @pytest.mark.asyncio
 async def test_busy_decider_receives_owner_timezone() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，晚點找你",
@@ -330,11 +121,11 @@ async def test_busy_decider_receives_owner_timezone() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    chat, character_service, _ = _build_chat_service(
+    chat, character_service, _ = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
-        operator_profile_service=_StubOperatorProfileService(),
+        operator_profile_service=StubOperatorProfileService(),
     )
     created = await character_service.create_character(
         CreateCharacterRequest(name="Airi", personality=[], interests=[]),
@@ -354,16 +145,16 @@ async def test_busy_decider_receives_owner_timezone() -> None:
 
 @pytest.mark.asyncio
 async def test_busy_decider_keeps_seed_relationship_above_low_interaction_band() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([BusyDecision()])
+    activity = busy_activity()
+    decider = ScriptedDecider([BusyDecision()])
     pending_repo = InMemoryPendingFollowUpRepository()
-    chat, character_service, _ = _build_chat_service(
+    chat, character_service, _ = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
-        operator_profile_service=_StubOperatorProfileService(),
-        operator_persona_service=_StubOperatorPersonaService(),
-        relationship_seed_repository=_StubRelationshipSeedRepository(),
+        operator_profile_service=StubOperatorProfileService(),
+        operator_persona_service=StubOperatorPersonaService(),
+        relationship_seed_repository=StubRelationshipSeedRepository(),
     )
     created = await character_service.create_character(
         CreateCharacterRequest(name="Airi", personality=[], interests=[]),
@@ -389,14 +180,14 @@ async def test_busy_decider_receives_recent_proactive_outreach() -> None:
     busy decider so it can tell "the user is replying to outreach I just
     initiated" from "an unsolicited interruption mid-focus" — the bug
     where replying to a proactive ping got a busy brush-off."""
-    activity = _busy_activity()
+    activity = busy_activity()
     # IMMEDIATE: we only assert what the decider was *given*, not its call.
-    decider = _ScriptedDecider([BusyDecision()])
+    decider = ScriptedDecider([BusyDecision()])
     pending_repo = InMemoryPendingFollowUpRepository()
     proactive_repo = InMemoryProactiveAttemptRepository()
-    chat, character_service, _ = _build_chat_service(
+    chat, character_service, _ = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
         proactive_attempt_repository=proactive_repo,
     )
@@ -426,8 +217,8 @@ async def test_busy_decider_receives_recent_proactive_outreach() -> None:
 
 @pytest.mark.asyncio
 async def test_brief_defer_records_journal_and_runs_persona_extraction() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等等找你",
@@ -437,10 +228,10 @@ async def test_brief_defer_records_journal_and_runs_persona_extraction() -> None
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
     journal_repo = InMemoryTurnJournalRepository()
-    persona = _StubPersonaExtractionService()
-    chat, character_service, _conversation_repository = _build_chat_service(
+    persona = StubPersonaExtractionService()
+    chat, character_service, _conversation_repository = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
         persona_extraction_service=persona,
         journal_repository=journal_repo,
@@ -461,8 +252,8 @@ async def test_brief_defer_records_journal_and_runs_persona_extraction() -> None
 
 @pytest.mark.asyncio
 async def test_brief_defer_respects_persona_disabled_flag() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回",
@@ -471,10 +262,10 @@ async def test_brief_defer_respects_persona_disabled_flag() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    persona = _StubPersonaExtractionService()
-    chat, character_service, _ = _build_chat_service(
+    persona = StubPersonaExtractionService()
+    chat, character_service, _ = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
         persona_extraction_service=persona,
     )
@@ -495,8 +286,8 @@ async def test_brief_defer_respects_persona_disabled_flag() -> None:
 
 @pytest.mark.asyncio
 async def test_second_message_is_appended_before_pending_row_cancels() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等等",
@@ -511,8 +302,8 @@ async def test_second_message_is_appended_before_pending_row_cancels() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, _ = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, _ = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -547,8 +338,8 @@ async def test_second_message_is_appended_before_pending_row_cancels() -> None:
 
 @pytest.mark.asyncio
 async def test_existing_pending_follow_up_is_cancelled_and_next_turn_replies() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等等",
@@ -558,8 +349,8 @@ async def test_existing_pending_follow_up_is_cancelled_and_next_turn_replies() -
         BusyDecision(mode=BusyReplyMode.IMMEDIATE),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, conv_repo = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, conv_repo = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -606,8 +397,8 @@ async def test_existing_pending_follow_up_is_cancelled_and_next_turn_replies() -
 
 @pytest.mark.asyncio
 async def test_existing_pending_follow_up_prevents_consecutive_defer() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等等",
@@ -622,8 +413,8 @@ async def test_existing_pending_follow_up_prevents_consecutive_defer() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, _ = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, _ = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -648,11 +439,11 @@ async def test_existing_pending_follow_up_prevents_consecutive_defer() -> None:
 
 @pytest.mark.asyncio
 async def test_immediate_decision_runs_normal_path() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([BusyDecision()])  # immediate
+    activity = busy_activity()
+    decider = ScriptedDecider([BusyDecision()])  # immediate
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, conv_repo = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, conv_repo = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -673,8 +464,8 @@ async def test_immediate_decision_runs_normal_path() -> None:
 @pytest.mark.asyncio
 async def test_low_busy_activity_skips_decider_invocation() -> None:
     """Perf gate: skip the LLM call when patently idle."""
-    activity = _busy_activity(busy=0.3)  # below the floor
-    decider = _ScriptedDecider([
+    activity = busy_activity(busy=0.3)  # below the floor
+    decider = ScriptedDecider([
         # If the decider WERE invoked, this would defer — but we expect
         # the perf floor to skip the call entirely.
         BusyDecision(
@@ -684,8 +475,8 @@ async def test_low_busy_activity_skips_decider_invocation() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=activity)
-    chat, character_service, _ = _build_chat_service(
+    schedule = StubScheduleService(current_activity=activity)
+    chat, character_service, _ = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -705,7 +496,7 @@ async def test_low_busy_activity_skips_decider_invocation() -> None:
 @pytest.mark.asyncio
 async def test_no_schedule_skips_decider() -> None:
     """No current activity → no busy context to defer on."""
-    decider = _ScriptedDecider([
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="should not fire",
@@ -713,8 +504,8 @@ async def test_no_schedule_skips_decider() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    schedule = _StubScheduleService(current_activity=None)
-    chat, character_service, _ = _build_chat_service(
+    schedule = StubScheduleService(current_activity=None)
+    chat, character_service, _ = build_chat_service(
         decider=decider, schedule_service=schedule, pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -728,21 +519,10 @@ async def test_no_schedule_skips_decider() -> None:
     assert decider.calls == []
 
 
-class _SpyReleaseEnqueuer:
-    """Records the follow-up rows handed to the distributed release enqueuer."""
-
-    def __init__(self) -> None:
-        self.rows: list[Any] = []
-
-    async def enqueue(self, row, *, now=None) -> bool:  # noqa: ANN001
-        self.rows.append(row)
-        return True
-
-
 @pytest.mark.asyncio
 async def test_brief_defer_enqueues_event_driven_release_job() -> None:
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，等會議結束我再好好回你",
@@ -751,10 +531,10 @@ async def test_brief_defer_enqueues_event_driven_release_job() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    enqueuer = _SpyReleaseEnqueuer()
-    chat, character_service, conversation_repository = _build_chat_service(
+    enqueuer = SpyReleaseEnqueuer()
+    chat, character_service, conversation_repository = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
         release_enqueuer=enqueuer,
     )
@@ -777,8 +557,8 @@ async def test_brief_defer_enqueues_event_driven_release_job() -> None:
 async def test_embedded_path_writes_row_without_enqueuer() -> None:
     # No enqueuer wired (self-host / embedded): the row is still persisted and the
     # turn succeeds — zero path difference from before Phase 5.
-    activity = _busy_activity()
-    decider = _ScriptedDecider([
+    activity = busy_activity()
+    decider = ScriptedDecider([
         BusyDecision(
             mode=BusyReplyMode.BRIEF_DEFER,
             brief_reply="先回，晚點找你",
@@ -787,9 +567,9 @@ async def test_embedded_path_writes_row_without_enqueuer() -> None:
         ),
     ])
     pending_repo = InMemoryPendingFollowUpRepository()
-    chat, character_service, conversation_repository = _build_chat_service(
+    chat, character_service, conversation_repository = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=pending_repo,
     )
     created = await character_service.create_character(
@@ -810,10 +590,10 @@ async def test_scheduled_promise_write_point_enqueues_release_job() -> None:
     # The second write point (_persist_message_promises) also enqueues the
     # event-driven release for the promised instant.
     pending_repo = InMemoryPendingFollowUpRepository()
-    enqueuer = _SpyReleaseEnqueuer()
-    chat, character_service, _ = _build_chat_service(
-        decider=_ScriptedDecider([]),
-        schedule_service=_StubScheduleService(current_activity=None),
+    enqueuer = SpyReleaseEnqueuer()
+    chat, character_service, _ = build_chat_service(
+        decider=ScriptedDecider([]),
+        schedule_service=StubScheduleService(current_activity=None),
         pending_repo=pending_repo,
         release_enqueuer=enqueuer,
     )
@@ -831,6 +611,7 @@ async def test_scheduled_promise_write_point_enqueues_release_job() -> None:
         character_id=created.id,
         conversation_id="conv-promise",
         promises=[promise],
+        turn_record_id="turn-promise",
     )
 
     assert len(enqueuer.rows) == 1
@@ -868,14 +649,14 @@ async def _run_busy_turn(
     *,
     note: str | None,
     operator_persona_enabled: bool = True,
-) -> _ScriptedDecider:
+) -> ScriptedDecider:
     """One busy turn that reaches the decider; returns what it was given."""
-    activity = _busy_activity()
-    decider = _ScriptedDecider([BusyDecision()])  # IMMEDIATE — prompt only
+    activity = busy_activity()
+    decider = ScriptedDecider([BusyDecision()])  # IMMEDIATE — prompt only
     notes = InMemoryPlayerPersonaNoteRepository()
-    chat, character_service, _ = _build_chat_service(
+    chat, character_service, _ = build_chat_service(
         decider=decider,
-        schedule_service=_StubScheduleService(current_activity=activity),
+        schedule_service=StubScheduleService(current_activity=activity),
         pending_repo=InMemoryPendingFollowUpRepository(),
         operator_profile_service=_FixedOperatorProfileService(),
         player_persona_note_repository=notes,
@@ -904,7 +685,7 @@ async def _run_busy_turn(
     return decider
 
 
-def _decider_prompt(decider: _ScriptedDecider) -> str:
+def _decider_prompt(decider: ScriptedDecider) -> str:
     """The prompt the decider would actually build from what it was handed.
 
     Asserting on the rendered prompt rather than on the argument tuple is
@@ -983,3 +764,80 @@ async def test_busy_decision_prompt_obeys_the_operator_persona_gate() -> None:
     prompt = _decider_prompt(decider)
     assert PLAYER_PERSONA_NOTE_HEADER not in prompt
     assert _PLAYER_NOTE not in prompt
+
+
+@pytest.mark.asyncio
+async def test_upsert_merges_into_the_open_row_instead_of_opening_a_second(
+) -> None:
+    """Characterization pin for the upsert-merge branch (TU4 pre-work).
+
+    Reached directly rather than through ``send_message``: a normal turn
+    cancels the open row before it ever gets here, so the merge is a
+    race-condition fallback (another request opened a row between that
+    check and this upsert). Undo has to reverse it correctly all the
+    same, and reversing it correctly means knowing exactly what it does —
+    hence this pin, written before the rollback step that depends on it.
+
+    What it does: keeps the row (id, schedule, ack, reason, activity all
+    untouched), appends the new message after the existing ones, moves
+    ``updated_at``, and mints no second release job — the existing job
+    already covers this id at this instant.
+    """
+    activity = busy_activity()
+    pending_repo = InMemoryPendingFollowUpRepository()
+    enqueuer = SpyReleaseEnqueuer()
+    chat, character_service, _ = build_chat_service(
+        decider=ScriptedDecider([]),
+        schedule_service=StubScheduleService(current_activity=activity),
+        pending_repo=pending_repo,
+        release_enqueuer=enqueuer,
+    )
+    created = await character_service.create_character(
+        CreateCharacterRequest(name="Airi", personality=[], interests=[]),
+    )
+    first_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    existing = PendingFollowUp.new(
+        character_id=created.id,
+        conversation_id="conv-merge",
+        first_message=PendingFollowUpMessage.new(
+            content="第一則", queued_at=first_at,
+        ),
+        brief_reply="先回，等會議結束",
+        defer_reason="會議中",
+        scheduled_for=activity.end_at,
+        activity_id=activity.id,
+        now=first_at,
+    )
+    await pending_repo.add(existing)
+
+    merged_at = datetime.now(timezone.utc)
+    merged = await chat._upsert_pending_follow_up(
+        character_id=created.id,
+        conversation_id="conv-merge",
+        user_message_text="第二則",
+        decision=BusyDecision(
+            mode=BusyReplyMode.BRIEF_DEFER,
+            brief_reply="這句不會被採用",
+            defer_until=merged_at + timedelta(hours=3),
+            defer_reason="這個理由也不會被採用",
+        ),
+        current_activity=activity,
+        now=merged_at,
+    )
+
+    assert merged.id == existing.id
+    assert [m.content for m in merged.messages] == ["第一則", "第二則"]
+    # The merge inherits the *original* defer terms — the new decision's
+    # brief reply / reason / defer_until are discarded.
+    assert merged.brief_reply == "先回，等會議結束"
+    assert merged.defer_reason == "會議中"
+    assert merged.scheduled_for == activity.end_at
+    assert merged.activity_id == activity.id
+    assert merged.status == PendingFollowUpStatus.QUEUED
+    assert merged.queued_at == existing.queued_at
+    assert merged.updated_at == merged_at
+    # One row, and no second release job for it.
+    assert len(await pending_repo.list_created_since(
+        "conv-merge", first_at,
+    )) == 1
+    assert enqueuer.rows == []

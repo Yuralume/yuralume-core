@@ -610,6 +610,13 @@ class DailyScheduleRow(Base):
     is_planned: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true",
     )
+    # True once the operator has hand-edited this day (add/modify/delete
+    # via the manual schedule routes). Operator-owned days are exempt from
+    # the same-day weather re-plan so a deleted activity can't resurrect;
+    # the explicit regenerate route replaces the row (flag resets false).
+    manually_adjusted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     # Intra-day weather-drift gate marker: which activity was in progress
     # the last time the drift judge ran on this day, and the weather
     # condition phrase that was true then. NULL = never vetted. Purely a
@@ -649,6 +656,11 @@ class ScheduleActivityRow(Base):
     )
     scene_privacy: Mapped[str | None] = mapped_column(String(40), nullable=True)
     meeting_affordance: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    source_beat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    """KB2 — the story-arc beat this block is the reserved slot for, or
+    ``NULL`` for an ordinary activity. A block with lineage is a plan for
+    a scene, never a lived hour: the memorializer skips it so the beat's
+    record is written once, by the realize path."""
     memorialized: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,
     )
@@ -792,6 +804,18 @@ class CharacterEncounterIntentRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    turn_record_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True,
+    )
+    """The turn that recorded this agreement, for turn-undo (TU6).
+
+    Written by the **background** post-turn, so a ``created_at`` window
+    anchored on the turn's start races the writer. This table also has no
+    conversation column, and a character can be live in a web and a LINE
+    conversation at once — an anchor is the only scope that keeps undoing
+    one thread from deleting the other thread's meeting. ``NULL`` means
+    the row predates migration ``t0h6b3e10045``; undo leaves those alone
+    rather than guessing (see ``EncounterIntentDeleteStep``)."""
 
 
 class MemoryItemRow(Base):
@@ -870,6 +894,19 @@ class MemoryItemRow(Base):
     moments), or ``""`` (legacy / unjudged). The LumeGram feed collector
     skips ``private`` rows; recall in chat is unaffected. ``server_default``
     keeps legacy rows feed-eligible."""
+    player_knowledge: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+    )
+    """Disclosure ledger (KB5 of ``PLAYER_KNOWLEDGE_BOUNDARY_PLAN``) —
+    whether the *character* believes the player knows about this
+    memory: ``shared`` / ``private`` / ``disclosed``, or ``NULL`` for
+    legacy rows and any row a write station hasn't classified yet.
+    Nullable with no server default and zero backfill, unlike
+    ``audience`` above — see the migration docstring
+    (``z5s2n9q80051_memory_items_player_knowledge``) for why. The
+    application layer normalizes ``NULL`` to ``""`` at the
+    ``MemoryItem`` boundary; nothing downstream of the mapping layer
+    should read this column directly."""
 
 
 class MessagingAccountRow(Base):
@@ -1499,13 +1536,56 @@ class TurnJournalRow(Base):
         DateTime(timezone=True), nullable=False, index=True,
     )
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    """JSON blob holding the pre-turn snapshots (``prev_character_state``,
-    ``prev_goals``, ``prev_active_arc``, ``prev_daily_schedule``,
-    ``prev_active_arc_id``) and the post-turn id lists
-    (``added_memory_ids``, ``added_state_snapshot_ids``,
-    ``added_story_event_ids``). Kept as a single column because the
-    schema of the payload is tightly coupled to
-    ``turn_snapshot_codec`` and we don't query individual fields."""
+    """JSON blob holding the pre-turn snapshots and the turn's identity.
+
+    Today: ``prev_character_state``, ``prev_goals``, ``prev_active_arc``,
+    ``prev_daily_schedule``, ``had_active_arc``, ``prev_open_follow_ups``,
+    ``prev_address_preference``, ``prev_scene_session`` and
+    ``turn_record_id``. Kept as a single column precisely so this list
+    can grow without a migration — the payload's shape is owned by
+    ``turn_snapshot_codec`` / ``turn_journal_snapshots``, and no query
+    ever filters on a field inside it.
+
+    (An earlier version of this docstring also listed ``prev_active_arc_id``,
+    ``added_memory_ids``, ``added_state_snapshot_ids`` and
+    ``added_story_event_ids``. None of those were ever written: the
+    corresponding deletes are time-window based, keyed off
+    ``turn_started_at``.)"""
+
+
+class UndoneTurnRow(Base):
+    """Tombstone for a turn that was undone — see the ``UndoneTurn`` entity.
+
+    Deliberately **not** a column on ``turn_journals``: the undo deletes
+    the journal row as its final step, and this marker has to outlive it
+    so an in-flight post-turn can still be told to stop. Keyed by
+    ``turn_record_id`` because that id is the only thing the background
+    post-turn carries.
+
+    No ``character_id`` column, on purpose. It would buy nothing —
+    nothing looks a tombstone up by character — while pulling an
+    operational, non-player-facing marker into the character
+    backup/erasure boundary registry, whose scan keys on exactly that
+    column name. The cascade to ``conversations`` already cleans the
+    rows up when a conversation (or its character) is deleted, and the
+    GC sweep handles the rest.
+    """
+
+    __tablename__ = "undone_turns"
+
+    turn_record_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    undone_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True,
+    )
+    """Indexed because the GC sweep's only predicate is ``undone_at <
+    cutoff``; without it the sweep degrades into a full scan of a table
+    that only ever grows between sweeps."""
 
 
 class FeedPostRow(Base):
@@ -1567,6 +1647,13 @@ class FeedPostRow(Base):
     reactions_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    """When the player actually saw this post (KB11 of
+    ``PLAYER_KNOWLEDGE_BOUNDARY_PLAN``). ``NULL`` = never viewed (or a
+    pre-migration existing row — zero backfill, D7 of that plan).
+    Single-user world: one reader, one timestamp, no views table."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True,
     )
@@ -1813,6 +1900,30 @@ class PendingFollowUpRow(Base):
     )
     """Natural-language description of what the character promised to do
     at ``scheduled_for``. Empty string for ``kind=busy_defer`` rows."""
+    turn_record_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True,
+    )
+    """The turn that wrote this row, for turn-undo to delete by (TU4).
+
+    Set only on ``kind=scheduled_promise`` rows: those are written by the
+    **background** post-turn, so the turn's own time window cannot name
+    them without racing the writer in both directions. ``NULL`` on a
+    busy-defer row is correct and permanent — that branch runs no
+    post-turn and mints no turn record, and its row is written inline
+    during the turn, which is the one case the window is exact for.
+    ``NULL`` on a promise row means it predates migration
+    ``t0h6b3e10045``; undo falls back to the window for those alone."""
+    honesty_park_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    """How many times the HV1 honesty gate withheld this row's composed
+    reply because the model re-claimed an unsupported outcome (F1).
+
+    Persisted rather than kept in process memory because the retry budget
+    has to survive the thing it is bounding: the release runs on whichever
+    worker claimed the job, and a restart or a re-lease would otherwise
+    reset the count and make the ceiling unreachable. Judge-outage parks
+    are NOT counted here — see the entity field's docstring."""
 
 
 class OperatorProfileFieldRow(Base):
@@ -2163,6 +2274,91 @@ class PlayerPersonaNoteRow(Base):
     )
     operator_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     note: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
+class PlayerIdentityCardRow(Base):
+    """玩家身分卡 — a named, reusable copy of the creation intake (IC series).
+
+    Operator-level, **not** character-level: there is deliberately no
+    ``character_id`` here. A card is a template the player reuses across
+    characters, so binding it to one would both misstate its lifetime and
+    pull the player's whole card library into that character's
+    ``.lumebackup`` (the character-boundary registry classifies tables by
+    exactly that column).
+
+    ``(operator_id, name)`` is unique — the name is how the player finds
+    the card again, so two cards called 「上班族的我」 would make the
+    picker unusable. Re-saving under an existing name is an overwrite of
+    that row, not a second one.
+    """
+
+    __tablename__ = "player_identity_cards"
+    __table_args__ = (
+        UniqueConstraint(
+            "operator_id", "name", name="uq_player_identity_cards_operator_name",
+        ),
+        Index("ix_player_identity_cards_operator", "operator_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    operator_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("operator_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    # The eleven creation-intake fields, column-for-column with
+    # ``character_operator_relationship_seeds`` so applying a card is a
+    # straight copy with no shape translation.
+    relationship_label: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    known_context: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    living_arrangement: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    user_address_name: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    character_address_name: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    tone_distance: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    familiarity_boundary: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    schedule_involvement_policy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="none", server_default="none",
+    )
+    proactive_permission: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    proactive_cadence_hint: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    user_profile_notes: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+
+    persona_note: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    """The player's own 人設 (PP series). Stored here as template text;
+    applying a card writes it through the existing per-character
+    ``player_persona_notes`` endpoint rather than into that table
+    directly."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )
@@ -3296,3 +3492,239 @@ class StorySceneSessionRow(Base):
         String(length=16), nullable=True,
     )
     operator_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DialogueCheckpointRow(Base):
+    """The rolling dialogue summary for one (character, operator) pair.
+
+    One row per pair, so the primary key *is* the pair — there is no
+    surrogate id to get out of sync with it and no way for a bug to
+    leave two live checkpoints for the same conversation partner.
+
+    Keyed on the operator rather than the conversation on purpose: the
+    unified timeline the summary is built from already merges web /
+    Telegram / LINE threads (``recent_messages_for_character``), so a
+    per-conversation checkpoint would summarise a third of the story
+    three times over.
+    """
+
+    __tablename__ = "dialogue_checkpoints"
+
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    operator_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    summary_text: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    covers_until_message_key: Mapped[str] = mapped_column(
+        String(64), nullable=False,
+    )
+    """Content fingerprint of the newest absorbed message — **not a row
+    id**. The domain ``Message`` exposes none, so the boundary is named
+    by a digest of (role, created_at, content); see
+    ``domain/entities/dialogue_checkpoint.checkpoint_cursor_key``. It
+    doubles as the compare-and-swap token: a hosted replica writes only
+    while this column still holds the value it read."""
+
+    covers_until_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    """Timestamp of that same message. The actual ordering cursor — the
+    key above only breaks ties within one instant."""
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    model: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="", server_default="",
+    )
+    """Which model produced ``summary_text``. Audit only; never read by
+    the runtime."""
+
+    stale: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    """True when the summary absorbed something later reversed. The next
+    update rebuilds from scratch instead of merging on top."""
+
+
+class PromptMaterialDigestRow(Base):
+    """The material digest one turn budgeted for the next (DIGEST_OFFPATH).
+
+    Derived data with a durable home. The digest used to be an aux-LLM
+    call made *during* every chat turn; it is now produced by the turn's
+    post-turn and read by the following turn. On hosted those two run in
+    different processes — the post-turn is a worker job, the read is an
+    API request — so process memory cannot carry it across and the handoff
+    has to be a row.
+
+    One row per ``(character, operator)``, and the pair *is* the primary
+    key: there is no surrogate id, so nothing can leave two live digests
+    for one relationship. The same shape (and the same reasoning) as
+    ``dialogue_checkpoints``.
+
+    **Not part of a character backup.** Every column here is rebuildable
+    from rows the backup already carries — one post-turn regenerates it —
+    and a stale digest restored beside fresh source material would be
+    strictly worse than no digest at all, which is a fully supported
+    render. It is registered in the character-backup registry as
+    ``EXCLUDE_RUNTIME`` to say exactly that; classification is mandatory
+    for any table with a ``character_id``, and the registry is what makes
+    the reason reviewable rather than implicit.
+
+    That same registration is also what deletes these rows when a
+    character is deleted: ``EXCLUDE_RUNTIME`` defaults to
+    ``DeletePolicy.PURGE``, and ``SACharacterDataEraser`` emits an
+    explicit ``DELETE`` per registered table. The ``ON DELETE CASCADE``
+    below is a schema-level backstop, not the mechanism — the engine
+    never issues ``PRAGMA foreign_keys=ON``, so on the SQLite path the
+    cascade does not fire at all and the registry-driven delete is the
+    only thing that runs.
+    """
+
+    __tablename__ = "prompt_material_digests"
+
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    operator_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content_tolerance: Mapped[str] = mapped_column(String(32), nullable=False)
+    """The tolerance the bullets were generated to. A reader rendering for
+    a different one treats the row as absent — an NSFW-mode digest handed
+    to a normal-mode prompt would walk content across the boundary the
+    tolerance exists to hold."""
+
+    digest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    """JSON-encoded :class:`PromptMaterialDigest` — ``bullets`` plus the
+    ``digest_metadata`` the turn record reports. JSON text rather than a
+    JSON column for the same portability reason as the rest of this file:
+    the unit tests run the very same repository on SQLite."""
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    """When the post-turn wrote it. The read side refuses rows older than
+    its max-age — a row never expires on its own, and a player returning
+    after a month must not be told their month-old material is current."""
+
+
+class LineReactivationCampaignRow(Base):
+    """One admin-triggered LINE reactivation run (LR series).
+
+    The operator's action, not any character's data: actor, when, and how
+    many characters were selected. It outlives every character in it, and
+    carries no character reference of its own — which is exactly why the
+    per-character outcomes live in the sibling item table below.
+    """
+
+    __tablename__ = "line_reactivation_campaigns"
+
+    campaign_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    """Generated by the admin console (UUID) so a lost response can be
+    retried onto the same ledger row instead of starting a second run
+    (D5). Core never mints one."""
+
+    actor: Mapped[str] = mapped_column(String(320), nullable=False)
+    """The admin identity the user service resolved — never a value the
+    browser sent. Column is e-mail sized."""
+
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="running", server_default="running",
+    )
+    """``running`` | ``completed``. A campaign whose process died stays
+    ``running``; re-POSTing the same id resumes its pending items."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    total: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    """Size of the selected set, stamped at creation. Kept alongside the
+    item rows rather than derived from them so the report can say
+    ``done/total`` without counting, and so a resume can compare the
+    selection it was handed against the one the campaign was created
+    with."""
+
+    __table_args__ = (
+        Index("ix_line_reactivation_campaigns_created", "created_at"),
+    )
+
+
+class LineReactivationCampaignItemRow(Base):
+    """One character's slot in a reactivation campaign (LR series).
+
+    ``(campaign_id, character_id)`` **is** the primary key — per-item
+    idempotency is therefore a schema property, not a runner convention:
+    a resumed run cannot produce a second attempt row for a character
+    that already has one.
+
+    ``outcome IS NULL`` is the pending marker. The runner writes the
+    outcome (a ``ProactiveOutcome`` value) and ``attempted_at`` together,
+    so "attempted" and "has an outcome" can never disagree.
+
+    ``claimed_at`` is the cross-replica send fence: a runner wins a
+    leased claim on the row *before* it calls the dispatcher, so two API
+    replicas handed the same campaign cannot both message one player.
+    The primary key alone only fences the write, which happens after the
+    message is already out.
+
+    **Not part of a character backup.** It is a record of what an
+    operator did, keyed on a campaign that no backup carries; restoring
+    it into another deployment would assert an admin action that never
+    happened there. Registered ``EXCLUDE_RUNTIME`` in the
+    character-backup registry, which is also what purges these rows when
+    the character is deleted — the ``ON DELETE CASCADE`` below is a
+    schema-level backstop only (the engine never sets ``PRAGMA
+    foreign_keys=ON``, so on SQLite it does not fire at all).
+    """
+
+    __tablename__ = "line_reactivation_campaign_items"
+
+    campaign_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("line_reactivation_campaigns.campaign_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    character_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("characters.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    outcome: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Human-readable amplification of ``outcome`` for the report (the
+    gate that blocked it, the transport error). Never parsed."""
+
+    message_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The body the character actually sent, verbatim and unclipped.
+
+    The operator's workflow is to fire a small batch, read what was said,
+    and only then release the rest — a judgement ``outcome`` cannot
+    support. Non-null only for ``outcome = 'sent'``: a body that never
+    reached anyone is not evidence of how the recall reads."""
+
+    attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    """When a runner took the leased claim on this row. Never reported —
+    to a reader a claimed-but-unstamped row is simply still pending."""
+
+    __table_args__ = (
+        Index(
+            "ix_line_reactivation_campaign_items_pending",
+            "campaign_id",
+            "outcome",
+        ),
+    )

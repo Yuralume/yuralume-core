@@ -4,6 +4,7 @@ import {
   buildInitialRelationshipPayload,
   emptyInitialRelationshipEditForm,
   emptyInitialRelationshipForm,
+  newCharacterInitialRelationshipForm,
   splitList,
   type InitialRelationshipEditForm,
 } from '@/composables/useInitialRelationshipForm'
@@ -54,6 +55,55 @@ describe('initial relationship form helpers', () => {
       life_goals: ['整理作品集', '練習日文'],
     })
     expect(splitList('A, B，C\nD')).toEqual(['A', 'B', 'C', 'D'])
+  })
+})
+
+// ----------------------------------------------------------------------
+// TR2-B: 「可以主動找我」在創角流程預設打開（opt-out），但只在創角流程。
+// ----------------------------------------------------------------------
+
+describe('create-time initial relationship defaults', () => {
+  it('pre-checks the proactive permission for a new character', () => {
+    expect(newCharacterInitialRelationshipForm().proactive_permission).toBe(true)
+  })
+
+  it('sends the permission even when the player fills in nothing else', () => {
+    // 這是預設開的整個重點：什麼都沒填也要送出 seed，否則翻預設等於沒翻。
+    expect(buildInitialRelationshipPayload(newCharacterInitialRelationshipForm()))
+      .toMatchObject({ proactive_permission: true, confirmed_by_user: true })
+  })
+
+  it('writes false when the player unchecks it', () => {
+    const form = newCharacterInitialRelationshipForm()
+    form.proactive_permission = false
+
+    // 全空 + 取消勾選 ⇒ 完全沒有 seed，跟翻預設前的「什麼都沒設定」一樣。
+    expect(buildInitialRelationshipPayload(form)).toBeNull()
+  })
+
+  it('writes false alongside the rest when the player unchecks it but fills the form', () => {
+    const form = newCharacterInitialRelationshipForm()
+    form.proactive_permission = false
+    form.relationship_label = '第一次見面'
+
+    expect(buildInitialRelationshipPayload(form)).toMatchObject({
+      relationship_label: '第一次見面',
+      proactive_permission: false,
+    })
+  })
+
+  it('leaves the neutral empty form alone so existing seeds are never backfilled', () => {
+    // 後編輯路徑（IR2）載入不到 seed 時用的是這份；被創角預設污染就等於
+    // 存量角色被回填成「允許」，那是拍板紅線。
+    expect(emptyInitialRelationshipForm().proactive_permission).toBe(false)
+    expect(emptyInitialRelationshipEditForm().proactive_permission).toBe(false)
+  })
+
+  it('only differs from the empty form by the proactive permission', () => {
+    expect(newCharacterInitialRelationshipForm()).toEqual({
+      ...emptyInitialRelationshipForm(),
+      proactive_permission: true,
+    })
   })
 })
 

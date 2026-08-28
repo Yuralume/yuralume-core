@@ -430,6 +430,7 @@ onMounted(refresh)
 }
 .users-admin__card-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
   gap: var(--space-2);
@@ -454,6 +455,7 @@ onMounted(refresh)
 .users-admin__card-actions,
 .users-admin__reset-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
   margin-top: var(--space-3);
 }

@@ -199,6 +199,7 @@ def test_schedule_records_round_trip() -> None:
         date="2026-08-05",
         generated_at=_NOW,
         is_planned=True,
+        manually_adjusted=False,
         weather_vet_activity_id=None,
         weather_vet_condition=None,
     )

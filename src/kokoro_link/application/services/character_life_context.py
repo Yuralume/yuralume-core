@@ -134,7 +134,7 @@ class CharacterLifeContextBuilder:
                 ambient_reference=ambient_reference or character,
             ),
             operator_dialogue_summary=await self._operator_dialogue_summary(
-                character,
+                character, now=moment, local_tz=tz,
             ),
         )
 
@@ -360,7 +360,9 @@ class CharacterLifeContextBuilder:
             )
             return None
 
-    async def _operator_dialogue_summary(self, character: Character) -> str:
+    async def _operator_dialogue_summary(
+        self, character: Character, *, now: datetime, local_tz: tzinfo,
+    ) -> str:
         if self._conversations is None or self._dialogue_summarizer is None:
             return ""
         try:
@@ -383,7 +385,10 @@ class CharacterLifeContextBuilder:
             return ""
         try:
             return await self._dialogue_summarizer.summarize(
-                character=character, messages=messages,
+                character=character,
+                messages=messages,
+                now=now,
+                local_tz=local_tz,
             )
         except Exception:
             _LOGGER.exception(

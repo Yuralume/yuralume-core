@@ -17,11 +17,9 @@ pass.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections.abc import Sequence
-from typing import Any
 
 from kokoro_link.application.services.fusion_character_brief import (
     CharacterBrief,
@@ -44,6 +42,11 @@ from kokoro_link.domain.value_objects.drama_critique import (
     SEVERITY_CLEAN,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import (
+    extract_object_outcome,
+    first_region_is_array,
+    log_parse_outcome,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -185,10 +188,26 @@ def _parse_critique(
     if not raw:
         return None
     cleaned = _FENCE_RE.sub("", raw).strip().rstrip("`")
-    try:
-        obj: Any = json.loads(cleaned)
-    except json.JSONDecodeError:
+    # Old behaviour, preserved: the old parser was a whole-string
+    # ``json.loads`` only. When that succeeded with a non-dict value
+    # (the model wrapped its verdict in ``[...]``), the isinstance
+    # check right below discarded it — a balanced-scan extractor must
+    # not dig past that value for a plausible-looking nested object and
+    # smuggle a fragment through the very check meant to reject it.
+    #
+    # FX1/DH-2: that guard is asked structurally now. Spelled as "the
+    # whole reply decodes and isn't a dict" it needed the *entire*
+    # string to parse, so the one thing models actually do — close the
+    # array, then add a closing remark — switched it off completely.
+    if first_region_is_array(cleaned):
         return None
+    # DH2-services: truncation repair is on — the critic's prompt
+    # unconditionally asks for JSON, so a reply chopped by max_tokens
+    # now still yields a verdict instead of silently falling back to
+    # ``DramaCritique.clean()``.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="branching_drama.critic")
+    obj = outcome.value
     if not isinstance(obj, dict):
         return None
     try:

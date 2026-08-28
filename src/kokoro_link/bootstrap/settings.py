@@ -474,8 +474,10 @@ class WorldEventSettings:
 class AutoConsolidationSettings:
     """Controls for the post-turn auto-consolidation trigger.
 
-    Disabled by default on ``fake`` provider because the null consolidator
-    can't actually merge anything, and enabling would just spin cycles.
+    Enabled by default everywhere: whether a merge can actually run is a
+    per-call, DB-routing-aware question (``LLMMemoryConsolidator.merge``
+    short-circuits on ``is_fake``), and a truly fake route degrades to
+    the decay-only pipeline rather than spinning LLM cycles.
     """
 
     enabled: bool = True
@@ -749,6 +751,164 @@ class PromptQualitySettings:
                         os.getenv("KOKORO_REPLY_QUALITY_SIMILARITY_THRESHOLD"),
                         default=0.88,
                     ),
+                ),
+            ),
+        )
+
+
+MINIMUM_DIALOGUE_WINDOW_MESSAGES = 8
+"""Floor for ``DialogueCheckpointSettings.window_messages``.
+
+Eight because that is the **pre-DH3 window**
+(``chat_service._RECENT_MESSAGE_LIMIT``): turning the checkpoint on is
+allowed to widen what the prompt loads, never to narrow it below what
+the path it replaces had. Below this floor nothing fails loudly, and
+which way it fails silently depends on the number:
+
+* at or under the raw tail (three messages), the middle band is empty
+  on every turn — no checkpoint is ever written and the feature is
+  inert while looking perfectly configured;
+* just above it, the pressure backstop's margin (three more) is already
+  spent, so a merge fires on essentially *every* turn: the per-turn LLM
+  call DH3 exists to remove, reinstated;
+* and at any value below the floor, the "no checkpoint yet" fallback
+  slices the last eight messages off a list that now holds fewer, so
+  the prompt runs on less history than it had before the flag was
+  turned on.
+
+Pinned against both constants it is derived from in
+``tests/unit/test_dialogue_checkpoint_settings.py`` — the numbers live in
+different layers and this one is only correct relative to them.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class DialogueCheckpointSettings:
+    """Cumulative dialogue checkpoint (DH3). **Off by default.**
+
+    While ``enabled`` is False the chat prompt's dialogue section is
+    byte-for-byte what it was before DH3: three raw turns, an every-turn
+    throwaway summary of turns 4-8, and nothing older. Nothing in this
+    dataclass is read on that path — not the window, not the budgets —
+    so a mis-set number cannot leak into the shipped behaviour.
+
+    The two token numbers are **estimates** (``llm_output.tokens``,
+    ±30%) used only to compare text against text. They are not context
+    limits and must not be treated as any.
+    """
+
+    enabled: bool = False
+    """``FEATURE_DIALOGUE_CHECKPOINT``. Off through the migration period
+    (D8): the read path is a deliberate behaviour change (last-good on
+    failure instead of falling back to the full raw list) and wants real
+    conversations behind a flag before it is anyone's default."""
+
+    window_messages: int = 30
+    """How many recent messages the prompt loads when the flag is on.
+
+    The pre-DH3 window is 8, and it is 8 because every message past the
+    third cost an LLM summarisation call *per turn*. With a persisted
+    checkpoint carrying the older material, that reason is gone and the
+    window can be as wide as the token budget below allows. Only the
+    chat prompt's own load uses this; the post-turn's prior-message
+    window stays at the module constant, since widening it would change
+    what the extractor sees for no benefit this ticket can demonstrate.
+    """
+
+    prompt_budget_tokens: int = 2400
+    """Estimated ceiling for the raw messages in the dialogue section.
+
+    Applied oldest-first: the middle band is dropped a message at a time
+    until it fits. The raw tail is exempt and always survives — a
+    budget that could eat the last three turns would make a long reply
+    from the character shorten its own context.
+    """
+
+    backlog_trigger_tokens: int = 400
+    """Estimated backlog size that makes a merge worth its LLM call.
+
+    **This number has a hard ceiling above which it means nothing**, and
+    the ceiling is set by the two fields above it. The backlog is the
+    middle band, the middle band is at most
+    ``window_messages - 3`` rows (the raw tail is never in it), and at
+    this window that is 27 rows. Twenty-seven rows of ordinary
+    Traditional-Chinese chat — a message is typically 20-40 estimated
+    tokens, not the 40-120 an earlier draft of this comment assumed —
+    weigh something like 500-1100 tokens. A trigger above that is not
+    conservative, it is **unsatisfiable**: the backlog cannot grow to
+    reach it, so no checkpoint is ever written and the feature does
+    nothing at all while appearing to be configured. The 1500 this field
+    originally shipped with was exactly that.
+
+    400 sits below the ceiling with room to spare, which means a merge
+    roughly every 10-20 messages — a call on a minority of turns rather
+    than a summarisation on every one, and a coverage boundary that
+    reaches each message well before it scrolls out of the window.
+
+    Setting it too high is no longer *silent*, whatever the number: the
+    updater also merges when the middle band approaches what the window
+    can hold, and logs that it had to. But the backstop exists to stop
+    data loss, not to excuse a misconfigured trigger — a deployment
+    where every merge is pressure-triggered is one where this number
+    wants lowering.
+
+    Still provisional, and still wants calibration against real
+    conversations; what it is no longer is arithmetically impossible.
+    """
+
+    def __post_init__(self) -> None:
+        """Raise a too-narrow window to the floor, loudly.
+
+        In ``__post_init__`` rather than in :meth:`from_env` because a
+        window below :data:`MINIMUM_DIALOGUE_WINDOW_MESSAGES` is not a
+        parsing accident, it is a configuration that makes the feature
+        silently inert — and it arrives by direct construction (tests,
+        embedded callers) exactly as easily as by environment variable.
+        Clamping in only one of the two constructors would leave the
+        other free to build the broken value.
+        """
+        if self.window_messages >= MINIMUM_DIALOGUE_WINDOW_MESSAGES:
+            return
+        _LOGGER.warning(
+            "KOKORO_DIALOGUE_CHECKPOINT_WINDOW_MESSAGES=%d is below the "
+            "floor of %d and has been raised to it. A window that narrow "
+            "leaves no usable room behind the raw tail — the checkpoint "
+            "either never advances or merges on every single turn — and "
+            "it shrinks the prompt's history below what it was before "
+            "the feature was switched on.",
+            self.window_messages, MINIMUM_DIALOGUE_WINDOW_MESSAGES,
+        )
+        object.__setattr__(
+            self, "window_messages", MINIMUM_DIALOGUE_WINDOW_MESSAGES,
+        )
+
+    @classmethod
+    def from_env(cls) -> "DialogueCheckpointSettings":
+        return cls(
+            enabled=_parse_bool(
+                os.getenv("KOKORO_DIALOGUE_CHECKPOINT_ENABLED"),
+                default=False,
+            ),
+            window_messages=_parse_int(
+                os.getenv("KOKORO_DIALOGUE_CHECKPOINT_WINDOW_MESSAGES"),
+                default=30,
+            ),
+            prompt_budget_tokens=max(
+                1,
+                _parse_int(
+                    os.getenv(
+                        "KOKORO_DIALOGUE_CHECKPOINT_PROMPT_BUDGET_TOKENS",
+                    ),
+                    default=2400,
+                ),
+            ),
+            backlog_trigger_tokens=max(
+                1,
+                _parse_int(
+                    os.getenv(
+                        "KOKORO_DIALOGUE_CHECKPOINT_BACKLOG_TRIGGER_TOKENS",
+                    ),
+                    default=400,
                 ),
             ),
         )
@@ -1092,6 +1252,9 @@ class AppSettings:
     persona: PersonaSettings = field(default_factory=PersonaSettings)
     humanization: HumanizationSettings = field(default_factory=HumanizationSettings)
     prompt_quality: PromptQualitySettings = field(default_factory=PromptQualitySettings)
+    dialogue_checkpoint: DialogueCheckpointSettings = field(
+        default_factory=DialogueCheckpointSettings,
+    )
     memoir: MemoirSettings = field(default_factory=MemoirSettings)
     public_base_url: str = ""
     """Externally-reachable URL of this backend (no trailing slash).
@@ -1467,7 +1630,7 @@ class AppSettings:
             ),
         )
 
-        auto_consolidation = _load_auto_consolidation_settings(default_provider_id)
+        auto_consolidation = _load_auto_consolidation_settings()
         world_events = _load_world_event_settings()
         persona = _load_persona_settings()
         calendar = CalendarSettings(
@@ -1687,6 +1850,7 @@ class AppSettings:
             persona=persona,
             humanization=HumanizationSettings.from_env(),
             prompt_quality=PromptQualitySettings.from_env(),
+            dialogue_checkpoint=DialogueCheckpointSettings.from_env(),
             memoir=MemoirSettings.from_env(),
             public_base_url=public_base_url,
             uploads_dir=uploads_dir,
@@ -2217,13 +2381,21 @@ def _clamp_hour(value: int) -> int:
     return value
 
 
-def _load_auto_consolidation_settings(
-    default_provider_id: str,
-) -> AutoConsolidationSettings:
-    default_enabled = default_provider_id != "fake"
+def _load_auto_consolidation_settings() -> AutoConsolidationSettings:
+    # Unconditionally on. "Is there a real model behind this" is NOT a
+    # settings-load fact: real providers are DB-backed runtime settings
+    # registered after the container is built, so on a DB-routed
+    # self-host the static ``default_provider_id`` is still "fake" — the
+    # old ``!= "fake"`` default silently disabled the whole memory
+    # decay + consolidation pipeline on exactly those deployments (same
+    # bug family as the quality-gate fix beside ``novelty_gate`` in
+    # ``container.py``). ``LLMMemoryConsolidator.merge`` answers the
+    # question itself, per call, via ``is_fake``: a truly fake route
+    # skips the merge and the run falls through to decay-only, which is
+    # that pipeline's documented fallback.
     enabled = _parse_bool(
         os.getenv("KOKORO_AUTO_CONSOLIDATION_ENABLED"),
-        default=default_enabled,
+        default=True,
     )
     threshold = _parse_int(
         os.getenv("KOKORO_AUTO_CONSOLIDATION_THRESHOLD"), default=200,

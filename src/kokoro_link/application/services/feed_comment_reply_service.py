@@ -73,6 +73,11 @@ from kokoro_link.application.services.feed_event_bus import (
 )
 from kokoro_link.application.services.memory_embedding import attach_embeddings
 from kokoro_link.application.services.notification_service import NotificationService
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    length_overrun_lines,
+)
 from kokoro_link.application.services.schedule_service import ScheduleService
 from kokoro_link.contracts.repositories import CharacterRepositoryPort
 from kokoro_link.contracts.embedder import EmbedderError, EmbedderPort
@@ -85,6 +90,7 @@ from kokoro_link.contracts.feed_comment_reply import (
     FeedCommentReplyInput,
 )
 from kokoro_link.contracts.memory import MemoryRepositoryPort
+from kokoro_link.contracts.novelty_gate import NoveltyGateContext
 from kokoro_link.contracts.visible_slots import (
     SLOT_KIND_FEED_REPLY,
     VisibleSlotPort,
@@ -95,7 +101,10 @@ from kokoro_link.domain.entities.feed_comment import (
     FeedComment,
 )
 from kokoro_link.domain.entities.feed_post import FeedPost
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.value_objects.memory_kind import MemoryKind
 from kokoro_link.domain.value_objects.timezone import timezone_for_id
@@ -137,6 +146,21 @@ default rhythm (3 posts/day) × 2 — replies are cheaper to author than
 posts (no image, shorter prompt), but we still want a ceiling so a
 chatty user can't drain the LLM budget on LumeGram alone."""
 
+_REPLY_CAP_CHARS = 180
+"""Hard length ceiling enforced *after* the output-quality gate has
+reviewed the draft (QG3). Mirrors ``llm_comment_reply.MAX_REPLY_CHARS``
+— the target length the prompt states — but the two constants live in
+different layers on purpose: this service works against
+``FeedCommentReplyComposerPort`` generically and must not reach into a
+specific adapter's internals to learn the cap. Change the target
+length in both places together.
+
+Applied unconditionally, including when no gate is wired, so the
+observable output (what actually gets persisted) is unchanged from
+before QG3 in that configuration — only the truncation's *position*
+moved, from inside the composer to here, so the gate gets to see the
+overrun before anything is cut."""
+
 _BUSY_THRESHOLD = 0.85
 """Schedule activity busy_score at or above which the character won't
 reply this tick. Mirrors the existing prompt-tone heuristic — at this
@@ -169,6 +193,17 @@ class FeedCommentReplyService:
         notification_service: NotificationService | None = None,
         visible_slot_port: VisibleSlotPort | None = None,
         player_persona_note_repository=None,  # noqa: ANN001 - PlayerPersonaNoteRepositoryPort | None
+        # QG0 — the shared review→regenerate→dispose band, taken now so the
+        # container wiring lands once. This is the one player-visible
+        # surface that has never had *any* quality gate; QG3 turns it on
+        # through this orchestrator alone, which is why no separate gate
+        # port or register profiler is threaded in beside it.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
+        # RC — the deployment's switches for that band, named as every
+        # other adopting surface names them. Defaults reproduce exactly
+        # what QG3 hard-coded, so an unwired caller is unchanged.
+        reply_quality_gate_enabled: bool = True,
+        reply_quality_gate_max_retries: int = 1,
     ) -> None:
         self._posts = post_repository
         self._comments = comment_repository
@@ -201,6 +236,13 @@ class FeedCommentReplyService:
         # talking *to this player*, so the declaration is staging here in
         # a way it is not on the post composer, which addresses nobody.
         self._player_persona_note_repository = player_persona_note_repository
+        self._output_quality_orchestrator = output_quality_orchestrator
+        # RC. The batch's rollback switch does not remove the orchestrator
+        # — it hands it a null gate that passes everything — so without
+        # these the "off" position still spent a review per reply and
+        # recorded a ``pass`` for it on the scrape.
+        self._quality_gate_enabled = bool(reply_quality_gate_enabled)
+        self._quality_gate_max_retries = max(0, int(reply_quality_gate_max_retries))
 
     async def tick(
         self,
@@ -456,6 +498,62 @@ class FeedCommentReplyService:
         candidate: "_PostCandidate",
     ) -> str:
         operator_language = await self._resolve_operator_language(character)
+        persona_note = await self._load_player_persona_note(character)
+        raw = await self._compose_once(
+            character, candidate, operator_language, persona_note,
+        )
+        if not raw:
+            return ""
+
+        orchestrator = self._output_quality_orchestrator
+        if orchestrator is None:
+            # No gate wired — behaviour must stay exactly what it was
+            # before QG3, just with the cap applied here instead of
+            # inside the composer.
+            return _cap_reply(raw)
+
+        async def regenerate(feedback: str) -> str | None:
+            retry = await self._compose_once(
+                character, candidate, operator_language, persona_note,
+                quality_feedback=feedback,
+            )
+            return retry or None
+
+        def context_for(reply_text: str) -> NoveltyGateContext:
+            return self._reply_gate_context(
+                character, candidate, operator_language, reply_text,
+            )
+
+        review = await orchestrator.review(
+            raw,
+            surface="feed_comment",
+            context_for=context_for,
+            regenerate=regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=character,
+            max_retries=self._quality_gate_max_retries,
+            enabled=self._quality_gate_enabled,
+        )
+        if review.skipped:
+            # A hard defect survived its regeneration — nothing ships
+            # this tick. The empty-string return is the same "skip"
+            # signal ``tick()`` already understood before QG3.
+            return ""
+        return _cap_reply(review.final or "")
+
+    async def _compose_once(
+        self,
+        character: Character,
+        candidate: "_PostCandidate",
+        operator_language: str,
+        persona_note: str,
+        *,
+        quality_feedback: str = "",
+    ) -> str:
+        """One LLM round trip. ``quality_feedback`` is empty on the
+        ordinary compose and carries the gate's verdict feedback on the
+        orchestrator's regeneration call — see
+        ``FeedCommentReplyInput.quality_feedback``."""
         try:
             output = await self._composer.compose(FeedCommentReplyInput(
                 character=character,
@@ -463,9 +561,8 @@ class FeedCommentReplyService:
                 user_comments=tuple(candidate.unanswered),
                 busy_hint=self._build_busy_hint(character),
                 operator_primary_language=operator_language,
-                player_persona_note=await self._load_player_persona_note(
-                    character,
-                ),
+                player_persona_note=persona_note,
+                quality_feedback=quality_feedback,
             ))
         except Exception:
             _LOGGER.exception(
@@ -473,8 +570,42 @@ class FeedCommentReplyService:
                 character.id, candidate.post.id,
             )
             return ""
-        body = (output.content_text or "").strip()
-        return body
+        return (output.content_text or "").strip()
+
+    def _reply_gate_context(
+        self,
+        character: Character,
+        candidate: "_PostCandidate",
+        operator_language: str,
+        reply_text: str,
+    ) -> NoveltyGateContext:
+        """QG3's gate context, built entirely from what ``_compose_once``
+        already sent the composer — no extra repository query. The post
+        body and every unanswered comment but the newest count as
+        ``known_material`` (context already established in this thread);
+        the newest unanswered comment is what the reply is actually
+        answering, so it becomes ``latest_user_message``."""
+        unanswered = candidate.unanswered
+        latest_message = unanswered[-1].content_text if unanswered else ""
+        known_material = tuple(
+            text for text in (
+                candidate.post.content_text,
+                *(c.content_text for c in unanswered[:-1]),
+            )
+            if text and text.strip()
+        )
+        operator_id = getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID
+        return NoveltyGateContext(
+            character_id=character.id,
+            operator_id=operator_id,
+            response_text=reply_text,
+            known_material=known_material,
+            latest_user_message=latest_message,
+            operator_primary_language=operator_language,
+            mechanical_evidence_lines=length_overrun_lines(
+                reply_text, _REPLY_CAP_CHARS,
+            ),
+        )
 
     async def _load_player_persona_note(self, character: Character) -> str:
         """The player's declared identity for this pair, or nothing.
@@ -741,6 +872,9 @@ def _build_reply_memory(
         salience=_REPLY_SALIENCE,
         tags=tags,
         created_at=reply.created_at,
+        # KB6: a two-sided exchange the player started — their comment
+        # is the trigger and the reply lands where they will read it.
+        player_knowledge=PLAYER_KNOWLEDGE_SHARED,
     )
 
 
@@ -749,3 +883,14 @@ def _shorten(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(1, limit - 1)] + "…"
+
+
+def _cap_reply(text: str) -> str:
+    """QG3's post-gate safety net (D6): the same "trim to cap" behaviour
+    ``llm_comment_reply._normalize`` used to apply unconditionally,
+    moved here so it runs after the gate has seen — and can act on —
+    the untruncated draft. If the model produced something coherent
+    we'd rather keep the gist than drop the whole reply."""
+    if len(text) <= _REPLY_CAP_CHARS:
+        return text
+    return text[: _REPLY_CAP_CHARS - 1].rstrip() + "…"

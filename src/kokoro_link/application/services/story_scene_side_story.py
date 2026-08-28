@@ -280,6 +280,12 @@ class SideStorySceneMaterialProvider(StorySceneMaterialProviderPort):
         if not messages:
             return ""
         try:
+            # ``now`` / ``local_tz`` deliberately omitted: this station is
+            # handed a civil ``today`` and never an instant or an operator
+            # zone, so it takes the summariser's fail-soft anchor (UTC
+            # clock, UTC zone). The relative 「約 N 分鐘前」 half stays
+            # exact either way — only the absolute clock is unlocalised —
+            # and a side-story scene reads the thread, not the wall clock.
             return (
                 await self._dialogue_summarizer.summarize(
                     character=character, messages=messages,

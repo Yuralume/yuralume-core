@@ -127,6 +127,7 @@ class PostTurnRunnerCallback(Protocol):
         persona_enabled: bool,
         content_mode: str,
         has_user_message: bool = True,
+        private_memory_ids: tuple[str, ...] = (),
         now: datetime | None = None,
     ) -> Mapping[str, Any]:
         ...
@@ -163,6 +164,7 @@ class PostTurnEnqueuer:
         persona_enabled: bool,
         content_mode: str,
         has_user_message: bool = True,
+        private_memory_ids: tuple[str, ...] = (),
         operator_id: str | None = None,
         tenant_id: str | None = None,
         now: datetime | None = None,
@@ -204,6 +206,17 @@ class PostTurnEnqueuer:
                 # line as this turn's input. Absent on jobs enqueued before
                 # SN1, where the handler's default (``True``) is correct.
                 "has_user_message": bool(has_user_message),
+                # KB8: the ``private`` memory ids this turn's reply prompt
+                # carried. Ids, not content — the §3.1 / §11 rail is about
+                # chat text and secrets, and the worker still re-reads
+                # every row it names. They cannot be re-derived worker-side
+                # because memory selection is a live ranked pick: re-running
+                # it later answers "what would be recalled now", not "what
+                # was recalled then". Absent on pre-KB8 jobs, where the
+                # handler's default (empty) correctly flips nothing.
+                "private_memory_ids": [
+                    str(item_id) for item_id in private_memory_ids if item_id
+                ],
             },
         )
         last_exc: Exception | None = None
@@ -283,6 +296,23 @@ class PostTurnEnqueuer:
         return datetime.now(timezone.utc)
 
 
+def _payload_ids(value: Any) -> tuple[str, ...]:
+    """Read an id list off a job payload, tolerating anything else.
+
+    A payload is JSON that has round-tripped through a queue row, so a
+    field can be absent (pre-KB8 job), null, or — after a bad write —
+    the wrong shape entirely. None of those is worth failing a job over
+    when the consequence of ignoring them is simply that this turn
+    discloses nothing.
+    """
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        item.strip() for item in value
+        if isinstance(item, str) and item.strip()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PostTurnHandlerResult:
     """Outcome of handling one post-turn job (observability / test assertions)."""
@@ -339,6 +369,7 @@ class PostTurnHandler:
             persona_enabled=persona_enabled,
             content_mode=content_mode,
             has_user_message=bool(payload.get("has_user_message", True)),
+            private_memory_ids=_payload_ids(payload.get("private_memory_ids")),
             now=resolved_now,
         )
         reason = str((result or {}).get("post_turn_skipped") or "executed")

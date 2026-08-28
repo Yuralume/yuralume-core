@@ -179,7 +179,12 @@ def test_second_admin_shares_installation_wide_byok(
     assert listing.status_code == 200
     assert "OpenAI prod" in [row["label"] for row in listing.json()]
 
-    # ...and can add his own.
+    # ...and can add his own. A second enabled openai/llm row needs its own
+    # ``connection_slug``: without one both rows resolve to the runtime id
+    # ``openai`` and the later sync would silently replace the earlier
+    # registration, so the save is refused (see
+    # tests/unit/test_provider_connection_slug.py). Distinct ids are what
+    # "installation-wide" means here — both admins' keys stay usable at once.
     bob_created = client.post(
         "/api/v1/admin/providers",
         headers=_auth(member_token),
@@ -187,7 +192,10 @@ def test_second_admin_shares_installation_wide_byok(
             "provider": "openai",
             "label": "OpenAI bob",
             "capabilities": ["llm"],
-            "config": {"default_model": "gpt-4o-mini"},
+            "config": {
+                "default_model": "gpt-4o-mini",
+                "connection_slug": "bob",
+            },
             "secret": {"api_key": "sk-bob-secret"},
         },
     )

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
+    format_datetime_ago_phrase,
+    format_elapsed_ago_label,
+    format_hours_days_label,
     render_current_time_fact_lines,
     render_subjective_time_topical_hint,
     time_of_day_hint,
@@ -102,3 +105,77 @@ def test_time_of_day_hint(hour: int, expected: str) -> None:
     assert time_of_day_hint(
         datetime(2026, 6, 20, hour, 0, tzinfo=ZoneInfo("Asia/Taipei")),
     ) == expected
+
+
+# ----------------------------------------------------------------------
+# SP2: shared "N 分鐘/小時/天前" formatters consolidated out of the
+# proactive decider, intention judge, dialogue feed-digest, emotion
+# section, busy follow-up composer, and world-event recall stations.
+# These pin the exact byte output each hand-rolled implementation
+# produced before consolidation.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hours, prefix, suffix, expected",
+    [
+        (2.0, "", "", "2.0 小時"),
+        (23.94, "", "", "23.9 小時"),
+        (24.0, "", "", "1.0 天"),
+        (72.5, "", "", "3.0 天"),
+        (5.0, "約 ", "", "約 5.0 小時"),
+        (48.0, "約 ", "", "約 2.0 天"),
+        (5.0, "", "前", "5.0 小時前"),
+        (48.0, "", "前", "2.0 天前"),
+    ],
+)
+def test_format_hours_days_label(
+    hours: float, prefix: str, suffix: str, expected: str,
+) -> None:
+    assert format_hours_days_label(hours, prefix=prefix, suffix=suffix) == expected
+
+
+@pytest.mark.parametrize(
+    "minutes, expected",
+    [
+        (0.4, "0 分鐘前"),
+        (5, "5 分鐘前"),
+        (59.5, "60 分鐘前"),  # rounds up to the minute, stays under the hour tier
+        (90, "1.5 小時前"),
+        (60 * 23.94, "23.9 小時前"),
+        (60 * 24, "1.0 天前"),
+        (60 * 72.5, "3.0 天前"),
+    ],
+)
+def test_format_elapsed_ago_label(minutes: float, expected: str) -> None:
+    assert format_elapsed_ago_label(minutes) == expected
+
+
+def test_format_datetime_ago_phrase_just_now_under_one_hour() -> None:
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    past = now - timedelta(minutes=30)
+    assert format_datetime_ago_phrase(past=past, now=now) == "剛剛"
+
+
+def test_format_datetime_ago_phrase_floors_hours_under_one_day() -> None:
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    past = now - timedelta(hours=5, minutes=59)
+    assert format_datetime_ago_phrase(past=past, now=now) == "約 5 小時前"
+
+
+def test_format_datetime_ago_phrase_floors_days_at_or_past_one_day() -> None:
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    past = now - timedelta(days=3, hours=23)
+    assert format_datetime_ago_phrase(past=past, now=now) == "3 天前"
+
+
+def test_format_datetime_ago_phrase_future_clock_skew_degrades_to_just_now() -> None:
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    future = now + timedelta(minutes=5)
+    assert format_datetime_ago_phrase(past=future, now=now) == "剛剛"
+
+
+def test_format_datetime_ago_phrase_reads_naive_input_as_utc() -> None:
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    naive_past = datetime(2026, 6, 20, 6, 0)  # no tzinfo
+    assert format_datetime_ago_phrase(past=naive_past, now=now) == "約 6 小時前"

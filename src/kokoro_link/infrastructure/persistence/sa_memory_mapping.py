@@ -46,6 +46,7 @@ def item_to_row(item: MemoryItem) -> MemoryItemRow:
         world_id=item.world_id,
         location=item.location,
         audience=item.audience or "",
+        player_knowledge=item.player_knowledge or None,
     )
 
 
@@ -73,6 +74,7 @@ def row_to_item(row: MemoryItemRow) -> MemoryItem:
         world_id=row.world_id,
         location=row.location,
         audience=row.audience or "",
+        player_knowledge=row.player_knowledge or "",
     )
 
 

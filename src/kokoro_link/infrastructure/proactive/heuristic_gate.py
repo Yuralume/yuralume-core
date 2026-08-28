@@ -22,12 +22,19 @@ Signals (all short-circuit, in order):
 5. Schedule-aware quiet period: if the character's current activity
    category reads like sleep / rest (or energy is very low), skip.
 
+Which of the five a given trigger is actually subject to is declared in
+:class:`TriggerGatePolicy` — see :data:`_TRIGGER_POLICIES`. Two triggers
+sit outside that table and short-circuit the whole battery above it
+(``PENDING_FOLLOW_UP`` / ``SCHEDULED_PROMISE``), because the user asked
+for those pushes by name.
+
 All of this is pure Python and returns in microseconds, so it's safe
 to run on every tick.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 
 from kokoro_link.contracts.proactive import GateVerdict, ProactiveGatePort
@@ -44,6 +51,63 @@ _LOW_ENERGY_THRESHOLD = 15
 _QUIET_HOUR_START = 0   # inclusive — 00:00 local
 _QUIET_HOUR_END = 7     # exclusive — 07:00 local
 """Window where proactive push is always blocked, even with no schedule."""
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerGatePolicy:
+    """Which of this gate's checks a given trigger is subject to.
+
+    Written as one flag per check rather than as a "bypass set" on
+    purpose: the interesting fact about a trigger is not *that* it skips
+    something, it is exactly **which** guards still hold, and a set of
+    names elsewhere in the file makes that a two-place lookup. Every flag
+    defaults to ``True``, so a trigger with no entry in
+    :data:`_TRIGGER_POLICIES` gets the full battery.
+    """
+
+    min_idle: bool = True
+    daily_limit: bool = True
+    cooldown: bool = True
+    quiet_hours: bool = True
+    quiet_activity: bool = True
+    low_energy: bool = True
+
+
+_DEFAULT_POLICY = TriggerGatePolicy()
+
+_ADMIN_REACTIVATION_POLICY = TriggerGatePolicy(
+    # An operator hand-picked this dormant character in the reactivation
+    # console (LR plan D3). Every throttle below exists to pace the
+    # *scheduler*; none of them describes a reason not to honour a human's
+    # explicit one-off selection.
+    min_idle=False,
+    # The daily limit budgets ambient chatter. A recall campaign is not
+    # ambient, and a character that happens to have used its budget today
+    # is precisely one the operator would still want called back.
+    daily_limit=False,
+    cooldown=False,
+    # Low energy / quiet activity are in-fiction rhythm, not player
+    # protection: the character being sleepy is not a reason to refuse a
+    # message a human decided to send.
+    low_energy=False,
+    quiet_activity=False,
+    # **Kept.** The one guard that protects the *player* rather than the
+    # cadence. The promise-fulfilment triggers waive this because the
+    # player asked for a 03:00 wake-up by name; nobody asked for a recall
+    # message, so the night floor still holds. Blocked rows land in the
+    # campaign report as ``gate_blocked`` and are not auto-retried (D6).
+    quiet_hours=True,
+)
+
+_TRIGGER_POLICIES: dict[ProactiveTrigger, TriggerGatePolicy] = {
+    ProactiveTrigger.ADMIN_REACTIVATION: _ADMIN_REACTIVATION_POLICY,
+}
+
+
+def policy_for(trigger: ProactiveTrigger) -> TriggerGatePolicy:
+    """The check policy for ``trigger`` — full battery unless declared."""
+
+    return _TRIGGER_POLICIES.get(trigger, _DEFAULT_POLICY)
 
 
 class HeuristicProactiveGate(ProactiveGatePort):
@@ -99,7 +163,13 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 reason=f"trigger={trigger.value} (promise-fulfilment bypass)",
             )
 
-        if idle_minutes is not None and idle_minutes < _MIN_IDLE_MINUTES:
+        policy = policy_for(trigger)
+
+        if (
+            policy.min_idle
+            and idle_minutes is not None
+            and idle_minutes < _MIN_IDLE_MINUTES
+        ):
             return GateVerdict(
                 passed=False,
                 reason=(
@@ -108,7 +178,7 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 ),
             )
 
-        if sent_today >= character.proactive_daily_limit:
+        if policy.daily_limit and sent_today >= character.proactive_daily_limit:
             return GateVerdict(
                 passed=False,
                 reason=(
@@ -124,7 +194,7 @@ class HeuristicProactiveGate(ProactiveGatePort):
         # yield when the character has an appointment to keep. The
         # exemption is spent (revisit_at cleared) by the dispatcher the
         # moment this check passes, so it cannot repeat next tick.
-        if last_attempt_at is not None and not cooldown_exempt:
+        if policy.cooldown and last_attempt_at is not None and not cooldown_exempt:
             elapsed = now - _ensure_aware(last_attempt_at)
             cooldown = timedelta(minutes=character.proactive_cooldown_minutes)
             if elapsed < cooldown:
@@ -138,7 +208,9 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 )
 
         local_hour = _local_hour(now, local_tz or self._local_tz)
-        if _is_quiet_hour(local_hour, self._quiet_start, self._quiet_end):
+        if policy.quiet_hours and _is_quiet_hour(
+            local_hour, self._quiet_start, self._quiet_end,
+        ):
             return GateVerdict(
                 passed=False,
                 reason=(
@@ -147,7 +219,7 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 ),
             )
 
-        if _is_quiet_activity(current_activity):
+        if policy.quiet_activity and _is_quiet_activity(current_activity):
             return GateVerdict(
                 passed=False,
                 reason=(
@@ -156,7 +228,7 @@ class HeuristicProactiveGate(ProactiveGatePort):
                 ),
             )
 
-        if character.state.energy <= _LOW_ENERGY_THRESHOLD:
+        if policy.low_energy and character.state.energy <= _LOW_ENERGY_THRESHOLD:
             return GateVerdict(
                 passed=False,
                 reason=f"energy {character.state.energy} below threshold",

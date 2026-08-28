@@ -13,12 +13,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from kokoro_link.application.services.routing_reasoning import (
+    parse_reasoning_override,
+    reasoning_pref_value,
+)
 from kokoro_link.application.services.scoped_preferences import (
     delete_user_preference,
     set_user_preference,
     user_preference_key,
 )
 from kokoro_link.contracts.clock import ClockPort, ensure_utc
+from kokoro_link.contracts.llm import ReasoningOverrides
 from kokoro_link.contracts.repositories import PreferencesRepositoryPort
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,7 +46,16 @@ class NsfwModeTargetError(ValueError):
 class NsfwModeTarget:
     llm_provider_id: str
     llm_model_id: str
-    image_profile_id: str
+    # ``None`` is the operator's explicit "no image generation while the
+    # mode is active" choice (stored as JSON null), not an unset value.
+    # Image resolution must treat it like the refuse-fallback path — an
+    # NSFW request must never route to a normal image profile.
+    image_profile_id: str | None
+    # Reasoning posture bound onto the NSFW LLM target while the reroute
+    # is in effect. ``None`` (including a stored target without the key)
+    # keeps the target connection's own reasoning defaults — the normal
+    # route's feature/group postures never ride onto the NSFW target.
+    reasoning: ReasoningOverrides | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +68,7 @@ class NsfwModeStatus:
     llm_provider_id: str | None = None
     llm_model_id: str | None = None
     image_profile_id: str | None = None
+    reasoning: ReasoningOverrides | None = None
 
     @property
     def target(self) -> NsfwModeTarget | None:
@@ -67,11 +82,11 @@ class NsfwModeStatus:
             return None
         assert self.llm_provider_id is not None
         assert self.llm_model_id is not None
-        assert self.image_profile_id is not None
         return NsfwModeTarget(
             llm_provider_id=self.llm_provider_id,
             llm_model_id=self.llm_model_id,
             image_profile_id=self.image_profile_id,
+            reasoning=self.reasoning,
         )
 
 
@@ -146,12 +161,14 @@ class NsfwModeService:
         *,
         llm_provider_id: str,
         llm_model_id: str,
-        image_profile_id: str,
+        image_profile_id: str | None,
+        reasoning: ReasoningOverrides | None = None,
     ) -> NsfwModeTarget:
         target = _target_or_raise(
             llm_provider_id=llm_provider_id,
             llm_model_id=llm_model_id,
             image_profile_id=image_profile_id,
+            reasoning=reasoning,
         )
         await self._preferences.set(
             NSFW_MODE_TARGET_PREFERENCE_KEY,
@@ -345,6 +362,9 @@ class NsfwModeService:
                 image_profile_id=(
                     configured_target.image_profile_id if configured_target else None
                 ),
+                reasoning=(
+                    configured_target.reasoning if configured_target else None
+                ),
             )
         last_activity_at = _parse_datetime(raw.get("last_activity_at"))
         expires_at = (
@@ -374,6 +394,9 @@ class NsfwModeService:
             image_profile_id=(
                 configured_target.image_profile_id if configured_target else None
             ),
+            reasoning=(
+                configured_target.reasoning if configured_target else None
+            ),
         )
 
 
@@ -381,20 +404,23 @@ def _target_or_raise(
     *,
     llm_provider_id: str,
     llm_model_id: str,
-    image_profile_id: str,
+    image_profile_id: str | None,
+    reasoning: ReasoningOverrides | None = None,
 ) -> NsfwModeTarget:
+    normalized_image = (
+        image_profile_id.strip() if isinstance(image_profile_id, str) else None
+    )
     target = NsfwModeTarget(
         llm_provider_id=llm_provider_id.strip(),
         llm_model_id=llm_model_id.strip(),
-        image_profile_id=image_profile_id.strip(),
+        # An accidental empty string collapses to the explicit-off value
+        # rather than surviving as a fake profile id.
+        image_profile_id=normalized_image or None,
+        reasoning=reasoning,
     )
-    if (
-        not target.llm_provider_id
-        or not target.llm_model_id
-        or not target.image_profile_id
-    ):
+    if not target.llm_provider_id or not target.llm_model_id:
         raise NsfwModeTargetError(
-            "nsfw mode requires llm_provider_id, llm_model_id, and image_profile_id",
+            "nsfw mode requires llm_provider_id and llm_model_id",
         )
     return target
 
@@ -403,24 +429,32 @@ def _target_from_raw(raw: dict[str, Any]) -> NsfwModeTarget | None:
     llm = raw.get("llm")
     if not isinstance(llm, dict):
         return None
+    image_raw = raw.get("image_profile_id")
     try:
         return _target_or_raise(
             llm_provider_id=str(llm.get("provider_id") or ""),
             llm_model_id=str(llm.get("model_id") or ""),
-            image_profile_id=str(raw.get("image_profile_id") or ""),
+            image_profile_id=image_raw if isinstance(image_raw, str) else None,
+            reasoning=parse_reasoning_override(raw),
         )
     except NsfwModeTargetError:
         return None
 
 
 def _target_to_raw(target: NsfwModeTarget) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "llm": {
             "provider_id": target.llm_provider_id,
             "model_id": target.llm_model_id,
         },
         "image_profile_id": target.image_profile_id,
     }
+    # Absent key = no posture; keeps pre-feature stored targets and new
+    # writes without reasoning byte-identical.
+    reasoning = reasoning_pref_value(target.reasoning)
+    if reasoning is not None:
+        value["reasoning"] = reasoning
+    return value
 
 
 def _parse_datetime(value: object) -> datetime | None:

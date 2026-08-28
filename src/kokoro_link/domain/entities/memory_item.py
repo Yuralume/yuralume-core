@@ -5,6 +5,7 @@ It is the domain-level view — storage schemas and extractor outputs map
 onto this shape.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -37,6 +38,67 @@ def _normalize_audience(value: str) -> str:
     private — it never silences the back catalogue."""
     text = (value or "").strip().lower()
     return text if text in _VALID_AUDIENCES else ""
+
+
+PLAYER_KNOWLEDGE_SHARED = "shared"
+PLAYER_KNOWLEDGE_PRIVATE = "private"
+PLAYER_KNOWLEDGE_DISCLOSED = "disclosed"
+_VALID_PLAYER_KNOWLEDGE = frozenset(
+    {PLAYER_KNOWLEDGE_SHARED, PLAYER_KNOWLEDGE_PRIVATE, PLAYER_KNOWLEDGE_DISCLOSED},
+)
+
+
+def _normalize_player_knowledge(value: str) -> str:
+    """Coerce to ``shared`` / ``private`` / ``disclosed`` / ``""``.
+
+    Unknown or absent values stay ``""`` (legacy / unjudged) — same
+    dispatch shape as :func:`_normalize_audience`. A value outside the
+    domain never raises; it degrades to "no judgement" so a malformed
+    write-station payload can't crash the write path, and a row
+    restored from an older schema version never becomes unreadable."""
+    text = (value or "").strip().lower()
+    return text if text in _VALID_PLAYER_KNOWLEDGE else ""
+
+
+def merge_player_knowledge(values: Iterable[str]) -> str:
+    """Propagate ``player_knowledge`` across a merged cluster (KB6).
+
+    Consolidation rewrites several memories into one line of text, so
+    the merged row inherits the *most protective* verdict any source
+    carried — it never mints a new one:
+
+    1. any ``private`` → ``private``. Absolute priority. The merged text
+       can restate that private fact, so it stays unknown to the player.
+    2. else any ``""`` (unjudged) → ``""``. One unknown source means the
+       merged text may restate something nobody classified; minting a
+       verdict for it would be guessing.
+    3. else any ``disclosed`` → ``disclosed``. Told once, still worth
+       marking as previously-told rather than as lived-together.
+    4. else → ``shared``.
+
+    **Why ``private`` outranks ``""`` and not the other way round.**
+    ``""`` is *not* the conservative end of the scale — at the only place
+    the ledger is read (``prompt/memory_lines.memory_knowledge_frame``)
+    ``""`` and ``shared`` both map to *no frame*, so they are rendering-
+    equivalent. Letting an unjudged source win would therefore strip a
+    ``private`` sibling of the one instruction that protects it, which is
+    the arc-leak incident this plan exists to stop — and it would fire on
+    essentially every merge, because the entire pre-KB5 back catalogue is
+    ``""`` while ``private`` rows are only now starting to be written.
+    "Don't invent a verdict" still holds for steps 2–4, where the worst
+    fallout is the character re-introducing something the player already
+    knew (mild); it does not get to outrank the actual boundary.
+
+    An empty ``values`` yields ``""``: no sources, no verdict.
+    """
+    seen = {_normalize_player_knowledge(value) for value in values}
+    if PLAYER_KNOWLEDGE_PRIVATE in seen:
+        return PLAYER_KNOWLEDGE_PRIVATE
+    if not seen or "" in seen:
+        return ""
+    if PLAYER_KNOWLEDGE_DISCLOSED in seen:
+        return PLAYER_KNOWLEDGE_DISCLOSED
+    return PLAYER_KNOWLEDGE_SHARED
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +156,36 @@ class MemoryItem:
     ``private`` memories so a private preference never becomes a public
     post; recall in chat is unaffected — salience measures *recall*
     importance, not *shareability*."""
+    player_knowledge: str = ""
+    """The disclosure ledger (KB5 of the player-knowledge-boundary plan):
+    what the *character* believes the player knows about this memory —
+    a different axis from ``audience`` (which asks whether the memory is
+    fit to broadcast publicly; a memory can be ``player_knowledge=private``
+    and ``audience=shareable`` at once, e.g. a solo errand the character
+    is happy to post about but hasn't mentioned to the player yet).
+
+    Four values:
+    - ``""`` = legacy / unjudged. No write station recorded a verdict
+      (either it predates this column, or the station hasn't been
+      updated yet). Rendering treats this exactly like today — the
+      back catalogue is never silently reinterpreted as private.
+    - ``shared`` = the player lived this or was told about it live —
+      the character can reference it as a common memory.
+    - ``private`` = the player did not witness this; it was written by
+      a background process (an autonomous story beat, encounter
+      hearsay, schedule memorialization of an unattended activity...).
+      The character should not treat it as something the player already
+      knows.
+    - ``disclosed`` = originally ``private``, but the character has
+      since told the player about it in-fiction (chat, a feed post the
+      player read, a proactive message) — structurally promoted so the
+      character stops re-introducing it as news.
+
+    Set once at write time by the station that created the memory
+    (deterministic from the write pathway, not an LLM guess — see the
+    plan's KB6) and later flipped ``private`` → ``disclosed`` by the
+    disclosure-ledger flip (KB8). ``""`` never gets guessed into one of
+    the other three after the fact."""
 
     @classmethod
     def create(
@@ -112,6 +204,7 @@ class MemoryItem:
         world_id: str | None = None,
         location: str | None = None,
         audience: str = "",
+        player_knowledge: str = "",
     ) -> "MemoryItem":
         trimmed_content = content.strip()
         if not trimmed_content:
@@ -131,6 +224,7 @@ class MemoryItem:
             world_id=(world_id.strip() or None) if world_id else None,
             location=(location.strip() or None) if location else None,
             audience=_normalize_audience(audience),
+            player_knowledge=_normalize_player_knowledge(player_knowledge),
         )
 
     @property

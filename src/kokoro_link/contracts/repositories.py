@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -135,6 +136,18 @@ class CharacterRepositoryPort(Protocol):
 
     async def get(self, character_id: str) -> Character | None:
         """Fetch character by id."""
+
+    async def list_names(
+        self, character_ids: Sequence[str],
+    ) -> dict[str, str]:
+        """Map id → display name for the ids that exist, in one query.
+
+        The deliberate opposite of ``get`` in a loop. Callers that need to
+        *label* a list of ids — an admin report over a few hundred rows,
+        polled every few seconds — must not load a few hundred full
+        aggregates (companions, loras, disposition, state …) to read one
+        string off each. Ids with no row are simply absent from the
+        result; the caller decides what a missing name renders as."""
 
     async def save(self, character: Character) -> None:
         """Store character.

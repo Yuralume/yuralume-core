@@ -29,6 +29,7 @@ from kokoro_link.infrastructure.cloud.hosted_channel_proactive_client import (
     ACCEPT_NO_ENDPOINT,
     ChannelAcceptResult,
     ChannelDeliveryTransientError,
+    EligibilityVerdict,
 )
 from kokoro_link.infrastructure.repositories.in_memory_external_proactive_events import (  # noqa: E501
     InMemoryExternalProactiveEventRepository,
@@ -48,7 +49,10 @@ class _FakeClient:
         self.eligibility_calls += 1
         if isinstance(self._eligibility, Exception):
             raise self._eligibility
-        return self._eligibility
+        if isinstance(self._eligibility, EligibilityVerdict):
+            return self._eligibility
+        # Bare bool convenience for tests that don't care about the reason.
+        return EligibilityVerdict(eligible=bool(self._eligibility), reason=None)
 
     async def accept_delivery(self, payload):
         self.accept_payloads.append(payload)
@@ -246,8 +250,43 @@ async def test_eligibility_negative_cached_for_30s() -> None:
     assert first.eligible is False
     assert first.ttl_seconds == 30.0
     clock.t += 29.0
-    await adapter.check_eligibility("c1")
+    second = await adapter.check_eligibility("c1")
     assert client.eligibility_calls == 1
+    # LQ-F2 fallback state: the channel declined with no body ``reason`` (the
+    # fake client's bare-bool convenience), so the pre-LQ-F2 fallback text
+    # must survive verbatim — an absent body field cannot silently change
+    # what an existing consumer (the LINE reactivation candidate listing)
+    # reads, and the cached re-read must agree with the live one.
+    assert first.reason == "no active channel endpoint"
+    assert second.reason == "no active channel endpoint"
+
+
+@pytest.mark.asyncio
+async def test_eligibility_reason_passes_through_from_channel_body() -> None:
+    """LQ-F2: the channel's own decline reason reaches the caller verbatim.
+
+    Regression lock for the bug this ticket fixes — before LQ-F2 the adapter
+    discarded the channel body's ``reason`` and hardcoded "no active channel
+    endpoint" for every decline, so the LINE reactivation candidate listing
+    (which renders ``verdict.reason`` straight to an operator) could not tell
+    a quota-exhausted character apart from a genuinely broken binding.
+    """
+    client = _FakeClient(
+        eligibility=EligibilityVerdict(
+            eligible=False, reason="quota_character_monthly_exhausted",
+        ),
+    )
+    clock = _Monotonic()
+    adapter = _adapter(client=client, monotonic=clock)
+    first = await adapter.check_eligibility("c1")
+    assert first.eligible is False
+    assert first.reason == "quota_character_monthly_exhausted"
+    # The cached re-read must carry the SAME specific reason, not silently
+    # regress to the generic fallback text.
+    clock.t += 1.0
+    second = await adapter.check_eligibility("c1")
+    assert client.eligibility_calls == 1  # served from cache
+    assert second.reason == "quota_character_monthly_exhausted"
 
 
 @pytest.mark.asyncio
@@ -267,6 +306,10 @@ async def test_eligibility_transient_is_negative_short_ttl() -> None:
     result = await _adapter(client=client).check_eligibility("c1")
     assert result.eligible is False
     assert result.ttl_seconds == 30.0
+    # A transport failure is not a channel-supplied decline reason — the
+    # reason text must stay this transient-specific string, never a body
+    # ``reason`` value (there was no body) and never the no-endpoint fallback.
+    assert result.reason == "channel eligibility unavailable"
 
 
 @pytest.mark.asyncio

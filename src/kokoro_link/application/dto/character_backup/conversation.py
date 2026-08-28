@@ -1,7 +1,7 @@
 """Conversation-domain backup DTOs (plan §3.1「對話」).
 
 ``conversations`` / ``messages`` / ``turn_journals`` /
-``pending_follow_ups`` / ``deferred_intents``.
+``pending_follow_ups`` / ``deferred_intents`` / ``dialogue_checkpoints``.
 """
 
 from __future__ import annotations
@@ -68,6 +68,26 @@ class PendingFollowUpBackupRecord(BackupRecord):
     last_error: str | None = None
     kind: str = "busy_defer"
     promise_intent: str = ""
+    turn_record_id: str | None = None
+    """Added after v1 — defaults to ``None`` so an archive written
+    before the column existed still restores (base.py §version policy).
+
+    Carried rather than dropped because ``turn_journals`` is carried too,
+    and the anchor is only meaningful as a *pair*: the journal's
+    ``turn_record_id`` (inside its ``payload_json``) against the row's.
+    Drop one side and a restored archive's undo would fall back to
+    identifying promise rows by time window — the failure this column
+    exists to remove. Neither side is remapped on import, so the pairing
+    survives verbatim; the ``turn_records`` row itself is telemetry and
+    is not carried, which costs nothing because nothing reads it here."""
+    honesty_park_attempts: int = 0
+    """Added after v1 — defaults to ``0`` so an archive written before the
+    column existed still restores (base.py §version policy).
+
+    Carried rather than reset because it is the retry budget of a promise
+    that is itself carried: restoring a row whose model has already lied
+    through most of its allowance with a fresh full allowance would hand
+    the restored character back the exact loop the budget exists to end."""
 
 
 class DeferredIntentBackupRecord(BackupRecord):
@@ -89,3 +109,29 @@ class DeferredIntentBackupRecord(BackupRecord):
     """Added after v1 — defaults to ``None`` so an archive written
     before the column existed still restores (base.py §version
     tolerance)."""
+
+
+class DialogueCheckpointBackupRecord(BackupRecord):
+    """``dialogue_checkpoints`` — the pair's cumulative dialogue summary.
+
+    Carried rather than left to rebuild itself (DH3). The checkpoint is
+    the only place the character's memory of everything older than the
+    loaded window still exists: the messages behind it are in the
+    archive, but the *summary* of them is not derivable from a window
+    that no longer reaches back that far. Dropping it would restore a
+    character who has forgotten the relationship — visibly, and with no
+    way to get it back.
+
+    ``covers_until_message_key`` is a content fingerprint of a message,
+    not a row id, so it survives the import's id reissue untouched and
+    still names the same message on the far side.
+    """
+
+    character_id: str
+    operator_id: str
+    summary_text: str = ""
+    covers_until_message_key: str
+    covers_until_created_at: datetime
+    updated_at: datetime
+    model: str = ""
+    stale: bool = False

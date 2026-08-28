@@ -20,6 +20,8 @@ from kokoro_link.application.services.proactive_delivery.hosted_adapter import (
 )
 from kokoro_link.application.services.proactive_delivery.hosted_identity import (
     build_hosted_delivery_identity_resolver,
+    cloud_identity_of,
+    owning_operator_id,
 )
 from kokoro_link.application.services.proactive_delivery.local_adapter import (
     LocalMessagingProactiveDeliveryAdapter,
@@ -34,6 +36,8 @@ __all__ = [
     "ProactiveDeliveryRetryWorker",
     "ResolvedProactiveSink",
     "build_hosted_delivery_identity_resolver",
+    "cloud_identity_of",
     "find_eligible_proactive_binding",
     "list_eligible_proactive_bindings",
+    "owning_operator_id",
 ]

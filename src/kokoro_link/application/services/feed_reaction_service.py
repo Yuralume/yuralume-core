@@ -20,11 +20,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kokoro_link.contracts.feed import (
     FeedPostRepositoryPort,
     FeedReactionRepositoryPort,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from kokoro_link.application.services.memory_disclosure_service import (
+        MemoryDisclosureService,
+    )
 from kokoro_link.domain.entities.feed_post import FeedPost, FeedReactionSummary
 from kokoro_link.domain.entities.feed_reaction import (
     LOCAL_LIKER_ID,
@@ -58,9 +64,14 @@ class FeedReactionService:
         *,
         post_repository: FeedPostRepositoryPort,
         reaction_repository: FeedReactionRepositoryPort,
+        disclosure_service: "MemoryDisclosureService | None" = None,
     ) -> None:
         self._posts = post_repository
         self._reactions = reaction_repository
+        # KB8 — optional so the harnesses that build this service from
+        # two repos keep working; a deployment without it just relies on
+        # the frontend's exposure report for disclosure instead.
+        self._disclosure = disclosure_service
 
     async def like(
         self,
@@ -120,6 +131,20 @@ class FeedReactionService:
         from the reactions table. Idempotent: safe to call even when
         the toggle was a no-op (re-counts the same number).
 
+        Also backfills ``viewed_at`` (KB11): a like is only possible
+        because the player is looking at the post right now, so it is
+        read-proof at least as strong as the frontend's exposure
+        report — a fallback for when that report never lands (network
+        drop, tab closed before the batch flushes). ``mark_viewed`` is
+        itself idempotent, so this never moves an earlier timestamp.
+
+        The same reasoning carries the KB8 disclosure flip: if the post
+        was made of a memory the player had never been told, reacting to
+        it proves he has now read it. Run *before* the early return
+        below, because an already-viewed post whose counts didn't change
+        still reaches here — and that is exactly the shape a retry after
+        a failed flip takes.
+
         Best-effort on the persist step — a transient DB hiccup must
         not roll back the like itself; the next toggle will resync.
         """
@@ -128,11 +153,17 @@ class FeedReactionService:
             likes=likes,
             comments=int(post.reactions.comments),
         )
-        if next_summary == post.reactions:
+        next_post = post
+        if next_summary != post.reactions:
+            next_post = next_post.with_reactions(next_summary)
+        if next_post.viewed_at is None:
+            next_post = next_post.mark_viewed()
+        if self._disclosure is not None:
+            await self._disclosure.disclose_from_post(post)
+        if next_post is post:
             return likes
-        updated = post.with_reactions(next_summary)
         try:
-            await self._posts.save(updated)
+            await self._posts.save(next_post)
         except Exception:
             _LOGGER.exception(
                 "feed reaction count resync failed post=%s likes=%d",

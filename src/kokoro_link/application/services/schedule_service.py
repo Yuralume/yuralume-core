@@ -445,7 +445,9 @@ class ScheduleService:
         # overwrite them. Expired ones are filtered out at this input layer,
         # so the planner never sees a dead invite framed as a live promise.
         pre_commitments = self._carry_forward_commitments(existing)
-        summary = await self._summarize_recent_dialogue(character)
+        summary = await self._summarize_recent_dialogue(
+            character, local_tz=local_tz,
+        )
         today_beat, upcoming = await self._collect_arc_beats(
             character=character, target=target,
         )
@@ -748,7 +750,9 @@ class ScheduleService:
         local_tz = await self._resolve_operator_timezone(character)
         local_today = await self.today_for_character(character)
         target = date_ or local_today
-        summary = await self._summarize_recent_dialogue(character)
+        summary = await self._summarize_recent_dialogue(
+            character, local_tz=local_tz,
+        )
         today_beat, upcoming = await self._collect_arc_beats(
             character=character, target=target,
         )
@@ -1144,10 +1148,15 @@ class ScheduleService:
         weather adapter, literally from a different day's weather), so when
         the day it covers finally arrives we re-plan it once with that
         day's real weather. We only do this while it is safe — no activity
-        has been memorialised yet — so a same-day refresh can never
-        duplicate memories the morning already recorded.
+        has been memorialised yet and the operator has not edited the day
+        by hand — so a same-day refresh can never duplicate memories the
+        morning already recorded, nor resurrect an activity the operator
+        deliberately deleted. A manually-adjusted day is operator-owned;
+        the explicit regenerate route stays the way to re-open it.
         """
         if target != local_today:
+            return False
+        if existing.manually_adjusted:
             return False
         if any(activity.memorialized for activity in existing.activities):
             return False
@@ -1255,7 +1264,9 @@ class ScheduleService:
             )
             return []
 
-    async def _summarize_recent_dialogue(self, character: Character) -> str:
+    async def _summarize_recent_dialogue(
+        self, character: Character, *, local_tz: tzinfo | None = None,
+    ) -> str:
         """Pull dialogue merged across every source, filter tool-only
         turns, and ask the summarizer to condense it.
 
@@ -1290,7 +1301,10 @@ class ScheduleService:
             return ""
         try:
             return await self._dialogue_summarizer.summarize(
-                character=character, messages=messages,
+                character=character,
+                messages=messages,
+                now=datetime.now(timezone.utc),
+                local_tz=local_tz or self._local_tz or timezone.utc,
             )
         except Exception:
             _LOGGER.exception(
@@ -1454,8 +1468,16 @@ class ScheduleService:
         adjustments: list[ScheduleAdjustment],
         date_: date | None = None,
         character: Character | None = None,
+        manual: bool = False,
     ) -> DailySchedule | None:
         """Apply post-turn schedule mutations and persist the result.
+
+        ``manual=True`` marks the affected day(s) as operator-owned
+        (:attr:`DailySchedule.manually_adjusted`): the manual schedule
+        routes pass it so the same-day weather refresh can never rebuild
+        an edited day and resurrect a deleted activity. LLM post-turn
+        callers keep the default ``False`` so the refresh still works for
+        days only the model has touched.
 
         Adjustments are bucketed by their effective date (
         ``target_date_iso`` when set, otherwise ``date_`` arg, otherwise
@@ -1513,6 +1535,7 @@ class ScheduleService:
                 target=target,
                 today=today,
                 local_tz=local_tz,
+                manual=manual,
             )
             if target == default_target and updated is not None:
                 today_result = updated
@@ -1526,6 +1549,7 @@ class ScheduleService:
         target: date,
         today: date,
         local_tz: tzinfo,
+        manual: bool = False,
     ) -> DailySchedule | None:
         """Apply a single-date bucket of adjustments.
 
@@ -1601,6 +1625,10 @@ class ScheduleService:
 
         current_activities = _resolve_overlaps(current_activities)
         updated_schedule = schedule.with_activities(current_activities)
+        if manual:
+            # Operator took ownership of this day — freeze it against the
+            # same-day weather re-plan (see _is_stale_current_day_plan).
+            updated_schedule = updated_schedule.with_manual_adjustment()
         await self._repository.save(updated_schedule)
         return updated_schedule
 

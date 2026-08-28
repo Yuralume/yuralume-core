@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
@@ -39,6 +38,7 @@ from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 if TYPE_CHECKING:  # pragma: no cover
     from kokoro_link.application.services.character_service import CharacterService
@@ -421,13 +421,15 @@ def _world_event_lines(events: list[WorldEvent]) -> list[str]:
 
 
 def _parse_suggestions(raw: str, *, limit: int) -> list[ChatAssistSuggestion]:
-    payload = _extract_json_object(raw)
-    if payload is None:
-        return []
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return []
+    # DH2-services: the local balanced-brace scanner (a hand-rolled
+    # duplicate of ``llm_output.extract.balanced_end``) is retired in
+    # favour of the shared layer, which additionally repairs a reply
+    # truncated by max_tokens — this prompt unconditionally asks for the
+    # JSON envelope, so a chopped suggestions list is now worth trying
+    # to salvage rather than dropping every suggestion.
+    outcome = extract_object_outcome(raw)
+    log_parse_outcome(_LOGGER, outcome, site="chat_assist.suggestions")
+    parsed = outcome.value
     items = parsed.get("suggestions") if isinstance(parsed, dict) else None
     if not isinstance(items, list):
         return []
@@ -448,34 +450,6 @@ def _parse_suggestions(raw: str, *, limit: int) -> list[ChatAssistSuggestion]:
         if len(out) >= limit:
             break
     return out
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
 
 
 def _clean_generated_text(value: Any, *, max_chars: int = 240) -> str:

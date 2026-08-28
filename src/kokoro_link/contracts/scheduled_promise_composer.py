@@ -98,6 +98,26 @@ class ScheduledPromiseComposeInput:
     character whose camera broke has to say so, and a composer that
     only ever saw successes would write as if the promise had been kept.
     """
+    honesty_correction: str = ""
+    """Set ONLY on a re-compose ordered by the HV1 honesty gate.
+
+    The previous attempt claimed a completed outcome the tools never
+    produced; this carries the instruction naming what it overclaimed and
+    which honest ways out remain. Empty on every ordinary compose, so the
+    rendered prompt is byte-identical to the pre-HV1 one — which is what
+    makes the field safe to add to a dual-tracked prompt surface without
+    touching a shipped template."""
+    promise_made_at: datetime | None = None
+    """When the promise was recorded — ``PendingFollowUp.queued_at`` on
+    the row, i.e. the moment the post-turn extractor lodged it (not the
+    promised ``scheduled_for`` moment).
+
+    Without this the composer has no fact to anchor "你之前答應的事" to,
+    so the model guesses a vague "之前" — for a promise made half an
+    hour ago that reads to the player as "yesterday". ``None`` on rows
+    written before this field existed (or any caller that hasn't been
+    updated) leaves the rendered prompt byte-identical to before, so the
+    field is fail-soft to add without touching a shipped template."""
 
 
 @dataclass(frozen=True, slots=True)

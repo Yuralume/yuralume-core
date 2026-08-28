@@ -67,7 +67,16 @@
  *    ——**以操作者計、不是每個角色各自算**的滾動 24 小時上限，只在
  *    `cloud_mode` 生效，超過直接擋下該次匯出）；現成角色卡＝
  *    `playerSidebar.characterCards.gallery.title`（**玩家面沒有「櫥窗」
- *    這個詞**，那是後台 feature key，且與 portal 的公開櫥窗頁撞名）。
+ *    這個詞**，那是後台 feature key，且與 portal 的公開櫥窗頁撞名）；玩家
+ *    身分卡＝`identityCard.*`（IC 系列）——存的是創角精靈裡「你和他的關係
+ *    要怎麼定」那組欄位（稱呼、相處距離、主動找你的授權、你的人設…），**不
+ *    是**角色本身也不是檔案，與 `.lumecard`／`.lumebackup` 正交；三個入口
+ *    一次講完：創角精靈的 `identityCard.picker.*`（帶入）與
+ *    `identityCard.save.*`（存成新卡）、既有角色設定頁的
+ *    `identityCard.saveFromCharacter.*`（回存）、設定頁「個人」分頁的
+ *    `identityCard.manage.*`（改名／刪除／預覽，第一版不能編輯內容）。
+ *    複製快照語意是這條的核心：帶入後每一欄都能再改，改動**不會**回寫卡
+ *    片——卡片是那一刻的快照，寫反了會讓玩家以為卡片會跟著新角色變。
  *  - 第 10 章 螢火與方案（hosted-only 整章）：`credits.*` 全套——
  *    `credits.price.*` 的價籤、`credits.badge.*` 的餘額、
  *    `credits.insufficient.*`、`credits.overage.*`。

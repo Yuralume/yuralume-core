@@ -279,6 +279,22 @@ class PostTurnResult:
     the address-change governance instead of being written as a memory,
     so the direction is never inverted and the change does not leak into
     the public feed. Empty list = no address change this turn (default)."""
+    disclosed_memory_ids: list[str] = field(default_factory=list)
+    """KB8 — which of the ``disclosure_candidates`` the character
+    actually told the player about in the reply this pass just read.
+
+    The one field here that answers a question about the *reply* rather
+    than about what to write next, and it rides this call rather than
+    its own because the extraction already has the reply in front of it:
+    a separate model call would be paying twice to read the same two
+    messages.
+
+    Ids only, and only ids the caller supplied. The caller intersects
+    this list back against the candidates it injected before acting, so
+    an invented id — or one naming a memory that was never in this
+    turn's prompt — flips nothing. The empty default means both "nothing
+    was disclosed" and "this processor doesn't implement the section";
+    the two need not be distinguishable, because both mean no flip."""
 
 
 class PostTurnProcessorPort(Protocol):
@@ -297,6 +313,7 @@ class PostTurnProcessorPort(Protocol):
         now: datetime | None = None,
         peer_context_lines: list[str] | None = None,
         player_persona_note: str = "",
+        disclosure_candidates: list[MemoryItem] | None = None,
     ) -> PostTurnResult:
         """Extract memories, suggest state updates, propose schedule
         adjustments, and — when an arc is active — emit optional arc
@@ -314,4 +331,14 @@ class PostTurnProcessorPort(Protocol):
         — earlier turns may set up what the user just said. Passing
         them in lets the extractor reason over multi-turn situations
         rather than isolated pairs.
+
+        ``disclosure_candidates`` (KB8) are the ``private`` memories the
+        caller injected into *this* turn's reply prompt — the only
+        memories a flip could reach, so the only ones worth showing.
+        The processor answers which of them the reply actually conveyed;
+        it is never asked to decide whether a memory *should* be private,
+        which stays a structural fact of the write station (red line 3).
+        ``None`` / empty means the turn had none, and the section is
+        omitted from the prompt entirely rather than rendered empty —
+        an empty list invites the model to fill it.
         """

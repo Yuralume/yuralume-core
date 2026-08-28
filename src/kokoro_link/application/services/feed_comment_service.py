@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kokoro_link.contracts.feed import (
     FeedCommentRepositoryPort,
@@ -27,6 +28,11 @@ from kokoro_link.domain.entities.feed_comment import (
     FeedComment,
 )
 from kokoro_link.domain.entities.feed_post import FeedPost, FeedReactionSummary
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from kokoro_link.application.services.memory_disclosure_service import (
+        MemoryDisclosureService,
+    )
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,9 +76,14 @@ class FeedCommentService:
         *,
         post_repository: FeedPostRepositoryPort,
         comment_repository: FeedCommentRepositoryPort,
+        disclosure_service: "MemoryDisclosureService | None" = None,
     ) -> None:
         self._posts = post_repository
         self._comments = comment_repository
+        # KB8 — optional for the same reason as on the reaction service:
+        # a harness without it simply leaves disclosure to the exposure
+        # report.
+        self._disclosure = disclosure_service
 
     async def add(
         self,
@@ -133,17 +144,34 @@ class FeedCommentService:
 
     async def _sync_count(self, post: FeedPost) -> int:
         """Refresh the denormalised ``comments`` counter on the post row.
-        Best-effort on the persist step (mirrors FeedReactionService)."""
+        Best-effort on the persist step (mirrors FeedReactionService).
+
+        Also backfills ``viewed_at`` (KB11): commenting requires having
+        read the post, so it's read-proof at least as strong as the
+        frontend's exposure report — a fallback for when that report
+        never lands. ``mark_viewed`` is idempotent, so an already-set
+        timestamp never moves.
+
+        Same for the KB8 disclosure flip, and for the same reason it
+        sits ahead of the early return in ``FeedReactionService``: an
+        already-viewed post with an unchanged count still arrives here,
+        which is what a retry after a failed flip looks like."""
         comments = await self._comments.count_for_post(post.id)
         next_summary = FeedReactionSummary(
             likes=int(post.reactions.likes),
             comments=comments,
         )
-        if next_summary == post.reactions:
+        next_post = post
+        if next_summary != post.reactions:
+            next_post = next_post.with_reactions(next_summary)
+        if next_post.viewed_at is None:
+            next_post = next_post.mark_viewed()
+        if self._disclosure is not None:
+            await self._disclosure.disclose_from_post(post)
+        if next_post is post:
             return comments
-        updated = post.with_reactions(next_summary)
         try:
-            await self._posts.save(updated)
+            await self._posts.save(next_post)
         except Exception:
             _LOGGER.exception(
                 "feed comment count resync failed post=%s comments=%d",

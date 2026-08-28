@@ -11,6 +11,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from kokoro_link.application.services.pre_message_proactive_budget import (
+    PRE_MESSAGE_BUDGET_UNAVAILABLE_REASON,
+    PRE_MESSAGE_CAP_REASON,
+    PRE_MESSAGE_DELAY_REASON,
+    PRE_MESSAGE_INTERVAL_REASON,
+    PRE_MESSAGE_PROACTIVE_CAP,
+    PRE_MESSAGE_PROACTIVE_DELAY_HOURS,
+)
 from kokoro_link.application.services.proactive_dispatcher import ProactiveDispatcher
 from kokoro_link.contracts.proactive import (
     ProactiveContext,
@@ -31,6 +39,7 @@ from kokoro_link.domain.entities.character_operator_relationship_seed import (
     CharacterOperatorRelationshipSeed,
 )
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
+from kokoro_link.domain.entities.proactive_attempt import ProactiveAttempt
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
 from kokoro_link.domain.value_objects.platform import Platform
@@ -375,6 +384,429 @@ async def test_pre_message_proactive_without_permission_still_waits_even_with_ca
     assert attempt.outcome == ProactiveOutcome.GATE_BLOCKED
     assert attempt.reason == "waiting for first user message"
     assert decider.calls == []
+
+
+async def _pre_message_dispatcher(
+    harness,
+    *,
+    decider: ProactiveDeciderPort,
+    attempts: InMemoryProactiveAttemptRepository | None = None,
+):
+    """A character the player has never spoken to, permitted to reach out."""
+    relationship_repo = InMemoryCharacterOperatorRelationshipSeedRepository()
+    dispatcher, attempt_repo = _make_dispatcher(
+        harness,
+        decider=decider,
+        attempts=attempts,
+        relationship_seed_repository=relationship_repo,
+    )
+    return dispatcher, attempt_repo, relationship_repo
+
+
+async def _permit_pre_message(relationship_repo, character_id: str) -> None:
+    await relationship_repo.save(
+        CharacterOperatorRelationshipSeed(
+            character_id=character_id,
+            operator_id=DEFAULT_OPERATOR_ID,
+            relationship_label="朋友",
+            proactive_permission=True,
+        ),
+    )
+
+
+def _past_pre_message_send(character_id: str, at: datetime):
+    return ProactiveAttempt.record(
+        character_id=character_id,
+        trigger=ProactiveTrigger.TICK,
+        outcome=ProactiveOutcome.SENT,
+        reason="ok",
+        message="在嗎",
+        now=at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_message_cap_allows_the_first_two_then_blocks(
+) -> None:
+    """TR2-A: 0 and 1 prior pushes pass; the cap-th one stops the run.
+
+    Anti-nag before the player ever speaks cannot lean on the unanswered
+    streak — that signal is pinned to 0 while ``idle_minutes`` is None —
+    so the ceiling is a plain total, and once spent no amount of elapsed
+    time buys another push back.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    first = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+    assert first.outcome == ProactiveOutcome.SENT
+
+    # Second push, a full interval later — still inside the cap.
+    second = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=now + timedelta(days=2),
+    )
+    assert second.outcome == ProactiveOutcome.SENT
+
+    # Third: the budget is spent, and days of extra silence do not refill it.
+    third = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=now + timedelta(days=9),
+    )
+    assert third.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert third.reason.startswith(PRE_MESSAGE_CAP_REASON)
+    assert f"/{PRE_MESSAGE_PROACTIVE_CAP}" in third.reason
+    # Blocked in the cheap band: no model call was spent on the refusal.
+    assert len(decider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pre_message_interval_floor_blocks_a_same_day_second_push(
+) -> None:
+    """One push a day at most while the player has said nothing."""
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    await attempt_repo.add(
+        _past_pre_message_send(character.id, now - timedelta(hours=3)),
+    )
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert attempt.reason.startswith(PRE_MESSAGE_INTERVAL_REASON)
+    assert decider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_pre_message_budget_stops_applying_once_the_player_speaks(
+) -> None:
+    """The cap is a cold-start ceiling, not a lifetime quota.
+
+    Same character, same spent budget, same clock — the only difference
+    is that the player has now said something, and the normal cadence
+    (cooldown / daily limit / unanswered streak) takes over.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    for index in range(PRE_MESSAGE_PROACTIVE_CAP):
+        await attempt_repo.add(
+            _past_pre_message_send(
+                character.id, now - timedelta(days=5 + index),
+            ),
+        )
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    blocked = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+    assert blocked.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert blocked.reason.startswith(PRE_MESSAGE_CAP_REASON)
+
+    # The player finally opens their mouth.
+    spoke = character.update(
+        name=None, summary=None, personality=None, interests=None,
+        speaking_style=None, boundaries=None, aspirations=None,
+        appearance=None,
+        state=replace(
+            character.state, last_active_at=now - timedelta(hours=2),
+        ),
+    )
+    await harness.character_repository.save(spoke)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+    assert len(decider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_message_budget_does_not_gate_promise_fulfilment() -> None:
+    """PENDING_FOLLOW_UP is a promise being kept, not an unprompted push.
+
+    It is already exempt from the first-user-message gate; the cap sits
+    inside that same branch so the exemption has to survive verbatim.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    for index in range(PRE_MESSAGE_PROACTIVE_CAP + 1):
+        await attempt_repo.add(
+            _past_pre_message_send(character.id, now - timedelta(minutes=index)),
+        )
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "查到了"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.PENDING_FOLLOW_UP,
+        now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+
+
+@pytest.mark.asyncio
+async def test_pre_message_budget_lookup_failure_blocks_rather_than_sends(
+) -> None:
+    """An unreadable audit log means an unknown budget — do not push."""
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+
+    class _BrokenAttempts(InMemoryProactiveAttemptRepository):
+        async def list_recent_sent(self, character_id: str, *, limit: int = 8):
+            raise RuntimeError("audit log unavailable")
+
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=_BrokenAttempts(),
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc),
+    )
+
+    assert attempt.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert attempt.reason == PRE_MESSAGE_BUDGET_UNAVAILABLE_REASON
+    assert decider.calls == []
+
+
+async def _created_at(harness, character, when: datetime):
+    """Give the character a creation stamp the delay window can read.
+
+    The in-memory repository does not synthesise one (the column is
+    server-managed in the SA adapter), so tests that care about the
+    TR2-B window set it explicitly; every other test leaves it ``None``
+    and the window stays out of the way.
+    """
+    stamped = replace(character, created_at=when)
+    await harness.character_repository.save(stamped)
+    return stamped
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_blocks_a_freshly_created_character(
+) -> None:
+    """TR2-B: permission is pre-checked, so the first push still waits.
+
+    Blocked in the cheap band and *before* the budget lookup — a refused
+    tick must not spend a model call, and must not spend one of the two
+    pre-message pushes either.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    await _created_at(
+        harness,
+        character,
+        now - timedelta(hours=PRE_MESSAGE_PROACTIVE_DELAY_HOURS - 2),
+    )
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert attempt.reason.startswith(PRE_MESSAGE_DELAY_REASON)
+    assert decider.calls == []
+    assert await attempt_repo.list_recent_sent(character.id, limit=5) == []
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_lapses_and_the_push_goes_out() -> None:
+    """Same character, same permission — only the clock moved."""
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    created = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    await _created_at(harness, character, created)
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=created + timedelta(hours=PRE_MESSAGE_PROACTIVE_DELAY_HOURS),
+    )
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_does_not_refund_the_cap() -> None:
+    """The two floors stack; neither one resets the other.
+
+    Waiting out the delay window does not buy back a spent budget, and
+    an untouched budget does not shorten the window.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    created = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    await _created_at(harness, character, created)
+    attempt_repo = InMemoryProactiveAttemptRepository()
+    for index in range(PRE_MESSAGE_PROACTIVE_CAP):
+        await attempt_repo.add(
+            _past_pre_message_send(
+                character.id, created - timedelta(days=index),
+            ),
+        )
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider, attempts=attempt_repo,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    inside = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=created + timedelta(hours=1),
+    )
+    assert inside.reason.startswith(PRE_MESSAGE_DELAY_REASON)
+
+    outside = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.TICK,
+        now=created + timedelta(days=4),
+    )
+    assert outside.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert outside.reason.startswith(PRE_MESSAGE_CAP_REASON)
+    assert decider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_ignores_a_character_who_was_spoken_to(
+) -> None:
+    """A player who chats straight away is not made to wait.
+
+    The window is a floor under *unprompted* first contact only; once
+    there is a conversation the normal cadence owns the rhythm, so a
+    brand-new character may speak the same hour it was created.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=90.0, accepts_web_proactive=True,
+    )
+    now = datetime.now(timezone.utc)
+    await _created_at(harness, character, now - timedelta(minutes=95))
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_does_not_gate_promise_fulfilment(
+) -> None:
+    """A kept promise is not unprompted contact — the exemption holds."""
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    await _created_at(harness, character, now - timedelta(minutes=5))
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "查到了"))
+    dispatcher, _, relationship_repo = await _pre_message_dispatcher(
+        harness, decider=decider,
+    )
+    await _permit_pre_message(relationship_repo, character.id)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id,
+        trigger=ProactiveTrigger.PENDING_FOLLOW_UP,
+        now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.SENT
+
+
+@pytest.mark.asyncio
+async def test_pre_message_delay_window_stays_behind_the_permission_question(
+) -> None:
+    """Seed permission is still asked first, not the clock.
+
+    Pins the ordering so the audit trail does not start blaming the
+    delay window for what is actually a missing opt-in.
+    """
+    harness = build_messaging_harness()
+    character = await _enable_character(
+        harness, idle_minutes=None, accepts_web_proactive=True,
+    )
+    now = datetime(2026, 5, 10, 14, 0, tzinfo=timezone.utc)
+    await _created_at(harness, character, now - timedelta(minutes=5))
+    decider = _FixedDecider(ProactiveDecision(True, "ok", "hi"))
+    dispatcher, _, _ = await _pre_message_dispatcher(harness, decider=decider)
+
+    attempt = await dispatcher.evaluate(
+        character_id=character.id, trigger=ProactiveTrigger.TICK, now=now,
+    )
+
+    assert attempt.outcome == ProactiveOutcome.GATE_BLOCKED
+    assert attempt.reason == "waiting for first user message"
 
 
 @pytest.mark.asyncio

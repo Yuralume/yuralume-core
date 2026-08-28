@@ -777,6 +777,136 @@ async def test_mark_feed_reactions_seen_resets_unread_reply_count() -> None:
     assert after.unread_feed_reply_count == 0
 
 
+# ---------- Viewed batch (KB11 read-receipt) ----------
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_returns_404_for_unknown_character() -> None:
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    container.feed_post_repository = InMemoryFeedPostRepository()
+
+    response = _client(container).post(
+        "/api/v1/characters/ghost/feed/viewed",
+        json={"post_ids": ["p1"]},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_stamps_and_returns_updated_count() -> None:
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    posts = InMemoryFeedPostRepository()
+    container.feed_post_repository = posts
+    character = await create_character(harness)
+    a = FeedPost.create(
+        character_id=character.id, kind=FeedKind.MOOD,
+        content_text="a", source=FeedSource.beat("b1"),
+    )
+    b = FeedPost.create(
+        character_id=character.id, kind=FeedKind.MOOD,
+        content_text="b", source=FeedSource.beat("b2"),
+    )
+    await posts.add(a)
+    await posts.add(b)
+
+    response = _client(container).post(
+        f"/api/v1/characters/{character.id}/feed/viewed",
+        json={"post_ids": [a.id, b.id]},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 2}
+    stored_a = await posts.get(a.id)
+    stored_b = await posts.get(b.id)
+    assert stored_a.viewed_at is not None
+    assert stored_b.viewed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_is_idempotent() -> None:
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    posts = InMemoryFeedPostRepository()
+    container.feed_post_repository = posts
+    character = await create_character(harness)
+    post = FeedPost.create(
+        character_id=character.id, kind=FeedKind.MOOD,
+        content_text="a", source=FeedSource.beat("b1"),
+    )
+    await posts.add(post)
+    client = _client(container)
+
+    first = client.post(
+        f"/api/v1/characters/{character.id}/feed/viewed",
+        json={"post_ids": [post.id]},
+    )
+    second = client.post(
+        f"/api/v1/characters/{character.id}/feed/viewed",
+        json={"post_ids": [post.id]},
+    )
+
+    assert first.json() == {"updated": 1}
+    assert second.json() == {"updated": 0}
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_ignores_posts_from_other_characters() -> None:
+    """A batch scoped to one character can't backdoor-mark a post that
+    belongs to somebody else's character."""
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    posts = InMemoryFeedPostRepository()
+    container.feed_post_repository = posts
+    mine = await create_character(harness)
+    other = await create_character(harness)
+    foreign_post = FeedPost.create(
+        character_id=other.id, kind=FeedKind.MOOD,
+        content_text="not yours", source=FeedSource.beat("b1"),
+    )
+    await posts.add(foreign_post)
+
+    response = _client(container).post(
+        f"/api/v1/characters/{mine.id}/feed/viewed",
+        json={"post_ids": [foreign_post.id]},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 0}
+    stored = await posts.get(foreign_post.id)
+    assert stored.viewed_at is None
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_rejects_empty_batch() -> None:
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    container.feed_post_repository = InMemoryFeedPostRepository()
+    character = await create_character(harness)
+
+    response = _client(container).post(
+        f"/api/v1/characters/{character.id}/feed/viewed",
+        json={"post_ids": []},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_mark_feed_posts_viewed_zero_when_repository_unset() -> None:
+    harness = build_messaging_harness()
+    container = build_service_container(harness)
+    character = await create_character(harness)
+    # feed_post_repository intentionally left as None.
+
+    response = _client(container).post(
+        f"/api/v1/characters/{character.id}/feed/viewed",
+        json={"post_ids": ["ghost"]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"updated": 0}
+
+
 # ---------- Global feed (LumeGram wall) ----------
 
 

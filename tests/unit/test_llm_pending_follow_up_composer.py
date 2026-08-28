@@ -26,6 +26,7 @@ from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.pending_follow_up import (
     PendingFollowUpMessage,
 )
+from kokoro_link.domain.entities.schedule import ScheduleActivity
 from kokoro_link.domain.value_objects.character_state import CharacterState
 from kokoro_link.domain.value_objects.disposition import CharacterDisposition
 from kokoro_link.domain.value_objects.personality_type import (
@@ -105,6 +106,48 @@ def test_prompt_includes_operator_persona_lines() -> None:
 
     assert "職業是後端工程師" in prompt
     assert "不要裝熟" in prompt
+
+
+def test_prompt_includes_schedule_activity_knowledge_boundary() -> None:
+    """KB9: an activity description can name a companion/place the player
+    has never heard of — pin the schedule-block rider that covers it."""
+    from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+        render_schedule_activity_knowledge_line,
+    )
+
+    payload = PendingFollowUpComposeInput(
+        character=_character(),
+        queued_messages=_queued_messages(),
+        brief_reply="先回，會議結束再好好回你",
+        defer_reason="會議中",
+        queued_at=_now() - timedelta(hours=1),
+        just_finished_activity=ScheduleActivity(
+            id="act-1",
+            start_at=_now() - timedelta(hours=1),
+            end_at=_now(),
+            description="跟阿凱討論山區那次的事",
+            category="social",
+            companion_names=("阿凱",),
+        ),
+        current_activity=None,
+        recent_dialogue_summary=None,
+        now=_now(),
+    )
+
+    prompt = _build_prompt(payload)
+
+    assert render_schedule_activity_knowledge_line() in prompt
+
+
+def test_schedule_block_omits_activity_knowledge_line_when_free() -> None:
+    """No activity in either slot → the placeholder line only, no rider."""
+    from kokoro_link.infrastructure.prompt.player_knowledge_lines import (
+        render_schedule_activity_knowledge_line,
+    )
+
+    prompt = _build_prompt(_input())
+
+    assert render_schedule_activity_knowledge_line() not in prompt
 
 
 def test_prompt_includes_disposition_and_personality_type_lines() -> None:
@@ -649,3 +692,29 @@ async def test_ordinary_replies_still_ship_on_the_second_pass(raw: str) -> None:
 
     assert output.tool_calls == ()
     assert output.content_text != ""
+
+
+def test_follow_up_prompt_carries_the_staleness_discipline() -> None:
+    """TC — the composer had the number and no instruction.
+
+    ``距離對方第一則訊息已過 約 2.3 天`` has always been rendered, but
+    nothing told the model what to do with it, so a 「我要出門了」 queued
+    yesterday afternoon came back as 「出門了嗎？」 the next morning. Its
+    siblings (``schedule/planner``, ``goal/reviewer``) have carried
+    expiry discipline for months; this surface was the gap.
+    """
+    prompt = _build_prompt(_input())
+
+    assert "時效紀律" in prompt
+    assert "不要把隔了很久的訊息回成好像才剛看到" in prompt
+    # LLM-first: a rule the model applies by judgement, not by a constant.
+    assert "不是某個固定時數" in prompt
+
+
+def test_follow_up_prompt_teaches_transformation_not_silence() -> None:
+    """The fix for an expired concern is to re-aim it (「昨天那個後來怎麼
+    樣？」), not to drop the reply — the player is owed an answer."""
+    prompt = _build_prompt(_input())
+
+    assert "改成回顧的說法" in prompt
+    assert "不要照原樣把過期的問題再問一次" in prompt

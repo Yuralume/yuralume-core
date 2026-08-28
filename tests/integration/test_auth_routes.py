@@ -19,6 +19,7 @@ from kokoro_link.contracts.cloud_auth import CloudAccountIdentity
 from kokoro_link.contracts.geo_location import GeoLocation
 from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
 from kokoro_link.domain.entities.operator_profile import OperatorProfile
+from tests.integration._cloud_app import create_cloud_app
 
 
 @pytest.fixture
@@ -77,7 +78,9 @@ def app_cloud(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("YURALUME_CLOUD_DEPLOYMENT_ID", "hosted-primary")
     monkeypatch.setenv("YURALUME_CLOUD_DEPLOYMENT_AUDIENCE", "yuralume-gateway")
     monkeypatch.setenv("YURALUME_CLOUD_USER_INTERNAL_CREDENTIAL", "core-kid|core|yuralume-user|introspection:session,runtime:read|core-secret")
-    app = create_app()
+    # Cloud mode without a DATABASE_URL is refused by the env-driven boot
+    # path; this surface is about the auth routes, not persistence.
+    app = create_cloud_app()
     with TestClient(app) as client:
         yield client
 

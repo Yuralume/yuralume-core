@@ -6,10 +6,13 @@ decide whether the character should say anything right now. The prompt
 is deliberately biased toward silence — LLMs tend to please by default,
 and an over-talkative proactive system burns trust fast.
 
-JSON parsing is tolerant (code fences / preambles allowed). Any
-failure — LLM timeout, unparseable output, missing fields — becomes a
-"don't send" decision with a descriptive ``reason`` so the operator
-can see it in the audit log.
+JSON parsing is tolerant (code fences / preambles allowed, truncation
+repaired). Any failure — LLM timeout, unparseable output, missing
+fields — becomes a "don't send" decision with a descriptive ``reason``
+so the operator can see it in the audit log.
+
+The raw-text-to-JSON step lives in ``kokoro_link.llm_output``; this
+module owns only the ``should_send`` field validation above.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from kokoro_link.domain.entities.schedule import (
     ScheduleActivity,
     without_expired_operator_commitments,
 )
+from kokoro_link.domain.value_objects.proactive_trigger import ProactiveTrigger
 from kokoro_link.domain.value_objects.tool_call import ToolCall
 from kokoro_link.domain.value_objects.timezone import to_timezone
 from kokoro_link.infrastructure.prompt.character_identity import (
@@ -42,6 +46,9 @@ from kokoro_link.infrastructure.prompt.character_identity import (
 )
 from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
+)
+from kokoro_link.infrastructure.prompt.outcome_claim_honesty import (
+    append_honesty_correction,
 )
 from kokoro_link.infrastructure.prompt.player_persona_note_lines import (
     render_player_persona_note_lines,
@@ -60,6 +67,7 @@ from kokoro_link.infrastructure.prompt.role_boundary import (
 )
 from kokoro_link.infrastructure.prompt.timing_utils import (
     describe_idle_natural,
+    format_elapsed_ago_label,
     render_current_time_fact_lines,
     render_subjective_time_topical_hint,
 )
@@ -67,10 +75,61 @@ from kokoro_link.infrastructure.prompt.weather_freshness import (
     render_weather_fact_lines,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import ParseReason, extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_MESSAGE_CHARS = 300
 _MAX_TOOL_CALLS_PER_DECISION = 1
+
+_HEALTH_FOLLOW_UP_HINT = (
+    # Deliberately names no heading: the dialogue-summary block is headed
+    # 「最近你和對方正在聊的事」 while the thread is live and 「你們上次聊到
+    # 的事」 once it has gone stale (G2-2), and a hint that quotes one of
+    # them by name is a dangling reference half the time.
+    "健康關懷加分項：如果上面的對話素材或「最近你記得的片段」裡，"
+    "對方曾提到持續或具體的身體不適（例如反覆的胸悶、單側頭痛、已經好幾天沒睡好，"
+    "不是隨口一句「有點累」），這次開口時可以順帶自然關心後續——"
+    "「上次說的胸悶後來好點了嗎」這種問法本身就是很好的開口理由，"
+    "也正是「被記得」這件事最打動人的地方。用你自己的性格語氣說，"
+    "不要切成衛教口吻、不要條列式問診、不要診斷或建議吃什麼藥、"
+    "不要貼求助專線或機構電話；上面素材裡沒有這種訊號就不用提，正常判斷就好。"
+)
+
+# G2-1 — how an ADMIN_REACTIVATION push is supposed to feel from the
+# inside. The trigger exists because a human picked this character out of
+# a dormant list, but that framing belongs to the operator, not to the
+# character: from where the character stands this is simply "I suddenly
+# thought of them again". Rendered code-side rather than in
+# ``decider_instructions.txt`` because that file is a baseline pack
+# (``prompt-packs/baseline.lock.json``) shadowed by a hosted tuned
+# overlay — editing it would make this a prompt-pack release.
+_ADMIN_REACTIVATION_FRAMING = (
+    "這次開口的定位（久違地重新聯繫）：\n"
+    "- 這次是你自己久違地想重新聯繫對方——對你而言就是「突然想起這個人、想重新搭上話」。\n"
+    "- 目的是溫和地重啟對話：catch-up 優先（先問問對方最近好不好、在忙什麼），"
+    "不要一開口就把舊話題硬接回來，也不要一次丟出一長串問題。\n"
+    "- 你並不知道對方這段期間發生了什麼，**不要假裝知道**、也不要替對方腦補近況；"
+    "想知道就用問的。\n"
+    #禁的是「把這次開口說成被安排的」，不是幾個字。前一版把「活動」「通知」
+    # 「名單」跟系統／後台／營運並排成禁字，於是連「最近有沒有什麼活動」這種
+    # 最自然的 catch-up 問法都被壓掉——恰好是這個 framing 想要的東西。改成以
+    # 語意描述涵蓋：營運概念本身不准出現，日常語境的同一個詞不在此列。
+    "- 絕對不要把這次開口描述成被系統、後台或營運安排的，"
+    "也不要提到推播、名單這類營運概念，或任何「被安排來找你」的說法"
+    "（日常語境的「活動」「通知」不在此限——"
+    "「最近有什麼活動嗎」這種問法本來就是正常的 catch-up）；"
+    "上面「觸發原因」欄位的英文代號只是內部標記，"
+    "不可出現在訊息裡，也不可被解讀成有人叫你來。這對你來說只是自己想起了對方而已。"
+)
+
+# G2-2 — beyond this idle gap the dialogue-summary block stops calling
+# itself 「正在聊的事」. The old heading told the model the thread was
+# still live while the 久未聯絡 catch-up hint two sections above told it
+# the opposite; a push built on a two-month-old topic then read as if the
+# conversation had never paused. Deliberately well above the 6h catch-up
+# threshold in ``timing_utils``: this one is not "should we catch up",
+# it is "is this thread dead", and those are different questions.
+_STALE_DIALOGUE_IDLE_HOURS = 48.0
 
 
 class LLMProactiveDecider(ProactiveDeciderPort):
@@ -117,27 +176,19 @@ class LLMProactiveDecider(ProactiveDeciderPort):
                 message=None,
             )
 
-        payload = _extract_json_object(raw)
-        if payload is None:
-            return ProactiveDecision(
-                should_send=False,
-                reason="LLM output contained no JSON object",
-                message=None,
+        # The prompt unconditionally asks for one JSON object, so a cut
+        # reply is worth repairing and any non-clean parse is worth a
+        # log line — there is no "the model answered in prose" branch.
+        outcome = extract_object_outcome(raw)
+        log_parse_outcome(_LOGGER, outcome, site="proactive.llm_decider")
+        parsed = outcome.value
+        if parsed is None:
+            reason = (
+                "LLM JSON unparseable"
+                if outcome.reason is ParseReason.DECODE_ERROR
+                else "LLM output contained no JSON object"
             )
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            return ProactiveDecision(
-                should_send=False,
-                reason=f"LLM JSON unparseable: {exc.msg}",
-                message=None,
-            )
-        if not isinstance(parsed, dict):
-            return ProactiveDecision(
-                should_send=False,
-                reason="LLM JSON was not an object",
-                message=None,
-            )
+            return ProactiveDecision(should_send=False, reason=reason, message=None)
 
         should_send = bool(parsed.get("should_send", False))
         reason = _coerce_str(parsed.get("reason")) or "(LLM gave no reason)"
@@ -302,6 +353,13 @@ def _build_prompt(context: ProactiveContext) -> str:
     interaction_lines.append(f"- 這次評估的觸發原因：{context.trigger.value}")
     sections.append("互動近況：\n" + "\n".join(interaction_lines))
 
+    # Its own section rather than one more 互動近況 bullet: the block is a
+    # framing instruction, not a fact about the last few days, and burying
+    # it among the counters is how "don't mention the console" gets read
+    # as background colour. Every other trigger renders nothing here.
+    if context.trigger == ProactiveTrigger.ADMIN_REACTIVATION:
+        sections.append(_ADMIN_REACTIVATION_FRAMING)
+
     # HUMANIZATION_ROADMAP §4.4: when the idle gap is large enough, expose
     # the topical-layer "久未聯絡 catch-up" hint as its own section so the
     # decider can shape opening choice without conflating it with the
@@ -323,7 +381,7 @@ def _build_prompt(context: ProactiveContext) -> str:
         ]
         for att in context.recent_sent_attempts[:5]:
             elapsed_min = (context.now - att.decided_at).total_seconds() / 60.0
-            when_text = _format_elapsed_minutes(elapsed_min)
+            when_text = format_elapsed_ago_label(elapsed_min)
             # User has replied iff their latest message came AFTER this
             # proactive. idle_minutes == minutes since user's last turn;
             # if that's smaller than elapsed_min the user spoke after
@@ -369,15 +427,24 @@ def _build_prompt(context: ProactiveContext) -> str:
         sections.append(upcoming_block)
 
     if context.recent_dialogue_summary.strip():
-        sections.append(
-            "最近你和對方正在聊的事（請避免再主動提同一件事；"
-            "若對方正在聊到的某個話題被晾著，也可以順著接）：\n"
-            + context.recent_dialogue_summary.strip()
-        )
+        sections.append(_render_dialogue_summary_section(context))
     if context.recent_memories_text.strip():
         sections.append("最近你記得的片段：\n" + context.recent_memories_text.strip())
     if context.active_goals_text.strip():
         sections.append("你目前在意的目標：\n" + context.active_goals_text.strip())
+
+    # TR3 — a code-side addendum, not a decider_instructions.txt edit: that
+    # file is a baseline pack (prompt-packs/baseline.lock.json), so
+    # changing it needs a hosted prompt-pack release. This hint instead
+    # rides the two material blocks just above, which are already
+    # rendered here in Python. Gated on their presence, not on any
+    # keyword in their text — the LLM decides whether either one actually
+    # contains a health signal worth a follow-up; a regex over 「胸悶」
+    # would be exactly the keyword-specialisation this codebase's CLAUDE.md
+    # forbids for a semantic judgement.
+    health_hint = _render_health_follow_up_hint(context)
+    if health_hint:
+        sections.append(health_hint)
 
     if context.active_arc is not None:
         arc = context.active_arc
@@ -484,7 +551,13 @@ def _build_prompt(context: ProactiveContext) -> str:
 
     sections.append(get_default_loader().render("proactive/decider_instructions"))
 
-    return "\n\n".join(sections)
+    # HV2 — last, and only on a re-decide. See
+    # ``ProactiveContext.honesty_correction`` for why the tail is the only
+    # place it may go; ``append_honesty_correction`` returns the body
+    # untouched when the field is empty, which is every ordinary tick.
+    return append_honesty_correction(
+        "\n\n".join(sections), context.honesty_correction,
+    )
 
 
 def _describe_activity(
@@ -504,16 +577,6 @@ def _describe_activity(
 
 def _join_list(items: list[str]) -> str:
     return "、".join(s.strip() for s in items if s and s.strip())
-
-
-def _format_elapsed_minutes(minutes: float) -> str:
-    if minutes < 60:
-        return f"{int(round(minutes))} 分鐘前"
-    hours = minutes / 60.0
-    if hours < 24:
-        return f"{hours:.1f} 小時前"
-    days = hours / 24.0
-    return f"{days:.1f} 天前"
 
 
 def _parse_tool_calls(raw: object, *, allowed: set[str]) -> tuple[ToolCall, ...]:
@@ -559,37 +622,72 @@ def _coerce_str(value: object) -> str:
     return str(value).strip()
 
 
-def _extract_json_object(text: str) -> str | None:
-    """Return the first balanced ``{...}`` substring, or ``None``.
+def _is_stale_dialogue(idle_minutes: float | None) -> bool:
+    """Has the thread been quiet long enough to stop calling it live?
 
-    Tolerates code fences / preambles. Quote-aware so braces inside
-    strings don't throw off the depth counter.
+    ``None`` (no prior conversation at all) is not stale — there is no
+    summary to head in that case anyway, and treating "never spoke" as
+    "spoke long ago" would be a different claim.
     """
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
+    if idle_minutes is None:
+        return False
+    return idle_minutes >= _STALE_DIALOGUE_IDLE_HOURS * 60.0
+
+
+def _render_dialogue_summary_section(context: ProactiveContext) -> str:
+    """The dialogue-summary block, headed by how live the thread still is.
+
+    Two wordings, one body. Under the threshold the conversation really is
+    in progress and the old instruction stands (don't re-raise the same
+    thing; a topic left hanging may be picked up). Over it the same text
+    is history: still the best material available for an opener, but
+    quoting it as though the exchange were still running is exactly the
+    「久未聯絡卻硬接上一輪」 failure the catch-up hint above tries to
+    prevent — and the two blocks used to say opposite things in the same
+    prompt.
+
+    Applies to every trigger, not only the reactivation one: a 兩個月沒說話
+    的 TICK push has the same problem, and gating on the trigger would fix
+    the rare case while leaving the common one.
+    """
+    body = context.recent_dialogue_summary.strip()
+    if not _is_stale_dialogue(context.idle_minutes):
+        return (
+            "最近你和對方正在聊的事（請避免再主動提同一件事；"
+            "若對方正在聊到的某個話題被晾著，也可以順著接）：\n"
+            + body
+        )
+    return (
+        # The instructions file — a baseline pack we may not edit — refers
+        # to this block by its live heading, so the stale heading keeps
+        # that phrase inside it as a pointer. Renaming the section without
+        # it would leave a quoted reference in the instructions that
+        # resolves to nothing.
+        "你們上次聊到的事（下方指示裡說的「最近你和對方正在聊的事」就是這一段；"
+        "**但已經隔了一段時間，這不是還在進行中的對話**）：\n"
+        + body
+        + "\n- 這些可以當作 catch-up 的引子，但別當作還在進行中的話題硬接；"
+        "要提就用「上次你說的…後來怎麼樣了」這種回頭問的語氣，"
+        "不要假設對方還停在那個當下。"
+    )
+
+
+def _render_health_follow_up_hint(context: ProactiveContext) -> str:
+    """TR3's proactive addendum — see the call site for why this is
+    code-side rather than a ``decider_instructions.txt`` edit.
+
+    Gated on whether either material block that could plausibly carry a
+    health signal actually rendered anything this turn (dialogue summary,
+    memories) — not on scanning their text. Scanning for 「胸悶」/「頭痛」
+    would turn a semantic judgement ("is this actually a persistent,
+    specific symptom, or throwaway small talk") into a keyword trigger,
+    which is what the character-voiced ``health_care`` chat section and
+    this file's CLAUDE.md both exist to avoid. The LLM reads the same
+    material and makes that call itself.
+    """
+    if not context.recent_dialogue_summary.strip() and not context.recent_memories_text.strip():
+        return ""
+    return _HEALTH_FOLLOW_UP_HINT
 
 
 def _render_upcoming_days_for_decider(context: ProactiveContext) -> str:

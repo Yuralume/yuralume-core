@@ -63,6 +63,22 @@ _CHAT_ASSIST_KEY = "chat_assist"
 _VISUAL_GENERATION_STYLE_KEY = VISUAL_GENERATION_STYLE_PREFERENCE_KEY
 
 
+class FeatureReasoningOverride(BaseModel):
+    """Optional routing-level reasoning posture on a routing entry
+    (feature/group/active_model — and the NSFW mode target).
+
+    When present (any field explicitly set), the resolver replaces the
+    provider connection's reasoning trio with this one for calls routed
+    through the entry — so the same model can run e.g. high effort on
+    ``high_reasoning_gates`` and reasoning-off on ``light_observers``.
+    An all-default object is normalised away on write (same as absent).
+    """
+
+    disable_reasoning: bool = False
+    reasoning_effort: str | None = None
+    thinking_budget_tokens: int | None = Field(default=None, ge=1)
+
+
 class ActiveModelPreference(BaseModel):
     """Global picker state — remembered across page loads.
 
@@ -75,26 +91,16 @@ class ActiveModelPreference(BaseModel):
     pick: ``null`` inherits the provider connection's flag, ``true`` /
     ``false`` pin it for calls resolved through active_model (needed
     because an aggregator connection fronts both vision and text-only
-    models)."""
+    models).
+
+    ``reasoning`` scopes the same way: it applies only to calls that
+    actually resolve through active_model — a feature/group pin routes
+    its calls elsewhere and never borrows this posture."""
 
     provider_id: str | None = None
     model_id: str | None = None
     supports_vision: bool | None = None
-
-
-class FeatureReasoningOverride(BaseModel):
-    """Optional routing-level reasoning posture on a feature/group entry.
-
-    When present (any field explicitly set), the resolver replaces the
-    provider connection's reasoning trio with this one for calls routed
-    through the entry — so the same model can run e.g. high effort on
-    ``high_reasoning_gates`` and reasoning-off on ``light_observers``.
-    An all-default object is normalised away on write (same as absent).
-    """
-
-    disable_reasoning: bool = False
-    reasoning_effort: str | None = None
-    thinking_budget_tokens: int | None = Field(default=None, ge=1)
+    reasoning: FeatureReasoningOverride | None = None
 
 
 class FeatureModelEntry(BaseModel):
@@ -220,6 +226,7 @@ async def get_active_model_preference(
         provider_id=_coerce_str(raw.get("provider_id")),
         model_id=_coerce_str(raw.get("model_id")),
         supports_vision=parse_vision_override(raw),
+        reasoning=_reasoning_from_raw_entry(raw),
     )
 
 
@@ -246,11 +253,24 @@ async def set_active_model_preference(
     # still counts as "clear" below).
     if payload.supports_vision is not None:
         value["supports_vision"] = payload.supports_vision
+    reasoning = _cleaned_reasoning_value(payload.reasoning)
+    if reasoning is not None:
+        value["reasoning"] = reasoning
+    # Free-text effort is probed against the real upstream before the
+    # preference is committed — same preflight as feature/group entries.
+    # active_model is the bottom routing layer, so the entry itself is
+    # the whole resolution chain.
+    await _validate_reasoning_effort_entries(
+        container,
+        {_ACTIVE_MODEL_KEY: value},
+        fallbacks={},
+    )
     if (
         user_id
         and payload.provider_id is None
         and payload.model_id is None
         and payload.supports_vision is None
+        and reasoning is None
     ):
         await delete_user_preference(
             container.preferences_repository,
@@ -264,7 +284,11 @@ async def set_active_model_preference(
             value,
             user_id=user_id,
         )
-    return payload
+    # Echo the normalised view (all-default reasoning collapses to null)
+    # so the UI reconciles with what actually got saved.
+    return payload.model_copy(
+        update={"reasoning": _reasoning_from_raw_entry(value)},
+    )
 
 
 def _reasoning_from_raw_entry(entry: Any) -> FeatureReasoningOverride | None:
@@ -280,19 +304,19 @@ def _reasoning_from_raw_entry(entry: Any) -> FeatureReasoningOverride | None:
 
 
 def _cleaned_reasoning_value(
-    entry: FeatureModelEntry,
+    reasoning: FeatureReasoningOverride | None,
 ) -> dict[str, object] | None:
     """Normalise a submitted reasoning override to its stored shape.
 
     All-default objects collapse to ``None`` so a blank reasoning form
     can't keep an otherwise-empty entry alive."""
-    if entry.reasoning is None:
+    if reasoning is None:
         return None
     return reasoning_pref_value(
         reasoning_override_from_fields(
-            disable_reasoning=entry.reasoning.disable_reasoning,
-            reasoning_effort=entry.reasoning.reasoning_effort,
-            thinking_budget_tokens=entry.reasoning.thinking_budget_tokens,
+            disable_reasoning=reasoning.disable_reasoning,
+            reasoning_effort=reasoning.reasoning_effort,
+            thinking_budget_tokens=reasoning.thinking_budget_tokens,
         ),
     )
 
@@ -306,7 +330,7 @@ def _cleaned_routing_entry(entry: FeatureModelEntry) -> dict[str, Any] | None:
     configuration and survives."""
     provider_id = _coerce_str(entry.provider_id)
     model_id = _coerce_str(entry.model_id)
-    reasoning = _cleaned_reasoning_value(entry)
+    reasoning = _cleaned_reasoning_value(entry.reasoning)
     # pydantic already validated the field as ``bool | None``; a bool is
     # a pin, ``None`` inherits the connection flag.
     vision = entry.supports_vision if isinstance(entry.supports_vision, bool) else None
@@ -566,6 +590,7 @@ async def get_feature_model_group_preferences(
             provider_id=_coerce_str(raw_active.get("provider_id")),
             model_id=_coerce_str(raw_active.get("model_id")),
             supports_vision=parse_vision_override(raw_active),
+            reasoning=_reasoning_from_raw_entry(raw_active),
         )
 
     return FeatureModelGroupsPreference(

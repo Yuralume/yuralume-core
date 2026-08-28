@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -19,6 +18,7 @@ from kokoro_link.infrastructure.observability.llm_metadata_wrapper import (
     LLMCallMetadata,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,7 +115,9 @@ def _render_lines(lines: tuple[str, ...]) -> str:
 
 
 def _parse_digest(raw: str) -> PromptMaterialDigest | None:
-    obj = _extract_object(raw or "")
+    outcome = extract_object_outcome(raw or "")
+    log_parse_outcome(_LOGGER, outcome, site="prompt.llm_material_digester")
+    obj = outcome.value
     if obj is None:
         return None
     bullets = tuple(_valid_bullets(obj.get("bullets")))
@@ -161,38 +163,6 @@ def _valid_bullets(raw: Any) -> list[str]:
         if len(bullets) >= _MAX_BULLETS:
             break
     return bullets
-
-
-def _extract_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    parsed = json.loads(text[start:index + 1])
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
 
 
 def _clip(text: str, limit: int) -> str:

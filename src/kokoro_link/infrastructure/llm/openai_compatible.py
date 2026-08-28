@@ -53,6 +53,29 @@ false positive costs one bounded retry that fails the same way."""
 
 _SYSTEM_PROMPT = "You are a roleplay character backend."
 
+REASONING_DIALECT_CHAT_TEMPLATE = "chat_template"
+"""Default reasoning-control request dialect: the vLLM / LM Studio /
+llama.cpp convention (``chat_template_kwargs: {enable_thinking: false}``
+for disable, top-level ``reasoning_effort`` for effort). It has no
+thinking-budget counterpart — a configured budget is withheld with one
+warning instead of being sent as a param the server never defined."""
+
+REASONING_DIALECT_OPENROUTER = "openrouter"
+"""OpenRouter's documented shape: a nested ``reasoning`` object
+(``{"enabled": false}`` / ``{"max_tokens": N}``) plus top-level
+``reasoning_effort``. The dialect exists because OpenRouter silently
+ignores unknown params — the ``chat_template_kwargs`` disable would be
+a no-op that misleads the operator into thinking reasoning is off.
+OpenRouter treats effort and ``reasoning.max_tokens`` as mutually
+exclusive: when both are configured the budget wins and the effort is
+withheld (owner D4, 2026-08-25). ``disable_reasoning`` and effort are
+likewise mutually exclusive — a disabled request sends
+``reasoning.enabled: false`` alone, never a top-level
+``reasoning_effort`` alongside it, on the same "no strength knob under
+a disable" principle as the budget suppression. Which dialect a preset
+speaks is a catalog-entry property (per-preset protocol adaptation,
+same precedent as OpenRouterImageProvider), never base_url sniffing."""
+
 _MAX_PRESCRIBED_RETRIES = 8
 """Defensive cap on server-prescribed adaptations per call. Every
 adaptation is monotone — it either consumes a one-shot memo (non-chat
@@ -123,6 +146,8 @@ class OpenAICompatibleChatModel(ChatModelPort):
         max_tokens: int | None = None,
         disable_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        thinking_budget_tokens: int | None = None,
+        reasoning_dialect: str = REASONING_DIALECT_CHAT_TEMPLATE,
         extra_request_params: dict | None = None,
         strip_think_tags: bool = False,
     ) -> None:
@@ -143,6 +168,8 @@ class OpenAICompatibleChatModel(ChatModelPort):
         # untouched.
         self._disable_reasoning = disable_reasoning
         self._reasoning_effort = reasoning_effort
+        self._thinking_budget_tokens = thinking_budget_tokens
+        self._reasoning_dialect = reasoning_dialect
         self._extra_request_params = extra_request_params
         self._strip_think_tags = strip_think_tags
         self._models_cache: list[str] | None = None
@@ -154,6 +181,10 @@ class OpenAICompatibleChatModel(ChatModelPort):
         # degrades siblings on the same (aggregator) connection. One
         # shared dict object so per-call clones learn together.
         self._quirks_by_model: dict[str, _LearnedQuirks] = {}
+        # One-shot warning memos. A shared SET object (same clone-sharing
+        # rationale as _quirks_by_model): per-call reasoning-override
+        # clones would otherwise each re-log, i.e. once per chat call.
+        self._warned_once: set[str] = set()
 
     def with_reasoning_overrides(
         self, overrides: ReasoningOverrides,
@@ -161,7 +192,7 @@ class OpenAICompatibleChatModel(ChatModelPort):
         """Return a copy bound to a routing-level reasoning posture.
 
         The routing layer (feature/group override) replaces the whole
-        reasoning pair this adapter understands; connection-level
+        reasoning trio this adapter understands; connection-level
         ``strip_think_tags`` / ``extra_request_params`` stay untouched
         (endpoint properties, not per-task posture). ``copy.copy``
         shares the model-list cache, the learned non-chat-model set and
@@ -171,6 +202,7 @@ class OpenAICompatibleChatModel(ChatModelPort):
         clone = copy.copy(self)
         clone._disable_reasoning = overrides.disable_reasoning
         clone._reasoning_effort = overrides.reasoning_effort
+        clone._thinking_budget_tokens = overrides.thinking_budget_tokens
         return clone
 
     def with_supports_vision(self, value: bool) -> "OpenAICompatibleChatModel":
@@ -268,14 +300,45 @@ class OpenAICompatibleChatModel(ChatModelPort):
             # server to pick something reasonable. The param name adapts to
             # what the endpoint accepts (see _is_max_tokens_param_error).
             payload[self._max_tokens_param] = self._max_tokens
-        # Reasoning controls — three independent opt-ins. Each key is only
-        # emitted when the operator explicitly set it; nothing is sent by
-        # default. extra_request_params merges last so an advanced user can
+        # Reasoning controls — all opt-in. Each key is only emitted when
+        # the operator explicitly set it; nothing is sent by default. The
+        # emitted SHAPE is the preset's reasoning dialect (see the
+        # REASONING_DIALECT_* constants for what each protocol accepts
+        # and why base_url sniffing is not how the dialect is chosen).
+        # extra_request_params merges last so an advanced user can
         # deliberately override the shape produced above.
-        if self._disable_reasoning:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
-        if self._reasoning_effort:
-            payload["reasoning_effort"] = self._reasoning_effort
+        if self._reasoning_dialect == REASONING_DIALECT_OPENROUTER:
+            if self._disable_reasoning:
+                # ``enabled: false`` alone — sending a budget alongside
+                # would contradict the disable.
+                payload["reasoning"] = {"enabled": False}
+            elif self._thinking_budget_tokens is not None:
+                payload["reasoning"] = {
+                    "max_tokens": self._thinking_budget_tokens,
+                }
+            if (
+                self._reasoning_effort
+                and not self._disable_reasoning
+                and self._thinking_budget_tokens is None
+            ):
+                # Effort and max_tokens are mutually exclusive on
+                # OpenRouter; a configured budget wins (owner D4).
+                # Effort is also withheld under disable — sending any
+                # strength knob alongside `reasoning.enabled: false`
+                # self-contradicts the disable, same principle as the
+                # budget suppression above (OpenRouter's own priority
+                # between the two on that combination is undocumented).
+                payload["reasoning_effort"] = self._reasoning_effort
+        else:
+            if self._disable_reasoning:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+            if self._reasoning_effort:
+                payload["reasoning_effort"] = self._reasoning_effort
+            if self._thinking_budget_tokens is not None:
+                # No budget counterpart in this dialect — withhold it,
+                # but never silently (the operator would otherwise
+                # believe the cap is live).
+                self._warn_dropped_thinking_budget()
         if self._extra_request_params:
             payload.update(self._extra_request_params)
         if stream:
@@ -751,6 +814,20 @@ class OpenAICompatibleChatModel(ChatModelPort):
             "model",
             self.provider_id,
             model,
+        )
+
+    def _warn_dropped_thinking_budget(self) -> None:
+        if "dropped_thinking_budget" in self._warned_once:
+            return
+        self._warned_once.add("dropped_thinking_budget")
+        _LOGGER.warning(
+            "LLM %s: thinking_budget_tokens has no counterpart in the "
+            "%r reasoning dialect; withholding it from requests on this "
+            "connection (route the budget through an OpenRouter "
+            "connection, or use extra_request_params for a "
+            "server-specific field)",
+            self.provider_id,
+            self._reasoning_dialect,
         )
 
     def _remember_non_stream_fallback(self, model: str) -> None:

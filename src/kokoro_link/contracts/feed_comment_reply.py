@@ -55,6 +55,14 @@ class FeedCommentReplyInput:
     nobody in particular, while a comment reply is the character speaking
     to this player, which is the only place the declaration is staging
     rather than trivia. Empty leaves the prompt byte-identical."""
+    quality_feedback: str = ""
+    """QG3 — the output-quality gate's feedback on a rejected first draft.
+
+    Set only on the regeneration call the orchestrator drives; empty on
+    every ordinary compose, which leaves the prompt byte-identical to
+    before QG3. There is no other field this rides on: ``busy_hint`` is
+    the character's own state, not a note about the previous draft, and
+    mixing the two would blur what the model is meant to fix."""
 
 
 @dataclass(frozen=True, slots=True)

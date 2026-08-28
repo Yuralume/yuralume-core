@@ -109,12 +109,18 @@ was scheduled and nothing will be — the caller must handle the work itself."""
 def _release_window(scheduled_for: datetime) -> int:
     """Idempotency window derived from the row's release instant.
 
-    ``scheduled_for`` is fixed for the life of a row (merge keeps it, cancel
-    terminates the row), so both the write-point enqueue and the reconcile compute
-    the SAME ``follow_up:{id}:{window}`` key → the queue accepts at most one active
-    release job per row. A later occurrence of the same row id (a failed release
-    flipped back to ``queued`` after its job reached a terminal state) reuses the
-    same key, which is accepted only because the previous job is no longer active."""
+    ``scheduled_for`` is the row's own release instant, so both the write-point
+    enqueue and the reconcile compute the SAME ``follow_up:{id}:{window}`` key from
+    whatever the row currently says → the queue accepts at most one active release
+    job per row. A later occurrence of the same row id (a failed release flipped
+    back to ``queued`` after its job reached a terminal state) reuses the same key,
+    which is accepted only because the previous job is no longer active.
+
+    An honesty park (F1) is the one thing that *moves* ``scheduled_for``, and it
+    moves it only forward, only after its own release job has already run to a
+    terminal state. So the key changes, the next enqueue mints a job at the new
+    instant, and any straggler minted under the old key is answered by the
+    handler's ``not_due`` re-verify rather than by an early release."""
     return int(ensure_utc(scheduled_for).timestamp())
 
 
@@ -287,6 +293,59 @@ class PendingFollowUpReleaseEnqueuer:
         if self._clock is not None:
             return ensure_utc(self._clock.now())
         return datetime.now(timezone.utc)
+
+
+def release_idempotency_keys(row: PendingFollowUp) -> tuple[str, ...]:
+    """Every idempotency key a release job for ``row`` can carry.
+
+    Derived from the row rather than looked up, exactly like the enqueue
+    side — both compute the same ``follow_up:{id}:{window}`` base from
+    ``scheduled_for``, which is fixed for the life of the row."""
+    kinds = (
+        PENDING_FOLLOW_UP_RELEASE_KIND,
+        *sorted(_CAPABILITY_RELEASE_KINDS.values()),
+    )
+    return tuple(_release_idempotency_key(row, kind) for kind in kinds)
+
+
+class PendingFollowUpReleaseWithdrawer:
+    """Take back the release jobs of a row that no longer exists.
+
+    The mirror image of :class:`PendingFollowUpReleaseEnqueuer`, and its
+    only caller today is turn-undo: a row the reverted turn created gets
+    deleted, so the job scheduled to release it now describes work that
+    is gone. The handler re-loads its row and skips a missing one, so
+    nothing breaks without this — what it buys is a queue whose contents
+    still describe real work, and an active-idempotency key freed now
+    instead of at the row's original due instant.
+
+    Every release kind minted for the row is withdrawn, not only the text
+    one: the image half is a second key under the same row, and leaving
+    it holds a capability slot for a promise nobody is owed. No
+    coordinator lease is read — withdrawal removes work rather than
+    admitting it, so there is no epoch to fence against.
+    """
+
+    def __init__(self, *, queue: BackgroundJobQueuePort) -> None:
+        self._queue = queue
+
+    async def withdraw(self, row: PendingFollowUp, *, now: datetime) -> int:
+        """Withdraw every queued release job for ``row``; count retired.
+
+        Never raises: the caller is mid-rollback, and a queue hiccup must
+        not cost the player the rest of the undo."""
+        withdrawn = 0
+        for key in release_idempotency_keys(row):
+            try:
+                withdrawn += await self._queue.withdraw_queued(
+                    key, now=ensure_utc(now),
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "follow-up release withdraw failed id=%s key=%s",
+                    row.id, key,
+                )
+        return withdrawn
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,6 +37,13 @@ class ProviderCatalogEntry:
     default_models: tuple[str, ...] = field(default_factory=tuple)
     adapter_kind: str = ""
     docs_url: str = ""
+    # Which reasoning-control request dialect the openai_compatible chat
+    # adapter speaks for this preset (see the REASONING_DIALECT_*
+    # constants in infrastructure/llm/openai_compatible.py). A catalog
+    # property because protocol adaptation is per-preset (same precedent
+    # as OpenRouterImageProvider), never base_url sniffing; only
+    # adapter_kind="openai_compatible" presets consume it.
+    reasoning_dialect: str = "chat_template"
 
 
 def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
@@ -221,10 +228,35 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
     )
     thinking_budget_tokens = ProviderFieldSpec(
         key="thinking_budget_tokens",
-        label="Thinking budget tokens (blank = extended thinking off)",
+        label="Thinking budget tokens",
         kind="number",
         placeholder="e.g. 4096",
         advanced=True,
+        hint="Leave blank to turn extended thinking off.",
+    )
+    # OpenRouter variant of the budget knob (dialect "openrouter": sent
+    # as ``reasoning: {max_tokens: N}``). Shares the field KEY with the
+    # Anthropic spec so connection config, routing overrides and the
+    # frontend i18n-by-field-key lookup all stay on one name. Both specs
+    # ship their own English ``hint`` now — the frontend's per-preset
+    # i18n lookup (providerFields.<presetId>.thinking_budget_tokens.hint)
+    # normally wins for the three shipped locales; this text is only the
+    # last-resort fallback for an untranslated locale, so the two hints
+    # must NOT be conflated even though the key is shared: "blank" means
+    # something different on each dialect (off vs. upstream default).
+    openrouter_thinking_budget_tokens = ProviderFieldSpec(
+        key="thinking_budget_tokens",
+        label="Thinking budget tokens",
+        kind="number",
+        placeholder="e.g. 4096",
+        advanced=True,
+        hint=(
+            "Sent as reasoning.max_tokens. Mutually exclusive with "
+            "reasoning effort — when both are filled in, this budget "
+            "wins. Leaving it blank means the parameter is not sent at "
+            "all (the upstream model's own default applies) — it does "
+            "NOT turn thinking off."
+        ),
     )
     # Web-search (`search` capability) fields. `max_results` caps snippets
     # per call; `search_depth` is Tavily-specific (basic/advanced).
@@ -491,6 +523,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
                 supports_vision,
                 max_tokens,
                 reasoning_effort,
+                openrouter_thinking_budget_tokens,
                 extra_request_params,
                 strip_think_tags,
                 connection_slug,
@@ -499,6 +532,7 @@ def list_provider_catalog() -> tuple[ProviderCatalogEntry, ...]:
             default_models=("openai/gpt-4o-mini",),
             adapter_kind="openai_compatible",
             docs_url="https://openrouter.ai/docs",
+            reasoning_dialect="openrouter",
         ),
         ProviderCatalogEntry(
             id="nanogpt",

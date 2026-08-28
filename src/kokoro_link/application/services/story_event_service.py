@@ -56,10 +56,14 @@ from kokoro_link.contracts.story_arc import (
 from kokoro_link.domain.entities.character import Character
 from kokoro_link.domain.entities.memory_item import (
     MEMORY_AUDIENCE_PRIVATE,
+    PLAYER_KNOWLEDGE_PRIVATE,
+    PLAYER_KNOWLEDGE_SHARED,
     MemoryItem,
+    merge_player_knowledge,
 )
 from kokoro_link.domain.entities.story_arc import (
     ARC_COMPLETED,
+    OPERATOR_POSITION_ABSENT,
     OPERATOR_POSITION_CENTRAL,
     OPERATOR_POSITION_PRESENT,
     TENSION_CLIMAX,
@@ -340,6 +344,16 @@ class StoryEventService:
                     event = await self.record_arc_beat_realization(
                         character,
                         beat_id=beat.id,
+                        # KB6/F2: not a player-present station. The
+                        # rechecker retires a beat that ran out of
+                        # attempts and writes its own summary; nobody
+                        # performed it in front of the player, and this
+                        # branch is reached from unattended ticks too.
+                        # So the beat's own ``operator_position`` stays
+                        # the only evidence — including its unjudged
+                        # ``None``, which lands as "" rather than a
+                        # fabricated "the player does not know".
+                        player_present=False,
                         narrative=adjustment.narrative,
                         now=datetime.combine(
                             today,
@@ -401,12 +415,23 @@ class StoryEventService:
         narrative: str,
         now: datetime | None = None,
         emotional_tone: str | None = None,
+        player_present: bool = False,
     ) -> StoryEvent | None:
         """Persist the event that actually happened in chat/proactive.
 
         Direction B moves arc realization from calendar time to
         interaction time. This method is called after post-turn LLM
         emits ``mark_realized`` with a narrative of what happened.
+
+        ``player_present`` (KB6/F2) says the player *watched this land* —
+        they were in the room while it was performed, so the memory is
+        common ground no matter what the beat's ``operator_position``
+        guessed beforehand. It is a caller fact, not a beat fact: the
+        beat's position is the writer's plan, while this is what actually
+        happened, and only the caller knows which of the two it is
+        holding. Default ``False`` mirrors ``ensure_today(unattended=)``
+        — a caller that forgets it falls back to the position
+        projection rather than silently claiming the player was there.
         """
         if self._arc_service is None:
             return None
@@ -456,7 +481,7 @@ class StoryEventService:
             )
             return None
 
-        await self._memorialize(event)
+        await self._memorialize(event, player_present=player_present)
         try:
             updated_arc = await self._arc_service.realize_beat(
                 beat_id=beat_id, event_id=event.id,
@@ -665,18 +690,29 @@ class StoryEventService:
         except Exception:  # pragma: no cover - defensive
             return default
 
-    async def _memorialize(self, event: StoryEvent) -> None:
+    async def _memorialize(
+        self,
+        event: StoryEvent,
+        *,
+        player_present: bool = False,
+    ) -> None:
         """Fire-and-forget episodic memory write for the event.
 
         Failure here must not abort the caller — the event is persisted
         and the character still gets the narrative in prompts via
         ``list_recent``. Worst case, it's not in hybrid-ranker pool.
+
+        ``player_present`` is threaded through untouched to
+        :func:`_player_knowledge_for_story_memory`; the two internal
+        writers below (gacha expansion, beat expansion) are both
+        world-simulation paths and keep the ``False`` default.
         """
         try:
             kind = MemoryKind.EPISODIC
             salience = 0.45
             tags = ["story_event"]
             participants: tuple[ParticipantRef, ...] = ()
+            beat: StoryArcBeat | None = None
             if event.arc_beat_id and self._arc_service is not None:
                 arc = await self._arc_service.get_arc_by_beat(event.arc_beat_id)
                 beat = arc.find_beat(event.arc_beat_id) if arc is not None else None
@@ -699,6 +735,10 @@ class StoryEventService:
                 tags=tags,
                 created_at=event.created_at,
                 participants=participants,
+                player_knowledge=_player_knowledge_for_story_memory(
+                    player_present=player_present,
+                    beat=beat,
+                ),
             )
             embedded = await attach_embeddings([item], self._embedder)
             await self._memories.add_many(embedded)
@@ -736,6 +776,33 @@ class StoryEventService:
                 tags=["story_event", "arc_completion", tag],
                 # Relationship-progression book-keeping — not a public post.
                 audience=MEMORY_AUDIENCE_PRIVATE,
+                # F3a: this recap spans up to five realized beats whose
+                # positions may differ, so the verdict has to be a merge,
+                # not a single re-projection. Re-running
+                # ``_player_knowledge_for_story_memory`` per beat would be
+                # wrong on its own: F2 taught that projection needs
+                # ``player_present`` (was the player actually in the
+                # room?), and that fact does not exist here — a milestone
+                # summarises beats after the fact, it was never itself
+                # performed in front of anyone. What each beat's own
+                # realization *did* record is the real answer, written
+                # into that beat's memory by ``_memorialize`` at the time
+                # it happened. ``_realized_beat_memory_player_knowledge``
+                # recovers that value via the ``arc_beat_id:<id>`` tag
+                # ``_arc_memory_shape`` stamps on every beat memory, and
+                # falls back to "" (unjudged) when it can't — a beat
+                # realized before this fix carries no such tag, and the
+                # lookup only searches ``existing`` (capped at 80 recent
+                # memories), so an older beat's memory can fall outside
+                # the window. ``merge_player_knowledge`` (KB6) then folds
+                # the up-to-five verdicts into one, most-protective wins:
+                # any ``private`` source outranks everything, and a
+                # failed lookup contributes "" like any other unjudged
+                # source — it never gets treated as "shared" by default.
+                player_knowledge=merge_player_knowledge(
+                    _realized_beat_memory_player_knowledge(beat, existing)
+                    for beat in realized
+                ),
             )
             embedded = await attach_embeddings([item], self._embedder)
             await self._memories.add_many(embedded)
@@ -789,7 +856,9 @@ class StoryEventService:
 
 
 def _arc_memory_shape(beat: StoryArcBeat) -> tuple[MemoryKind, float, list[str]]:
-    tags = ["story_event", "arc_beat", beat.tension]
+    tags = [
+        "story_event", "arc_beat", beat.tension, _arc_beat_memory_tag(beat.id),
+    ]
     if beat.tension in {TENSION_CLIMAX, TENSION_RESOLUTION}:
         return MemoryKind.RELATIONSHIP_MILESTONE, 0.9, tags + ["arc_milestone"]
     salience_by_tension = {
@@ -802,6 +871,87 @@ def _arc_memory_shape(beat: StoryArcBeat) -> tuple[MemoryKind, float, list[str]]
         salience_by_tension.get(beat.tension, 0.55),
         tags,
     )
+
+
+def _arc_beat_memory_tag(beat_id: str) -> str:
+    """Tag linking a realized beat's memory back to the beat itself
+    (F3a). This is the only persisted pointer from a ``StoryArcBeat`` to
+    the ``MemoryItem`` its realization wrote — there is no foreign key
+    either direction — so it is how the arc-completion milestone (which
+    only holds ``StoryArcBeat`` objects, not memories) recovers each
+    beat's actual ``player_knowledge`` verdict for the merge."""
+    return f"arc_beat_id:{beat_id}"
+
+
+def _realized_beat_memory_player_knowledge(
+    beat: StoryArcBeat,
+    memories: list[MemoryItem],
+) -> str:
+    """Player-knowledge verdict of the memory a realized beat's own
+    write station created, or ``""`` when it cannot be found (F3a).
+
+    ``memories`` is the caller's already-fetched, most-recent-first
+    window (bounded, not exhaustive) — a beat whose memory has aged out
+    of it, or one realized before ``_arc_memory_shape`` started stamping
+    the ``arc_beat_id:<id>`` tag, yields the unjudged fallback rather
+    than an exception or a guess.
+    """
+    marker = _arc_beat_memory_tag(beat.id)
+    for memory in memories:
+        if marker in memory.tags:
+            return memory.player_knowledge
+    return ""
+
+
+def _player_knowledge_for_story_memory(
+    *,
+    player_present: bool,
+    beat: StoryArcBeat | None,
+) -> str:
+    """KB6 verdict for every writer that shares ``_memorialize``.
+
+    Two facts answer it, in this order:
+
+    1. **Did the player watch it happen?** ``player_present`` is the
+       caller's report of the room, and it wins outright. The two
+       stations that realize a beat *while the player is playing* —
+       post-turn ``mark_realized`` and the scene-session close — know
+       something the beat's plan cannot: it was performed in front of
+       them. This is the F2 fix. The old projection read only
+       ``operator_position``, which is ``None`` on essentially the whole
+       existing corpus (nothing back-fills it, and four of the six
+       ``StoryArcBeat.create`` sites never pass it), so a scene the
+       player personally acted out was stamped ``private`` and the
+       character would later re-introduce it to them as news.
+
+    2. **Otherwise, what did the beat say the player's place was?**
+       ``present``/``central`` → ``shared`` (the plan put them in the
+       scene and nothing contradicted it); ``absent`` → ``private`` (the
+       plan deliberately kept them out); ``None`` → ``""``, *unjudged*.
+
+    The ``None`` → ``""`` landing is the other half of the fix. ``""``
+    is not "the player does not know" — it is "nobody has ruled", and it
+    renders exactly as it does today (``memory_knowledge_frame`` gives
+    ``""`` and ``shared`` the same no-frame treatment) while
+    :func:`merge_player_knowledge` keeps propagating it as unjudged.
+    Stamping ``private`` there would have the character actively assert
+    a boundary nobody established.
+
+    A story event with no beat at all (the gacha day-roll, or a beat
+    whose arc lookup failed) stays ``private``: that station *is*
+    classified — the world simulation wrote it while the player was not
+    looking — so it is a verdict, not a gap.
+    """
+    if player_present:
+        return PLAYER_KNOWLEDGE_SHARED
+    if beat is None:
+        return PLAYER_KNOWLEDGE_PRIVATE
+    position = beat.operator_position
+    if position in (OPERATOR_POSITION_PRESENT, OPERATOR_POSITION_CENTRAL):
+        return PLAYER_KNOWLEDGE_SHARED
+    if position == OPERATOR_POSITION_ABSENT:
+        return PLAYER_KNOWLEDGE_PRIVATE
+    return ""
 
 
 def _operator_participants_for_position(

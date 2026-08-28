@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 
@@ -24,6 +23,7 @@ from kokoro_link.infrastructure.prompts import get_default_loader
 from kokoro_link.infrastructure.story.date_context import (
     render_story_date_context_block,
 )
+from kokoro_link.llm_output import ParseReason, extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -120,17 +120,21 @@ def _build_prompt(context: ArcCompletionMemoryContext) -> str:
 
 def _parse_content(raw: str) -> str:
     text = (raw or "").strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            content = data.get("content")
-            if isinstance(content, str):
-                return _clean(content)
+    outcome = extract_object_outcome(text, repair_truncated=True)
+    if outcome.value is not None:
+        content = outcome.value.get("content")
+        if isinstance(content, str):
+            return _clean(content)
+    elif outcome.reason is not ParseReason.NO_JSON:
+        # A '{' was found but nothing usable came out of it (versus plain
+        # prose, which is this site's legitimate other reply shape and
+        # not worth a warning) — log once for visibility.
+        log_parse_outcome(_LOGGER, outcome, site="story.arc_completion_memory_writer")
+    # Same guard as before the migration: a region that looks like a
+    # broken JSON envelope (starts with '{' or ends with '}') must not
+    # leak as narration text even when it never resolved to usable
+    # content — only text that never looked JSON-shaped falls through
+    # to the plain-prose path below.
     if text.startswith("{") or text.endswith("}"):
         return ""
     return _clean(text)

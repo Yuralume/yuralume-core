@@ -28,9 +28,12 @@ invite the model to present a broken link as its source.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from kokoro_link.domain.entities.world_event import WorldEvent
+from kokoro_link.infrastructure.prompt.timing_utils import (
+    format_datetime_ago_phrase,
+)
 
 TITLE_CLIP = 160
 SOURCE_CLIP = 80
@@ -105,20 +108,11 @@ def _ago_phrase(*, mentioned_at: datetime, now: datetime) -> str:
     """Coarse "how long ago" phrasing for a recalled mention.
 
     Deliberately coarse: the character is recalling that it said
-    something, not quoting a timestamp. Naive inputs are read as UTC
-    (the storage convention), and a mention stamped in the future —
-    clock skew between a worker and the API — degrades to 「剛剛」
-    rather than rendering negative time."""
-    left = mentioned_at if mentioned_at.tzinfo else mentioned_at.replace(
-        tzinfo=timezone.utc,
-    )
-    right = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-    delta = right - left
-    if delta < timedelta(hours=1):
-        return "剛剛"
-    if delta < timedelta(days=1):
-        return f"約 {int(delta.total_seconds() // 3600)} 小時前"
-    return f"{delta.days} 天前"
+    something, not quoting a timestamp. Thin wrapper around the shared
+    :func:`~kokoro_link.infrastructure.prompt.timing_utils.format_datetime_ago_phrase`
+    (SP2 timing-formatter consolidation) — kept local only to preserve
+    this module's ``mentioned_at=``/``now=`` call-site naming."""
+    return format_datetime_ago_phrase(past=mentioned_at, now=now)
 
 
 def render_event_candidate_line(event: WorldEvent) -> str | None:

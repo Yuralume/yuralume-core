@@ -524,8 +524,14 @@ async def test_abandoned_stream_releases_the_count() -> None:
     await finalizer.release_turn_lease()
 
     assert fixture.drain.active_turns == 0
-    # Idempotent, because the route releases in a ``finally`` on top of the
-    # finalizer's own release. A double decrement would under-report.
+    # Idempotent, because release is reached from two directions on the same
+    # turn: ``finish`` ends every completed turn by releasing the lease it just
+    # settled, and the relay's ``finally`` releases every turn that never got
+    # to ``finish`` (upstream error, refusal, detach timeout). A double
+    # decrement would under-report ``active_turns`` and let drain call a
+    # replica idle while a turn is still writing. (The route itself releases
+    # nothing — see ``tests/unit/test_chat_stream_detached_completion.py`` for
+    # what a disconnect does instead.)
     await finalizer.release_turn_lease()
     assert fixture.drain.active_turns == 0
 

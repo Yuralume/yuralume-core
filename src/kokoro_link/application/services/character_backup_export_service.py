@@ -28,6 +28,19 @@ The full pipeline behind ``POST /characters/{id}/backup``:
 Execution mirrors the Creator Studio job precedent (fusion/branching):
 asyncio tasks in this process, a durable ledger row for restart
 recovery, ``MAX_BACKUP_JOB_ATTEMPTS`` bounding crash loops.
+
+**Known and accepted: the dump is not a single snapshot.** Each table is
+streamed in its own session (``SACharacterBackupExportReader.stream_rows``
+opens one per call), so an archive taken while the character is being
+talked to can hold a later table referencing rows an earlier table was
+dumped before. The sharpest instance is ``dialogue_checkpoints``, whose
+``covers_until_message_key`` can name a message written after
+``messages.jsonl`` was closed — a restored archive would then carry a
+summary reaching past its own transcript. It is a whole-pipeline
+property rather than that table's: fixing it there alone would buy a
+guarantee the other carried tables do not keep. The real fix is one
+repeatable-read transaction spanning the whole dump, which changes how
+the export runs rather than what it exports.
 """
 
 from __future__ import annotations

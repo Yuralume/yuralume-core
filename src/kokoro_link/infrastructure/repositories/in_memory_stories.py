@@ -14,6 +14,10 @@ from kokoro_link.domain.entities.story_event import StoryEvent
 from kokoro_link.domain.entities.story_seed import StorySeed
 
 
+def _ensure_tz(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class InMemoryStorySeedRepository(StorySeedRepositoryPort):
     def __init__(self) -> None:
         self._seeds: dict[str, StorySeed] = {}
@@ -181,6 +185,21 @@ class InMemoryStoryEventRepository(StoryEventRepositoryPort):
             to_remove = [
                 eid for eid, e in self._events.items()
                 if e.character_id == character_id
+            ]
+            for eid in to_remove:
+                del self._events[eid]
+        return len(to_remove)
+
+    async def delete_arc_beat_realizations_since(
+        self, character_id: str, since: datetime,
+    ) -> int:
+        moment = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        with self._lock:
+            to_remove = [
+                eid for eid, e in self._events.items()
+                if e.character_id == character_id
+                and e.arc_beat_id is not None
+                and _ensure_tz(e.created_at) >= moment
             ]
             for eid in to_remove:
                 del self._events[eid]

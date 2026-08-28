@@ -29,6 +29,12 @@ That is a deliberately lossy record, not a fabricated one. Landing
 nothing at all was the alternative and it is worse: the beat would stay
 pending, and the next 起幕 would re-enact a scene the player can still
 read further up the same thread.
+
+QG7 added one more way to produce nothing, and reused that same answer for
+it: the wrap-up now reviews through the shared output-quality band before
+it reaches the thread, and prose that fails a hard axis twice is discarded
+exactly as an absent draft is. No new fail-soft path, therefore no new
+path that only the timeout sweep ever walks.
 """
 
 from __future__ import annotations
@@ -39,12 +45,18 @@ from datetime import date as date_type, datetime, timezone
 from typing import Sequence
 
 from kokoro_link.application.services.memory_embedding import attach_embeddings
+from kokoro_link.application.services.output_quality import (
+    OutputQualityOrchestrator,
+    OutputQualityPolicy,
+    script_mix_lines,
+)
 from kokoro_link.application.services.story_scene_thread import (
     append_scene_messages,
 )
 from kokoro_link.contracts.clock import ensure_utc
 from kokoro_link.contracts.embedder import EmbedderPort
 from kokoro_link.contracts.memory import MemoryRepositoryPort
+from kokoro_link.contracts.novelty_gate import NoveltyGateContext
 from kokoro_link.contracts.repositories import ConversationRepositoryPort
 from kokoro_link.contracts.story_scene import (
     SCENE_NARRATION_SPEAKER,
@@ -62,7 +74,11 @@ from kokoro_link.domain.entities.conversation import (
     MessageKind,
     MessageRole,
 )
-from kokoro_link.domain.entities.memory_item import MemoryItem
+from kokoro_link.domain.entities.operator_profile import DEFAULT_OPERATOR_ID
+from kokoro_link.domain.entities.memory_item import (
+    PLAYER_KNOWLEDGE_SHARED,
+    MemoryItem,
+)
 from kokoro_link.domain.entities.story_scene_session import (
     SCENE_CLOSE_RESOLVED,
     StorySceneSession,
@@ -104,6 +120,58 @@ log line, so an operator reading a thin memory can tell "the writer
 failed here" from "the scene really was that small"."""
 
 
+SCENE_OPENING_QUALITY_SURFACE = "story_scene_opening"
+"""``surface`` label the raising of the curtain reports under."""
+
+SCENE_CLOSING_QUALITY_SURFACE = "story_scene_closing"
+"""``surface`` label the wrap-up reports under.
+
+One label per *hook point*, not one per feature — the same split
+``character_encounter_service`` already ships (``encounter_transcript`` vs
+``encounter_reflection``), and for the same reason. The opening and the
+wrap-up share a scene and a policy but nothing else an operator acts on:
+they call different writer ports, on different triggers (a button press vs
+the idle sweep), and they fail differently — a withheld opening fails the
+action and refunds, a withheld wrap-up closes the scene unnarrated. Folded
+into one ``story_scene`` label, a hard-skip streak named a feature and left
+the operator to guess which of the two halves was actually breaking; split,
+the pair still adds up to the feature's rate with a ``sum by (outcome)``,
+because these are Prometheus labels rather than metric names.
+
+Both are defined here rather than next to the opening path because
+:mod:`story_scene_service` already imports this module and the reverse
+import would be a cycle; the same reason the renderer below lives here.
+"""
+
+
+def labelled_scene_segments(*segments: tuple[str, str]) -> str:
+    """Scene prose as one reviewable body, with its speaker labels kept.
+
+    The quality gate judges a single ``response_text``, and a scene's
+    player-visible write is one segment (the wrap-up) or two (the opening's
+    narration and the character's first line). Labelling them is not
+    decoration: the register axes cannot be read at all without knowing
+    which half is narration and which half is somebody speaking.
+
+    The prose itself passes through byte for byte apart from surrounding
+    whitespace — unlike
+    :func:`~kokoro_link.contracts.story_scene.render_scene_line`, which
+    flattens a paragraph break into a space because a *transcript* line has
+    to stay one line. Here the opposite is true: the axes that carry the
+    most cost (a leaked schema fragment, a sentence that stops mid-word)
+    live in exactly the characters a reformatting pass would tidy away.
+
+    Empty segments are dropped, so a caller can splice in a field that is
+    legitimately blank without producing a dangling label.
+    """
+    parts: list[str] = []
+    for label, body in segments:
+        text = (body or "").strip()
+        if text:
+            parts.append(f"{label}：\n{text}")
+    return "\n\n".join(parts)
+
+
 @dataclass(frozen=True, slots=True)
 class SceneClosing:
     """The outcome of wrapping one scene up."""
@@ -135,6 +203,18 @@ class SceneClosingCoordinator:
         story_event_service=None,  # noqa: ANN001 - optional, duck-typed
         memory_repository: MemoryRepositoryPort | None = None,
         embedder: EmbedderPort | None = None,
+        # QG0 — the shared review→regenerate→dispose band, handed down by
+        # :class:`StorySceneService` so the opening and the wrap-up review
+        # under one policy. ``None`` skips the review entirely, which is
+        # what keeps a self-host close byte-identical.
+        output_quality_orchestrator: OutputQualityOrchestrator | None = None,
+        # QG7b — handed down from :class:`StorySceneService` alongside the
+        # orchestrator itself, so the wrap-up reads the same container-wired
+        # knob the opening does rather than a second copy of QG7's old
+        # hardcoded defaults. Defaults preserve QG7's byte-for-byte
+        # behaviour for any caller still pinned to the pre-QG7b signature.
+        reply_quality_gate_enabled: bool = True,
+        reply_quality_gate_max_retries: int = 1,
     ) -> None:
         self._sessions = sessions
         self._conversations = conversations
@@ -142,6 +222,11 @@ class SceneClosingCoordinator:
         self._story_events = story_event_service
         self._memories = memory_repository
         self._embedder = embedder
+        self._output_quality_orchestrator = output_quality_orchestrator
+        self._reply_quality_gate_enabled = bool(reply_quality_gate_enabled)
+        self._reply_quality_gate_max_retries = max(
+            0, int(reply_quality_gate_max_retries),
+        )
 
     # ── verdict ──────────────────────────────────────────────────────
 
@@ -216,6 +301,21 @@ class SceneClosingCoordinator:
                 already_closed=True,
             )
 
+        # QG7 — the wrap-up is player-visible prose, so it reviews before it
+        # reaches the thread. After the compare-and-set on purpose: a replica
+        # that lost the close writes nothing either way, and reviewing above
+        # this line would spend a judge call (and a regeneration) on prose
+        # that was already destined for the bin.
+        draft = await self._review_closing(
+            character,
+            session=session,
+            mode=mode,
+            draft=draft,
+            conversation=scene_thread,
+            today=today,
+            language=language,
+            player_persona_note=player_persona_note,
+        )
         narration = await self._append_narration(
             closed, draft=draft, now=moment,
         )
@@ -271,6 +371,100 @@ class SceneClosingCoordinator:
                 mode,
             )
             return None
+
+    async def _review_closing(
+        self,
+        character: Character,
+        *,
+        session: StorySceneSession,
+        mode: str,
+        draft: StorySceneClosingDraft | None,
+        conversation: Conversation | None,
+        today: date_type | None,
+        language: str,
+        player_persona_note: str,
+    ) -> StorySceneClosingDraft | None:
+        """Review the wrap-up, regenerate once, or throw it away (QG7).
+
+        ``None`` back is the **existing** "the writer produced nothing"
+        answer, not a new one: :meth:`_append_narration` writes nothing and
+        :meth:`_land_canon` degrades to the opening narration under the
+        ``story_scene_unnarrated`` tag. That mapping is deliberate — a
+        wrap-up whose prose leaked a schema fragment or stopped mid-word is
+        a writer that failed, and the honest record of a scene nobody
+        narrated already exists. The scene still closes; the player is
+        never stuck inside one because a judge disliked its ending.
+
+        A draft with no narration at all is a legitimate outcome (see
+        :class:`~kokoro_link.contracts.story_scene.StorySceneCloserPort`)
+        and skips the review untouched: there is nothing player-visible to
+        judge, and gating it would turn "the writer honestly declined" into
+        a discarded canon summary.
+        """
+        orchestrator = self._output_quality_orchestrator
+        if (
+            orchestrator is None
+            or draft is None
+            or not self._reply_quality_gate_enabled
+        ):
+            return draft
+        if not (draft.closing_narration or "").strip():
+            return draft
+        _, player_lines = render_scene_transcript(
+            conversation, session=session, character=character,
+        )
+
+        async def _regenerate(
+            feedback: str,
+        ) -> StorySceneClosingDraft | None:
+            # The feedback reaches the log (the orchestrator writes it) but
+            # not the writer: ``StorySceneClosingContext`` has no revision
+            # field and the port is outside this ticket, so the retry is a
+            # fresh sample rather than a directed rewrite. A wrap-up that
+            # comes back without narration is *not* a second draft — the
+            # orchestrator must dispose on the first verdict instead of
+            # re-reviewing an empty one.
+            _LOGGER.info(
+                "story scene wrap-up regenerating after the quality gate "
+                "scene=%s mode=%s feedback=%s",
+                session.id, mode, feedback,
+            )
+            retry = await self._write(
+                character,
+                session=session,
+                mode=mode,
+                conversation=conversation,
+                today=today,
+                language=language,
+                player_persona_note=player_persona_note,
+            )
+            if retry is None or not (retry.closing_narration or "").strip():
+                return None
+            return retry
+
+        review = await orchestrator.review(
+            draft,
+            surface=SCENE_CLOSING_QUALITY_SURFACE,
+            context_for=lambda candidate: _closing_gate_context(
+                character,
+                session=session,
+                draft=candidate,
+                language=language,
+                player_lines=player_lines,
+            ),
+            regenerate=_regenerate,
+            policy=OutputQualityPolicy.BACKGROUND_FAIL_CLOSED,
+            character=character,
+            max_retries=self._reply_quality_gate_max_retries,
+            enabled=self._reply_quality_gate_enabled,
+        )
+        if review.skipped:
+            _LOGGER.warning(
+                "story scene wrap-up withheld by the quality gate scene=%s "
+                "mode=%s — closing without a visible wrap-up",
+                session.id, mode,
+            )
+        return review.final
 
     async def _scene_thread(
         self, session: StorySceneSession, conversation: Conversation | None,
@@ -395,6 +589,14 @@ class SceneClosingCoordinator:
                 narrative=narrative,
                 now=now,
                 emotional_tone=tone,
+                # KB6/F2: the same fact ``_remember_side_story`` below
+                # stamps ``shared`` on — a scene session only exists
+                # because the player played it to a close, so they lived
+                # every line this canon summary compresses. Passing it
+                # explicitly is what stops layers 1/2 and layer 3 of the
+                # *same closing* disagreeing about whether the player
+                # was there.
+                player_present=True,
             )
         except Exception:  # noqa: BLE001 - the session is already closed
             _LOGGER.exception(
@@ -433,6 +635,12 @@ class SceneClosingCoordinator:
                 salience=_SIDE_STORY_SALIENCE,
                 tags=tags,
                 created_at=now,
+                # KB6: unlike ``audience`` (left unjudged above because
+                # stamping one would invent a rule), the player-knowledge
+                # verdict here is not a judgement call — a scene session
+                # only exists because the player played it through to a
+                # close, so they lived every line this memory summarises.
+                player_knowledge=PLAYER_KNOWLEDGE_SHARED,
             )
             embedded = await attach_embeddings([item], self._embedder)
             await self._memories.add_many(embedded)
@@ -443,6 +651,69 @@ class SceneClosingCoordinator:
             )
             return False
         return True
+
+
+# ── quality gate context ─────────────────────────────────────────────
+
+
+def _closing_gate_context(
+    character: Character,
+    *,
+    session: StorySceneSession,
+    draft: StorySceneClosingDraft,
+    language: str,
+    player_lines: tuple[str, ...],
+) -> NoveltyGateContext:
+    """What the judge reads about one wrap-up.
+
+    Only ``closing_narration`` is offered as the candidate. ``canon_summary``
+    is generated by the same call but is never shown to anybody — it is the
+    sentence that lands in memory — and folding it into the player-visible
+    body would let a defect in a private field withhold prose the player was
+    about to read.
+
+    ``known_material`` is the scene's own frame rather than its transcript:
+    compressing the transcript is the wrap-up's *job*, so handing the
+    transcript over as "already known material" would ask the novelty axis
+    to punish the writer for doing it.
+    """
+    return NoveltyGateContext(
+        character_id=character.id,
+        operator_id=getattr(character, "user_id", None) or DEFAULT_OPERATOR_ID,
+        response_text=labelled_scene_segments(
+            (SCENE_NARRATION_SPEAKER, draft.closing_narration),
+        ),
+        known_material=scene_frame_lines(session),
+        latest_user_message=player_lines[-1] if player_lines else "",
+        operator_primary_language=language,
+        mechanical_evidence_lines=script_mix_lines(
+            (draft.closing_narration,),
+            primary_language=language,
+        ),
+    )
+
+
+def scene_frame_lines(session: StorySceneSession) -> tuple[str, ...]:
+    """The scene's staging, as labelled lines for a gate context.
+
+    The frame the player has had on screen since the curtain went up, which
+    is also the only "already known" material shared by the opening and the
+    wrap-up. Blank fields are dropped rather than rendered as a placeholder:
+    a judge told 「地點：（未指定）」 has been given a fact that is not one.
+    """
+    fields: tuple[tuple[str, str | None], ...] = (
+        ("場景標題", session.title),
+        ("地點", session.location),
+        ("氛圍", session.mood),
+        ("戲劇問題", session.dramatic_question),
+        ("玩家在這場戲裡的位置", session.operator_position),
+        ("玩家在場註記", session.operator_note),
+    )
+    return tuple(
+        f"{label}：{(value or '').strip()}"
+        for label, value in fields
+        if (value or "").strip()
+    )
 
 
 # ── transcript ───────────────────────────────────────────────────────
@@ -534,7 +805,11 @@ def _clip(text: str) -> str:
 
 
 __all__: Sequence[str] = (
+    "SCENE_CLOSING_QUALITY_SURFACE",
+    "SCENE_OPENING_QUALITY_SURFACE",
     "SceneClosing",
     "SceneClosingCoordinator",
+    "labelled_scene_segments",
     "render_scene_transcript",
+    "scene_frame_lines",
 )

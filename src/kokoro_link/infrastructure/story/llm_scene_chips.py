@@ -17,7 +17,6 @@ to distinguish them, which is why neither implementation raises.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 
@@ -32,6 +31,7 @@ from kokoro_link.infrastructure.prompt.operator_language import (
     render_operator_language_hint,
 )
 from kokoro_link.infrastructure.prompts import get_default_loader
+from kokoro_link.llm_output import extract_object_outcome, log_parse_outcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -147,14 +147,10 @@ def _build_prompt(context: StorySceneChipsContext) -> str:
 
 
 def _parse_actions(raw: str, *, limit: int) -> tuple[str, ...]:
-    payload = _extract_json_object(raw)
-    if payload is None:
-        return ()
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return ()
-    if not isinstance(parsed, dict):
+    outcome = extract_object_outcome(raw, repair_truncated=True)
+    log_parse_outcome(_LOGGER, outcome, site="story.scene_chips")
+    parsed = outcome.value
+    if parsed is None:
         return ()
     actions = parsed.get("actions")
     if not isinstance(actions, list):
@@ -194,31 +190,3 @@ def _clean(value: object) -> str:
     if len(text) > _MAX_CHIP_CHARS:
         return ""
     return text
-
-
-def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:index + 1]
-    return None
